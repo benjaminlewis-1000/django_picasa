@@ -1,0 +1,114 @@
+# Install django
+pip install Django
+ 
+# Install PostgreSQL driver
+pip install psycopg2-binary
+
+# Install celery
+pip install celery>=3.1.18
+pip install django-celery-beat
+
+# Start the site
+django-admin startproject <<mysite>>
+
+# Turn off debug in <mysite>/settings.py
+
+# Start an app, "periodic"
+python manage.py startapp periodic
+
+# Change TIME_ZONE to "America/New_York" in <project>/settings.py
+
+# Using steps from https://realpython.com/asynchronous-tasks-with-django-and-celery/, set up the celery.py
+# file in <mysite> directory.
+
+# Install redis as a broker
+sudo apt-get install redis
+pip install redis
+
+# Collect static files:
+python manage.py collectstatic
+
+# Then add the following (may need an edit) to settings.py:
+# CELERY STUFF
+BROKER_URL = 'redis://localhost:6379'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379'
+CELERY_ACCEPT_CONTENT = ['application/json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'America/New_York'
+
+# Set up a Django superuser admin
+
+python manage.py createsuperuser
+# My user: benjamin
+# My password: <the movie one>
+
+#*#*#*#*#*# 
+MUST BE SET DURING DEPLOY
+*#*#*#*#*#*
+
+settings.py -- ALLOWED_HOSTS
+
+
+#### Adding a Celery Task ####
+# From https://realpython.com/asynchronous-tasks-with-django-and-celery/, set up the celery.py
+# Section: Periodic tasks
+
+Add 'tasks.py' in the app (e.g. 'periodic' folder), with the 'periodic task' code. Also add the 'periodic' app
+ to the project and make the views.py and urls.py as described in https://docs.djangoproject.com/en/2.2/intro/tutorial01/.
+ -- Crontab only goes down to minutes...
+#### NOTE: The task should be named 'task_...'
+
+# Apply your migrations:
+python manage.py migrate
+
+# Start celery workers:
+celery -A <project> worker -l info -n <unique_name>
+# You can see all workers with
+celery -A <project> status
+# Run the celery beat with
+celery -A <project> beat
+
+# HOW IT **SHOULD** WORK:
+celery -A <project> inspect scheduled 
+# should list the scheduled tasks. But there are none. 
+# Also:
+celery -A picasa shell
+celery.conf.beat_schedule
+
+'''
+I don't know why but the syntax used in the SO question is outdated, you must use
+app.autodiscover_tasks(lambda: settings.INSTALLED_APPS) now: http://docs.celeryproject.org/en/latest/django/first-steps-with-django.html
+'''
+
+# NEED TO ADD APP TO settings/INSTALLED_APPS.
+# Also need to add the one line in <app>/apps.py
+
+-- from django.apps import AppConfig
+
+-- class <Appname>Config(Appconfig)
+--     name = '<whatever>'
+
+# GOT IT!
+Key sites to figure it out: 
+-- http://docs.celeryproject.org/en/latest/django/first-steps-with-django.html (Documentation)
+-- https://www.merixstudio.com/blog/django-celery-beat/ (Had a couple weird things)
+
+# Key ideas: 
+
+-- @task or @shared_task decorator in <app>/tasks.py
+-- <app>/apps.py - a couple lines (see example)
+-- <app>/__init__.py - default_app_config = '<app>.apps.<Appname>Config'
+-- <project>/celery.py, set up according to http://docs.celeryproject.org/en/latest/django/first-steps-with-django.html .. The lines pertaining to the "proj.settings" are important to get right, rather than mporting the settings from django.conf (this causes circular dependency). The tasks can be defined elsewhere...
+-- <project>/settings.py -- set up with CELERY namespace items, largely according to https://www.merixstudio.com/blog/django-celery-beat/. 
+---- also need to have the app in the INSTALLED_APPS list. 
+-- <project>/__init__.py -- the lines described in http://docs.celeryproject.org/en/latest/django/first-steps-with-django.html . 
+-- Maybe <project>/urls.py set up, but that doesn't seem to be a requirement. 
+-- Timing for the tasks goes in the <project>/settings.py file.
+-- To run tasks: 
+	-- Create a worker: celery -A picasa worker -l info
+	-- ** AND **
+	-- Create a celery beat: celery -A picasa beat -l INFO 
+
+# MAKE APPS REUSABLE
+https://docs.djangoproject.com/en/2.2/intro/reusable-apps/	
