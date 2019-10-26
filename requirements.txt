@@ -1,0 +1,11 @@
+face_recognition
+Django>=2.0.2
+celery>=4.0.2
+psycopg2-binary
+opencv-python-headless
+numpy
+scons
+Pillow
+django-celerybeat-status 
+dj-database-url
+postgres

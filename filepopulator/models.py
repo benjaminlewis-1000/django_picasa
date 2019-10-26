@@ -21,6 +21,11 @@ import pytz
 import logging
 import cv2
 import numpy as np
+
+# Image thumbnail processing
+from stdimage import StdImageField, JPEGField
+from stdimage.utils import render_variations
+
 # Create your models here.
 
 # What do I want to happen when the images have the same hash? 
@@ -34,10 +39,6 @@ logging.warning("TODO: Need to handle thumbnails in this better")
 logging.warning("TODO: May want to handle bad files more gracefully.")
 logging.warning("TODO: More logic is needed to see if the file has changed at all, instead of just hash")
 
-class Face(models.Model):
-    # Primary key comes for free
-    person_name = models.CharField(max_length=100)
-
 class Directory(models.Model):
     dir_path = models.CharField(max_length=255)
 
@@ -49,14 +50,13 @@ class ImageFile(models.Model):
 
     filename = models.CharField(max_length=255, validators=[RegexValidator(regex="\.[j|J][p|P][e|E]?[g|G]$", message="Filename must be a JPG")], db_index = True)
     # CASCADE is expected; if delete directory, delete images.
-    directory = models.ForeignKey(Directory, on_delete=models.CASCADE)
+    directory = models.ForeignKey(Directory, on_delete=models.PROTECT)
     pixel_hash = models.CharField(max_length = 64, null = False, default = -1)
     file_hash = models.CharField(max_length = 64, null = False, default = -1)
-    # id = models.AutoField(primary_key=True,  default=-1, editable=False)
-    # id is a default field
 
     # Thumbnails 
-    thumbnail = models.ImageField(upload_to='thumbnails')
+    thumbnail = models.ImageField(upload_to='thumbnails', editable=False)
+    # thumbnail = JPEGField(upload_to='thumbnails', variations={'thumbnail': settings.FILEPOPULATOR_THUMBNAIL_SIZE})
     logging.warning('upload_to is wrong')
     # thumbnail_tiny = models.ImageField(upload_to='thumbnails_tiny')
     # thumbnail_small = models.ImageField(upload_to='thumbnails_small')
@@ -108,7 +108,6 @@ class ImageFile(models.Model):
     def __str__(self):
         return "{}".format(self.filename)
 
-
     def process_new(self):
 
         is_new = True
@@ -120,7 +119,6 @@ class ImageFile(models.Model):
         self._init_image()
         self._get_dir()
         self._generate_md5_hash()
-        self._generate_thumbnail()
         self._get_date_taken()
 
         name_match = ImageFile.objects.filter(filename=self.filename)
@@ -136,6 +134,10 @@ class ImageFile(models.Model):
                 # raise NotImplementedError('What do we do here?')
             # return
 
+        self.height=1
+        self.width=1
+
+        # self._generate_thumbnail()
 
         # hash_match = ImageFile.objects.filter(pixel_hash__contains=self.pixel_hash)
         # if hash_match and name_match:
@@ -266,6 +268,33 @@ class ImageFile(models.Model):
         self.isProcessed = False
         self.dateAdded = timezone.now()
 
+
+        # If no ExifTags, no rotating needed.
+        try:
+            # Grab orientation value.
+            # Already done in _init_image()
+
+            # Rotate depending on orientation.
+            if self.orientation == 2:
+                self.image = self.image.transpose(PIL.Image.FLIP_LEFT_RIGHT)
+            if self.orientation == 3:
+                self.image = self.image.transpose(PIL.Image.ROTATE_180)
+            if self.orientation == 4:
+                self.image = self.image.transpose(PIL.Image.FLIP_TOP_BOTTOM)
+            if self.orientation == 5:
+                self.image = self.image.transpose(PIL.Image.FLIP_LEFT_RIGHT).transpose(
+                    PIL.Image.ROTATE_90)
+            if self.orientation == 6:
+                self.image = self.image.transpose(PIL.Image.ROTATE_270)
+            if self.orientation == 7:
+                self.image = self.image.transpose(PIL.Image.FLIP_TOP_BOTTOM).transpose(
+                    PIL.Image.ROTATE_90)
+            if self.orientation == 8:
+                self.image = self.image.transpose(PIL.Image.ROTATE_90)
+        except:
+            # Orientation 1 
+            pass
+
     # Orientation ? 
     def _generate_md5_hash(self):
         # Reads the pixels in the image, reshapes them,
@@ -331,86 +360,49 @@ class ImageFile(models.Model):
         # self.dateTaken = (self.dateTaken)
 
     def _generate_thumbnail(self):
-        # PIL will open the image without regard to the orientation flag. So we need to open it and get the
-        # data for the orientation, then orient correctly before deciding on width and height. 
+        """
+        Create and save the thumbnail for the photo (simple resize with PIL).
+        """
+        # fh = storage.open(self.photo_name, 'r')
+        # try:
+        #     image = Image.open(self.filename)
+        # except:
+        #     print("Couldn't open")  
+        #     return False
 
-        # full_path = os.path.join(self.directory.dir_path, self.filename)
+        image = self.image
 
-        # If no ExifTags, no rotating needed.
-        try:
-            # Grab orientation value.
-            # Already done in _init_image()
+        image.thumbnail(settings.FILEPOPULATOR_THUMBNAIL_SIZE_BIG, Image.ANTIALIAS)
 
-            # Rotate depending on orientation.
-            if self.orientation == 2:
-                self.image = self.image.transpose(PIL.Image.FLIP_LEFT_RIGHT)
-            if self.orientation == 3:
-                self.image = self.image.transpose(PIL.Image.ROTATE_180)
-            if self.orientation == 4:
-                self.image = self.image.transpose(PIL.Image.FLIP_TOP_BOTTOM)
-            if self.orientation == 5:
-                self.image = self.image.transpose(PIL.Image.FLIP_LEFT_RIGHT).transpose(
-                    PIL.Image.ROTATE_90)
-            if self.orientation == 6:
-                self.image = self.image.transpose(PIL.Image.ROTATE_270)
-            if self.orientation == 7:
-                self.image = self.image.transpose(PIL.Image.FLIP_TOP_BOTTOM).transpose(
-                    PIL.Image.ROTATE_90)
-            if self.orientation == 8:
-                self.image = self.image.transpose(PIL.Image.ROTATE_90)
-        except:
-            # Orientation 1 
-            pass
+        thumb_filename = f'{self.pixel_hash}_{self.file_hash}.jpg'
 
-        self.width, self.height = self.image.size
+        FTYPE = 'JPEG' # 'GIF' or 'PNG' are possible extensions
 
-        self.image.thumbnail(settings.FILEPOPULATOR_THUMBNAIL_SIZE_BIG,
-                        PIL.Image.ANTIALIAS)
-
-        FTYPE = 'JPEG'
-        DJANGO_TYPE = 'image/jpeg'
-        thumb_name = self.pixel_hash + '_' + self.file_hash + '.jpg'
-
+        # Save thumbnail to in-memory file as StringIO
         temp_thumb = BytesIO()
-        self.image.save(temp_thumb, FTYPE)
+        image.save(temp_thumb, FTYPE)
         temp_thumb.seek(0)
-        # self.thumbnail = ContentFile(temp_thumb.getvalue())
-        suf = SimpleUploadedFile(self.pixel_hash + "_" + self.file_hash,temp_thumb.read(), content_type=DJANGO_TYPE)
-        self.thumbnail.save('%s.%s'%(os.path.splitext(suf.name)[0],FTYPE), suf, save=True)
-
-        # suf = SimpleUploadedFile('%s.%s'%(os.path.splitext(suf.name)[0],FILE_EXTENSION)
-                # temp_thumb.read(), content_type=DJANGO_TYPE)
-
-
 
         # Load a ContentFile into the thumbnail field so it gets saved
-        # The 'thumbnail.save' line doesn't actually save, but it does generate
-        # the thumbnail name. 
-        # self.thumbnail.save(thumb_name, suf, save=True)
-        # self.image.save(self.thumbnail.name, "JPEG", quality=90)
+        self.thumbnail.save(thumb_filename, ContentFile(temp_thumb.read()), save=False)
+        print(self.filename + " saved to : " + self.thumbnail.path)
 
         temp_thumb.close()
 
-        # assert os.path.isfile(self.thumbnail.name)
+        return True
+
+    def save(self, *args, **kwargs):
+        """
+        Make and save the thumbnail for the photo here.
+        """
+        self.process_new()
+        if not self._generate_thumbnail():
+            raise Exception('Could not create thumbnail - is the file type valid?')
+        super(ImageFile, self).save(*args, **kwargs)
+
+    def delete(self):
+        file = ImageFile.objects.filter(id=self.id)
+        os.remove(file[0].thumbnail.path)
+        super(ImageFile, self).delete()
 
 
-        # image_io_thumb = BytesIO()
-        # logging.debug(self.image.size)
-        # self.image.save(image_io_thumb, format="JPEG")
-        # self.thumbnail = ContentFile(image_io_thumb.getvalue())
-        # print(self.thumbnail)
-        # print(image_io_thumb.getvalue()[0:10])
-        # logging.debug("TODO: Actually save thumbnails")
-        # # print(self.thumbnail.name)
-
-        # image_io_thumb.close()
-        def save(self, *args, **kwargs):
-            try:
-                this = ImageFile.objects.get(id=self.id)
-                self._generate_thumbnail()
-                # if this.profile_pic != self.profile_pic:
-                #     this.profile_pic.delete(save=False)
-                #     this.thumb_pic.delete(save=False)
-            except: 
-                pass
-            super(ImageFile, self).save(*args, **kwargs)

@@ -28,20 +28,25 @@ def create_image_file(file_path):
 
     new_photo = ImageFile(filename=file_path)
     new_photo.process_new()
-
-    # Case 1: photo exists at this location. 
+ 
 
     def instance_clean_and_save(instance):
         try:
             instance.full_clean()
         except ValidationError as ve:
-            logging.error("Did not add photo {}: {}".format(file_path, ve) )
+            if file_path.lower().endswith(('.jpg', '.jpeg')):
+                logging.critical("Did not add JPEG-type photo {}: {}".format(file_path, ve))
+            else:
+                logging.debug("Did not add photo {}: {}".format(file_path, ve) )
         else:
             instance.save()
-            assert os.path.isfile(instance.thumbnail.name), \
+
+            assert os.path.isfile(instance.thumbnail.path), \
                 'Thumbnail {} wasn''t generated for {}.'.\
                 format(instance.thumbnail.name, file_path)
+        
 
+    # Case 1: photo exists at this location.
     if len(exist_photo):
         if len(exist_photo) > 1:
             raise ValueError('Should only have at most one instance of a file. You have {}'.format(len(exist_photo)))
@@ -54,18 +59,16 @@ def create_image_file(file_path):
             # Don't want to delete it -- they reference the same picture in distinct locations.
                 return
             else:
+                exist_photo = new_photo
                 exist_photo.orientation = new_photo.orientation
                 exist_photo.dateAdded = timezone.now()
                 exist_photo.isProcessed = False
                 instance_clean_and_save(exist_photo)
                 return
         else:
-            # raise NotImplementedError('Photo already exists, but image hash is different.')
-            print("Here")
-            exist_photo.thumbnail.delete()
             exist_photo.delete()
             instance_clean_and_save(new_photo)
-        # Need to check if the image has changed and such. 
+            return
 
     # Case 2: No photo exists at this location.
     else:
@@ -115,7 +118,6 @@ def delete_removed_photos():
     for each_photo in all_photos:
         filepath = each_photo.filename
         if not os.path.isfile(filepath):
-            each_photo.thumbnail.delete()
             each_photo.delete()
 
     # ImageFile.objects.all().delete()

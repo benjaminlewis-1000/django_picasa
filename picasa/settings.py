@@ -71,6 +71,8 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'periodic.apps.PeriodicConfig',
     'filepopulator',
+    'face_manager',
+    'upload_img',
 ]
 
 MIDDLEWARE = [
@@ -107,13 +109,27 @@ WSGI_APPLICATION = 'picasa.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/2.2/ref/settings/#databases
 
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.sqlite3',
+#         'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+#     }
+# }
+
+DB_NAME = 'picasa'
+DB_USER = 'benjamin'
+DB_PASS = 'lewis'
+
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': DB_NAME,
+        'USER': DB_USER,
+        'PASSWORD': DB_PASS,
+        'HOST': 'localhost',
+        'PORT': '5432',
     }
 }
-
 
 # Password validation
 # https://docs.djangoproject.com/en/2.2/ref/settings/#auth-password-validators

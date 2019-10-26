@@ -11,6 +11,28 @@ pip install django-celery-beat
 # Start the site
 django-admin startproject <<mysite>>
 
+# Set up the postgres database
+> sudo apt install postgresql postgresql-contrib
+> pip install dj-database-url postgres
+> sudo su - postgres
+> psql
+> CREATE USER <username> PASSWORD '<password>';
+> CREATE DATABASE <db_name> OWNER <username>;
+> ALTER USER <username> CREATEDB;
+- Change the database line in settings.py to:
+'''
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': '<db_name>',
+        'USER': '<username>',
+        'PASSWORD': '<password>',
+        'HOST': 'localhost',
+        'PORT': '5432',
+    }
+}
+'''
+
 # Turn off debug in <mysite>/settings.py
 
 # Start an app, "periodic"

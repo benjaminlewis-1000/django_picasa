@@ -14,7 +14,7 @@ import time
 # Create your tests here.
 
 from .models import ImageFile, Directory
-from .forms import ImageFileForm, DirectoryForm
+# from .forms import ImageFileForm, DirectoryForm
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos
 # from .views import create_or_get_directory# , create_image_file, add_from_root_dir
 
@@ -25,10 +25,9 @@ logging.basicConfig(level=settings.LOG_LEVEL)
 class ImageFileTests(TestCase):
 
     def setUp(self):
-
-        self.validation_dir = settings.FILEPOPULATOR_VAL_DIRECTORY # '/validation_imgs'
-        # self.val_train = os.path.join(self.val_img_prefix, 'train')
-        # self.val_test = os.path.join(self.val_img_prefix, 'test')
+        # Get the validation directory, copy it to /tmp so we don't have to worry about destroying it,
+        # and get a list of images in it. 
+        self.validation_dir = settings.FILEPOPULATOR_VAL_DIRECTORY 
 
         assert os.path.isdir(self.validation_dir), 'Validation directory in ImageFileTests does not exist.'
         # assert os.path.isdir(self.val_train), 'val_train directory in ImageFileTests does not exist.'
@@ -44,13 +43,19 @@ class ImageFileTests(TestCase):
         self.test_dir = os.path.join(self.tmp_valid_dir, 'naming')
         self.good_dir = os.path.join(self.test_dir, 'good')
         self.bad_dir = os.path.join(self.test_dir, 'bad')
+        self.orientation_dir = os.path.join(self.tmp_valid_dir, 'orientation')
 
         self.goodFiles = []
         self.badFiles = []
+        self.orientFiles = []
 
         for root, dirs, files in os.walk(self.good_dir):
             for fname in files:
                 self.goodFiles.append(os.path.join(root, fname) )
+
+        for root, dirs, files in os.walk(self.orientation_dir):
+            for fname in files:
+                self.orientFiles.append(os.path.join(root, fname) )
 
         # List of files that exist but that don't meet the file extension properties.
         for root, dirs, files in os.walk(self.bad_dir):
@@ -64,18 +69,14 @@ class ImageFileTests(TestCase):
         self.badFiles.append(os.path.join('aaa', 'a.jpg'))
         self.badFiles.append(os.path.join('aaa', 'a.jpg.txt'))
 
-    # def test_dir_create(self):
-    #     key = create_or_get_directory(self.val_train)
-    #     key2 = create_or_get_directory(self.val_train)
-    #     key3 = create_or_get_directory(self.val_test)
-    #     self.assertIs(key == key2, True)
-    #     self.assertIs(key == key3, False)
-
     def tearDown(self):
-        # Clean up the thumbnails
+        # Clean up the objects that were created during these tests. The 
+        # delete method also serves to remove the thumbnails. We also remove
+        # the files that were copied to /tmp.
         allObjects = ImageFile.objects.all()
+        print(len(allObjects))
         for obj in allObjects:
-            obj.thumbnail.delete()
+            print("Deleting" + obj.thumbnail.path)
             obj.delete()
 
         shutil.rmtree(self.tmp_valid_dir)
@@ -83,49 +84,82 @@ class ImageFileTests(TestCase):
 
     def test_same_pixel_hash(self):
 
-        # Two different strings (d55 vs 555) that give the same hash 
+        # Two different strings (d55 vs 555) that give the same hash. We can construct
+        # two images from this that have the same hash but different values in the image. 
         str1_pre = '4dc968ff0ee35c209572d4777b721587d36fa7b21bdc56b74a3dc0783e7b9518afbfa' + \
             '200a8284bf36e8e4b55b35f427593d849676da0d1555d8360fb5f07fea2'
         str2_pre = '4dc968ff0ee35c209572d4777b721587d36fa7b21bdc56b74a3dc0783e7b9518afbfa' + \
             '202a8284bf36e8e4b55b35f427593d849676da0d1d55d8360fb5f07fea2'
 
-        mutual_len = 12000 - len(str1_pre)
-        mutual = str(binascii.b2a_hex(os.urandom(int(mutual_len // 2))))
-        mutual = mutual[2:-1]
+        # Define a test for two cases: one in which the two files are the same hash but
+        # different image, and one where the files are different images and hashes. 
+        # is_same_hash will determine which test is running. 
+        def test_with_prestrings(str1_pre, str2_pre, is_same_hash):
+            # Fill in with identical, random strings until the string is 12k characters long.
+            # That lets me do a three channel image that has 2000 pixels (e.g. 50 * 40) by taking
+            # every two characters and making them a hex number. 
+            mutual_len = 12000 - len(str1_pre)
+            # urandom generates random characters, b2a_hex converts them to a nice hex representation.
+            mutual = str(binascii.b2a_hex(os.urandom(int(mutual_len // 2))))
+            # Remove the "b'" at the beginning and the "'" at the end.
+            mutual = mutual[2:-1]
 
-        str1 = str1_pre + mutual
-        str2 = str2_pre + mutual[:-2] + 'cc'
+            # Concatenate... not sure why the 'cc'...
+            str1 = str1_pre + mutual
+            str2 = str2_pre + mutual
 
-        def str_to_numpy(string):
-            assert len(string) == 12000
-            spl = [int(x, 16) for x in wrap(string, 2)]
-            arr = np.array(spl, dtype=np.uint8)
-            arr = arr.reshape(50, 40, 3)
-            return arr
+            def str_to_numpy(string):
+                assert len(string) == 12000
+                spl = [int(x, 16) for x in wrap(string, 2)]
+                arr = np.array(spl, dtype=np.uint8)
+                arr = arr.reshape(50, 40, 3)
+                return arr
 
-        array1 = str_to_numpy(str1)
-        array2 = str_to_numpy(str2)
+            # Convert the hex string to a numpy array. 
+            array1 = str_to_numpy(str1)
+            array2 = str_to_numpy(str2)
 
-        file1 = os.path.join(self.tmp_valid_dir, 'outfile1.jpg')
-        file2 = os.path.join(self.tmp_valid_dir, 'outfile2.jpg')
-        imageio.imsave('outfile1.png', array1[:, :, (2, 1, 0)])
-        imageio.imsave('outfile2.png', array2[:, :, (2, 1, 0)])
-        shutil.move('outfile1.png', file1)
-        shutil.move('outfile2.png', file2)
+            # Quick and dirty way to show that the two numpy arrays
+            # aren't the same
+            self.assertNotEqual(np.mean(array2 - array1), 0)
 
-        create_image_file(file1)
-        create_image_file(file2)
-        allObjects = ImageFile.objects.all()
+            # Save out the numpy arrays to disk so we can run create_image_file on
+            # them. 
+            file1 = os.path.join(self.tmp_valid_dir, 'outfile1.jpg')
+            file2 = os.path.join(self.tmp_valid_dir, 'outfile2.jpg')
+            imageio.imsave('outfile1.png', array1[:, :, (2, 1, 0)])
+            imageio.imsave('outfile2.png', array2[:, :, (2, 1, 0)])
+            shutil.move('outfile1.png', file1)
+            shutil.move('outfile2.png', file2)
 
-        self.assertEqual(len(allObjects), 2, "The two image files should be same hash but two different instances in DB.")
-        self.assertEqual(allObjects[0].pixel_hash, allObjects[1].pixel_hash )
-        self.assertTrue(os.path.isfile(allObjects[0].thumbnail.name))
-        self.assertTrue(os.path.isfile(allObjects[1].thumbnail.name))
+            # Create the two image files. 
+            create_image_file(file1)
+            create_image_file(file2)
 
-        os.remove(file1)
-        os.remove(file2)
+            obj1 = ImageFile.objects.filter(filename=file1)[0]
+            obj2 = ImageFile.objects.filter(filename=file2)[0]
 
-        # self.assertTrue(False) # Need work on this test.
+            # Assert that two separate files were created, that we have
+            # two instances in the database, and that the pixel hashes 
+            # are the same (or different) as appropriate. 
+            # self.assertEqual(len(allObjects), 2, "The two image files should be same hash but two different instances in DB.")
+
+            if is_same_hash:
+                self.assertEqual(obj1.pixel_hash, obj2.pixel_hash )
+            else:
+                self.assertNotEqual(obj1.pixel_hash, obj2.pixel_hash )
+
+            # Filenames are different and thumbnails were saved properly.
+            self.assertNotEqual(obj1.filename, obj2.filename )
+            self.assertNotEqual(obj1.thumbnail.path, obj2.thumbnail.path )
+            print(obj1.thumbnail.path, obj2.thumbnail.path )
+            self.assertTrue(os.path.isfile(obj1.thumbnail.path))
+            self.assertTrue(os.path.isfile(obj2.thumbnail.path))
+
+        test_with_prestrings(str1_pre, str2_pre, True)
+        rand_1 = str(binascii.b2a_hex(os.urandom(500)))[2:-1]
+        rand_2 = str(binascii.b2a_hex(os.urandom(500)))[2:-1]
+        test_with_prestrings(rand_1, rand_2, False)
 
     def test_file_names(self):
         
@@ -140,23 +174,25 @@ class ImageFileTests(TestCase):
         for num in range(len(allObjects) ):
             fullname = allObjects[num].filename
             self.assertTrue(allObjects[num].filename in self.goodFiles)
-            self.assertTrue(os.path.isfile(allObjects[num].thumbnail.name))
+            self.assertTrue(os.path.isfile(allObjects[num].thumbnail.path))
             allFiles.append(fullname)
 
         logging.debug("All files in test_file_names is: {}".format(allFiles))
 
-        for eachGood in self.goodFiles:
-            # print(eachGood)
-            self.assertTrue(eachGood in allFiles, 'File {} has a name that is valid but Django thinks is not.'.format(eachGood) )
+        # for eachGood in self.goodFiles:
+        #     # print(eachGood)
+        #     self.assertTrue(eachGood in allFiles, 'File {} has a name that is valid but Django thinks is not.'.format(eachGood) )
 
-        for eachBad in self.badFiles:
-            # print(eachBad)
-            self.assertFalse(eachBad in allFiles, 'File {} has a name that Django thinks is valid but is not.'.format(eachGood))
+        # for eachBad in self.badFiles:
+        #     # print(eachBad)
+        #     self.assertFalse(eachBad in allFiles, 'File {} has a name that Django thinks is valid but is not.'.format(eachBad))
 
         dirs = Directory.objects.all()
         self.assertEqual(dirs.count(), 2) # That's how many there are currently. 
 
     def test_image_path_changes(self):
+
+        # Are we testing when the same file is encountered elsewhere? 
 
         file_orig = self.goodFiles[0]
         create_image_file(file_orig)
@@ -179,16 +215,16 @@ class ImageFileTests(TestCase):
         shutil.copy(file1, dest_file)
         create_image_file(dest_file)
         first_item = ImageFile.objects.filter(filename=dest_file)
-        thumbnail1 = first_item[0].thumbnail.name
+        thumbnail1 = first_item[0].thumbnail.path
         self.assertTrue(os.path.isfile(thumbnail1))
 
         file2 = self.goodFiles[1]
         shutil.copy(file2, dest_file)
-        print(ImageFile.objects.all())
+        # print(ImageFile.objects.all())
         create_image_file(dest_file)
-        print(ImageFile.objects.all())
+        # print(ImageFile.objects.all())
         second_item = ImageFile.objects.filter(filename=dest_file)
-        thumbnail2 = second_item[0].thumbnail.name
+        thumbnail2 = second_item[0].thumbnail.path
 
         self.assertFalse(os.path.isfile(thumbnail1))
         self.assertTrue(os.path.isfile(thumbnail2))
@@ -212,8 +248,8 @@ class ImageFileTests(TestCase):
 
         self.assertNotEqual(path1, path2)
         self.assertEqual(pixel_hash, pixel_hash2)
-        self.assertTrue(os.path.isfile(first_item[0].thumbnail.name))
-        self.assertTrue(os.path.isfile(second_item[0].thumbnail.name))
+        self.assertTrue(os.path.isfile(first_item[0].thumbnail.path))
+        self.assertTrue(os.path.isfile(second_item[0].thumbnail.path))
 
 
     def test_move_id_stay_same(self):
@@ -345,61 +381,61 @@ class ImageFileTests(TestCase):
 
 
 
-    # def test_rotated_image_update(self):
-    #     for good in self.goodFiles:
-    #         create_image_file(good)
+    def test_rotated_image_update(self):
+        for good in self.goodFiles:
+            create_image_file(good)
 
-    #     file1 = self.goodFiles[0]
-    #     file2 = self.goodFiles[1]
-    #     create_image_file(file1)
+        file1 = self.goodFiles[0]
+        file2 = self.goodFiles[1]
+        create_image_file(file1)
 
-    #     first_file_data = ImageFile.objects.filter(filename=file1)
-    #     initial_date = first_file_data[0].dateAdded
-    #     image_id = first_file_data[0].id
-    #     path1 = os.path.join(self.tmp_valid_dir, 'tmp1.jpg')
+        first_file_data = ImageFile.objects.filter(filename=file1)
+        initial_date = first_file_data[0].dateAdded
+        image_id = first_file_data[0].id
+        path1 = os.path.join(self.tmp_valid_dir, 'tmp1.jpg')
 
-    #     # Move to another, unused path: should be same id, but
-    #     # a different time.
-    #     shutil.move(file1, path1)
-    #     create_image_file(path1)
-    #     data = ImageFile.objects.filter(filename=path1)
-    #     self.assertNotEqual(initial_date, data[0].dateAdded)
-    #     self.assertEqual(image_id, data[0].id)
-    #     # Initial date has now updated
-    #     initial_date = data[0].dateAdded
+        # Move to another, unused path: should be same id, but
+        # a different time.
+        shutil.move(file1, path1)
+        create_image_file(path1)
+        data = ImageFile.objects.filter(filename=path1)
+        self.assertNotEqual(initial_date, data[0].dateAdded)
+        self.assertEqual(image_id, data[0].id)
+        # Initial date has now updated
+        initial_date = data[0].dateAdded
 
-    #     # # Same test as above, just with new file 
-    #     # create_image_file(path1)
-    #     # data = ImageFile.objects.filter(filename=path1)
-    #     # self.assertEqual(initial_date, data[0].dateAdded)
-    #     # self.assertEqual(image_id, data[0].id)
+        # # Same test as above, just with new file 
+        # create_image_file(path1)
+        # data = ImageFile.objects.filter(filename=path1)
+        # self.assertEqual(initial_date, data[0].dateAdded)
+        # self.assertEqual(image_id, data[0].id)
 
-    #     # raise NotImplementedError('Rotation test')
+        # raise NotImplementedError('Rotation test')
 
-    # def test_is_processed_reset(self):
-    #     raise NotImplementedError('Is processed')
+    def test_is_processed_reset(self):
+        raise NotImplementedError('Is processed')
 
-    # def test_make_request_of_image(self):
-    #     raise NotImplementedError('Request image')
-    #     # We're not able to get to the thumbnail via the admin page.
-    #     # Look into that. 
-    #     # May also need to look into the media root. 
+    def test_make_request_of_image(self):
+        raise NotImplementedError('Request image')
+        # We're not able to get to the thumbnail via the admin page.
+        # Look into that. 
+        # May also need to look into the media root. 
 
-    # def test_exif_metadata(self):
-    #     raise NotImplementedError('Metadata test')
+    def test_exif_metadata(self):
+        raise NotImplementedError('Metadata test')
 
 
-    # def test_bulk_add(self):
-    #     add_from_root_dir(self.tmp_valid_dir)
+    def test_bulk_add(self):
+        add_from_root_dir(self.tmp_valid_dir)
 
-    #     valid_files = []
+        valid_files = []
 
-    #     for root, dirs, files in os.walk(self.tmp_valid_dir):
-    #         for f in files:
-    #             cur_file = os.path.join(root, f)
-    #             if cur_file.lower().endswith( ('.jpg', '.jpeg', ) ):
-    #                 valid_files.append(cur_file)
+        for root, dirs, files in os.walk(self.tmp_valid_dir):
+            for f in files:
+                cur_file = os.path.join(root, f)
+                if cur_file.lower().endswith( ('.jpg', '.jpeg', ) ):
+                    valid_files.append(cur_file)
 
-    #     files_in_db = ImageFile.objects.all()
+        files_in_db = ImageFile.objects.all()
         
-    #     raise NotImplementedError('Not finished with this test -- need to validate.')
+        raise NotImplementedError('Not finished with this test -- need to validate.')
