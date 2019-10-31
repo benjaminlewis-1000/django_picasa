@@ -203,11 +203,11 @@ CELERY_BEAT_SCHEDULE = {
 
 
 FILEPOPULATOR_THUMBNAIL_DIR = '/home/benjamin/git_repos/picasa_files/thumbnails' # place to store thumbnails that are derived from the images. 
-FILEPOPULATOR_THUMBNAIL_SIZE_TINY = (30, 30)
-FILEPOPULATOR_THUMBNAIL_SIZE_SMALL = (100, 100)
-FILEPOPULATOR_THUMBNAIL_SIZE_MEDIUM = (250, 250)
-FILEPOPULATOR_THUMBNAIL_SIZE = (250, 250)
+# FILEPOPULATOR_THUMBNAIL_SIZE_TINY = (30, 30)
+# FILEPOPULATOR_THUMBNAIL_SIZE = (250, 250)
 FILEPOPULATOR_THUMBNAIL_SIZE_BIG = (500, 500)
+FILEPOPULATOR_THUMBNAIL_SIZE_MEDIUM = (250, 250)
+FILEPOPULATOR_THUMBNAIL_SIZE_SMALL = (100, 100)
 FILEPOPULATOR_SERVER_IMG_DIR = '/home/benjamin/git_repos/picasa_files/actual_imgs' # root location of images you want to index into. (This maybe will change)
 FILEPOPULATOR_CODE_DIR = '/home/benjamin/git_repos/local_picasa' # root directory of the code. 
 FILEPOPULATOR_VAL_DIRECTORY = '/home/benjamin/git_repos/picasa_files/test_imgs'  # point to a directory that will have validation images when testing the app.

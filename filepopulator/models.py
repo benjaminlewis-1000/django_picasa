@@ -55,12 +55,9 @@ class ImageFile(models.Model):
     file_hash = models.CharField(max_length = 64, null = False, default = -1)
 
     # Thumbnails 
-    thumbnail = models.ImageField(upload_to='thumbnails', editable=False)
-    # thumbnail = JPEGField(upload_to='thumbnails', variations={'thumbnail': settings.FILEPOPULATOR_THUMBNAIL_SIZE})
-    logging.warning('upload_to is wrong')
-    # thumbnail_tiny = models.ImageField(upload_to='thumbnails_tiny')
-    # thumbnail_small = models.ImageField(upload_to='thumbnails_small')
-    # thumbnail_big = models.ImageField(upload_to='thumbnails_big')
+    thumbnail_big = models.ImageField(upload_to='thumbnails_big', editable=False, default=None)
+    thumbnail_medium = models.ImageField(upload_to='thumbnails_med', editable=False, default=None)
+    thumbnail_small = models.ImageField(upload_to='thumbnails_small', editable=False, default=None)
 
     # square_thumbnail = models.ImageField(upload_to='square_thumbnails')
     # square_thumbnail_tiny = models.ImageField(
@@ -121,16 +118,16 @@ class ImageFile(models.Model):
         self._generate_md5_hash()
         self._get_date_taken()
 
-        name_match = ImageFile.objects.filter(filename=self.filename)
-        if name_match: # i.e. we've looked at this file before.
-            is_new = False
-            assert len(name_match) == 1, 'More than one record for same image filepath.'
-            old_pixel_hash = name_match[0].pixel_hash
-            if old_pixel_hash == self.pixel_hash:
-                # Still the same picture. We're good.
-                return
-            else:
-                logging.warning("TODO: File repeat with changes. Need logic to see if the file has changed at all...")
+        # name_match = ImageFile.objects.filter(filename=self.filename)
+        # if name_match: # i.e. we've looked at this file before.
+        #     is_new = False
+        #     assert len(name_match) == 1, 'More than one record for same image filepath.'
+        #     old_pixel_hash = name_match[0].pixel_hash
+        #     if old_pixel_hash == self.pixel_hash:
+        #         # Still the same picture. We're good.
+        #         return
+        #     else:
+        #         logging.debug("TODO: File repeat with changes. Need logic to see if the file has changed at all...")
                 # raise NotImplementedError('What do we do here?')
             # return
 
@@ -370,24 +367,31 @@ class ImageFile(models.Model):
         #     print("Couldn't open")  
         #     return False
 
-        image = self.image
+        thumb_fields = [self.thumbnail_big, self.thumbnail_medium, self.thumbnail_small]
+        thumb_sizes = [settings.FILEPOPULATOR_THUMBNAIL_SIZE_BIG, \
+                        settings.FILEPOPULATOR_THUMBNAIL_SIZE_MEDIUM, \
+                        settings.FILEPOPULATOR_THUMBNAIL_SIZE_SMALL]
 
-        image.thumbnail(settings.FILEPOPULATOR_THUMBNAIL_SIZE_BIG, Image.ANTIALIAS)
+        for field, size in zip(thumb_fields, thumb_sizes):
 
-        thumb_filename = f'{self.pixel_hash}_{self.file_hash}.jpg'
 
-        FTYPE = 'JPEG' # 'GIF' or 'PNG' are possible extensions
+            image = self.image
 
-        # Save thumbnail to in-memory file as StringIO
-        temp_thumb = BytesIO()
-        image.save(temp_thumb, FTYPE)
-        temp_thumb.seek(0)
+            image.thumbnail(size, Image.ANTIALIAS)
 
-        # Load a ContentFile into the thumbnail field so it gets saved
-        self.thumbnail.save(thumb_filename, ContentFile(temp_thumb.read()), save=False)
-        print(self.filename + " saved to : " + self.thumbnail.path)
+            thumb_filename = f'{self.pixel_hash}_{self.file_hash}.jpg'
 
-        temp_thumb.close()
+            FTYPE = 'JPEG' # 'GIF' or 'PNG' are possible extensions
+
+            # Save thumbnail to in-memory file as StringIO
+            temp_thumb = BytesIO()
+            image.save(temp_thumb, FTYPE)
+            temp_thumb.seek(0)
+
+            # Load a ContentFile into the thumbnail field so it gets saved
+            field.save(thumb_filename, ContentFile(temp_thumb.read()), save=False)
+
+            temp_thumb.close()
 
         return True
 
@@ -401,8 +405,11 @@ class ImageFile(models.Model):
         super(ImageFile, self).save(*args, **kwargs)
 
     def delete(self):
-        file = ImageFile.objects.filter(id=self.id)
-        os.remove(file[0].thumbnail.path)
+        # file = ImageFile.objects.filter(id=self.id)
+        # os.remove(file[0].thumbnail_small.path)
+        os.remove(self.thumbnail_big.path)
+        os.remove(self.thumbnail_medium.path)
+        os.remove(self.thumbnail_small.path)
         super(ImageFile, self).delete()
 
 

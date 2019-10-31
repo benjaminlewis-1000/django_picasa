@@ -41,10 +41,16 @@ def create_image_file(file_path):
         else:
             instance.save()
 
-            assert os.path.isfile(instance.thumbnail.path), \
+            assert os.path.isfile(instance.thumbnail_big.path), \
                 'Thumbnail {} wasn''t generated for {}.'.\
-                format(instance.thumbnail.name, file_path)
-        
+                format(instance.thumbnail_big.name, file_path)
+            assert os.path.isfile(instance.thumbnail_medium.path), \
+                'Thumbnail {} wasn''t generated for {}.'.\
+                format(instance.thumbnail_medium.name, file_path)
+            assert os.path.isfile(instance.thumbnail_small.path), \
+                'Thumbnail {} wasn''t generated for {}.'.\
+                format(instance.thumbnail_small.name, file_path)
+
 
     # Case 1: photo exists at this location.
     if len(exist_photo):
