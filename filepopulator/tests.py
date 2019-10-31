@@ -10,6 +10,8 @@ import shutil
 import numpy as np
 import imageio
 import time
+from GPSPhoto import gpsphoto
+import random
 
 # Create your tests here.
 
@@ -265,47 +267,237 @@ class ImageFileTests(TestCase):
         num_goodfiles = ImageFile.objects.filter(filename = goodFile).count()
         self.assertEqual(num_goodfiles, 1)
 
-    # def test_image_path_changes(self):
+    def test_image_path_changes(self): ### CHECKED ### 
+        # Case: we have an image that is already in the database, but it is then
+        # moved somewhere else in the filesystem and the original file is no 
+        # longer in place. 
+        # Expected outcome: The database detects that the file has been moved 
+        # and updates the record to show that it's the same ID. The path to the
+        # thumbnail should change, though (mostly for ease of doing business)
+        # and the old thumbnail shouldn't exist.
 
-    #     # Are we testing when the same file is encountered elsewhere? 
+        # Are we testing when the same file is encountered elsewhere? 
 
-    #     file_orig = self.goodFiles[0]
-    #     create_image_file(file_orig)
-    #     new_path = os.path.join(self.tmp_valid_dir, 'tmpmv.jpg')
-    #     shutil.move(file_orig, new_path )
-    #     create_image_file(new_path)
+        file_orig = self.goodFiles[0]
+        create_image_file(file_orig)
+        orig_data = ImageFile.objects.filter(filename=file_orig)[0]
+        # Test default of isProcessed
+        self.assertFalse(orig_data.isProcessed)
+        orig_data.isProcessed = True
+        orig_data.save()
+        orig_data = ImageFile.objects.filter(filename=file_orig)[0]
+        # Test that isProcessed was saved to database
+        self.assertTrue(orig_data.isProcessed)
+        new_path = os.path.join(self.tmp_valid_dir, 'tmpmv.jpg')
+        shutil.move(file_orig, new_path )
+        create_image_file(new_path)
 
-    #     orig_ref = ImageFile.objects.filter(filename = file_orig)
-    #     new_ref = ImageFile.objects.filter(filename = new_path)
+        # Move the file, show that moving it doesn't affect anything that's
+        # in the database (until create_image_file is called again)
+        shutil.move(new_path, file_orig)
 
-    #     shutil.move(new_path, file_orig)
+        orig_ref = ImageFile.objects.filter(filename = file_orig)
+        new_ref = ImageFile.objects.filter(filename = new_path)
+        # Test that in this case, isProcessed was preserved. 
+        self.assertTrue(new_ref[0].isProcessed)
 
-    #     self.assertEqual(orig_ref.count(), 0)
-    #     self.assertEqual(new_ref.count(), 1)
+        self.assertTrue(os.path.isfile(new_ref[0].thumbnail_big.path))
+        self.assertTrue(os.path.isfile(new_ref[0].thumbnail_medium.path))
+        self.assertTrue(os.path.isfile(new_ref[0].thumbnail_small.path))
+        self.assertFalse(os.path.isfile(orig_data.thumbnail_big.path))
+        self.assertFalse(os.path.isfile(orig_data.thumbnail_medium.path))
+        self.assertFalse(os.path.isfile(orig_data.thumbnail_small.path))
+
+        self.assertEqual(orig_data.id, new_ref[0].id)
+        self.assertEqual(orig_ref.count(), 0)
+        self.assertEqual(new_ref.count(), 1)
+        # Check that the date added changed.
+        self.assertNotEqual(orig_data.dateAdded, new_ref[0].dateAdded)
+
+    def test_image_path_changes_two_instances(self): ### CHECKED ###
+        # Case: Similar to above, except that the same pixel image is already in the database
+        # twice, then one of them moves. Can we assure that the right record is altered?
+        # Expected outcome: the system recognizes that one image is still in place and the
+        # other one has moved. 
+
+        file_orig = self.goodFiles[0]
+        create_image_file(file_orig)
+        f1_data = ImageFile.objects.filter(filename=file_orig)[0]
+        f1_data.isProcessed = True
+        f1_data.save()
+        f1_data = ImageFile.objects.filter(filename=file_orig)[0]
+        new_path = os.path.join(self.tmp_valid_dir, 'tmpmv.jpg')
+        shutil.copy(file_orig, new_path )
+        create_image_file(new_path)
+        f2_data = ImageFile.objects.filter(filename=new_path)[0]
+
+        total_records = ImageFile.objects.all()
+        self.assertEqual(len(total_records), 2)
+
+        # Move one of the files
+        f3_path = os.path.join(self.tmp_valid_dir, 'f3.jpg')
+        shutil.move(file_orig, f3_path)
+        create_image_file(f3_path)
+        f3_data = ImageFile.objects.filter(filename=f3_path)[0]
+        f1_update = ImageFile.objects.filter(filename=file_orig)
+        self.assertEqual(len(f1_update), 0)
+
+        # Check the processing
+        self.assertTrue(f3_data.isProcessed)
+        self.assertFalse(f2_data.isProcessed)
+        # Check that IDs are the same
+        self.assertEqual(f1_data.id, f3_data.id)
+        self.assertNotEqual(f2_data.id, f3_data.id)
+        self.assertTrue(os.path.isfile(f2_data.thumbnail_big.path))
+        self.assertTrue(os.path.isfile(f3_data.thumbnail_big.path))
+        self.assertFalse(os.path.isfile(f1_data.thumbnail_big.path))
+
+        self.assertTrue(os.path.isfile(f2_data.filename))
+        self.assertTrue(os.path.isfile(f3_data.filename))
+        self.assertFalse(os.path.isfile(f1_data.filename))
+
+        self.assertNotEqual(f1_data.dateAdded, f3_data.dateAdded)
+
+    def test_same_picture_two_paths(self): ### CHECKED ### 
+        # Case: We have the exact same picture (same pixels) in two different
+        # file locations at the same time. We add both images to the database.
+        # Expected outcome is that there will be two entries in the database
+        # with different IDs and different paths but that the pixel hash will
+        # be the same. 
+
+        # Copy the same image to two places and add both to the database. 
+        src_file = self.goodFiles[0]
+        path1 = os.path.join(self.tmp_valid_dir, 'tmp1.jpg')
+        shutil.copy(src_file, path1)
+        path2 = os.path.join(self.tmp_valid_dir, 'tmp2.jpg')
+        shutil.copy(src_file, path2)
+        create_image_file(path1)
+        create_image_file(path2)
+
+        # Assert that both were added to the database. 
+        first_item = ImageFile.objects.filter(filename=path1)
+        self.assertEqual(len(first_item), 1)
+        pixel_hash = first_item[0].pixel_hash
+        second_item = ImageFile.objects.filter(filename=path2)
+        self.assertEqual(len(second_item), 1)
+        pixel_hash2 = second_item[0].pixel_hash
+
+        # Pretty standard checks that should all be equivalent -- same hash,
+        # different ID, thumbnails exist, paths are right, and the file isn't processed.
+        self.assertNotEqual(path1, path2)
+        self.assertEqual(pixel_hash, pixel_hash2)
+        # Don't feel the need to test all the thumbnails; we've done that elsewhere.
+        self.assertTrue(os.path.isfile(first_item[0].thumbnail_big.path))
+        self.assertTrue(os.path.isfile(second_item[0].thumbnail_big.path))
+        self.assertFalse(first_item[0].isProcessed)
+        self.assertFalse(second_item[0].isProcessed)
+        self.assertNotEqual(first_item[0].id, second_item[0].id)
+
+    def test_delete_photos(self): ### CHECKED ### 
+
+        # Case: We want to delete random photos from the file system, then run
+        # the function that cleans that up (delete_removed_photos) and 
+        # check that they were, in fact, completely removed from the database. 
+        # Expected outcome: files removed from disk will not show up in the 
+        # database, but other files will still be there. 
+        for good in self.goodFiles:
+            create_image_file(good)
+
+        # Get number of images
+        all_files = ImageFile.objects.all()
+        before_len = len(all_files)
+
+        num_to_remove = 3
+        # Remove a couple files from the disk
+        for n in range(num_to_remove):
+            os.remove(self.goodFiles[n])
+
+        delete_removed_photos()
+
+        # Test length of database
+        updated_files = ImageFile.objects.all()
+        self.assertTrue(before_len - len(updated_files) == num_to_remove)
+        # Test that the removed files aren't in the DB
+        for n in range(num_to_remove):
+            f = self.goodFiles[n]
+            in_db = ImageFile.objects.filter(filename=f)
+            self.assertEqual(len(in_db), 0)
+
+        # And test that the files that weren't removed still are good. 
+        for m in range(3, len(self.goodFiles)):
+            f = self.goodFiles[m]
+            in_db = ImageFile.objects.filter(filename=f)
+            self.assertEqual(len(in_db), 1)
+
+        # Make sure that adding again doesn't create more.
+        for good in self.goodFiles:
+            create_image_file(good)
+
+        updated_files = ImageFile.objects.all()
+        self.assertTrue(before_len - len(updated_files) == num_to_remove)
+
+        # And test that the files that weren't removed still are good. 
+        for m in range(3, len(self.goodFiles)):
+            f = self.goodFiles[m]
+            in_db = ImageFile.objects.filter(filename=f)
+            self.assertEqual(len(in_db), 1)
 
 
-    # def test_same_picture_two_paths(self):
-    #     src_file = self.goodFiles[0]
-    #     path1 = os.path.join(self.tmp_valid_dir, 'tmp1.jpg')
-    #     shutil.copy(src_file, path1)
-    #     path2 = os.path.join(self.tmp_valid_dir, 'tmp2.jpg')
-    #     shutil.copy(src_file, path2)
-    #     create_image_file(path1)
-    #     create_image_file(path2)
+    def test_metadata_gps(self): ### CHECKED ### 
+        # Case: the database processing should be able to detect 
+        # GPS data adequately in files and put that in the database.
+        # If a file doesn't have GPS data, it should get a -999 in 
+        # both latitude and longitude. 
+        # Expected outcome: pretty much that. I'm randomizing 
+        # GPS values in ~half of the images, writing to the JPG,
+        # and expecting to get that same data back and put it in
+        # the database. gpsphoto seems to have small bugs in a couple
+        # things, so I'm catching OS and Key errors for that. 
 
+        for file in self.goodFiles:
+            # Random select if the photo will have GPS data
+            rv = random.randint(0, 1)
+            photo = gpsphoto.GPSPhoto(file)
+            if rv == 1:
+                try:
+                    # Create GPSInfo Data Object
+                    lat = (random.random() - 0.5) * 180
+                    lon = (random.random() - 0.5) * 360
+                    info = gpsphoto.GPSInfo((lat, lon))
+                    # Modify GPS Data
+                    photo.modGPSData(info, file)
+                    create_image_file( file )
+                    fdata = ImageFile.objects.filter(filename=file)
+                    # Due to rounding precision in GPS, not every decimal
+                    # is represented, so we assert that the stored and 
+                    # actual values are within a small margin.
+                    self.assertTrue(abs(fdata[0].gps_lat_decimal - lat) < 0.01)
+                    self.assertTrue(abs(fdata[0].gps_lon_decimal - lon) < 0.01)
+                except OSError:
+                    pass
+                except KeyError:
+                    pass
+            else:
+                # Get the file. Some files have GPS built in already, so I either
+                # check that there was no GPS there and both fields are set to 
+                # default, or make the not-unreasonable assumption that the 
+                # lat and lon are different and assert such.
+                create_image_file( file )
+                fdata = ImageFile.objects.filter(filename=file)
+                if fdata[0].gps_lat_decimal == -999:
+                    self.assertEqual(fdata[0].gps_lon_decimal, -999)
+                else:
+                    self.assertNotEqual(fdata[0].gps_lat_decimal, fdata[0].gps_lon_decimal)
 
-    #     first_item = ImageFile.objects.filter(filename=path1)
-    #     self.assertEqual(len(first_item), 1)
-    #     pixel_hash = first_item[0].pixel_hash
-    #     second_item = ImageFile.objects.filter(filename=path2)
-    #     self.assertEqual(len(second_item), 1)
-    #     pixel_hash2 = second_item[0].pixel_hash
-
-    #     self.assertNotEqual(path1, path2)
-    #     self.assertEqual(pixel_hash, pixel_hash2)
-    #     self.assertTrue(os.path.isfile(first_item[0].thumbnail.path))
-    #     self.assertTrue(os.path.isfile(second_item[0].thumbnail.path))
-
+    def test_thumbnails(self): ### CHECKED ### 
+    # Explicit test of thumbnails. Nothing crazy, and covered by other tests,
+    # but it's good to have atomicity of tests.
+        file = self.goodFiles[0]
+        create_image_file(file)
+        f_data = ImageFile.objects.filter(filename = file)[0]
+        self.assertTrue(os.path.isfile(f_data.thumbnail_big.path))
+        self.assertTrue(os.path.isfile(f_data.thumbnail_medium.path))
+        self.assertTrue(os.path.isfile(f_data.thumbnail_small.path))
 
     # def test_move_id_stay_same(self):
 
@@ -371,63 +563,17 @@ class ImageFileTests(TestCase):
     # # Tested adding bad file names? Not there?
 
 
-    # def test_metadata_gps(self):
-    #     # raise NotImplementedError('GPS Test')
-    #     # Make sure at least one image has GPS data. 
-
-    #     for root, dirs, files in os.walk(self.tmp_valid_dir):
-    #         for fname in files:
-    #             create_image_file( os.path.join(root, fname) )
-
-    #     db_objects = ImageFile.objects.all()
-
-    #     gps_lats = []
-    #     gps_lons = []
-
-    #     for obj in db_objects:
-    #         gps_lats.append(obj.gps_lat_decimal)
-    #         gps_lons.append(obj.gps_lon_decimal)
-
-    #     lat_valid_set = set(gps_lats)
-    #     lon_valid_set = set(gps_lons)
-
-    #     # Assert that there is more than the default value for fields with 
-    #     # latitude and longitude. 
-    #     self.assertTrue(len(lat_valid_set) > 1)
-    #     self.assertTrue(len(lon_valid_set) > 1)
-
-    #     # Same test a different way: -999 is the default value.
-    #     lat_valid_set -= set([-999])
-    #     lon_valid_set -= set([-999])
-
-    #     self.assertTrue(len(lat_valid_set) > 0)
-    #     self.assertTrue(len(lon_valid_set) > 0)
-
-    # def test_delete_photos(self):
-
-    #     for good in self.goodFiles:
-    #         create_image_file(good)
-
-    #     all_files = ImageFile.objects.all()
-    #     before_len = len(all_files)
-
-    #     num_to_remove = 3
-    #     # Remove a couple files
-    #     for n in range(num_to_remove):
-    #         os.remove(self.goodFiles[n])
-
-    #     delete_removed_photos()
-
-    #     # Make sure that adding again doesn't create more.
-    #     for good in self.goodFiles:
-    #         create_image_file(good)
-
-    #     updated_files = ImageFile.objects.all()
-    #     self.assertTrue(before_len - len(updated_files) == num_to_remove)
-
-
 
     # def test_rotated_image_update(self):
+        # Case: an image stays in the same location, but is rotated and then
+        # re-processed. 
+        # Expected outcomes:
+        # - ID should stay the same
+        # - At least the pixels of the thumbnail should change to reflect
+        #       the rotation
+        # - isProcessed should be reset
+        # - dateAdded should update
+
     #     for good in self.goodFiles:
     #         create_image_file(good)
 
@@ -457,9 +603,6 @@ class ImageFileTests(TestCase):
     #     # self.assertEqual(image_id, data[0].id)
 
     #     # raise NotImplementedError('Rotation test')
-
-    # def test_is_processed_reset(self):
-    #     raise NotImplementedError('Is processed')
 
     # def test_make_request_of_image(self):
     #     raise NotImplementedError('Request image')

@@ -2,7 +2,9 @@ from django.db import models
 from django.conf import settings
 from django.forms import ModelForm
 from django.core.validators import MinValueValidator, MaxValueValidator, RegexValidator
-from django.core.validators import *
+from django.core.exceptions import ValidationError
+# from django.core.validators import *
+import re
 from datetime import datetime
 from django.utils import timezone
 
@@ -38,6 +40,24 @@ logging.basicConfig(level=settings.LOG_LEVEL)
 logging.warning("TODO: Need to handle thumbnails in this better")
 logging.warning("TODO: May want to handle bad files more gracefully.")
 logging.warning("TODO: More logic is needed to see if the file has changed at all, instead of just hash")
+
+# Latitude and longitude validators that accomodate out-of-GPS coordinates for
+# default "not there" values.
+def validate_lat(value):
+    if value != -999:
+        if not -90 < value < 90:
+            raise ValidationError(
+                _('%(value)s is not a valid latitude'),
+                params={'value': value},
+            )
+
+def validate_lon(value):
+    if value != -999:
+        if not -180 < value < 180:
+            raise ValidationError(
+                _('%(value)s is not a valid latitude'),
+                params={'value': value},
+            )
 
 class Directory(models.Model):
     dir_path = models.CharField(max_length=255)
@@ -78,8 +98,8 @@ class ImageFile(models.Model):
     fnumber_denom = models.IntegerField(validators=[MinValueValidator(-1)], default= -1)
     iso_value = models.IntegerField(validators=[MinValueValidator(-1)], default= -1)
     light_source = models.IntegerField(validators=[MinValueValidator(-1)], default= -1)
-    gps_lat_decimal = models.FloatField(default=-999)
-    gps_lon_decimal = models.FloatField(default=-999)
+    gps_lat_decimal = models.FloatField(default=-999,validators=[validate_lat])
+    gps_lon_decimal = models.FloatField(default=-999,validators=[validate_lon])
 
 
     dateAdded = models.DateTimeField( default=timezone.now )
@@ -261,8 +281,6 @@ class ImageFile(models.Model):
             else:
                 self.orientation = 1
 
-
-        self.isProcessed = False
         self.dateAdded = timezone.now()
 
 

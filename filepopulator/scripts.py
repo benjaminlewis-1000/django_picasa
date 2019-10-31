@@ -51,6 +51,11 @@ def create_image_file(file_path):
                 'Thumbnail {} wasn''t generated for {}.'.\
                 format(instance.thumbnail_small.name, file_path)
 
+    def delete_old_thumbnails(instance):
+        os.remove(instance.thumbnail_big.path)
+        os.remove(instance.thumbnail_medium.path)
+        os.remove(instance.thumbnail_small.path)
+
 
     # Case 1: photo exists at this location.
     if len(exist_photo):
@@ -80,7 +85,7 @@ def create_image_file(file_path):
     else:
         # new_photo.process_new()
         exist_with_same_hash = ImageFile.objects.filter(pixel_hash = new_photo.pixel_hash)
-        # print("same hash: ", exist_with_same_hash)
+
         if len(exist_with_same_hash):
             if len(exist_with_same_hash) == 1 and not os.path.exists(exist_with_same_hash[0].filename) :
                 # Exactly one other, but it's been deleted or moved.
@@ -89,6 +94,7 @@ def create_image_file(file_path):
                 instance = exist_with_same_hash[0]
                 instance.filename = file_path
                 instance.dateAdded = timezone.now()
+                delete_old_thumbnails(instance)
                 instance_clean_and_save(instance)
                 return
 
@@ -98,6 +104,7 @@ def create_image_file(file_path):
                     if not os.path.exists(each.filename):
                         each.filename = file_path
                         each.dateAdded = timezone.now()
+                        delete_old_thumbnails(each)
                         instance_clean_and_save(each)
                         return
             elif os.path.exists(exist_with_same_hash[0].filename) and len(exist_with_same_hash) == 1:
