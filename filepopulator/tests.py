@@ -12,6 +12,7 @@ import imageio
 import time
 from GPSPhoto import gpsphoto
 import random
+from PIL import Image
 
 # Create your tests here.
 
@@ -249,7 +250,7 @@ class ImageFileTests(TestCase):
         self.assertTrue(os.path.isfile(thumbnail2))
 
     def test_repeat_adds(self): ### CHECKED ### 
-        # Test to see that adding a file again does not create a duplicate file.
+        # Test to see that adding a file twice does not create a duplicate file.
         # What we expect: the file should be in the database only once, and the
         # ID shouldn't change. 
         goodFile = self.goodFiles[0]
@@ -263,6 +264,8 @@ class ImageFileTests(TestCase):
         self.assertEqual(id_first, id_second)
         num_goodfiles = ImageFile.objects.filter(filename = goodFile).count()
         self.assertEqual(num_goodfiles, 1)
+        num_files = ImageFile.objects.all().count()
+        self.assertEqual(num_files, 1)
 
     def test_image_path_changes(self): ### CHECKED ### 
         # Case: we have an image that is already in the database, but it is then
@@ -496,19 +499,21 @@ class ImageFileTests(TestCase):
         self.assertTrue(os.path.isfile(f_data.thumbnail_medium.path))
         self.assertTrue(os.path.isfile(f_data.thumbnail_small.path))
 
-    def test_move_id_stay_same(self):
+    def test_move_id_stay_same(self): ### CHECKED ###
         # Case: if a file moves to another location but otherwise stays
         # the same (no edits), it should keep the same ID and keep its 
         # isProcessed status. The path to the thumbnail should change. 
         # The original path should be removed as well. 
 
-
+        # Add all the files. We're going to move a bunch of them around. 
         for good in self.goodFiles:
             create_image_file(good)
 
+        # Get a list of all files that were initially added. 
         items = ImageFile.objects.all()
         item_files_init = [x.filename for x in items]
 
+        # Move the first file around. Set its isProcessed bit. 
         src_file = self.goodFiles[0]
         first_item = ImageFile.objects.filter(filename=src_file)[0]
         first_item.isProcessed = True
@@ -520,22 +525,28 @@ class ImageFileTests(TestCase):
         path1 = os.path.join(self.tmp_valid_dir, 'tmp1.jpg')
 
         shutil.move(src_file, path1)
-        # This path will effectively be removed from the database,
+        # This path (src_file) will be removed from the database,
         # so in the final comparison of the initial files and the 
         # files that are in the database at the end, it should be
-        # removed from this list. 
+        # removed from this list. (Done later)
         create_image_file(path1)
-        # Having just moved the file, the isProcessed should be saved. 
+        # Having just moved the file, the isProcessed should be saved
+        # in the new database entry. 
         path1_item = ImageFile.objects.filter(filename=path1)[0]
         self.assertTrue(path1_item.isProcessed)
         ident2 = path1_item.id
+        # Identity should be different because it moved to a different
+        # file location. 
         self.assertEqual(ident1, ident2)
         self.assertNotEqual(path1_item.dateAdded, date_add)
+        # src_file should no longer be in the database.
         i1_tmp = ImageFile.objects.filter(filename=src_file)
         self.assertEqual(len(i1_tmp), 0)
         date_add = path1_item.dateAdded
 
         # Have two of same input -- how can I figure out which moved?
+        # Here, we will add another copy of path1 in path2, then move one
+        # of the files and assert that the other one did not change.
         path2 = os.path.join(self.tmp_valid_dir, 'tmp2.jpg')
         path3 = os.path.join(self.tmp_valid_dir, 'tmp3.jpg')
         shutil.copy(path1, path2)
@@ -555,16 +566,19 @@ class ImageFileTests(TestCase):
         date_add3 = path3_item.dateAdded
         self.assertNotEqual(date_add2, date_add3)
         self.assertFalse(os.path.exists(path2_item.filename))
+        self.assertTrue(os.path.exists(path1_item.filename))
         self.assertEqual(path2_item.id, path3_item.id)
+        # Path1 should still be in the database
+        p1_tmp = ImageFile.objects.filter(filename=path1)
+        self.assertEqual(len(p1_tmp), 1)
 
-    #     # 3 should replace 2
         items = ImageFile.objects.all()
         item_files = [x.filename for x in items]
         # The initial items should only have path1 and path3 added to them now,
-        # and src_file shouldn't be in the set.
+        # and src_file removed from the set..
         self.assertEqual(set(item_files) , set(item_files_init + [path1, path3] ) - set([src_file]))
 
-    #     # Should gracefully handle overwriting existing files
+        # Should gracefully handle overwriting existing files
         shutil.move(self.goodFiles[3], path3)
         path3_item = ImageFile.objects.filter(filename=path3)[0]
 
@@ -578,30 +592,49 @@ class ImageFileTests(TestCase):
         self.assertEqual(path3_item.filename, path3_item_aft.filename)
 
     # # Tested adding bad file names? Not there?
+    def test_bogus_file(self): ### CHECKED ### 
+        bogus = '/tmp/asdfafdadsf.jpg'
+        create_image_file(bogus)
+        items = ImageFile.objects.all()
+        self.assertEqual(len(items), 0)
 
-
-
-    # def test_rotated_image_update(self):
+    def test_rotated_image_update(self):
         # Case: an image stays in the same location, but is rotated and then
         # re-processed. 
         # Expected outcomes:
-        # - ID should stay the same
+        # - ID should change -- we essentially treat it like a brand-new addition.
+        #    This makes sense -- we would have to reprocess faces anyway. 
         # - At least the pixels of the thumbnail should change to reflect
         #       the rotation
         # - isProcessed should be reset
         # - dateAdded should update
 
-    #     for good in self.goodFiles:
-    #         create_image_file(good)
+        for good in self.goodFiles:
+            create_image_file(good)
 
-    #     file1 = self.goodFiles[0]
-    #     file2 = self.goodFiles[1]
-    #     create_image_file(file1)
+        file1 = self.goodFiles[0]
 
-    #     first_file_data = ImageFile.objects.filter(filename=file1)
-    #     initial_date = first_file_data[0].dateAdded
-    #     image_id = first_file_data[0].id
-    #     path1 = os.path.join(self.tmp_valid_dir, 'tmp1.jpg')
+        first_file_data = ImageFile.objects.filter(filename=file1)[0]
+        first_file_data.isProcessed = True
+        first_file_data.save()
+        first_file_data = ImageFile.objects.filter(filename=file1)[0]
+        self.assertTrue(first_file_data.isProcessed)
+        initial_date = first_file_data.dateAdded
+        image_id = first_file_data.id
+
+        pil_file = Image.open(file1)
+        rotated = pil_file.rotate(90)
+        rotated.save(file1)
+
+        create_image_file(file1)
+        rot_data = ImageFile.objects.filter(filename = file1)[0]
+        self.assertNotEqual(first_file_data.id, rot_data.id)
+        self.assertEqual(first_file_data.filename, rot_data.filename)
+        self.assertFalse(rot_data.isProcessed)
+        self.assertNotEqual(first_file_data.pixel_hash, rot_data.pixel_hash)
+        self.assertNotEqual(first_file_data.thumbnail_big.path, rot_data.thumbnail_big.path)
+
+
 
     #     # Move to another, unused path: should be same id, but
     #     # a different time.
