@@ -214,3 +214,15 @@ FILEPOPULATOR_VAL_DIRECTORY = '/home/benjamin/git_repos/picasa_files/test_imgs' 
 FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL =150 # Maximum size of the short edge for thumbnails.
 
 LOG_LEVEL=logging.ERROR
+LOG_FILE='test.log'
+
+
+LOGGER = logging.getLogger(__name__)
+
+LOGGER.setLevel(LOG_LEVEL) # or whatever
+console = logging.StreamHandler()
+file = logging.FileHandler(LOG_FILE)
+#set a level on the handlers if you want;
+#if you do, they will only output events that are >= that level
+LOGGER.addHandler(console)
+LOGGER.addHandler(file)

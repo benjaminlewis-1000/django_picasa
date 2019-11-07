@@ -18,9 +18,9 @@ import faceid
 import filepopulator
 
 # Create your models here
-logging.basicConfig(level=settings.LOG_LEVEL)
+# logging.basicConfig(level=settings.LOG_LEVEL)
 
-logging.warning("TODO: Implement model for faces")
+settings.LOGGER.warning("TODO: Implement model for faces")
 
 class Person(models.Model):
 	person_name = models.CharField(max_length=256)

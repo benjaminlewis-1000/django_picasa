@@ -20,9 +20,6 @@ from .models import ImageFile, Directory
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos
 # from .views import create_or_get_directory# , create_image_file, add_from_root_dir
 
-import logging
-
-logging.basicConfig(level=settings.LOG_LEVEL)
 
 class ImageFileTests(TestCase):
 
@@ -200,7 +197,7 @@ class ImageFileTests(TestCase):
             self.assertTrue(os.path.isfile(allObjects[num].thumbnail_small.path))
             allFiles.append(fullname)
 
-        logging.debug("All files in test_file_names is: {}".format(allFiles))
+        settings.LOGGER.debug("All files in test_file_names is: {}".format(allFiles))
 
         # Reverse test -- make sure that all of the good files made it into the database, and 
         # none of the bad files did. 
@@ -499,66 +496,86 @@ class ImageFileTests(TestCase):
         self.assertTrue(os.path.isfile(f_data.thumbnail_medium.path))
         self.assertTrue(os.path.isfile(f_data.thumbnail_small.path))
 
-    # def test_move_id_stay_same(self):
+    def test_move_id_stay_same(self):
+        # Case: if a file moves to another location but otherwise stays
+        # the same (no edits), it should keep the same ID and keep its 
+        # isProcessed status. The path to the thumbnail should change. 
+        # The original path should be removed as well. 
 
-    #     for good in self.goodFiles:
-    #         create_image_file(good)
 
-    #     items = ImageFile.objects.all()
-    #     item_files_init = [x.filename for x in items]
+        for good in self.goodFiles:
+            create_image_file(good)
 
-    #     src_file = self.goodFiles[0]
-    #     src_item = ImageFile.objects.filter(filename=src_file)
-    #     first_item = ImageFile.objects.filter(filename=src_file)
-    #     ident1 = first_item[0].id
-    #     ph = first_item[0].pixel_hash
-    #     date_add = first_item[0].dateAdded
+        items = ImageFile.objects.all()
+        item_files_init = [x.filename for x in items]
 
-    #     path1 = os.path.join(self.tmp_valid_dir, 'tmp1.jpg')
+        src_file = self.goodFiles[0]
+        first_item = ImageFile.objects.filter(filename=src_file)[0]
+        first_item.isProcessed = True
+        first_item.save()
+        ident1 = first_item.id
+        ph = first_item.pixel_hash
+        date_add = first_item.dateAdded
 
-    #     shutil.move(src_file, path1)
-    #     # This path will effectively be removed from the database,
-    #     # so in the final comparison of the initial files and the 
-    #     # files that are in the database at the end, it should be
-    #     # removed from this list. 
-    #     item_files_init.remove(src_file)
-    #     create_image_file(path1)
-    #     second_item = ImageFile.objects.filter(filename=path1)
-    #     ident2 = second_item[0].id
-    #     print(ident2)
-    #     self.assertEqual(ident1, ident2)
-    #     self.assertNotEqual(second_item[0].dateAdded, date_add)
-    #     date_add = second_item[0].dateAdded
+        path1 = os.path.join(self.tmp_valid_dir, 'tmp1.jpg')
 
-    #     # Have two of same input -- how can I figure out which moved?
-    #     path2 = os.path.join(self.tmp_valid_dir, 'tmp2.jpg')
-    #     path3 = os.path.join(self.tmp_valid_dir, 'tmp3.jpg')
-    #     shutil.copy(path1, path2)
-    #     create_image_file(path2)
-    #     item2 = ImageFile.objects.filter(filename=path2)
-    #     date_add2 = item2[0].dateAdded
-    #     self.assertNotEqual(date_add2, date_add)
+        shutil.move(src_file, path1)
+        # This path will effectively be removed from the database,
+        # so in the final comparison of the initial files and the 
+        # files that are in the database at the end, it should be
+        # removed from this list. 
+        create_image_file(path1)
+        # Having just moved the file, the isProcessed should be saved. 
+        path1_item = ImageFile.objects.filter(filename=path1)[0]
+        self.assertTrue(path1_item.isProcessed)
+        ident2 = path1_item.id
+        self.assertEqual(ident1, ident2)
+        self.assertNotEqual(path1_item.dateAdded, date_add)
+        i1_tmp = ImageFile.objects.filter(filename=src_file)
+        self.assertEqual(len(i1_tmp), 0)
+        date_add = path1_item.dateAdded
+
+        # Have two of same input -- how can I figure out which moved?
+        path2 = os.path.join(self.tmp_valid_dir, 'tmp2.jpg')
+        path3 = os.path.join(self.tmp_valid_dir, 'tmp3.jpg')
+        shutil.copy(path1, path2)
+        create_image_file(path2)
+        path2_item = ImageFile.objects.filter(filename=path2)[0]
+        date_add2 = path2_item.dateAdded
+        self.assertNotEqual(date_add2, date_add)
+        self.assertNotEqual(path1_item.id, path2_item.id)
+        # Since the original still exists, the isProcessed status
+        # of the copy should be False.
+        self.assertFalse(path2_item.isProcessed)
     #     # 1 and 2 in database
-    #     shutil.move(path2, path3)
-    #     create_image_file(path3)
-    #     item3 = ImageFile.objects.filter(filename=path3)
-    #     date_add3 = item3[0].dateAdded
-    #     self.assertNotEqual(date_add2, date_add3)
+        shutil.move(path2, path3)
+        # 1 and 3 in database
+        create_image_file(path3)
+        path3_item = ImageFile.objects.filter(filename=path3)[0]
+        date_add3 = path3_item.dateAdded
+        self.assertNotEqual(date_add2, date_add3)
+        self.assertFalse(os.path.exists(path2_item.filename))
+        self.assertEqual(path2_item.id, path3_item.id)
 
     #     # 3 should replace 2
-    #     items = ImageFile.objects.all()
-    #     item_files = [x.filename for x in items]
-    #     # The initial items should only have path1 and path3 added to them now. 
-    #     self.assertEqual(set(item_files), set(item_files_init + [path1, path3] ))
+        items = ImageFile.objects.all()
+        item_files = [x.filename for x in items]
+        # The initial items should only have path1 and path3 added to them now,
+        # and src_file shouldn't be in the set.
+        self.assertEqual(set(item_files) , set(item_files_init + [path1, path3] ) - set([src_file]))
 
-    #     # Should gracefully handle moving existing files
-    #     shutil.move(self.goodFiles[3], path3)
-    #     path3_id = ImageFile.objects.filter(filename=path3)
-    #     path3_id = path3_id[0].id
-    #     create_image_file(path3)
-    #     path3_id_aft = ImageFile.objects.filter(filename=path3)
-    #     path3_id_aft = path3_id_aft[0].id
-    #     self.assertNotEqual(path3_id, path3_id_aft)
+    #     # Should gracefully handle overwriting existing files
+        shutil.move(self.goodFiles[3], path3)
+        path3_item = ImageFile.objects.filter(filename=path3)[0]
+
+        # Since a new file was written into this path, the ID should change
+        # and the thumbnail paths should be different
+        create_image_file(path3)
+        path3_item_aft = ImageFile.objects.filter(filename=path3)[0]
+
+        self.assertNotEqual(path3_item.id, path3_item_aft.id)
+        self.assertNotEqual(path3_item.thumbnail_big.path, path3_item_aft.thumbnail_big.path)
+        self.assertEqual(path3_item.filename, path3_item_aft.filename)
 
     # # Tested adding bad file names? Not there?
 

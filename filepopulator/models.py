@@ -35,11 +35,14 @@ from stdimage.utils import render_variations
 # What if the image moves? 
 # -- Update the record.
 
-logging.basicConfig(level=settings.LOG_LEVEL)
+print(settings.LOG_LEVEL)
+# logging.basicConfig(filename=settings.LOG_FILE, level=settings.LOG_LEVEL)
 
-logging.warning("TODO: Need to handle thumbnails in this better")
-logging.warning("TODO: May want to handle bad files more gracefully.")
-logging.warning("TODO: More logic is needed to see if the file has changed at all, instead of just hash")
+
+# logging.basicConfig(filename='example.log',level=logging.DEBUG)
+settings.LOGGER.warning("TODO: Need to handle thumbnails in this better")
+settings.LOGGER.warning("TODO: May want to handle bad files more gracefully.")
+settings.LOGGER.warning("TODO: More logic is needed to see if the file has changed at all, instead of just hash")
 
 # Latitude and longitude validators that accomodate out-of-GPS coordinates for
 # default "not there" values.
@@ -101,7 +104,7 @@ class ImageFile(models.Model):
     gps_lat_decimal = models.FloatField(default=-999,validators=[validate_lat])
     gps_lon_decimal = models.FloatField(default=-999,validators=[validate_lon])
 
-
+    # Default for date added is now.
     dateAdded = models.DateTimeField( default=timezone.now )
     width = models.IntegerField(validators=[MinValueValidator(1)])
     height = models.IntegerField(validators=[MinValueValidator(1)])
@@ -110,7 +113,7 @@ class ImageFile(models.Model):
     dateTaken = models.DateTimeField( default=datetime(2018, 1, 1) )
     dateTakenValid = models.BooleanField(default=False)
 
-    # Default for date added is now.
+    # isProcessed -- whether the photo has had faces detected.
     isProcessed = models.BooleanField(default=False)
     orientation = models.IntegerField(default=-8008)
 
@@ -130,7 +133,7 @@ class ImageFile(models.Model):
         is_new = True
 
         if not re.match(".*\.[j|J][p|P][e|E]?[g|G]$", self.filename):
-            logging.debug("File {} does not have a jpeg-type ending.".format(self.filename))
+            settings.LOGGER.debug("File {} does not have a jpeg-type ending.".format(self.filename))
             return
 
         self._init_image()
@@ -147,7 +150,7 @@ class ImageFile(models.Model):
         #         # Still the same picture. We're good.
         #         return
         #     else:
-        #         logging.debug("TODO: File repeat with changes. Need logic to see if the file has changed at all...")
+        #         settings.LOGGER.debug("TODO: File repeat with changes. Need logic to see if the file has changed at all...")
                 # raise NotImplementedError('What do we do here?')
             # return
 
@@ -325,7 +328,7 @@ class ImageFile(models.Model):
             pixel_hash_md5.update(bytes([it]))
         
         self.pixel_hash = pixel_hash_md5.hexdigest()
-        logging.debug(self.pixel_hash, self.filename)
+        settings.LOGGER.debug(f'{self.pixel_hash}, {self.filename}')
 
         hash_file = hashlib.md5()
         # with open(self.filename, "rb") as f:
@@ -340,12 +343,12 @@ class ImageFile(models.Model):
             for obj in other_hashed:
                 if os.path.exists(obj.filename):
                     pass
-                    logging.debug("Assumption made about same pixel hash and existing file, but not same filename: do nothing.")
+                    settings.LOGGER.debug("Assumption made about same pixel hash and existing file, but not same filename: do nothing.")
                    #  raise NotImplementedError('Same object hash -- what to do?')
                 else:
                     pass
                     # Do nothing
-                    logging.debug('Same hash as a deleted item. Watch this.')
+                    settings.LOGGER.debug('Same hash as a deleted item. Watch this.')
                     # obj.thumbnail.delete()
                     # obj.delete()
 
@@ -370,6 +373,9 @@ class ImageFile(models.Model):
         else:
             self.dateTaken = timezone.now()
             self.dateTakenValid = False
+            settings.LOGGER.warning(f"Date taken is not valid for file {self.filename}")
+
+        # settings.LOGGER.error('Hi, debug here:')
 
         # Make the taken date timezone aware to get rid of warnings.
         # self.dateTaken = (self.dateTaken)

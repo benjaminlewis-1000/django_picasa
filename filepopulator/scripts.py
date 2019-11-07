@@ -13,13 +13,12 @@ from django.conf import settings
 from django.utils import timezone
 import os
 
-logging.basicConfig(level=settings.LOG_LEVEL)
 
 def create_image_file(file_path):
 
     # print("At start: ", ImageFile.objects.all())
     if not os.path.isfile(file_path):
-        logging.debug('File {} is not a file path. Will not insert.'.format(file_path))
+        settings.LOGGER.debug('File {} is not a file path. Will not insert.'.format(file_path))
         return
 
     # Check if this photo already exists:
@@ -35,9 +34,9 @@ def create_image_file(file_path):
             instance.full_clean()
         except ValidationError as ve:
             if file_path.lower().endswith(('.jpg', '.jpeg')):
-                logging.critical("Did not add JPEG-type photo {}: {}".format(file_path, ve))
+                settings.LOGGER.critical("Did not add JPEG-type photo {}: {}".format(file_path, ve))
             else:
-                logging.debug("Did not add photo {}: {}".format(file_path, ve) )
+                settings.LOGGER.debug("Did not add photo {}: {}".format(file_path, ve) )
         else:
             instance.save()
 
