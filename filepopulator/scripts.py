@@ -12,6 +12,7 @@ from datetime import datetime
 from django.conf import settings
 from django.utils import timezone
 import os
+import time
 
 
 def create_image_file(file_path):
@@ -21,12 +22,15 @@ def create_image_file(file_path):
         settings.LOGGER.debug('File {} is not a file path. Will not insert.'.format(file_path))
         return
 
+    s = time.time()
     # Check if this photo already exists:
     exist_photo = ImageFile.objects.filter(filename=file_path)
     # print(exist_photo)
 
     new_photo = ImageFile(filename=file_path)
+
     new_photo.process_new()
+    print(time.time() - s )
  
 
     def instance_clean_and_save(instance):
@@ -122,6 +126,7 @@ def add_from_root_dir(root_dir):
     for root, dirs, files in os.walk(root_dir):
         for f in files:
             cur_file = os.path.join(root, f)
+            print(cur_file)
             create_image_file(cur_file)
 
 def delete_removed_photos():

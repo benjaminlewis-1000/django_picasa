@@ -35,7 +35,7 @@ from stdimage.utils import render_variations
 # What if the image moves? 
 # -- Update the record.
 
-print(settings.LOG_LEVEL)
+# print(settings.LOG_LEVEL)
 # logging.basicConfig(filename=settings.LOG_FILE, level=settings.LOG_LEVEL)
 
 
@@ -63,7 +63,7 @@ def validate_lon(value):
             )
 
 class Directory(models.Model):
-    dir_path = models.CharField(max_length=255)
+    dir_path = models.CharField(max_length=255, unique=True)
 
     def __str__(self):
         return "{} --- ({})".format(self.dir_path.split('/')[-1], self.dir_path)
@@ -138,7 +138,9 @@ class ImageFile(models.Model):
 
         self._init_image()
         self._get_dir()
+        s = time.time()
         self._generate_md5_hash()
+        print("MD5: ", time.time() - s)
         self._get_date_taken()
 
         # name_match = ImageFile.objects.filter(filename=self.filename)
@@ -240,6 +242,8 @@ class ImageFile(models.Model):
                     if 'Latitude' in info and 'Longitude' in info:
                         # print(info)
                         return [info['Latitude'], info['Longitude']]
+                    else:
+                        return [-999, -999]
 
                 gps_lat, gps_lon = get_decimal_coordinates(self.exifDict['GPSInfo'])
                 self.exifDict['GPSInfo']['GPSLatDec'] = gps_lat

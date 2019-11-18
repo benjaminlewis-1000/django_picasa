@@ -15,38 +15,41 @@ from celery.schedules import crontab
 import logging
 
 # # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
-# BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # # Static files (CSS, JavaScript, Images)
 # # https://docs.djangoproject.com/en/2.2/howto/static-files/
 
-# PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-# STATIC_URL = '/static/'
-# STATIC_ROOT = os.path.join(BASE_DIR, 'static/')
-
-# print(STATIC_URL)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+STATIC_URL = '/static/'
+STATIC_ROOT = os.path.join(PROJECT_ROOT, 'static/')
 
 
-# STATICFILES_DIRS = (
-#     os.path.join(PROJECT_ROOT, 'static'), 
-# )
-from unipath import Path
-
-BASE_DIR         =  Path(__file__).ancestor(2)
-MEDIA_ROOT       =  BASE_DIR.child('media')
-STATIC_ROOT      =  BASE_DIR.child('static')
-
-TEMPLATE_DIRS    = (
-    BASE_DIR.child('templates'),
-)
 
 STATICFILES_DIRS = (
-    BASE_DIR.child('picasa').child('static'),
+    os.path.join(STATIC_ROOT, 'admin'), 
+    os.path.join(STATIC_ROOT, 'rest_framework'), 
+    # os.path.join(STATIC_ROOT), 
 )
+# print(STATICFILES_DIRS)
+
+from unipath import Path
+
+# BASE_DIR         =  Path(__file__).ancestor(2)
+# MEDIA_ROOT       =  BASE_DIR.child('media')
+# STATIC_ROOT      =  BASE_DIR.child('static')
+
+# TEMPLATE_DIRS    = (
+#     BASE_DIR.child('templates'),
+# )
+
+# STATICFILES_DIRS = (
+#     BASE_DIR.child('picasa').child('static'),
+# )
 
 STATIC_URL         = '/static/'
 MEDIA_URL          = '/media/'
-print(STATICFILES_DIRS, STATIC_ROOT)
+# print(STATICFILES_DIRS, STATIC_ROOT)
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/2.2/howto/deployment/checklist/
@@ -70,9 +73,11 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'periodic.apps.PeriodicConfig',
+    'rest_framework',
     'filepopulator',
     'face_manager',
-    'upload_img',
+    'api',
+    # 'upload_img',
 ]
 
 MIDDLEWARE = [
@@ -148,6 +153,10 @@ AUTH_PASSWORD_VALIDATORS = [
         'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
     },
 ]
+
+REST_FRAMEWORK = {
+    
+}
 
 
 # Internationalization

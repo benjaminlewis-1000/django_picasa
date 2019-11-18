@@ -1,4 +1,8 @@
 thumbnails/*
+*.log
+picasa/static/*
+static/*
+*.jpg
 *.pyc
 */migrations/*
 media/*

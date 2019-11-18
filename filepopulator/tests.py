@@ -12,6 +12,7 @@ import imageio
 import time
 from GPSPhoto import gpsphoto
 import random
+from time import sleep
 from PIL import Image
 
 # Create your tests here.
@@ -635,6 +636,8 @@ class ImageFileTests(TestCase):
         self.assertNotEqual(first_file_data.thumbnail_big.path, rot_data.thumbnail_big.path)
 
 
+    # def test_directories(self):
+        # Somehow I'm getting the same directory added twice. Yikes!
 
     #     # Move to another, unused path: should be same id, but
     #     # a different time.
@@ -667,17 +670,29 @@ class ImageFileTests(TestCase):
     #     raise NotImplementedError('Need to test out the directory called "orientation".')
 
 
-    # def test_bulk_add(self):
-    #     add_from_root_dir(self.tmp_valid_dir)
+    def test_bulk_add(self):
 
-    #     valid_files = []
 
-    #     for root, dirs, files in os.walk(self.tmp_valid_dir):
-    #         for f in files:
-    #             cur_file = os.path.join(root, f)
-    #             if cur_file.lower().endswith( ('.jpg', '.jpeg', ) ):
-    #                 valid_files.append(cur_file)
 
-    #     files_in_db = ImageFile.objects.all()
-        
-    #     raise NotImplementedError('Not finished with this test -- need to validate.')
+        add_from_root_dir(self.tmp_valid_dir)
+        sleep(5)
+        add_from_root_dir(self.tmp_valid_dir)
+
+        valid_files = []
+
+        for root, dirs, files in os.walk(self.tmp_valid_dir):
+            for f in files:
+                cur_file = os.path.join(root, f)
+                if cur_file.lower().endswith( ('.jpg', '.jpeg', ) ):
+                    valid_files.append(cur_file)
+
+        files_in_db = ImageFile.objects.all()
+        files_in_db = [x.filename for x in files_in_db]
+
+        for vf in valid_files:
+            self.assertTrue(vf in files_in_db)
+
+        dir_objs = Directory.objects.all()
+        # print(dir_objs)
+        directory_list = [x.dir_path for x in dir_objs]
+        self.assertEqual(len(directory_list), len(set(directory_list)))
