@@ -1,4 +1,5 @@
 thumbnails/*
+picasa/adding.lock
 *.log
 picasa/static/*
 static/*

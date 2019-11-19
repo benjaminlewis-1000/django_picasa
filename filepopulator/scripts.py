@@ -30,8 +30,7 @@ def create_image_file(file_path):
     new_photo = ImageFile(filename=file_path)
 
     new_photo.process_new()
-    print(time.time() - s )
- 
+
 
     def instance_clean_and_save(instance):
         try:
@@ -63,9 +62,14 @@ def create_image_file(file_path):
     # Case 1: photo exists at this location.
     if len(exist_photo):
         if len(exist_photo) > 1:
-            raise ValueError('Should only have at most one instance of a file. You have {}'.format(len(exist_photo)))
+            raise ValueError('Should only have at most one instance of a file {}. You have {}'.format(file_path, len(exist_photo)))
         else:
             exist_photo = exist_photo[0]
+
+        if exist_photo.dateModified == new_photo.dateModified:
+            logging.error("No further action necessary")
+            return
+        print(f"Old: {exist_photo.dateModified} New: {new_photo.dateModified}")
 
         if exist_photo.pixel_hash == new_photo.pixel_hash:
             if exist_photo.orientation == new_photo.orientation:
@@ -76,6 +80,7 @@ def create_image_file(file_path):
                 exist_photo = new_photo
                 exist_photo.orientation = new_photo.orientation
                 exist_photo.dateAdded = timezone.now()
+                exist_photo.dateModified = datetime.fromtimestamp(os.path.getmtime(file_path))
                 exist_photo.isProcessed = False
                 instance_clean_and_save(exist_photo)
                 return
@@ -97,16 +102,19 @@ def create_image_file(file_path):
                 instance = exist_with_same_hash[0]
                 instance.filename = file_path
                 instance.dateAdded = timezone.now()
+                instance.dateModified = datetime.fromtimestamp(os.path.getmtime(file_path))
                 delete_old_thumbnails(instance)
                 instance_clean_and_save(instance)
                 return
 
             elif len(exist_with_same_hash) > 1:
                 # raise NotImplementedError('More than one...')
+                logging.error('This is not how I want it.')
                 for each in exist_with_same_hash:
                     if not os.path.exists(each.filename):
                         each.filename = file_path
                         each.dateAdded = timezone.now()
+                        each.dateModified = datetime.fromtimestamp(os.path.getmtime(file_path))
                         delete_old_thumbnails(each)
                         instance_clean_and_save(each)
                         return
@@ -123,11 +131,25 @@ def create_image_file(file_path):
 
 def add_from_root_dir(root_dir):
 
-    for root, dirs, files in os.walk(root_dir):
-        for f in files:
-            cur_file = os.path.join(root, f)
-            print(cur_file)
-            create_image_file(cur_file)
+    lockfile = settings.LOCKFILE
+
+    print(lockfile)
+    if os.path.isfile(lockfile):
+        print("Locked!")
+        return
+    else:
+
+        f = open(lockfile, 'w')
+        f.close()
+
+        try:
+            for root, dirs, files in os.walk(root_dir):
+                for f in files:
+                    cur_file = os.path.join(root, f)
+                    print(cur_file)
+                    create_image_file(cur_file)
+        finally:
+            os.remove(lockfile)
 
 def delete_removed_photos():
     all_photos = ImageFile.objects.all()

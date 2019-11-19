@@ -25,6 +25,9 @@ STATIC_URL = '/static/'
 STATIC_ROOT = os.path.join(PROJECT_ROOT, 'static/')
 
 
+LOCKFILE = os.path.join(PROJECT_ROOT, 'adding.lock')
+if os.path.isfile(LOCKFILE):
+    os.remove(LOCKFILE)
 
 STATICFILES_DIRS = (
     os.path.join(STATIC_ROOT, 'admin'), 

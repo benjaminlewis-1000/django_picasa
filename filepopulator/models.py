@@ -106,6 +106,7 @@ class ImageFile(models.Model):
 
     # Default for date added is now.
     dateAdded = models.DateTimeField( default=timezone.now )
+    dateModified = models.DateTimeField(default = timezone.now )
     width = models.IntegerField(validators=[MinValueValidator(1)])
     height = models.IntegerField(validators=[MinValueValidator(1)])
 
@@ -140,7 +141,7 @@ class ImageFile(models.Model):
         self._get_dir()
         s = time.time()
         self._generate_md5_hash()
-        print("MD5: ", time.time() - s)
+        # print("MD5: ", time.time() - s)
         self._get_date_taken()
 
         # name_match = ImageFile.objects.filter(filename=self.filename)
@@ -199,8 +200,12 @@ class ImageFile(models.Model):
         # # https://www.blog.pythonlibrary.org/2010/03/28/getting-photo-metadata-exif-using-python/
         # # Uses PIL to get a named dictionary of EXIF metadata.
 
-        # self.full_path = os.path.join(self.directory.dir_path, self.filename)
+
+        s = time.time()
         self.image = PIL.Image.open(self.filename)
+        self.dateModified = datetime.fromtimestamp(os.path.getmtime(self.filename))
+        print(self.dateModified)
+
         self.exifDict = {}
         # print(self.filename)
         try:
@@ -322,14 +327,20 @@ class ImageFile(models.Model):
         # Reads the pixels in the image, reshapes them,
         # and then hash the pixels one by one using md5. 
         pixel_hash_md5 = hashlib.md5()
-        self.pixels = cv2.imread(self.filename)
+
+        self.pixels = cv2.cvtColor(np.array(self.image), cv2.COLOR_BGR2RGB)
+
         arr = self.pixels.reshape(-1)
+        # arr = arr[::500]
+        # arr = np.ascontiguousarray(arr)
+        # print(arr)
 
         # Sample 1000 pixels in the array equally across the array.
         # This is deterministic. 
-        for idx in range(0,len(arr),max(len(arr)//1000, 1) ):
-            it = arr[idx]
-            pixel_hash_md5.update(bytes([it]))
+        # for idx in range(0,len(arr),max(len(arr)//1000, 1) ):
+        #     it = arr[idx]
+        #     pixel_hash_md5.update(bytes([it]))
+        pixel_hash_md5.update(arr)
         
         self.pixel_hash = pixel_hash_md5.hexdigest()
         settings.LOGGER.debug(f'{self.pixel_hash}, {self.filename}')
@@ -427,7 +438,10 @@ class ImageFile(models.Model):
         """
         Make and save the thumbnail for the photo here.
         """
-        self.process_new()
+        # self.process_new()
+
+        self._init_image()
+
         if not self._generate_thumbnail():
             raise Exception('Could not create thumbnail - is the file type valid?')
         super(ImageFile, self).save(*args, **kwargs)
