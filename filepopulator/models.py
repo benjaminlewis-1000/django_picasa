@@ -90,8 +90,8 @@ class ImageFile(models.Model):
     # square_thumbnail_big = models.ImageField(upload_to='square_thumbnails_big')
 
     # Fields for metadata
-    camera_make = models.CharField(max_length = 64, null=False, default='Unknown')
-    camera_model = models.CharField(max_length = 64, null=False, default='Unknown')
+    camera_make = models.CharField(max_length = 64, null=True, blank=True)
+    camera_model = models.CharField(max_length = 64, null=True, blank=True)
     flash_info = models.IntegerField(validators=[MinValueValidator(-1)], default= -1)
     exposure_num = models.IntegerField(validators=[MinValueValidator(-1)], default= -1)
     exposure_denom = models.IntegerField(validators=[MinValueValidator(-1)], default= -1)
@@ -129,20 +129,20 @@ class ImageFile(models.Model):
     def __str__(self):
         return "{}".format(self.filename)
 
-    def process_new(self):
+    def process_new_no_md5(self):
 
         is_new = True
 
         if not re.match(".*\.[j|J][p|P][e|E]?[g|G]$", self.filename):
             settings.LOGGER.debug("File {} does not have a jpeg-type ending.".format(self.filename))
-            return
+            return False # Success value
 
         self._init_image()
         self._get_dir()
         s = time.time()
-        self._generate_md5_hash()
-        # print("MD5: ", time.time() - s)
         self._get_date_taken()
+
+        return True # Success value
 
         # name_match = ImageFile.objects.filter(filename=self.filename)
         # if name_match: # i.e. we've looked at this file before.
@@ -157,8 +157,6 @@ class ImageFile(models.Model):
                 # raise NotImplementedError('What do we do here?')
             # return
 
-        self.height=1
-        self.width=1
 
         # self._generate_thumbnail()
 
@@ -204,7 +202,9 @@ class ImageFile(models.Model):
         s = time.time()
         self.image = PIL.Image.open(self.filename)
         self.dateModified = datetime.fromtimestamp(os.path.getmtime(self.filename))
-        print(self.dateModified)
+        if self.dateModified.tzinfo == None:
+            self.dateModified = self.dateModified.astimezone(pytz.utc)
+
 
         self.exifDict = {}
         # print(self.filename)
@@ -322,6 +322,8 @@ class ImageFile(models.Model):
             # Orientation 1 
             pass
 
+        self.width, self.height = self.image.size
+
     # Orientation ? 
     def _generate_md5_hash(self):
         # Reads the pixels in the image, reshapes them,
@@ -438,9 +440,13 @@ class ImageFile(models.Model):
         """
         Make and save the thumbnail for the photo here.
         """
-        # self.process_new()
+        # I only do the MD5 hash in the save function because it
+        # is so expensive. I also have to redo the _init_image function
+        # for some reason, so that the self.image field is populated
+        # appropriately (it somehow loses it...)
 
         self._init_image()
+        self._generate_md5_hash()
 
         if not self._generate_thumbnail():
             raise Exception('Could not create thumbnail - is the file type valid?')
@@ -455,3 +461,26 @@ class ImageFile(models.Model):
         super(ImageFile, self).delete()
 
 
+    # def admin_thumbnail(self):
+    #         func = getattr(self, 'get_admin_thumbnail_url', None)
+    #         if func is None:
+    #             return _('An "admin_thumbnail" photo size has not been defined.')
+    #         else:
+    #             if hasattr(self, 'get_absolute_url'):
+    #                 return mark_safe(u'<a href="{}"><img src="{}"></a>'.format(self.get_absolute_url(), func()))
+    #             else:
+    #                 return mark_safe(u'<a href="{}"><img src="{}"></a>'.format(self.image.url, func()))
+
+    # admin_thumbnail.short_description = ('Thumbnail')
+    # admin_thumbnail.allow_tags = True
+    def image_img(self):
+        if self.image:
+            return marksafe('<img src="%s" />' % self.thumbnail_small.url)
+        else:
+            return '(Sin imagen)'
+        image_img.short_description = 'Thumb'
+
+
+    def exposure(self):
+        return "hi" #f"{self.exposure_num}/{self.exposure_denom}"
+    exposure.short_description = 'Exposure'

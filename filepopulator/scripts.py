@@ -17,19 +17,18 @@ import time
 
 def create_image_file(file_path):
 
-    # print("At start: ", ImageFile.objects.all())
     if not os.path.isfile(file_path):
         settings.LOGGER.debug('File {} is not a file path. Will not insert.'.format(file_path))
         return
 
-    s = time.time()
     # Check if this photo already exists:
     exist_photo = ImageFile.objects.filter(filename=file_path)
-    # print(exist_photo)
 
     new_photo = ImageFile(filename=file_path)
 
-    new_photo.process_new()
+    success = new_photo.process_new_no_md5()
+    if not success:
+        return
 
 
     def instance_clean_and_save(instance):
@@ -66,15 +65,41 @@ def create_image_file(file_path):
         else:
             exist_photo = exist_photo[0]
 
-        if exist_photo.dateModified == new_photo.dateModified:
-            logging.error("No further action necessary")
+        exist_timestamp = exist_photo.dateModified.timestamp()
+        adding_timestamp = new_photo.dateModified.timestamp()
+
+        # Check the timestamp between the database and the file 
+        # under consideration. If they are exactly the same, 
+        # then we don't have to change anything in the database.
+        # We get the timestamp() value so that we don't have to 
+        # deal with some values having a timezone (all the database
+        # values) and some not (most pictures). Timestamp simply
+        # turns it into a float of UTC seconds. 
+        if exist_timestamp == adding_timestamp:
+            logging.debug("No further action necessary")
             return
-        print(f"Old: {exist_photo.dateModified} New: {new_photo.dateModified}")
+        # Only if the files are *not* the same do we compute the
+        # md5 hash of the file. This is because reading in the 
+        # pixel values of the file is a comparatively expensive
+        # operation, taking tenths of a second. If you did that
+        # all the time for every one of tens of thousands (or more)
+        # pictures, then it would take hours to run through. 
+        # Instead, we can process files with no change in ten-thousandths
+        # of a second each. Perfect!
+        # Small scale test with 200 pictures:
+        # With hash every time: ~20 seconds to add all
+        # This way with established database (no hashing): ~.5 seconds. 
+        # That's a 40x speedup.
+        else:
+            new_photo._generate_md5_hash()
 
         if exist_photo.pixel_hash == new_photo.pixel_hash:
             if exist_photo.orientation == new_photo.orientation:
             # The photo is already in place, and the pixel hash hasn't changed, and it hasn't rotated
             # Don't want to delete it -- they reference the same picture in distinct locations.
+            # However, our modification timestamps are off, so let's update that. 
+                exist_photo.dateModified = datetime.fromtimestamp(os.path.getmtime(file_path))
+                instance_clean_and_save(exist_photo)
                 return
             else:
                 exist_photo = new_photo
@@ -91,9 +116,9 @@ def create_image_file(file_path):
 
     # Case 2: No photo exists at this location.
     else:
-        # new_photo.process_new()
+        # new_photo.process_new_no_md5()
+        new_photo._generate_md5_hash()
         exist_with_same_hash = ImageFile.objects.filter(pixel_hash = new_photo.pixel_hash)
-
         if len(exist_with_same_hash):
             if len(exist_with_same_hash) == 1 and not os.path.exists(exist_with_same_hash[0].filename) :
                 # Exactly one other, but it's been deleted or moved.
@@ -109,7 +134,8 @@ def create_image_file(file_path):
 
             elif len(exist_with_same_hash) > 1:
                 # raise NotImplementedError('More than one...')
-                logging.error('This is not how I want it.')
+                print(exist_with_same_hash)
+                logging.error('This is not how I want it -- I want more matching validation. But getting here was right.')
                 for each in exist_with_same_hash:
                     if not os.path.exists(each.filename):
                         each.filename = file_path

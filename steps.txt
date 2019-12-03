@@ -134,3 +134,36 @@ Key sites to figure it out:
 
 # MAKE APPS REUSABLE
 https://docs.djangoproject.com/en/2.2/intro/reusable-apps/	
+
+# Make sure your media URL and static URL are set to something Apache can serve. 
+
+# SERVING FILES
+-Install mod-wsgi
+-Set /etc/apache2/conf-available/mod-wsgi.conf to: 
+    WSGIScriptAlias /test_wsgi /var/www/html/wsgi_test_script.py
+
+    WSGIScriptAlias / /home/benjamin/git_repos/local_picasa/picasa
+    WSGIPythonPath /home/benjamin/git_repos/local_picasa
+
+    Alias "/tmp" /home/benjamin/git_repos/local_picasa/picasa/tmp
+
+    <Directory /home/benjamin/git_repos/local_picasa/picasa>
+    <Files wsgi.py>
+       Require all granted
+    </Files>
+    </Directory>
+
+- a2enconf mod-wsgi
+- a2enmod xml2end
+
+-Put an Alias in "/etc/apache2/sites-available/000-default.conf" to 
+  the directory for media. Use "Require all granted" rather than order allow,deny
+  and stuff.  
+
+    Alias /media /home/benjamin/git_repos/local_picasa/media
+
+    <Directory /home/benjamin/git_repos/local_picasa/media>
+        Options Indexes FollowSymLinks MultiViews
+        AllowOverride None
+        Require all granted
+    </Directory>

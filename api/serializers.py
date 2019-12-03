@@ -23,8 +23,8 @@ class ImageFileSerializer(serializers.HyperlinkedModelSerializer):
         model = ImageFile
         fields = ['id', 'filename', 'pixel_hash', 'file_hash', 'camera_make', 'camera_model', \
                   'flash_info', 'exposure_num', 'exposure_denom', 'focal_num', 'focal_denom', \
-                  'fnumber_num', 'fnumber_denom', 'iso_value', 'light_source', 'gps_lat_decimal' \
-                  'gps_lon_decimal']
+                  'fnumber_num', 'fnumber_denom', 'iso_value', 'light_source', 'gps_lat_decimal', \
+                  'gps_lon_decimal', 'thumbnail_big', 'thumbnail_medium', 'thumbnail_small']
         # id = serializers.IntegerField(read_only=True)
         # filename = serializers.CharField(max_length=255, required=True, allow_blank=False)
         # pixel_hash = serializers.CharField(max_length = 64, allow_blank = False, default = -1)

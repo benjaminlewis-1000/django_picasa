@@ -519,6 +519,8 @@ class ImageFileTests(TestCase):
         first_item = ImageFile.objects.filter(filename=src_file)[0]
         first_item.isProcessed = True
         first_item.save()
+        first_item = ImageFile.objects.filter(filename=src_file)[0]
+        self.assertTrue(first_item.isProcessed)
         ident1 = first_item.id
         ph = first_item.pixel_hash
         date_add = first_item.dateAdded
@@ -534,11 +536,11 @@ class ImageFileTests(TestCase):
         # Having just moved the file, the isProcessed should be saved
         # in the new database entry. 
         path1_item = ImageFile.objects.filter(filename=path1)[0]
+        print(path1_item.id, first_item.id)
         self.assertTrue(path1_item.isProcessed)
-        ident2 = path1_item.id
         # Identity should be different because it moved to a different
         # file location. 
-        self.assertEqual(ident1, ident2)
+        self.assertEqual(path1_item.id, first_item.id)
         self.assertNotEqual(path1_item.dateAdded, date_add)
         # src_file should no longer be in the database.
         i1_tmp = ImageFile.objects.filter(filename=src_file)
@@ -671,8 +673,6 @@ class ImageFileTests(TestCase):
 
 
     def test_bulk_add(self):
-
-
 
         add_from_root_dir(self.tmp_valid_dir)
         sleep(5)

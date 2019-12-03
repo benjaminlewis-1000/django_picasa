@@ -75,3 +75,112 @@ Did not add JPEG-type photo /tmp/img_validation/naming/good/challenge dírectôr
 Did not add JPEG-type photo /tmp/img_validation/naming/good/challenge dírectôry_with_repeats/4.jpeg: {'directory': ['This field cannot be null.']}
 Did not add JPEG-type photo /tmp/img_validation/naming/good/challenge dírectôry_with_repeats/1.JPG: {'directory': ['This field cannot be null.']}
 Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0001.jpg: {'directory': ['directory instance with id 32 does not exist.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0035.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0012.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0021.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0011.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0013.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994_4.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0022.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0024.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/january_1994.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/testnew.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0016.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0027.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 (4).jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0039.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994_3.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0040.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 (2).jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0023.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0016.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0003.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 (2)_2.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0014.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0008.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0011.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0006.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0031.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0009.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 (5).jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0030.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0014.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0012.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 (2)_3.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0006.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0013.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0015.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0001.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0005.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 (3).jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 (1)_2.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0038.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0010.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0003.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0008.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0004.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0010.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 (1)_3.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0001.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0044.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0035.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0012.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0021.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0011.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0013.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994_4.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0022.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0024.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/january_1994.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/testnew.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0016.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0027.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 (4).jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0039.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994_3.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0040.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 (2).jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0023.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0016.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0003.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 (2)_2.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0014.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0008.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jul_1994 0011.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0006.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0031.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /home/benjamin/git_repos/picasa_files/actual_imgs/1994/jan_1994 0009.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/tmpmv.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/question_date_taken.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/space in filename.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/unicode_ãàÓ.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/4.jpeg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/5.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/6.JpEg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/2.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/1.JPG: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/challenge dírectôry_with_repeats/9.jpeg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/challenge dírectôry_with_repeats/10.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/tmpmv.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/question_date_taken.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/space in filename.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/unicode_ãàÓ.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/4.jpeg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/5.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/6.JpEg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/2.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/1.JPG: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/challenge dírectôry_with_repeats/9.jpeg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/challenge dírectôry_with_repeats/10.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/tmpmv.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/question_date_taken.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/space in filename.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/unicode_ãàÓ.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/4.jpeg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/5.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/6.JpEg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/2.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/1.JPG: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/challenge dírectôry_with_repeats/9.jpeg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}
+Did not add JPEG-type photo /tmp/img_validation/naming/good/challenge dírectôry_with_repeats/10.jpg: {'camera_make': ['This field cannot be blank.'], 'camera_model': ['This field cannot be blank.']}

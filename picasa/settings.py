@@ -20,20 +20,26 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # # Static files (CSS, JavaScript, Images)
 # # https://docs.djangoproject.com/en/2.2/howto/static-files/
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-STATIC_URL = '/static/'
-STATIC_ROOT = os.path.join(PROJECT_ROOT, 'static/')
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+import os
+SITE_ROOT = os.path.dirname(os.path.realpath(__file__))
+# STATICFILES_DIRS = (
+#   os.path.join(SITE_ROOT, 'static/'),
+# )
+
+# STATIC_URL = '/static/'
 
 
 LOCKFILE = os.path.join(PROJECT_ROOT, 'adding.lock')
 if os.path.isfile(LOCKFILE):
     os.remove(LOCKFILE)
 
-STATICFILES_DIRS = (
-    os.path.join(STATIC_ROOT, 'admin'), 
-    os.path.join(STATIC_ROOT, 'rest_framework'), 
-    # os.path.join(STATIC_ROOT), 
-)
+# STATICFILES_DIRS = (
+#     os.path.join(STATIC_ROOT, 'admin'), 
+#     os.path.join(STATIC_ROOT, 'rest_framework'), 
+#     # os.path.join(STATIC_ROOT), 
+# )
 # print(STATICFILES_DIRS)
 
 from unipath import Path
@@ -50,9 +56,16 @@ from unipath import Path
 #     BASE_DIR.child('picasa').child('static'),
 # )
 
-STATIC_URL         = '/static/'
-MEDIA_URL          = '/media/'
+STATIC_URL         = 'http://localhost/static/'
+MEDIA_URL          = 'http://localhost/media/'
+STATIC_SERVER = '/var/www/html/static'
+MEDIA_ROOT = os.path.join(PROJECT_ROOT, 'media')
 # print(STATICFILES_DIRS, STATIC_ROOT)
+
+# STATICFILES_DIRS = [
+#     STATIC_SERVER
+# ]
+# STATIC_ROOT = STATIC_SERVER
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/2.2/howto/deployment/checklist/
@@ -238,3 +251,5 @@ file = logging.FileHandler(LOG_FILE)
 #if you do, they will only output events that are >= that level
 LOGGER.addHandler(console)
 LOGGER.addHandler(file)
+
+logging.error("TODO: Set up apache server. STATIC_URL needs to be served by it.")
