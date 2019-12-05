@@ -482,5 +482,6 @@ class ImageFile(models.Model):
 
 
     def exposure(self):
-        return "hi" #f"{self.exposure_num}/{self.exposure_denom}"
+        return f"{self.exposure_num}/{self.exposure_denom}"
+        
     exposure.short_description = 'Exposure'

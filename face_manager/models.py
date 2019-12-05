@@ -14,8 +14,9 @@ path_to_script = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(path_to_script)
 
 import logging
-import faceid
 import filepopulator
+# import image_face_extractor
+
 
 # Create your models here
 # logging.basicConfig(level=settings.LOG_LEVEL)
@@ -25,21 +26,28 @@ settings.LOGGER.warning("TODO: Implement model for faces")
 class Person(models.Model):
 	person_name = models.CharField(max_length=256)
 
+    # id field has a primary key
+
+
 class Face(models.Model):
     # Primary key comes for free
     declared_name = models.ForeignKey('Person', on_delete=models.PROTECT,)
-    source_image = models.ForeignKey('filepopulator.ImageFile', on_delete=models.CASCADE, blank=True, null=True)
-    # ArrayField 
+    source_image_file = models.ForeignKey('filepopulator.ImageFile', on_delete=models.CASCADE, blank=True, null=True)
+    # ArrayField supported in PostGres
     face_encoding = ArrayField(
     						models.FloatField(),
     						size=128,
     					)
 
+    # This field will contain the top 5 possible identities as categorized
+    # by the FC network.
     top_idents = ArrayField(
-    						models.CharField(max_length=256)
+    						models.CharField(max_length=256),
+                            size=5,
     					)
 
-    written_in_photo = models.BooleanField(default=False)
+    written_to_photo_metadata = models.BooleanField(default=False)
+
     box_top = models.IntegerField(validators=[MinValueValidator(1)], default=-1)
     box_bottom = models.IntegerField(validators=[MinValueValidator(1)], default=-1)
     box_left = models.IntegerField(validators=[MinValueValidator(1)], default=-1)
@@ -50,6 +58,3 @@ class Face(models.Model):
 
     def __str__(self):
         return "{}".format(self.declared_name)
-
-    def face_from_facerect(self):
-    	pass

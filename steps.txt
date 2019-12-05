@@ -136,6 +136,8 @@ Key sites to figure it out:
 https://docs.djangoproject.com/en/2.2/intro/reusable-apps/	
 
 # Make sure your media URL and static URL are set to something Apache can serve. 
+# This means that apache needs to serve both the 'static' dir and the 'media' dir, 
+# and you should be able to access those from the web. 
 
 # SERVING FILES
 -Install mod-wsgi

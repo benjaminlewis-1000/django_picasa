@@ -88,8 +88,9 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'periodic.apps.PeriodicConfig',
+    # 'periodic.apps.PeriodicConfig',
     'rest_framework',
+    'rest_framework.authtoken',
     'filepopulator',
     'face_manager',
     'api',
@@ -170,8 +171,13 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
+# Token authentication: https://simpleisbetterthancomplex.com/tutorial/2018/11/22/how-to-implement-token-authentication-using-django-rest-framework.html
 REST_FRAMEWORK = {
-    
+     'DEFAULT_AUTHENTICATION_CLASSES': [
+        # 'rest_framework.authentication.BasicAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
+        'rest_framework.authentication.TokenAuthentication',  # <-- And here
+    ]
 }
 
 
