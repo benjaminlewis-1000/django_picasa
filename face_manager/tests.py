@@ -35,13 +35,22 @@ class FaceManageTests(TestCase):
         scripts.create_image_file(cls.face_file)
         scripts.add_from_root_dir(cls.tmp_valid_dir)
 
+    @classmethod
+    def tearDownClass(cls):
+
+        allObjects = ImageFile.objects.all()
+        for obj in allObjects:
+            obj.delete()
+
+        shutil.rmtree(cls.tmp_valid_dir)
+
     def tearDown(self):
         pass
 
     def test_add_file(self):
         first_file = ImageFile.objects.filter(filename=self.face_file)[0]
         print("First file: ", first_file.filename)
-        populateFromImage(first_file.filename)
+        # populateFromImage(first_file.filename)
         pass
 
     def test_that(self):

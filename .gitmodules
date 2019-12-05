@@ -1,0 +1,3 @@
+[submodule "image_face_extractor"]
+	path = image_face_extractor
+	url = https://github.com/benjaminlewis-1000/faceTagging
