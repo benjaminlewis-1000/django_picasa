@@ -1,9 +1,9 @@
 from django.shortcuts import render
 
 from django.contrib.auth.models import User, Group
-from filepopulator.models import ImageFile
+from filepopulator.models import ImageFile, Directory
 from rest_framework import viewsets
-from api.serializers import UserSerializer, GroupSerializer, ImageFileSerializer
+from api.serializers import UserSerializer, GroupSerializer, ImageFileSerializer, DirectorySerializer
 # Authentication: https://simpleisbetterthancomplex.com/tutorial/2018/11/22/how-to-implement-token-authentication-using-django-rest-framework.html
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -39,6 +39,13 @@ class ImageViewSet(viewsets.ModelViewSet):
 
     queryset = ImageFile.objects.all()
     serializer_class = ImageFileSerializer
+
+class DirectoryViewSet(viewsets.ModelViewSet):
+
+	permission_classes = (IsAuthenticated,)
+
+	queryset = Directory.objects.all()
+	serializer_class = DirectorySerializer
 
 # class HelloView(APIView):
 #     permission_classes = (IsAuthenticated,)             # <-- And here

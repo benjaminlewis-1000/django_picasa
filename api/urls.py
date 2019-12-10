@@ -10,6 +10,7 @@ router = routers.DefaultRouter()
 router.register(r'users', views.UserViewSet)
 router.register(r'mygroups', views.GroupViewSet)
 router.register(r'images', views.ImageViewSet)
+router.register(r'directories', views.DirectoryViewSet)
 # router.register(r'hello', views.HelloView)
 
 urlpatterns = [

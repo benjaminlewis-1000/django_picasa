@@ -62,11 +62,61 @@ def validate_lon(value):
                 params={'value': value},
             )
 
-class Directory(models.Model):
+class Directory(models.Model): 
     dir_path = models.CharField(max_length=255, unique=True)
+    mean_datetime = models.DateTimeField(default = timezone.now)
+    mean_datesec = models.FloatField(default = -1)
+    first_datetime = models.DateTimeField(default = timezone.now)
+    first_datesec = models.FloatField(default = -1)
 
     def __str__(self):
         return "{} --- ({})".format(self.dir_path.split('/')[-1], self.dir_path)
+
+    def top_level_name(self):
+        return "{}".format(self.dir_path.split('/')[-1])
+
+    def imgs_in_dir(self):
+        imgs = ImageFile.objects.filter(directory__dir_path=self.dir_path)
+        imgs = [i.id for i in imgs]
+        return imgs
+
+    def __get_filtered_img_dates__(self):
+        imgs = ImageFile.objects.filter(directory__dir_path=self.dir_path)
+
+        img_date = [time.mktime(i.dateTaken.timetuple()) for i in imgs if i.dateTakenValid]
+        img_date = np.array(img_date)
+
+        def reject_outliers(data, m = 2.):
+            d = np.abs(data - np.median(data))
+            mdev = np.median(d)
+            s = d/mdev if mdev else 0.
+            return data[s<m]
+
+        img_date =reject_outliers(img_date)
+        if len(img_date) == 0:
+            return None
+        else:
+            return img_date.reshape(-1)
+
+    def average_date_taken(self):
+        img_dates = self.__get_filtered_img_dates__()
+        if img_dates is None:
+            self.mean_datesec = datetime.fromtimestamp(timezone.now, timezone.utc)
+            self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, timezone.utc)
+        else:
+            self.mean_datesec = float(np.mean(img_dates))
+            self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, timezone.utc)
+
+    def beginning_date_taken(self):
+        img_dates = self.__get_filtered_img_dates__()
+        if img_dates is None:
+            self.first_datesec = datetime.fromtimestamp(timezone.now, timezone.utc)
+            self.first_datetime = datetime.fromtimestamp(self.mean_datesec, timezone.utc)
+        else:
+            img_dates.sort()
+            first_date = img_dates[0]
+            self.first_datesec = int(first_date)
+            self.first_datetime = datetime.fromtimestamp(self.first_datesec, timezone.utc)
     
 # Lots ripped from https://github.com/hooram/ownphotos/blob/dev/api/models.py 
 class ImageFile(models.Model):

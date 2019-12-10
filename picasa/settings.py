@@ -226,7 +226,11 @@ CELERY_BEAT_SCHEDULE = {
     'filepopulate_root': {
         'task': 'filepopulator.populate_files_from_root',
         'schedule': crontab(minute='*/1'),
-    }
+    },
+    'dirs_datetimes': {
+        'task': 'filepopulator.update_dir_dates',
+        'schedule': crontab(minute='*/1')
+    },
 
 }
 

@@ -7,7 +7,8 @@ from django.conf import settings
 from celery import shared_task, task
 import time
 import os
-from .scripts import create_image_file, add_from_root_dir, delete_removed_photos
+import scripts
+from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime
 
 if not settings.configured:
     settings.configure()
@@ -31,13 +32,12 @@ def load_images_into_db():
         fh.write('The time is : {}\n'.format( time.time() ) )
     add_from_root_dir(base_directory)
     delete_removed_photos()
-    # flist = []
-    # for root, dirs, files in os.walk(base_directory, topdown=False):
-    #     for name in files:
-    #         print(os.path.join(root, name))
-    #         flist.append(os.path.join(root, name))
 
-    # return flist
+
+@task(name='filepopulator.update_dir_dates')
+def update_dir_dates():
+    print("Updates")
+    update_dirs_datetime()
 
 # # Some test tasks:
 # @shared_task

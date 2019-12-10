@@ -186,3 +186,12 @@ def delete_removed_photos():
             each_photo.delete()
 
     # ImageFile.objects.all().delete()
+
+def update_dirs_datetime():
+
+    dirs = Directory.objects.all()
+    for d in dirs:
+        print(d)
+        d.average_date_taken()
+        d.beginning_date_taken()
+        d.save()

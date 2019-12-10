@@ -19,7 +19,7 @@ from PIL import Image
 
 from .models import ImageFile, Directory
 # from .forms import ImageFileForm, DirectoryForm
-from .scripts import create_image_file, add_from_root_dir, delete_removed_photos
+from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime
 # from .views import create_or_get_directory# , create_image_file, add_from_root_dir
 
 
@@ -696,3 +696,58 @@ class ImageFileTests(TestCase):
         # print(dir_objs)
         directory_list = [x.dir_path for x in dir_objs]
         self.assertEqual(len(directory_list), len(set(directory_list)))
+
+
+class DirectoryTests(TestCase):
+
+    def setUp(self):
+        pass
+
+    @classmethod
+    def setUpTestData(cls):
+
+        cls.validation_dir = settings.FILEPOPULATOR_VAL_DIRECTORY 
+
+        assert os.path.isdir(cls.validation_dir), 'Validation directory in FaceManageTests does not exist.'
+
+        # Copy the validation files to the /tmp directory
+        cls.tmp_valid_dir = '/tmp/img_validation'
+
+        if os.path.exists(cls.tmp_valid_dir):
+            shutil.rmtree(cls.tmp_valid_dir)
+
+        shutil.copytree(cls.validation_dir, cls.tmp_valid_dir)
+
+        cls.face_file = os.path.join(cls.tmp_valid_dir, 'has_face_tags.jpg')
+
+        create_image_file(cls.face_file)
+        add_from_root_dir(cls.tmp_valid_dir)
+
+    def test_top_name(self):
+        
+        dirs = Directory.objects.all()
+        for d in dirs:
+            tln = d.dir_path.split('/')[-1]
+            print(tln, d.top_level_name())
+            self.assertEqual(tln, d.top_level_name())
+
+    def test_get_imgs(self):
+
+        dirs = Directory.objects.all()
+        for d in dirs:
+            print(d.imgs_in_dir())
+
+    def test_get_average_age(self):
+
+        dirs = Directory.objects.all()
+
+        for d in dirs:
+            print("Average before: ", d.mean_datesec)
+            self.assertEqual(d.mean_datesec, -1)
+            
+        update_dirs_datetime()
+
+        dirs = Directory.objects.all()
+        for d in dirs:
+            print("Average after: ", d.mean_datesec)
+            self.assertNotEqual(d.mean_datesec, -1)

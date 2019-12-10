@@ -50,7 +50,7 @@ class FaceManageTests(TestCase):
     def test_add_file(self):
         first_file = ImageFile.objects.filter(filename=self.face_file)[0]
         print("First file: ", first_file.filename)
-        # populateFromImage(first_file.filename)
+        populateFromImage(first_file.filename)
         pass
 
     def test_that(self):
