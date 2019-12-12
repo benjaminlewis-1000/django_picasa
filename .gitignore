@@ -1,4 +1,6 @@
 thumbnails/*
+*.sublime*
+celerybeat* 
 picasa/adding.lock
 *.log
 picasa/static/*
