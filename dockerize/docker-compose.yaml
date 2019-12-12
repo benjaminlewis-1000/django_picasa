@@ -1,0 +1,15 @@
+
+version: "3.3"
+services:
+  picasa:
+    build:
+      context: ..
+      dockerfile: ./dockerize/Dockerfile
+      args:
+        buildno: 1
+    image:
+      picasa_img
+    command:
+      bash -c "service postgresql start && bash"
+
+      # Need to start postgresql service

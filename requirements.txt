@@ -17,6 +17,7 @@ piexif
 Pillow
 postgres
 psycopg2-binary
+redis
 scons
 unipath
 xmltodict
