@@ -7,5 +7,9 @@ numpy
 scons
 Pillow
 django-celerybeat-status 
+django-celery-beat
 dj-database-url
 postgres
+unipath
+django-rest-framework
+django-admin-thumbnails

@@ -25,8 +25,6 @@ import cv2
 import numpy as np
 
 # Image thumbnail processing
-from stdimage import StdImageField, JPEGField
-from stdimage.utils import render_variations
 
 # Create your models here.
 
