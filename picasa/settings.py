@@ -262,4 +262,5 @@ file = logging.FileHandler(LOG_FILE)
 LOGGER.addHandler(console)
 LOGGER.addHandler(file)
 
-logging.error("TODO: Set up apache server. STATIC_URL needs to be served by it.")
+# logging.error("TODO: Set up apache server. STATIC_URL needs to be served by it.")
+logging.error('TODO: set up text alerts for client image handler and such.')
