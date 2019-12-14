@@ -21,9 +21,6 @@ def populateFromImage(filename):
     # def face_from_facerect(self, filename):
     face_data = image_face_extractor.image_client.face_extract_client(filename)
 
-    assert len(foreign_key) == 1
-    foreign_key = foreign_key[0]
-
     if len(face_data) == 0:
         foreign_key.isProcessed = True
         foreign_key.save()
@@ -34,7 +31,9 @@ def populateFromImage(filename):
     for idx in range(len(face_data)):
         eachface = face_data[idx]
         name = eachface.name
-        encoding = list(eachface.encoding)
+        encoding = eachface.encoding
+        if encoding is not None:
+            encoding = list(encoding)
         square_face = eachface.square_face
         rect = eachface.rectangle
         r_left = rect.left

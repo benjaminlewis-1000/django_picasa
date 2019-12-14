@@ -38,7 +38,7 @@ class Face(models.Model):
     # ArrayField supported in PostGres
     face_encoding = ArrayField(
                             models.FloatField(),
-                            size=128,
+                            size=128, blank=True, null=True
                         )
 
     # This field will contain the top 5 possible identities as categorized
