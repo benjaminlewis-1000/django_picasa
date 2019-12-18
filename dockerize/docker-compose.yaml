@@ -3,13 +3,76 @@ version: "3.3"
 services:
   picasa:
     build:
-      context: ..
-      dockerfile: ./dockerize/Dockerfile
+      context: .
+      dockerfile: Dockerfile
       args:
         buildno: 1
     image:
       picasa_img
     command:
-      bash -c "service postgresql start && bash"
+      python /code/manage.py runserver
+    expose:
+      - "${CLIENT_FACE_PORT}"
+      # - "8000"
+    env_file:
+      - .env
+    ports:
+      - "8081:8000"
+    volumes:
+      - ${DJANGO_FILES_ROOT}:/code
+      - ${PHOTO_ROOT}:/photos
+      - ${TEST_PHOTOS}:/test_imgs
+    depends_on:
+      - db_django
+    # environment:
+      # - IN_DOCKER=True
 
       # Need to start postgresql service
+
+  db_django:
+    build:
+      context: .
+      dockerfile: Dockerfile_postgres
+    image: postgres_init
+    # expose: 
+    #   - '5432'
+    # ports:
+    #   - '5432'
+    # command:
+    #   service postgresql start
+    env_file:
+      - .env
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+#      PGDATA: /database
+    volumes:
+      - ${DB_FILES_LOCATION}:/var/lib/postgresql/data
+      # Initialization script - see Postgres Docker documentation.
+
+    labels:
+      - "user=postgres"
+    container_name: db_picasa  
+    # networks:
+    #   - test_default
+
+  task_redis:
+    image: redis:5.0-alpine
+    # env_file:
+    #   - .env_picasa
+    restart: always
+    env_file:
+      - .env
+
+  apache_fileserve:
+    image: httpd:2.4-alpine
+    env_file:
+      - .env
+    # environment:
+    #   - MEDIA_FILES_LOCATION=${MEDIA_FILES_LOCATION}
+    restart: always
+    ports:
+      - "8080:80" 
+    volumes:
+      - ${MEDIA_FILES_LOCATION}:/usr/local/apache2/htdocs/

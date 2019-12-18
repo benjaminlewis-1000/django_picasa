@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/2.2/ref/settings/
 import os
 from celery.schedules import crontab
 import logging
+from unipath import Path
 
 # # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,62 +23,71 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-import os
-SITE_ROOT = os.path.dirname(os.path.realpath(__file__))
-# STATICFILES_DIRS = (
-#   os.path.join(SITE_ROOT, 'static/'),
-# )
 
-# STATIC_URL = '/static/'
+LOG_LEVEL=logging.ERROR
+LOG_FILE='test.log'
+
+
+LOGGER = logging.getLogger(__name__)
+
+LOGGER.setLevel(LOG_LEVEL) # or whatever
+console = logging.StreamHandler()
+file = logging.FileHandler(LOG_FILE)
+#set a level on the handlers if you want;
+#if you do, they will only output events that are >= that level
+LOGGER.addHandler(console)
+LOGGER.addHandler(file)
+
+if 'IN_DOCKER' in os.environ.keys():
+    in_docker = True
+else:
+    in_docker = False
+
+if in_docker:
+    SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
+    DB_NAME = os.environ['DB_NAME']
+    DB_USER = os.environ['DB_USER']
+    DB_PASS = os.environ['DB_PWD']
+    DB_HOST = 'db_django'
+    MEDIA_ROOT = os.environ['MEDIA_FILES_LOCATION']
+    REDIS_HOST = 'task_redis'
+    PHOTO_ROOT = '/photos'
+    TEST_IMG_DIR = '/test_imgs'
+    ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+    LOGGER.warning("Allowed hosts is wrong in docker")
+    STATIC_URL = 'http://localhost/static/'
+    MEDIA_URL  = 'http://localhost:8080/'
+else:
+    DB_NAME = 'picasa'
+    DB_USER = 'benjamin'
+    DB_PASS = 'lewis'
+    DB_HOST = 'localhost'
+    REDIS_HOST = 'localhost'
+    MEDIA_ROOT = os.path.join(PROJECT_ROOT, 'media')
+    SECRET_KEY = '46r=!b*lkf2-^#a=40kq(9nxkfz53d7!ft7_iccd1!2aa%q@6z'
+    ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+    PHOTO_ROOT = '/home/benjamin/git_repos/picasa_files/actual_imgs'
+    TEST_IMG_DIR = '/home/benjamin/git_repos/picasa_files/test_imgs'
+
+    STATIC_URL = 'http://localhost/static/'
+    MEDIA_URL  = 'http://localhost/media/'
+    STATIC_SERVER = '/var/www/html/static'
+    LOGGER.warning("Allowed hosts is wrong in docker")
+
+SITE_ROOT = os.path.dirname(os.path.realpath(__file__))
 
 
 LOCKFILE = os.path.join(PROJECT_ROOT, 'adding.lock')
 if os.path.isfile(LOCKFILE):
     os.remove(LOCKFILE)
 
-# STATICFILES_DIRS = (
-#     os.path.join(STATIC_ROOT, 'admin'), 
-#     os.path.join(STATIC_ROOT, 'rest_framework'), 
-#     # os.path.join(STATIC_ROOT), 
-# )
-# print(STATICFILES_DIRS)
-
-from unipath import Path
-
-# BASE_DIR         =  Path(__file__).ancestor(2)
-# MEDIA_ROOT       =  BASE_DIR.child('media')
-# STATIC_ROOT      =  BASE_DIR.child('static')
-
-# TEMPLATE_DIRS    = (
-#     BASE_DIR.child('templates'),
-# )
-
-# STATICFILES_DIRS = (
-#     BASE_DIR.child('picasa').child('static'),
-# )
-
-STATIC_URL         = 'http://localhost/static/'
-MEDIA_URL          = 'http://localhost/media/'
-STATIC_SERVER = '/var/www/html/static'
-MEDIA_ROOT = os.path.join(PROJECT_ROOT, 'media')
-# print(STATICFILES_DIRS, STATIC_ROOT)
-
-# STATICFILES_DIRS = [
-#     STATIC_SERVER
-# ]
-# STATIC_ROOT = STATIC_SERVER
-
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/2.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = '46r=!b*lkf2-^#a=40kq(9nxkfz53d7!ft7_iccd1!2aa%q@6z'
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
-
-ALLOWED_HOSTS = ['localhost', '127.0.0.1']
-
 
 # Application definition
 
@@ -131,16 +141,6 @@ WSGI_APPLICATION = 'picasa.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/2.2/ref/settings/#databases
 
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.sqlite3',
-#         'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
-#     }
-# }
-
-DB_NAME = 'picasa'
-DB_USER = 'benjamin'
-DB_PASS = 'lewis'
 
 DATABASES = {
     'default': {
@@ -148,7 +148,7 @@ DATABASES = {
         'NAME': DB_NAME,
         'USER': DB_USER,
         'PASSWORD': DB_PASS,
-        'HOST': 'localhost',
+        'HOST': DB_HOST,
         'PORT': '5432',
     }
 }
@@ -194,16 +194,13 @@ USE_L10N = True
 
 USE_TZ = True
 
-
-
-
 # CELERY STUFF
-CELERY_BROKER_URL = 'redis://localhost:6379'
-CELERY_RESULT_BACKEND = 'redis://localhost:6379'
+CELERY_BROKER_URL = f'redis://{REDIS_HOST}:6379'
+CELERY_RESULT_BACKEND = f'redis://{REDIS_HOST}:6379'
 CELERY_ACCEPT_CONTENT = ['application/json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = 'America/New_York'
+CELERY_TIMEZONE = TIME_ZONE
 
 CELERY_BEAT_SCHEDULE = {
 
@@ -237,30 +234,17 @@ CELERY_BEAT_SCHEDULE = {
 # FILEPOPULATOR settings
 
 
-FILEPOPULATOR_THUMBNAIL_DIR = '/home/benjamin/git_repos/picasa_files/thumbnails' # place to store thumbnails that are derived from the images. 
+# FILEPOPULATOR_THUMBNAIL_DIR = '/home/benjamin/git_repos/picasa_files/thumbnails' # place to store thumbnails that are derived from the images. 
 # FILEPOPULATOR_THUMBNAIL_SIZE_TINY = (30, 30)
 # FILEPOPULATOR_THUMBNAIL_SIZE = (250, 250)
 FILEPOPULATOR_THUMBNAIL_SIZE_BIG = (500, 500)
 FILEPOPULATOR_THUMBNAIL_SIZE_MEDIUM = (250, 250)
 FILEPOPULATOR_THUMBNAIL_SIZE_SMALL = (100, 100)
-FILEPOPULATOR_SERVER_IMG_DIR = '/home/benjamin/git_repos/picasa_files/actual_imgs' # root location of images you want to index into. (This maybe will change)
-FILEPOPULATOR_CODE_DIR = '/home/benjamin/git_repos/local_picasa' # root directory of the code. 
-FILEPOPULATOR_VAL_DIRECTORY = '/home/benjamin/git_repos/picasa_files/test_imgs'  # point to a directory that will have validation images when testing the app.
+FILEPOPULATOR_SERVER_IMG_DIR = PHOTO_ROOT # root location of images you want to index into. (This maybe will change)
+FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code. 
+FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR  # point to a directory that will have validation images when testing the app.
 FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL =150 # Maximum size of the short edge for thumbnails.
 
-LOG_LEVEL=logging.ERROR
-LOG_FILE='test.log'
-
-
-LOGGER = logging.getLogger(__name__)
-
-LOGGER.setLevel(LOG_LEVEL) # or whatever
-console = logging.StreamHandler()
-file = logging.FileHandler(LOG_FILE)
-#set a level on the handlers if you want;
-#if you do, they will only output events that are >= that level
-LOGGER.addHandler(console)
-LOGGER.addHandler(file)
 
 # logging.error("TODO: Set up apache server. STATIC_URL needs to be served by it.")
 logging.error('TODO: set up text alerts for client image handler and such.')

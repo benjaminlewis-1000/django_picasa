@@ -15,7 +15,7 @@ import time
 
 from .models import ImageFile, Directory
 from .forms import ImageFileForm, DirectoryForm
-from .views import create_or_get_directory, create_image_file, add_from_root_dir
+from .scripts import create_image_file, add_from_root_dir
 
 import logging
 
@@ -258,7 +258,7 @@ class ImageFileTests(TestCase):
         for root, dirs, files in os.walk(self.tmp_valid_dir):
             for f in files:
                 cur_file = os.path.join(root, f)
-                if cur_file.lower().endswith( ('.jpg', '.jpeg',`) ):
+                if cur_file.lower().endswith( ('.jpg', '.jpeg') ):
                     valid_files.append(cur_file)
 
         files_in_db = ImageFile.objects.all()

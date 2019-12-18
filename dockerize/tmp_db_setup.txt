@@ -1,0 +1,26 @@
+
+RUN which psql
+
+ARG DB_NAME=picasa
+ARG DB_USER=benjamin
+ARG DB_PASS=lewis
+ARG USER_EMAIL=benjamin.lewis.1000@gmail.com
+ARG TMP_PASS=tmp
+
+# export DB_NAME=picasa
+# export DB_USER=benjamin
+# export DB_PASS=lewis
+
+
+
+# # Actually, we'll want this all to be run via docker compose, but good try?!?
+# RUN service postgresql start && \
+# 	su - postgres -c "psql -c \"CREATE USER ${DB_USER} PASSWORD '${DB_PASS}'; \" " && \
+# 	su - postgres -c "psql -c \"ALTER USER ${DB_USER} CREATEDB; \" " && \
+# 	su - postgres -c "psql -c \"CREATE DATABASE ${DB_NAME} OWNER ${DB_USER}\" "
+
+# RUN service postgresql start &&  \
+# 	python manage.py makemigrations && \
+# 	python manage.py migrate && \ 
+# 	echo "from django.contrib.auth.models import User; User.objects.create_superuser('${DB_USER}', '${USER_EMAIL}', '${TMP_PASS}')" | python manage.py shell
+
