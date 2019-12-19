@@ -11,7 +11,7 @@ RUN apt install python3-pip -y
 ADD requirements.txt /code/requirements.txt
 RUN pip3 install -r /code/requirements.txt
 
-RUN apt remove cmake python3-pip -y
+RUN apt remove cmake -y
 
 RUN cp /usr/bin/python3 /usr/bin/python
 

@@ -11,13 +11,17 @@ services:
       picasa_img
     command:
       python /code/manage.py runserver
+    command:
+      celery -A picasa worker -l info
+    command:
+      celery -A picasa beat -l info
     expose:
       - "${CLIENT_FACE_PORT}"
       # - "8000"
     env_file:
       - .env
     ports:
-      - "8081:8000"
+      - "8080:8000"
     volumes:
       - ${DJANGO_FILES_ROOT}:/code
       - ${PHOTO_ROOT}:/photos
@@ -73,6 +77,6 @@ services:
     #   - MEDIA_FILES_LOCATION=${MEDIA_FILES_LOCATION}
     restart: always
     ports:
-      - "8080:80" 
+      - "80:80" 
     volumes:
       - ${MEDIA_FILES_LOCATION}:/usr/local/apache2/htdocs/

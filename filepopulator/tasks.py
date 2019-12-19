@@ -7,7 +7,7 @@ from django.conf import settings
 from celery import shared_task, task
 import time
 import os
-import scripts
+# import scripts
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime
 
 if not settings.configured:

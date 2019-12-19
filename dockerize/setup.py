@@ -40,6 +40,10 @@ while choice.lower() == 'n':
 	media_storage_dir = input("Where would you like to store files created by this app?  ")
 	choice = input(f"Are you sure you'd like to put your media in {media_storage_dir}? [Y/n]  ")
 
+test_dir = input("Where are your test files?  ")
+while not os.path.isdir(test_dir):
+    test_dir = input(f"Location {test_dir} is not a valid directory. What is the location of your test files? ")
+
 choice = 'N'
 while choice.lower() == 'n':
 	username = input("What would you like your username to be for the admin console? ")
@@ -76,16 +80,12 @@ if os.path.isdir(db_dir):
 			print("Not removing the database directory. You will need to initialize the database table manually.")
 pathlib.Path( db_dir ).mkdir(parents=True, exist_ok=True)
 
-exit()
-
 SECRET_KEY = ''.join([random.SystemRandom().choice("{}{}{}".\
 	format(string.ascii_letters, string.digits, string.punctuation)) for i in range(50)])
 DB_PWD = ''.join([random.SystemRandom().choice("{}{}{}".\
 	format(string.ascii_letters, string.digits, string.punctuation)) for i in range(20)])
 
 out_file_path = os.path.join(script_path, '.env')
-
-print("TODO! Test photo dir")
 
 with open(out_file_path, 'w') as fh:
 	fh.write(f"ADMIN_PW={pw1}\n")
@@ -103,7 +103,7 @@ with open(out_file_path, 'w') as fh:
 	fh.write(f"WEBAPP_DOMAIN=picasa.exploretheworld.tech\n")
 	fh.write(f"DJANGO_FILES_ROOT={project_path}\n")
 	fh.write(f"IN_DOCKER=True\n")
-	fh.write(f"TEST_PHOTOS=/home/benjamin/")
+	fh.write(f"TEST_PHOTOS={test_dir}\n")
 
 PSQL_SCRIPT = '''
 #!/bin/bash
