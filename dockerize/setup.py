@@ -96,7 +96,7 @@ with open(out_file_path, 'w') as fh:
 	fh.write(f"DB_PWD={DB_PWD}\n")
 	fh.write(f"DB_USER={username}\n")
 	fh.write(f"DJANGO_SECRET_KEY={SECRET_KEY}\n")
-	fh.write(f"DOMAIN_NAME=exploretheworld.tech\n")
+	fh.write(f"DOMAINNAME=exploretheworld.tech\n")
 	fh.write(f"MEDIA_DOMAIN=picasamedia.exploretheworld.tech\n")
 	fh.write(f"MEDIA_FILES_LOCATION={thumbs_dir}\n")
 	fh.write(f"PHOTO_ROOT={photo_location}\n")

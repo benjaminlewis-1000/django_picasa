@@ -24,7 +24,7 @@ services:
       - "8080:8000"
     volumes:
       - ${DJANGO_FILES_ROOT}:/code
-      - ${PHOTO_ROOT}:/photos
+      - ${PHOTO_ROOT}:/photos:ro
       - ${TEST_PHOTOS}:/test_imgs
     depends_on:
       - db_django
@@ -70,13 +70,83 @@ services:
       - .env
 
   apache_fileserve:
-    image: httpd:2.4-alpine
+    # image: httpd:2.4-alpine
+    image: httpd
     env_file:
       - .env
+    expose:
+      - '80'
     # environment:
     #   - MEDIA_FILES_LOCATION=${MEDIA_FILES_LOCATION}
     restart: always
-    ports:
-      - "80:80" 
+#     ports:
+#       - "80:80" 
     volumes:
       - ${MEDIA_FILES_LOCATION}:/usr/local/apache2/htdocs/
+    networks:
+      - traefik_default
+    labels:
+      - "traefik.backend=picasa_media"
+      - "traefik.frontend.rule=Host:${MEDIA_DOMAIN}"
+      - "traefik.enable=true"
+      - "traefik.port=80"
+      - "traefik.docker.network=traefik_proxy"
+
+  apache:
+    container_name: apache
+    restart: always
+    # image: httpd:2.4-alpine
+    image: httpd
+    # expose:
+    #   - "80"
+    labels:
+      - "traefik.frontend.rule=Host:apache.${DOMAINNAME}"
+      - "traefik.backend=apache"
+      - "traefik.enable=true"
+      - "traefik.port=80"
+      - "traefik.docker.network=traefik_proxy"
+    networks:
+      - traefik_proxy
+      # - traefik_proxy
+
+#  whoamiapach:
+#    image: emilevauge/whoami # A container that exposes an API to show its IP address
+#    image: httpd
+#    labels:
+#      - "traefik.backend=whoamiapach"
+     # - "traefik.frontend.rule=Host:whoami.docker.localhost"
+#      - "traefik.frontend.rule=Host:apachewho.${DOMAINNAME}"
+#      - "traefik.enable=true"
+#      - "traefik.port=80"
+##      - "traefik.protocol=http"
+#      - "traefik.docker.network=traefik_proxy"
+  # The traefik container will automatically create a network called <imagename>_default and publish it to bridge. I need to hook into that network if starting from an external docker-compose.yml file.
+#    networks:
+#      - traefik_default
+#   ports:
+
+  whoami:
+#    image: emilevauge/whoami # A container that exposes an API to show its IP address
+    image: httpd
+    labels:
+      - "traefik.backend=whoami"
+     # - "traefik.frontend.rule=Host:whoami.docker.localhost"
+      - "traefik.frontend.rule=Host:whoami2.${DOMAINNAME}"
+      - "traefik.enable=true"
+      - "traefik.port=80"
+#      - "traefik.protocol=http"
+      - "traefik.docker.network=traefik_proxy"
+  # The traefik container will automatically create a network called <imagename>_default and publish it to bridge. I need to hook into that network if starting from an external docker-compose.yml file.
+    networks:
+      - traefik_default
+
+
+
+networks:
+  default: 
+    driver: bridge
+  traefik_proxy:
+    external: true
+  traefik_default:
+    external: true
+#       name: traefik_default
