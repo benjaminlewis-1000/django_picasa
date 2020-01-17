@@ -26,7 +26,7 @@ if not settings.configured:
 @task(ignore_result=True, name='filepopulator.populate_files_from_root')
 def load_images_into_db():
     base_directory = settings.FILEPOPULATOR_SERVER_IMG_DIR
-    fname = '/home/benjamin/filepopulate.txt'
+    fname = os.path.join(os.environ['HOME'], 'filepopulate.txt')
     # logger.info("Write time")
     with open(fname, 'a') as fh:
         fh.write('The time is : {}\n'.format( time.time() ) )

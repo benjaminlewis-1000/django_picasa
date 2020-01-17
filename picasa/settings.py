@@ -49,10 +49,10 @@ if in_docker:
     DB_USER = os.environ['DB_USER']
     DB_PASS = os.environ['DB_PWD']
     DB_HOST = 'db_django'
-    MEDIA_ROOT = os.environ['MEDIA_FILES_LOCATION']
+    MEDIA_ROOT = '/media' # os.environ['MEDIA_FILES_LOCATION']
     REDIS_HOST = 'task_redis'
     PHOTO_ROOT = '/photos'
-    TEST_IMG_DIR = '/test_imgs'
+    TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
     ALLOWED_HOSTS = ['localhost', '127.0.0.1']
     LOGGER.warning("Allowed hosts is wrong in docker")
     STATIC_URL = 'http://localhost/static/'
@@ -67,7 +67,7 @@ else:
     SECRET_KEY = '46r=!b*lkf2-^#a=40kq(9nxkfz53d7!ft7_iccd1!2aa%q@6z'
     ALLOWED_HOSTS = ['localhost', '127.0.0.1']
     PHOTO_ROOT = '/home/benjamin/git_repos/picasa_files/actual_imgs'
-    TEST_IMG_DIR = '/home/benjamin/git_repos/picasa_files/test_imgs'
+    TEST_IMG_DIR_FILEPOPULATE = '/home/benjamin/git_repos/picasa_files/test_imgs'
 
     STATIC_URL = 'http://localhost/static/'
     MEDIA_URL  = 'http://localhost/media/'
@@ -242,7 +242,7 @@ FILEPOPULATOR_THUMBNAIL_SIZE_MEDIUM = (250, 250)
 FILEPOPULATOR_THUMBNAIL_SIZE_SMALL = (100, 100)
 FILEPOPULATOR_SERVER_IMG_DIR = PHOTO_ROOT # root location of images you want to index into. (This maybe will change)
 FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code. 
-FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR  # point to a directory that will have validation images when testing the app.
+FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory that will have validation images when testing the app.
 FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL =150 # Maximum size of the short edge for thumbnails.
 
 

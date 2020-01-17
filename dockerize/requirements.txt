@@ -21,3 +21,5 @@ redis
 scons
 unipath
 xmltodict
+requests
+flower

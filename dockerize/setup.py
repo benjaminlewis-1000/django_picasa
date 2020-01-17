@@ -103,7 +103,7 @@ with open(out_file_path, 'w') as fh:
 	fh.write(f"WEBAPP_DOMAIN=picasa.exploretheworld.tech\n")
 	fh.write(f"DJANGO_FILES_ROOT={project_path}\n")
 	fh.write(f"IN_DOCKER=True\n")
-	fh.write(f"TEST_PHOTOS={test_dir}\n")
+	fh.write(f"TEST_PHOTOS_FILEPOPULATE={test_dir}\n")
 
 PSQL_SCRIPT = '''
 #!/bin/bash
