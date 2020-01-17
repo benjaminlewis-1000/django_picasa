@@ -1,4 +1,5 @@
 thumbnails/*
+.env
 *.sublime*
 celerybeat* 
 picasa/adding.lock

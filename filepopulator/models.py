@@ -179,8 +179,6 @@ class ImageFile(models.Model):
 
     def process_new_no_md5(self):
 
-        is_new = True
-
         if not re.match(".*\.[j|J][p|P][e|E]?[g|G]$", self.filename):
             settings.LOGGER.debug("File {} does not have a jpeg-type ending.".format(self.filename))
             return False # Success value
@@ -234,6 +232,10 @@ class ImageFile(models.Model):
 
             self.directory = Directory.objects.get(dir_path = directory_of_file)
 
+
+    def _get_mod_time(self):
+        self.dateModified = datetime.fromtimestamp(os.path.getctime(self.filename))
+
     def _init_image(self):
         # # Get the date taken:
         # # Source for these EXIF tag attributes: 
@@ -249,7 +251,8 @@ class ImageFile(models.Model):
 
         s = time.time()
         self.image = PIL.Image.open(self.filename)
-        self.dateModified = datetime.fromtimestamp(os.path.getmtime(self.filename))
+        self._get_mod_time()
+        # self.dateModified = datetime.fromtimestamp(os.path.getctime(self.filename))
         if self.dateModified.tzinfo == None:
             self.dateModified = self.dateModified.astimezone(pytz.utc)
 

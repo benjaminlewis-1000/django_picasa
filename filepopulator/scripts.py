@@ -1,17 +1,18 @@
 #! /usr/bin/env python
 
-from PIL import Image
-import logging
-from PIL.ExifTags import TAGS 
-from django.core.files.base import ContentFile
-from django.utils import timezone
-from django.http import HttpResponse
-from django.core.exceptions import ValidationError
 from .models import ImageFile, Directory
 from datetime import datetime
 from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.core.files.base import ContentFile
+from django.http import HttpResponse
 from django.utils import timezone
+from django.utils import timezone
+from PIL import Image
+from PIL.ExifTags import TAGS 
+import logging
 import os
+import re
 import time
 
 
@@ -26,9 +27,13 @@ def create_image_file(file_path):
 
     new_photo = ImageFile(filename=file_path)
 
-    success = new_photo.process_new_no_md5()
-    if not success:
-        return
+    # success = new_photo.process_new_no_md5()
+    # if not success:
+    #     return
+
+    if not re.match(".*\.[j|J][p|P][e|E]?[g|G]$", file_path):
+        settings.LOGGER.debug("File {} does not have a jpeg-type ending.".format(file_path))
+        return # Success value
 
 
     def instance_clean_and_save(instance):
@@ -66,6 +71,7 @@ def create_image_file(file_path):
             exist_photo = exist_photo[0]
 
         exist_timestamp = exist_photo.dateModified.timestamp()
+        new_photo._get_mod_time()
         adding_timestamp = new_photo.dateModified.timestamp()
 
         # Check the timestamp between the database and the file 
@@ -91,6 +97,7 @@ def create_image_file(file_path):
         # This way with established database (no hashing): ~.5 seconds. 
         # That's a 40x speedup.
         else:
+            new_photo.process_new_no_md5()
             new_photo._generate_md5_hash()
 
         if exist_photo.pixel_hash == new_photo.pixel_hash:
@@ -116,7 +123,7 @@ def create_image_file(file_path):
 
     # Case 2: No photo exists at this location.
     else:
-        # new_photo.process_new_no_md5()
+        new_photo.process_new_no_md5()
         new_photo._generate_md5_hash()
         exist_with_same_hash = ImageFile.objects.filter(pixel_hash = new_photo.pixel_hash)
         if len(exist_with_same_hash):
