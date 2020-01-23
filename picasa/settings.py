@@ -23,25 +23,15 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-
-LOG_LEVEL=logging.ERROR
-LOG_FILE='test.log'
-
-
-LOGGER = logging.getLogger(__name__)
-
-LOGGER.setLevel(LOG_LEVEL) # or whatever
-console = logging.StreamHandler()
-file = logging.FileHandler(LOG_FILE)
-#set a level on the handlers if you want;
-#if you do, they will only output events that are >= that level
-LOGGER.addHandler(console)
-LOGGER.addHandler(file)
-
 if 'IN_DOCKER' in os.environ.keys():
     in_docker = True
 else:
     in_docker = False
+
+production = False
+if 'PRODUCTION' in os.environ.keys():
+    if os.environ['PRODUCTION'] == 'True':
+        production = True
 
 if in_docker:
     SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
@@ -53,10 +43,11 @@ if in_docker:
     REDIS_HOST = 'task_redis'
     PHOTO_ROOT = '/photos'
     TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
-    ALLOWED_HOSTS = ['localhost', '127.0.0.1']
-    LOGGER.warning("Allowed hosts is wrong in docker")
+#    ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['WEBAPP_DOMAIN']]
+    ALLOWED_HOSTS = ['*']
     STATIC_URL = 'http://localhost/static/'
     MEDIA_URL  = 'http://localhost:8080/'
+    LOG_DIR = '/var/log/picasa'
 else:
     DB_NAME = 'picasa'
     DB_USER = 'benjamin'
@@ -72,10 +63,38 @@ else:
     STATIC_URL = 'http://localhost/static/'
     MEDIA_URL  = 'http://localhost/media/'
     STATIC_SERVER = '/var/www/html/static'
+    LOG_DIR = '/home/benjamin/git_repos/picasa_files/logs'
+
+# Set up logging
+formatter = logging.Formatter('%(levelname)s - %(message)s')
+LOGGER = logging.getLogger("__main__")
+LOGGER.setLevel(logging.DEBUG)
+LOGGER.propagate = False
+
+fh_low = logging.FileHandler(os.path.join(LOG_DIR, 'picasa_debug.log'), 'w')
+fh_low.setLevel(logging.DEBUG)
+fh_low.setFormatter(formatter)
+LOGGER.addHandler(fh_low)
+
+fh_high = logging.FileHandler(os.path.join(LOG_DIR, 'picasa_important.log'), 'w')
+fh_high.setLevel(logging.WARNING)
+fh_high.setFormatter(formatter)
+LOGGER.addHandler(fh_high)
+
+fh_mid = logging.FileHandler(os.path.join(LOG_DIR, 'picasa_lite_debug.log'), 'w')
+fh_mid.setLevel(logging.INFO)
+fh_mid.setFormatter(formatter)
+LOGGER.addHandler(fh_mid)
+
+ch = logging.StreamHandler()
+ch.setLevel(logging.ERROR)
+ch.setFormatter(formatter)
+LOGGER.addHandler(ch)
+
+if in_docker:
     LOGGER.warning("Allowed hosts is wrong in docker")
 
 SITE_ROOT = os.path.dirname(os.path.realpath(__file__))
-
 
 LOCKFILE = os.path.join(PROJECT_ROOT, 'adding.lock')
 if os.path.isfile(LOCKFILE):
@@ -187,6 +206,7 @@ REST_FRAMEWORK = {
 LANGUAGE_CODE = 'en-us'
 
 TIME_ZONE = 'America/New_York'
+LOGGER.debug(f"Time zone is {TIME_ZONE}")
 
 USE_I18N = True
 
@@ -202,7 +222,22 @@ CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
 
-CELERY_BEAT_SCHEDULE = {
+
+if production: 
+    CELERY_BEAT_SCHEDULE = {
+        'filepopulate_root': {
+            'task': 'filepopulator.populate_files_from_root',
+            'schedule': crontab(minute=0, hour='*/6'),
+        },
+        'dirs_datetimes': {
+            'task': 'filepopulator.update_dir_dates',
+            'schedule': crontab(minute=0, hour='*/12')
+        },
+
+    }
+
+else:
+    CELERY_BEAT_SCHEDULE = {
 
 #  'send-summary-every-hour': {
 #        'task': 'summary',
@@ -220,16 +255,23 @@ CELERY_BEAT_SCHEDULE = {
     #     'task': 'time_write',
     #     'schedule': 20.0, # crontab(minute='*/2'),
     # },
-    'filepopulate_root': {
-        'task': 'filepopulator.populate_files_from_root',
-        'schedule': crontab(minute='*/1'),
-    },
-    'dirs_datetimes': {
-        'task': 'filepopulator.update_dir_dates',
-        'schedule': crontab(minute='*/1')
-    },
+        'filepopulate_root': {
+            'task': 'filepopulator.populate_files_from_root',
+            'schedule': crontab(minute='*/1'),
+        },
+        'dirs_datetimes': {
+            'task': 'filepopulator.update_dir_dates',
+            'schedule': crontab(minute='*/1')
+        },
 
-}
+    }
+
+if not 'filepopulate_root' in CELERY_BEAT_SCHEDULE.keys():
+    LOGGER.error("Filepopulate celery task not instantiated.")
+    raise ValueError('Filepopulate celery task not instantiated.')
+if not 'dirs_datetimes' in CELERY_BEAT_SCHEDULE.keys():
+    LOGGER.error("Dirs_datetimes celery task not instantiated.")
+    raise ValueError('Dirs_datetimes celery task not instantiated.')
 
 # FILEPOPULATOR settings
 
@@ -246,5 +288,8 @@ FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory 
 FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL =150 # Maximum size of the short edge for thumbnails.
 
 
-# logging.error("TODO: Set up apache server. STATIC_URL needs to be served by it.")
+logging.error("TODO: Set up apache server. STATIC_URL needs to be served by it.")
 logging.error('TODO: set up text alerts for client image handler and such.')
+
+
+

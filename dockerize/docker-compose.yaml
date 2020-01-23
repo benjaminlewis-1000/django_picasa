@@ -15,21 +15,22 @@ services:
 #      celery -A picasa worker -l info
 #    command:
 #      celery -A picasa beat -l info
-    command:
 #      bash -c "celery flower -A picasa --port=5555  | celery -A picasa beat -l info --pidfile=\"/var/run/lock/celerybeat.pid\" | celery -A picasa worker -l info | python /code/manage.py runserver"
+    command:
       bash /startup.sh
 #    expose:
 #      - "${CLIENT_FACE_PORT}"
-      # - "8000"
+#      - "8000"
     env_file:
       - .env
 #    ports:
-#      - "8080:8000"
+#      - "8000:8000"
     volumes:
       - ${DJANGO_FILES_ROOT}:/code
       - ${PHOTO_ROOT}:/photos:ro
       - ${TEST_PHOTOS_FILEPOPULATE}:/test_imgs_filepopulate
       - ${MEDIA_FILES_LOCATION}:/media
+      - ${LOG_LOCATION}:/var/log/picasa
     depends_on:
       - db_django
     networks:

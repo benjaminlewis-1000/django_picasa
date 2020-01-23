@@ -16,6 +16,8 @@ RUN apt remove cmake python3-pip -y
 
 RUN cp /usr/bin/python3 /usr/bin/python
 
+RUN apt-get install -y wget
+
 RUN rm -r /var/lib/apt/lists
 
 ADD startup.sh /startup.sh

@@ -2,15 +2,23 @@
 
 import getpass
 import os
+import readline
 import pathlib
 import random
 import shutil
 import string
 import xmltodict
 import subprocess
+import tabCompleter
 
 project_path = os.path.abspath(os.path.join(__file__,"../.."))
 script_path  = os.path.abspath(os.path.join(__file__,".."))
+
+t = tabCompleter.tabCompleter()
+readline.set_completer_delims('\t')
+readline.parse_and_bind("tab: complete")
+readline.set_completer(t.pathCompleter)
+
 
 print("TODO: Test file location")
 print("TODO: explicit ports for postgres and redis")
@@ -37,8 +45,8 @@ while not os.path.isdir(photo_location):
 
 choice = 'N'
 while choice.lower() == 'n':
-	media_storage_dir = input("Where would you like to store files created by this app?  ")
-	choice = input(f"Are you sure you'd like to put your media in {media_storage_dir}? [Y/n]  ")
+	app_file_dir = input("Where would you like to store files created by this app?  ")
+	choice = input(f"Are you sure you'd like to put your media in {app_file_dir}? [Y/n]  ")
 
 test_dir = input("Where are your test files?  ")
 while not os.path.isdir(test_dir):
@@ -49,6 +57,12 @@ while choice.lower() == 'n':
 	username = input("What would you like your username to be for the admin console? ")
 	choice = input(f"Are you sure you want your username to be {username}? [Y/n] ")
 
+production_choice = input(f"Do you want to put this into production? [y/N] ")
+if production_choice.lower() != 'y':
+    production = "False"
+else:
+    production = "True"
+
 pw1 = ''
 pw2 = 'ghjk'
 while pw1 != pw2:
@@ -58,13 +72,16 @@ while pw1 != pw2:
 		pw1 = getpass.getpass(f"Passwords don't match! Please input a password for user {username}: ")
 	pw2 = getpass.getpass("Please put in your password again: ")
 
-if not os.path.isdir(media_storage_dir):
-	pathlib.Path(media_storage_dir).mkdir(parents=True, exist_ok=True)
+if not os.path.isdir(app_file_dir):
+	pathlib.Path(app_file_dir).mkdir(parents=True, exist_ok=True)
 
-db_dir = os.path.join(media_storage_dir, 'database')
-thumbs_dir = os.path.join(media_storage_dir, 'files')
+media_dir = os.path.join(app_file_dir, 'media_files')
+log_dir = os.path.join(app_file_dir, 'logs')
+pathlib.Path( media_dir ).mkdir(parents=True, exist_ok=True)
+pathlib.Path( log_dir ).mkdir(parents=True, exist_ok=True)
+
+db_dir = os.path.join(app_file_dir, 'database')
 db_name = 'picasa'
-pathlib.Path( thumbs_dir).mkdir(parents=True, exist_ok=True)
 
 # Remove the database directory. 
 if os.path.isdir(db_dir):
@@ -98,12 +115,14 @@ with open(out_file_path, 'w') as fh:
 	fh.write(f"DJANGO_SECRET_KEY={SECRET_KEY}\n")
 	fh.write(f"DOMAINNAME=exploretheworld.tech\n")
 	fh.write(f"MEDIA_DOMAIN=picasamedia.exploretheworld.tech\n")
-	fh.write(f"MEDIA_FILES_LOCATION={thumbs_dir}\n")
+	fh.write(f"MEDIA_FILES_LOCATION={media_dir}\n")
 	fh.write(f"PHOTO_ROOT={photo_location}\n")
 	fh.write(f"WEBAPP_DOMAIN=picasa.exploretheworld.tech\n")
 	fh.write(f"DJANGO_FILES_ROOT={project_path}\n")
 	fh.write(f"IN_DOCKER=True\n")
 	fh.write(f"TEST_PHOTOS_FILEPOPULATE={test_dir}\n")
+	fh.write(f"LOG_LOCATION={log_dir}\n")
+	fh.write(f"PRODUCTION={production}\n")
 
 PSQL_SCRIPT = '''
 #!/bin/bash
