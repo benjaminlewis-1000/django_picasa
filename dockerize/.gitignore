@@ -1,3 +1,4 @@
 .env
+.env*
 apache_pwd.pwd
 .env_picasa

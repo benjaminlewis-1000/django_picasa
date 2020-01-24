@@ -10,6 +10,13 @@ import string
 import xmltodict
 import subprocess
 import tabCompleter
+import string
+
+def randomString(stringLength=10):
+    """Generate a random string of fixed length """
+    letters = string.ascii_letters + string.digits
+    return ''.join(random.choice(letters) for i in range(stringLength))
+
 
 project_path = os.path.abspath(os.path.join(__file__,"../.."))
 script_path  = os.path.abspath(os.path.join(__file__,".."))
@@ -57,11 +64,6 @@ while choice.lower() == 'n':
 	username = input("What would you like your username to be for the admin console? ")
 	choice = input(f"Are you sure you want your username to be {username}? [Y/n] ")
 
-production_choice = input(f"Do you want to put this into production? [y/N] ")
-if production_choice.lower() != 'y':
-    production = "False"
-else:
-    production = "True"
 
 pw1 = ''
 pw2 = 'ghjk'
@@ -83,6 +85,12 @@ pathlib.Path( log_dir ).mkdir(parents=True, exist_ok=True)
 db_dir = os.path.join(app_file_dir, 'database')
 db_name = 'picasa'
 
+production_choice = input(f"Do you want to put this into production? [y/N] ")
+if production_choice.lower() != 'y':
+    production = "False"
+else:
+    production = "True"
+
 # Remove the database directory. 
 if os.path.isdir(db_dir):
 	rmd = input("This script needs to remove the database directory to get the initialization to work properly. OK? (y/N) ")
@@ -99,13 +107,12 @@ pathlib.Path( db_dir ).mkdir(parents=True, exist_ok=True)
 
 SECRET_KEY = ''.join([random.SystemRandom().choice("{}{}{}".\
 	format(string.ascii_letters, string.digits, string.punctuation)) for i in range(50)])
-DB_PWD = ''.join([random.SystemRandom().choice("{}{}{}".\
-	format(string.ascii_letters, string.digits, string.punctuation)) for i in range(20)])
-APACHE_PWD = ''.join([random.SystemRandom().choice("{}{}{}".\
-	format(string.ascii_letters, string.digits, string.punctuation)) for i in range(20)])
+DB_PWD = randomString(25)
+APACHE_PWD = randomString(25)
 APACHE_USER = 'picasa_data'
 
 os.system(f'htpasswd -cb {script_path}/apache_pwd.pwd {APACHE_USER} {APACHE_PWD}')
+print(f'htpasswd -cb {script_path}/apache_pwd.pwd {APACHE_USER} {APACHE_PWD}')
 
 out_file_path = os.path.join(script_path, '.env')
 

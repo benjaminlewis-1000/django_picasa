@@ -3,7 +3,7 @@
 set -e
 
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
-    CREATE USER benjamin PASSWORD ')r^#:|!s@lj73j\c,9wk';
+    CREATE USER benjamin PASSWORD 'FM3KvdPKyflM7hn5AQ97Alslq';
     ALTER USER benjamin CREATEDB;
     CREATE DATABASE picasa;
     GRANT ALL PRIVILEGES ON DATABASE picasa TO benjamin;

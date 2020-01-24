@@ -46,6 +46,7 @@ def create_image_file(file_path):
                 settings.LOGGER.debug("Did not add photo {}: {}".format(file_path, ve) )
         else:
             instance.save()
+            settings.LOGGER.debug(f"Saved file {file_path} to database")
 
             assert os.path.isfile(instance.thumbnail_big.path), \
                 'Thumbnail {} wasn''t generated for {}.'.\
@@ -66,6 +67,7 @@ def create_image_file(file_path):
     # Case 1: photo exists at this location.
     if len(exist_photo):
         if len(exist_photo) > 1:
+            settings.LOGGER.critical(f"You have multiple instances of file {file_path} in the database.")
             raise ValueError('Should only have at most one instance of a file {}. You have {}'.format(file_path, len(exist_photo)))
         else:
             exist_photo = exist_photo[0]
@@ -82,7 +84,6 @@ def create_image_file(file_path):
         # values) and some not (most pictures). Timestamp simply
         # turns it into a float of UTC seconds. 
         if exist_timestamp == adding_timestamp:
-            logging.debug("No further action necessary")
             return
         # Only if the files are *not* the same do we compute the
         # md5 hash of the file. This is because reading in the 
@@ -97,6 +98,7 @@ def create_image_file(file_path):
         # This way with established database (no hashing): ~.5 seconds. 
         # That's a 40x speedup.
         else:
+            settings.LOGGER.debug(f"Updating file {file_path} in database due to changed timestamp")
             new_photo.process_new_no_md5()
             new_photo._generate_md5_hash()
 
@@ -123,6 +125,7 @@ def create_image_file(file_path):
 
     # Case 2: No photo exists at this location.
     else:
+        settings.LOGGER.debug(f"Adding new file {file_path} to database.")
         new_photo.process_new_no_md5()
         new_photo._generate_md5_hash()
         exist_with_same_hash = ImageFile.objects.filter(pixel_hash = new_photo.pixel_hash)
@@ -132,6 +135,7 @@ def create_image_file(file_path):
                 # In this case, update the filename and the date added
                 # and save it back to the database. 
                 instance = exist_with_same_hash[0]
+                settings.LOGGER.debug(f"Found a file like {file_path} with the same hash. The old file is {instance.filename} .")
                 instance.filename = file_path
                 instance.dateAdded = timezone.now()
                 instance.dateModified = datetime.fromtimestamp(os.path.getmtime(file_path))
@@ -155,7 +159,7 @@ def create_image_file(file_path):
                 pass
                 # Should just create it.
             else:
-                raise NotImplementedError('You shouldn''t be here...')
+                raise NotImplementedError('You shouldn''t be here... the logic should be watertight.')
 
     new_photo.dateAdded = timezone.now()
 

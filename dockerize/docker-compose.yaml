@@ -91,7 +91,7 @@ services:
   apache_fileserve:
     # image: httpd:2.4-alpine
     build:
-      context: .
+      context: . 
       dockerfile: Dockerfile_apache
       args:
         buildno: 1
