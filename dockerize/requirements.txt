@@ -21,3 +21,4 @@ redis
 scons
 unipath
 xmltodict
+gunicorn

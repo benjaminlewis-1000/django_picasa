@@ -3,6 +3,7 @@
 python /code/manage.py makemigrations
 python /code/manage.py makemigrations filepopulator
 python /code/manage.py migrate
+python /code/manage.py collectstatic
 
 
 # celery flower -A picasa --port=5555 &

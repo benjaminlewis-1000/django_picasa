@@ -4,7 +4,7 @@ services:
   picasa:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile_picasa
       args:
         buildno: 1
     image:
@@ -90,7 +90,13 @@ services:
 
   apache_fileserve:
     # image: httpd:2.4-alpine
-    image: httpd
+    build:
+      context: .
+      dockerfile: Dockerfile_apache
+      args:
+        buildno: 1
+    image:
+      httpd_image
     env_file:
       - .env
 #    expose:
@@ -98,10 +104,11 @@ services:
     # environment:
     #   - MEDIA_FILES_LOCATION=${MEDIA_FILES_LOCATION}
     restart: always
-#     ports:
-#       - "80:80" 
     volumes:
-      - ${MEDIA_FILES_LOCATION}:/usr/local/apache2/htdocs/
+      # - ${MEDIA_FILES_LOCATION}:/usr/local/apache2/htdocs/
+      - ${MEDIA_FILES_LOCATION}:/var/www/media
+      - ${STATIC_LOCATION}:/var/www/static
+      - /home/benjamin/git_repos/django_picasa/dockerize/apache_config/000-default.confi:/etc/apache2/sites-enabled/000-default.conf
     networks:
       - traefik_proxy
     labels:

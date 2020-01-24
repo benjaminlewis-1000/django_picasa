@@ -44,9 +44,11 @@ if in_docker:
     PHOTO_ROOT = '/photos'
     TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
 #    ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['WEBAPP_DOMAIN']]
-    ALLOWED_HOSTS = ['*']
-    STATIC_URL = 'http://localhost/static/'
-    MEDIA_URL  = 'http://localhost:8080/'
+    ALLOWED_HOSTS = [os.environ['DOMAINNAME'], os.environ['WEBAPP_DOMAIN']]
+#    STATIC_URL = 'http://localhost/static/'
+#    MEDIA_URL  = 'http://localhost:8080/'
+    STATIC_URL = os.environ['MEDIA_DOMAIN'] + '/static/'
+    MEDIA_URL = os.environ['MEDIA_DOMAIN'] + '/media/'
     LOG_DIR = '/var/log/picasa'
 else:
     DB_NAME = 'picasa'

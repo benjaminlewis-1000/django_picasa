@@ -101,6 +101,11 @@ SECRET_KEY = ''.join([random.SystemRandom().choice("{}{}{}".\
 	format(string.ascii_letters, string.digits, string.punctuation)) for i in range(50)])
 DB_PWD = ''.join([random.SystemRandom().choice("{}{}{}".\
 	format(string.ascii_letters, string.digits, string.punctuation)) for i in range(20)])
+APACHE_PWD = ''.join([random.SystemRandom().choice("{}{}{}".\
+	format(string.ascii_letters, string.digits, string.punctuation)) for i in range(20)])
+APACHE_USER = 'picasa_data'
+
+os.system(f'htpasswd -cb {script_path}/apache_pwd.pwd {APACHE_USER} {APACHE_PWD}')
 
 out_file_path = os.path.join(script_path, '.env')
 
@@ -123,6 +128,9 @@ with open(out_file_path, 'w') as fh:
 	fh.write(f"TEST_PHOTOS_FILEPOPULATE={test_dir}\n")
 	fh.write(f"LOG_LOCATION={log_dir}\n")
 	fh.write(f"PRODUCTION={production}\n")
+	fh.write(f"APACHE_USER={APACHE_USER}\n")
+	fh.write(f"APACHE_PWD={APACHE_PWD}\n")
+	fh.write(f"STATIC_LOCATION={project_path}/picasa/static\n")
 
 PSQL_SCRIPT = '''
 #!/bin/bash
