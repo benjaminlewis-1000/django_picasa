@@ -116,6 +116,21 @@ class Directory(models.Model):
             self.first_datesec = int(first_date)
             self.first_datetime = datetime.fromtimestamp(self.first_datesec, timezone.utc)
     
+def thumbnail_big_path(instance, filename):
+    first_dir = filename[:2]
+    second_dir = filename[2]
+    return f"thumbnails_big/{first_dir}/{second_dir}/{filename}"
+
+def thumbnail_med_path(instance, filename):
+    first_dir = filename[:2]
+    second_dir = filename[2]
+    return f"thumbnails_med/{first_dir}/{second_dir}/{filename}"
+
+def thumbnail_small_path(instance, filename):
+    first_dir = filename[:2]
+    second_dir = filename[2]
+    return f"thumbnails_small/{first_dir}/{second_dir}/{filename}"
+
 # Lots ripped from https://github.com/hooram/ownphotos/blob/dev/api/models.py 
 class ImageFile(models.Model):
 
@@ -126,9 +141,12 @@ class ImageFile(models.Model):
     file_hash = models.CharField(max_length = 64, null = False, default = -1)
 
     # Thumbnails 
-    thumbnail_big = models.ImageField(upload_to='thumbnails_big', editable=False, default=None)
-    thumbnail_medium = models.ImageField(upload_to='thumbnails_med', editable=False, default=None)
-    thumbnail_small = models.ImageField(upload_to='thumbnails_small', editable=False, default=None)
+    # thumbnail_big = models.ImageField(upload_to='thumbnails_big', editable=False, default=None)
+    # thumbnail_medium = models.ImageField(upload_to='thumbnails_med', editable=False, default=None)
+    # thumbnail_small = models.ImageField(upload_to='thumbnails_small', editable=False, default=None)
+    thumbnail_big = models.ImageField(upload_to=thumbnail_big_path, editable=False, default=None)
+    thumbnail_medium = models.ImageField(upload_to=thumbnail_med_path, editable=False, default=None)
+    thumbnail_small = models.ImageField(upload_to=thumbnail_small_path, editable=False, default=None)
 
     # square_thumbnail = models.ImageField(upload_to='square_thumbnails')
     # square_thumbnail_tiny = models.ImageField(
@@ -433,7 +451,10 @@ class ImageFile(models.Model):
                 if datetaken_tmp is None:
                     continue  # No value at this EXIF key
                 else:
-                    date = datetime.strptime(datetaken_tmp, '%Y:%m:%d %H:%M:%S')
+                    try:
+                        date = datetime.strptime(datetaken_tmp, '%Y:%m:%d %H:%M:%S')
+                    except ValueError as ve:
+                        date = datetime.strptime(datetaken_tmp, '%Y-%m-%d %H:%M:%S')
                     date = pytz.utc.localize(date)
                     if date < self.dateTaken: 
                         self.dateTaken = date
@@ -471,6 +492,7 @@ class ImageFile(models.Model):
 
             image.thumbnail(size, Image.ANTIALIAS)
 
+#            thumb_dir = self.pixel_hash[:2]
             thumb_filename = f'{self.pixel_hash}_{self.file_hash}.jpg'
 
             FTYPE = 'JPEG' # 'GIF' or 'PNG' are possible extensions

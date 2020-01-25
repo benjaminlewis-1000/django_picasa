@@ -1,3 +1,4 @@
+# NOTE: Only edit this file in the root directory
 celery>=4.0.2
 coloredlogs
 dj-database-url
@@ -21,3 +22,5 @@ redis
 scons
 unipath
 xmltodict
+gunicorn
+# NOTE: Only edit this file in the root directory

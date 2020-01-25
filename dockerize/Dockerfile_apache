@@ -15,4 +15,4 @@ ADD apache_pwd.pwd /usr/local/apache2/.htpasswd
 
 CMD ["httpd-foreground"]
 
-COPY vhost.conf /usr/local/apache2/conf/extra/httpd-vhosts.conf
+# COPY vhost.conf /usr/local/apache2/conf/extra/httpd-vhosts.conf

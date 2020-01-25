@@ -9,18 +9,8 @@ services:
         buildno: 1
     image:
       picasa_img
-#    command:
-#      python /code/manage.py runserver
-#    command:
-#      celery -A picasa worker -l info
-#    command:
-#      celery -A picasa beat -l info
-#      bash -c "celery flower -A picasa --port=5555  | celery -A picasa beat -l info --pidfile=\"/var/run/lock/celerybeat.pid\" | celery -A picasa worker -l info | python /code/manage.py runserver"
     command:
       bash /startup.sh
-#    expose:
-#      - "${CLIENT_FACE_PORT}"
-#      - "8000"
     env_file:
       - .env
 #    ports:
@@ -45,8 +35,6 @@ services:
       - "traefik.flower.frontend.rule=Host:flower.${DOMAINNAME}"
       - "traefik.flower.port=5555"
       - "traefik.docker.network=traefik_proxy"
-    # environment:
-      # - IN_DOCKER=True
 
       # Need to start postgresql service
 
@@ -55,12 +43,6 @@ services:
       context: .
       dockerfile: Dockerfile_postgres
     image: postgres_init
-    # expose: 
-    #   - '5432'
-    # ports:
-    #   - '5432'
-    # command:
-    #   service postgresql start
     env_file:
       - .env
     restart: always
@@ -108,7 +90,9 @@ services:
       # - ${MEDIA_FILES_LOCATION}:/usr/local/apache2/htdocs/
       - ${MEDIA_FILES_LOCATION}:/var/www/media
       - ${STATIC_LOCATION}:/var/www/static
-      - /home/benjamin/git_repos/django_picasa/dockerize/apache_config/000-default.confi:/etc/apache2/sites-enabled/000-default.conf
+      - ${DJANGO_FILES_ROOT}/dockerize/apache_config/000-default.config:/etc/apache2/sites-enabled/000-default.conf
+      - ${DJANGO_FILES_ROOT}/dockerize/apache_config/vhost.conf:/usr/local/apache2/conf/extra/httpd-vhosts.conf
+      - ${DJANGO_FILES_ROOT}/dockerize/apache_config/apache_pwd.pwd:/usr/local/apache2/.htpasswd 
     networks:
       - traefik_proxy
     labels:
@@ -117,55 +101,6 @@ services:
       - "traefik.enable=true"
       - "traefik.port=80"
       - "traefik.docker.network=traefik_proxy"
-
-#  apache:
-#    container_name: apache
-#    restart: always
-    # image: httpd:2.4-alpine
-#    image: httpd
-    # expose:
-    #   - "80"
-#    labels:
-#      - "traefik.frontend.rule=Host:apache.${DOMAINNAME}"
-#      - "traefik.backend=apache"
-#      - "traefik.enable=true"
-#      - "traefik.port=80"
-#      - "traefik.docker.network=traefik_proxy"
-#    networks:
-#      - traefik_proxy
-      # - traefik_proxy
-
-#  whoamiapach:
-#    image: emilevauge/whoami # A container that exposes an API to show its IP address
-#    image: httpd
-#    labels:
-#      - "traefik.backend=whoamiapach"
-     # - "traefik.frontend.rule=Host:whoami.docker.localhost"
-#      - "traefik.frontend.rule=Host:apachewho.${DOMAINNAME}"
-#      - "traefik.enable=true"
-#      - "traefik.port=80"
-##      - "traefik.protocol=http"
-#      - "traefik.docker.network=traefik_proxy"
-  # The traefik container will automatically create a network called <imagename>_default and publish it to bridge. I need to hook into that network if starting from an external docker-compose.yml file.
-#    networks:
-#      - traefik_default
-#   ports:
-
-  whoami:
-    image: emilevauge/whoami # A container that exposes an API to show its IP address
-    labels:
-      - "traefik.backend=whoami"
-     # - "traefik.frontend.rule=Host:whoami.docker.localhost"
-      - "traefik.frontend.rule=Host:whoami.${DOMAINNAME}"
-      - "traefik.enable=true"
-      - "traefik.port=80"
-#      - "traefik.protocol=http"
-      - "traefik.docker.network=traefik_proxy"
-  # The traefik container will automatically create a network called <imagename>_default and publish it to bridge. I need to hook into that network if starting from an external docker-compose.yml file.
-    networks:
-      - traefik_proxy
-
-
 
 networks:
   default: 

@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+import traceback
 
 
 def create_image_file(file_path):
@@ -37,6 +38,7 @@ def create_image_file(file_path):
 
 
     def instance_clean_and_save(instance):
+        #            print(cur_file)
         try:
             instance.full_clean()
         except ValidationError as ve:
@@ -98,6 +100,7 @@ def create_image_file(file_path):
         # This way with established database (no hashing): ~.5 seconds. 
         # That's a 40x speedup.
         else:
+            print(file_path)
             settings.LOGGER.debug(f"Updating file {file_path} in database due to changed timestamp")
             new_photo.process_new_no_md5()
             new_photo._generate_md5_hash()
@@ -125,6 +128,7 @@ def create_image_file(file_path):
 
     # Case 2: No photo exists at this location.
     else:
+        print(file_path)
         settings.LOGGER.debug(f"Adding new file {file_path} to database.")
         new_photo.process_new_no_md5()
         new_photo._generate_md5_hash()
@@ -182,9 +186,17 @@ def add_from_root_dir(root_dir):
         try:
             for root, dirs, files in os.walk(root_dir):
                 for f in files:
-                    cur_file = os.path.join(root, f)
-                    print(cur_file)
-                    create_image_file(cur_file)
+                # Try/catch block only on individual file; lets the rest of the files be added regardless
+                # of a failure on one. 
+                    try:
+                        cur_file = os.path.join(root, f)
+                        create_image_file(cur_file)
+                    except Exception as e:
+                        stack_trace = traceback.format_exc()
+                        settings.LOGGER.error(type(e).__name__)
+                        settings.LOGGER.error(e)
+                        settings.LOGGER.error(cur_file)
+                        settings.LOGGER.error(stack_trace) 
         finally:
             os.remove(lockfile)
 

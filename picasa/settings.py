@@ -68,22 +68,22 @@ else:
     LOG_DIR = '/home/benjamin/git_repos/picasa_files/logs'
 
 # Set up logging
-formatter = logging.Formatter('%(levelname)s - %(message)s')
+formatter = logging.Formatter('%(levelname)s | %(asctime)s - %(message)s')
 LOGGER = logging.getLogger("__main__")
 LOGGER.setLevel(logging.DEBUG)
 LOGGER.propagate = False
 
-fh_low = logging.FileHandler(os.path.join(LOG_DIR, 'picasa_debug.log'), 'w')
+fh_low = logging.FileHandler(os.path.join(LOG_DIR, 'picasa_debug.log'), 'a')
 fh_low.setLevel(logging.DEBUG)
 fh_low.setFormatter(formatter)
 LOGGER.addHandler(fh_low)
 
-fh_high = logging.FileHandler(os.path.join(LOG_DIR, 'picasa_important.log'), 'w')
+fh_high = logging.FileHandler(os.path.join(LOG_DIR, 'picasa_important.log'), 'a')
 fh_high.setLevel(logging.WARNING)
 fh_high.setFormatter(formatter)
 LOGGER.addHandler(fh_high)
 
-fh_mid = logging.FileHandler(os.path.join(LOG_DIR, 'picasa_lite_debug.log'), 'w')
+fh_mid = logging.FileHandler(os.path.join(LOG_DIR, 'picasa_lite_debug.log'), 'a')
 fh_mid.setLevel(logging.INFO)
 fh_mid.setFormatter(formatter)
 LOGGER.addHandler(fh_mid)
@@ -230,6 +230,7 @@ if production:
         'filepopulate_root': {
             'task': 'filepopulator.populate_files_from_root',
             'schedule': crontab(minute=0, hour='*/6'),
+            # 'schedule': crontab(minute='*/1'),
         },
         'dirs_datetimes': {
             'task': 'filepopulator.update_dir_dates',

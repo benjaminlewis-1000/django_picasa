@@ -9,19 +9,49 @@ import shutil
 import string
 import xmltodict
 import subprocess
-import tabCompleter
 import string
+import sys
+import glob
 
 def randomString(stringLength=10):
     """Generate a random string of fixed length """
     letters = string.ascii_letters + string.digits
     return ''.join(random.choice(letters) for i in range(stringLength))
 
+# SOURCE : https://gist.github.com/iamatypeofwalrus/5637895
+class tabCompleter(object):
+    """ 
+    A tab completer that can either complete from
+    the filesystem or from a list.
+    
+    Partially taken from:
+    http://stackoverflow.com/questions/5637124/tab-completion-in-pythons-raw-input
+    """
+
+    def pathCompleter(self,text,state):
+        """ 
+        This is the tab completer for systems paths.
+        Only tested on *nix systems
+        """
+        line   = readline.get_line_buffer().split()
+
+        return [x for x in glob.glob(text+'*')][state]
+
+#    def createListCompleter(self,ll):
+        """ 
+        This is a closure that creates a method that autocompletes from
+        the given list.
+        
+        Since the autocomplete function can't be given a list to complete from
+        a closure is used to create the listCompleter function with a list to complete
+        from.
+        """
+
 
 project_path = os.path.abspath(os.path.join(__file__,"../.."))
 script_path  = os.path.abspath(os.path.join(__file__,".."))
 
-t = tabCompleter.tabCompleter()
+t = tabCompleter()
 readline.set_completer_delims('\t')
 readline.parse_and_bind("tab: complete")
 readline.set_completer(t.pathCompleter)
@@ -93,14 +123,15 @@ else:
 
 # Remove the database directory. 
 if os.path.isdir(db_dir):
-	rmd = input("This script needs to remove the database directory to get the initialization to work properly. OK? (y/N) ")
+	rmd = input("This script needs to remove the all files in the app file directory to get the initialization to work properly. OK? (y/N) ")
 	if rmd.lower() != 'y':
 		print("Not removing the database directory. You will need to initialize the database table manually.")
 	else:
+		print(f"Removing files in {app_file_dir}...")
 		rmd = input("SECOND CHANCE!!! Are you sure? (y/N) ")
 		if rmd.lower() == 'y':
 			print("removing...")
-			os.system(f"sudo rm -r {db_dir}")
+			os.system(f"sudo rm -r {app_file_dir}")
 		else:
 			print("Not removing the database directory. You will need to initialize the database table manually.")
 pathlib.Path( db_dir ).mkdir(parents=True, exist_ok=True)
@@ -111,8 +142,8 @@ DB_PWD = randomString(25)
 APACHE_PWD = randomString(25)
 APACHE_USER = 'picasa_data'
 
-os.system(f'htpasswd -cb {script_path}/apache_pwd.pwd {APACHE_USER} {APACHE_PWD}')
-print(f'htpasswd -cb {script_path}/apache_pwd.pwd {APACHE_USER} {APACHE_PWD}')
+os.system(f'htpasswd -cb {script_path}/apache_config/apache_pwd.pwd {APACHE_USER} {APACHE_PWD}')
+print(f'htpasswd -cb {script_path}/apache_config/apache_pwd.pwd {APACHE_USER} {APACHE_PWD}')
 
 out_file_path = os.path.join(script_path, '.env')
 
