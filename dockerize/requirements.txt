@@ -19,8 +19,16 @@ Pillow
 postgres
 psycopg2-binary
 redis
+requests
 scons
 unipath
 xmltodict
 gunicorn
+# For Twilio messages -- https://github.com/TwilioDevEd/server-notifications-django/blob/master/requirements.txt
+twilio
+python-dotenv
+black
+coverage
+flake8
+mock
 # NOTE: Only edit this file in the root directory

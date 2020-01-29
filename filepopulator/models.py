@@ -23,6 +23,7 @@ import pytz
 import logging
 import cv2
 import numpy as np
+from dateutil import parser
 
 # Image thumbnail processing
 
@@ -99,7 +100,8 @@ class Directory(models.Model):
     def average_date_taken(self):
         img_dates = self.__get_filtered_img_dates__()
         if img_dates is None:
-            self.mean_datesec = datetime.fromtimestamp(timezone.now, timezone.utc)
+            # self.mean_datesec = datetime.fromtimestamp(timezone.now(), timezone.utc)
+            self.mean_datesec = time.mktime(datetime.now().timetuple()) # datetime.now().total_seconds()
             self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, timezone.utc)
         else:
             self.mean_datesec = float(np.mean(img_dates))
@@ -108,7 +110,8 @@ class Directory(models.Model):
     def beginning_date_taken(self):
         img_dates = self.__get_filtered_img_dates__()
         if img_dates is None:
-            self.first_datesec = datetime.fromtimestamp(timezone.now, timezone.utc)
+            # self.first_datesec = datetime.fromtimestamp(timezone.now(), timezone.utc)
+            self.first_datesec = time.mktime(datetime.now().timetuple()) # datetime.fromtimestamp(timezone.now(), timezone.utc)
             self.first_datetime = datetime.fromtimestamp(self.mean_datesec, timezone.utc)
         else:
             img_dates.sort()
@@ -399,7 +402,10 @@ class ImageFile(models.Model):
         # and then hash the pixels one by one using md5. 
         pixel_hash_md5 = hashlib.md5()
 
-        self.pixels = cv2.cvtColor(np.array(self.image), cv2.COLOR_BGR2RGB)
+        try:
+            self.pixels = cv2.cvtColor(np.array(self.image), cv2.COLOR_BGR2RGB)
+        except TypeError as te:
+            self.pixels = cv2.imread(self.filename)
 
         arr = self.pixels.reshape(-1)
         # arr = arr[::500]
@@ -448,20 +454,27 @@ class ImageFile(models.Model):
             dateTakenKeys = ['DateTime', 'DateTimeOriginal', 'DateTimeDigitized']
             for exifKey in dateTakenKeys:
                 datetaken_tmp = self.exifDict[exifKey] if exifKey in self.exifDict.keys() else None
-                if datetaken_tmp is None:
+                # Remediations for occasional problems - I've seen \x00\x00... in the string 
+                # and date lines that are just spaces.
+                if datetaken_tmp is None or re.match('^\s+$', datetaken_tmp) or re.match('0000:00:00 00:00:00', datetaken_tmp):
                     continue  # No value at this EXIF key
                 else:
+                    datetaken_tmp = datetaken_tmp.replace('\x00', '')
                     try:
                         date = datetime.strptime(datetaken_tmp, '%Y:%m:%d %H:%M:%S')
                     except ValueError as ve:
-                        date = datetime.strptime(datetaken_tmp, '%Y-%m-%d %H:%M:%S')
-                    date = pytz.utc.localize(date)
+                        # settings.LOGGER.warning(f"Date taken format is _tmp}")
+                        date = parser.parse(datetaken_tmp)
+#                         date = datetime.strptime(datetaken_tmp, '%Y-%m-%d %H:%M:%S')
+                    
+                    if date.tzinfo == None:
+                        date = pytz.utc.localize(date)
                     if date < self.dateTaken: 
                         self.dateTaken = date
                         self.dateTakenValid = True
         else:
-            self.dateTaken = timezone.now()
-            self.dateTakenValid = False
+        #    self.dateTaken = timezone.now()
+        #    self.dateTakenValid = False
             settings.LOGGER.warning(f"Date taken is not valid for file {self.filename}")
 
         # settings.LOGGER.error('Hi, debug here:')

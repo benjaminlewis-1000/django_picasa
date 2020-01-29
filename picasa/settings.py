@@ -50,6 +50,7 @@ if in_docker:
     STATIC_URL = os.environ['MEDIA_DOMAIN'] + '/static/'
     MEDIA_URL = os.environ['MEDIA_DOMAIN'] + '/media/'
     LOG_DIR = '/var/log/picasa'
+    STATIC_ROOT = os.environ['STATIC_LOCATION']
 else:
     DB_NAME = 'picasa'
     DB_USER = 'benjamin'

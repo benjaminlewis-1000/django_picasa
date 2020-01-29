@@ -11,7 +11,7 @@ WORKDIR /var/www
 #ENTRYPOINT ["/docker-entrypoint.sh"]
 
 # ADD apache_pwd.pwd /usr/local/apache2/htdocs/.htpasswd
-ADD apache_pwd.pwd /usr/local/apache2/.htpasswd
+# ADD apache_pwd.pwd /usr/local/apache2/.htpasswd
 
 CMD ["httpd-foreground"]
 

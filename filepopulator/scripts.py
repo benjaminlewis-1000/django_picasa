@@ -47,7 +47,11 @@ def create_image_file(file_path):
             else:
                 settings.LOGGER.debug("Did not add photo {}: {}".format(file_path, ve) )
         else:
-            instance.save()
+            try:
+                instance.save()
+            except ValueError as ve:
+                print(instance)
+                raise ve
             settings.LOGGER.debug(f"Saved file {file_path} to database")
 
             assert os.path.isfile(instance.thumbnail_big.path), \
@@ -214,7 +218,7 @@ def update_dirs_datetime():
 
     dirs = Directory.objects.all()
     for d in dirs:
-        print(d)
+    #     print(d)
         d.average_date_taken()
         d.beginning_date_taken()
         d.save()

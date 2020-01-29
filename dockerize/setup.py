@@ -56,21 +56,25 @@ readline.set_completer_delims('\t')
 readline.parse_and_bind("tab: complete")
 readline.set_completer(t.pathCompleter)
 
+def find(name, path):
+    for root, dirs, files in os.walk(path):
+        if name in files:
+            return os.path.join(root, name)
+
+img_handle_path = find('client_image_handler.py', project_path)
+assert img_handle_path is not None
+img_handle_path = os.path.abspath(os.path.join(img_handle_path, '../..') )
+print(img_handle_path)
+img_handle_params = os.path.join(img_handle_path, 'parameters.xml')
+assert os.path.exists(img_handle_params), f'Parameter file for image handler {img_handle_params} doesn''t exist!'
+with open(img_handle_params) as p:
+    config = xmltodict.parse(p.read())
+port_ip_disc = int(config['params']['ports']['server_port_ip_disc'])
+client_port = int(config['params']['ports']['client_return_port'])
+print(client_port)
 
 print("TODO: Test file location")
 print("TODO: explicit ports for postgres and redis")
-
-param_file = os.path.join(project_path, 'image_face_extractor', 'parameters.xml')
-if not os.path.isdir(os.path.dirname(param_file)):
-	raise ValueError("Need to know the path to the face extraction code to fetch the parameter file.")
-if not os.path.isfile(param_file):
-	raise ValueError("Need to know the path to the face extraction code parameter file.")
-
-with open(param_file) as pf:
-	params = xmltodict.parse(pf.read())
-
-client_port_detect = params['params']['ports']['client_return_port']
-print(client_port_detect)
 
 shutil.copy(os.path.join(project_path, 'requirements.txt'), script_path)
 
@@ -150,7 +154,7 @@ out_file_path = os.path.join(script_path, '.env')
 with open(out_file_path, 'w') as fh:
 	fh.write(f"ADMIN_PW={pw1}\n")
 	fh.write(f"ADMIN_USERNAME={username}\n")
-	fh.write(f"CLIENT_FACE_PORT={client_port_detect}\n")
+	fh.write(f"CLIENT_FACE_PORT={client_port}\n")
 	fh.write(f"DB_FILES_LOCATION={db_dir}\n")
 	fh.write(f"DB_NAME={db_name}\n")
 	fh.write(f"DB_PWD={DB_PWD}\n")

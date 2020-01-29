@@ -13,8 +13,12 @@ services:
       bash /startup.sh
     env_file:
       - .env
-#    ports:
-#      - "8000:8000"
+    ports:
+      #- "${CLIENT_FACE_PORT}:${CLIENT_FACE_PORT}/udp"
+      #- "5001:5001/udp"
+      - 5000:5000
+      - 5001:5001
+      - 44444:44444
     volumes:
       - ${DJANGO_FILES_ROOT}:/code
       - ${PHOTO_ROOT}:/photos:ro
@@ -39,10 +43,15 @@ services:
       # Need to start postgresql service
 
   db_django:
-    build:
-      context: .
-      dockerfile: Dockerfile_postgres
-    image: postgres_init
+#    build:
+#      context: .
+#      dockerfile: Dockerfile_postgres
+#    image: postgres_init
+#FROM postgres:12.1-alpine
+# WORKDIR /docker-entrypoint-initdb.d
+# ADD psql_init.sh .
+
+    image: postgres:12.1-alpine
     env_file:
       - .env
     restart: always
@@ -52,6 +61,7 @@ services:
 #      PGDATA: /database
     volumes:
       - ${DB_FILES_LOCATION}:/var/lib/postgresql/data
+      - ${DJANGO_FILES_ROOT}/dockerize/psql_init.sh:/docker-entrypoint-initdb.d/psql_init.sh
       # Initialization script - see Postgres Docker documentation.
 
     labels:

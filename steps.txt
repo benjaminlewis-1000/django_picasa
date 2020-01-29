@@ -169,3 +169,7 @@ https://docs.djangoproject.com/en/2.2/intro/reusable-apps/
         AllowOverride None
         Require all granted
     </Directory>
+
+- Allow the server firewall to allow ports 5000, 5001, and 44444 to accept traffic on UDP. Pattern is
+sudo ufw allow 44444/udp
+The exact ports may vary but are listed in the parameters.xml for the image face processing code. 
