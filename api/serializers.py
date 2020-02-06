@@ -3,6 +3,7 @@
 from django.contrib.auth.models import User, Group
 from rest_framework import serializers
 from filepopulator.models import ImageFile, Directory
+from drf_queryfields import QueryFieldsMixin
 
 
 class UserSerializer(serializers.HyperlinkedModelSerializer):
@@ -27,9 +28,27 @@ class ImageFileSerializer(serializers.HyperlinkedModelSerializer):
                   'gps_lon_decimal', 'thumbnail_big', 'thumbnail_medium', 'thumbnail_small', 'exposure']
 
       
-class DirectorySerializer(serializers.HyperlinkedModelSerializer):
+class DirectorySerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
+    
+#    imgs_in_dir = serializers.HyperlinkedRelatedField(
+#        many=True,
+#        read_only=True,
+#        view_name='ImageFile'
+#    )
+
+    # The ForeignKey in the ImageFile that points to directory needs to have
+    # the related_name parameter set to 'image_set'. 
+    image_set = ImageFileSerializer(read_only=True, many=True)
+
+#    image_set = serializers.HyperlinkedRelatedField(many=True, view_name=image_set, read_only=True)
     class Meta:
 
+    # Able to filter to get just the fields you want usin QueryFieldsMixin.
+    # https://github.com/wimglenn/djangorestframework-queryfields
+    # Suggested for list of all directories: 
+    # <URL>/api/directories/?fields!=imgs_in_dir
         model = Directory
-        fields = ['dir_path', 'top_level_name', 'imgs_in_dir', 'mean_datetime', 'mean_datesec', \
+        fields = ['url', 'id', 'dir_path', 'top_level_name', 'image_set', 'mean_datetime', 'mean_datesec', \
         'first_datetime', 'first_datesec', ]
+#        fields = ['dir_path', 'top_level_name', 'mean_datetime', 'mean_datesec', \
+#        'first_datetime', 'first_datesec', ]

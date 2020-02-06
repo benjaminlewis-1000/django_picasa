@@ -31,4 +31,5 @@ black
 coverage
 flake8
 mock
+djangorestframework-queryfields
 # NOTE: Only edit this file in the root directory

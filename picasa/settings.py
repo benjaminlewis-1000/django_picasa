@@ -44,11 +44,12 @@ if in_docker:
     PHOTO_ROOT = '/photos'
     TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
 #    ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['WEBAPP_DOMAIN']]
-    ALLOWED_HOSTS = [os.environ['DOMAINNAME'], os.environ['WEBAPP_DOMAIN']]
+    ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['DOMAINNAME'], os.environ['WEBAPP_DOMAIN'], 'flower.' + os.environ['DOMAINNAME']]
+#    ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['DOMAINNAME'], os.environ['WEBAPP_DOMAIN'] ]
 #    STATIC_URL = 'http://localhost/static/'
 #    MEDIA_URL  = 'http://localhost:8080/'
-    STATIC_URL = os.environ['MEDIA_DOMAIN'] + '/static/'
-    MEDIA_URL = os.environ['MEDIA_DOMAIN'] + '/media/'
+    STATIC_URL = 'https://' + os.environ['MEDIA_DOMAIN'] + '/static/'
+    MEDIA_URL = 'https://' + os.environ['MEDIA_DOMAIN'] + '/media/'
     LOG_DIR = '/var/log/picasa'
     STATIC_ROOT = os.environ['STATIC_LOCATION']
 else:
@@ -109,7 +110,7 @@ if os.path.isfile(LOCKFILE):
 # SECURITY WARNING: keep the secret key used in production secret!
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False
+DEBUG = True # False
 
 # Application definition
 
@@ -230,8 +231,8 @@ if production:
     CELERY_BEAT_SCHEDULE = {
         'filepopulate_root': {
             'task': 'filepopulator.populate_files_from_root',
-            'schedule': crontab(minute=0, hour='*/6'),
-            # 'schedule': crontab(minute='*/1'),
+            # 'schedule': crontab(minute=0, hour='*/6'),
+            'schedule': crontab(minute='*/10'),
         },
         'dirs_datetimes': {
             'task': 'filepopulator.update_dir_dates',

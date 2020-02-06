@@ -10,3 +10,4 @@ static/*
 *.pyc
 */migrations/*
 media/*
+gdrive_credentials.json

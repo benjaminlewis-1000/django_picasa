@@ -50,7 +50,11 @@ def create_image_file(file_path):
             try:
                 instance.save()
             except ValueError as ve:
-                print(instance)
+                print(dir(instance))
+                print(instance.__dict__)
+#                for field in dir(instance):
+#                    if not field.startwith('_'):
+#                    print(field, instance.__dict__[field])
                 raise ve
             settings.LOGGER.debug(f"Saved file {file_path} to database")
 
@@ -194,7 +198,10 @@ def add_from_root_dir(root_dir):
                 # of a failure on one. 
                     try:
                         cur_file = os.path.join(root, f)
-                        create_image_file(cur_file)
+                        cur_parts = cur_file.split(os.sep)[:-1]
+                        # Check if a folder starts with '.'.
+                        if not True in set(map(lambda x: x.startswith('.'), cur_parts) ):
+                            create_image_file(cur_file)
                     except Exception as e:
                         stack_trace = traceback.format_exc()
                         settings.LOGGER.error(type(e).__name__)

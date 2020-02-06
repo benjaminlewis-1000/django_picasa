@@ -14,7 +14,7 @@ admin_thumbnails.ADMIN_THUMBNAIL_STYLE = {'display': 'block', 'width': '500px', 
 # admin_thumbnails.ADMIN_THUMBNAIL_FIELD_SUFFIX = ''
 
 def upper_case_name(obj):
-    return "Helll ther!"
+    return obj.filename
 upper_case_name.short_description = 'Name'
 
 @admin_thumbnails.thumbnail('thumbnail_big')

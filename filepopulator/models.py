@@ -7,6 +7,7 @@ from django.core.exceptions import ValidationError
 import re
 from datetime import datetime
 from django.utils import timezone
+from rest_framework.reverse import reverse
 
 from io import BytesIO
 from django.core.files.base import ContentFile
@@ -74,10 +75,10 @@ class Directory(models.Model):
     def top_level_name(self):
         return "{}".format(self.dir_path.split('/')[-1])
 
-    def imgs_in_dir(self):
-        imgs = ImageFile.objects.filter(directory__dir_path=self.dir_path)
-        imgs = [i.id for i in imgs]
-        return imgs
+#    def imgs_in_dir(self):
+#        imgs = ImageFile.objects.filter(directory__dir_path=self.dir_path)
+#        imgs = [i.id for i in imgs]
+#        return imgs
 
     def __get_filtered_img_dates__(self):
         imgs = ImageFile.objects.filter(directory__dir_path=self.dir_path)
@@ -139,7 +140,7 @@ class ImageFile(models.Model):
 
     filename = models.CharField(max_length=255, validators=[RegexValidator(regex="\.[j|J][p|P][e|E]?[g|G]$", message="Filename must be a JPG")], db_index = True)
     # CASCADE is expected; if delete directory, delete images.
-    directory = models.ForeignKey(Directory, on_delete=models.PROTECT)
+    directory = models.ForeignKey(Directory, on_delete=models.PROTECT, related_name='image_set')
     pixel_hash = models.CharField(max_length = 64, null = False, default = -1)
     file_hash = models.CharField(max_length = 64, null = False, default = -1)
 
@@ -271,7 +272,10 @@ class ImageFile(models.Model):
 
 
         s = time.time()
-        self.image = PIL.Image.open(self.filename)
+        try:
+            self.image = PIL.Image.open(self.filename)
+        except PIL.Image.DecompressionBombError:
+            self.image = PIL.Image.fromarray(cv2.imread(self.filename))
         self._get_mod_time()
         # self.dateModified = datetime.fromtimestamp(os.path.getctime(self.filename))
         if self.dateModified.tzinfo == None:
@@ -332,10 +336,12 @@ class ImageFile(models.Model):
             # I'm not feeling it right now. 
             if 'Make' in self.exifDict.keys():
                 make = self.exifDict['Make']
-                self.camera_make = make
+#                self.camera_make = make
+                self.camera_make = make.replace('\x00', '')
             if 'Model' in self.exifDict.keys():
                 model = self.exifDict['Model']
-                self.camera_model = model
+#                self.camera_model = model
+                self.ccamera_model = model.replace('\x00', '')
             if 'Flash' in self.exifDict.keys():
                 flash = self.exifDict['Flash']
                 self.flash_info = flash
@@ -406,6 +412,8 @@ class ImageFile(models.Model):
             self.pixels = cv2.cvtColor(np.array(self.image), cv2.COLOR_BGR2RGB)
         except TypeError as te:
             self.pixels = cv2.imread(self.filename)
+        except PIL.Image.DecompressionBombError as bomberror:
+            self.pixels = cv2.imread(self.filename)
 
         arr = self.pixels.reshape(-1)
         # arr = arr[::500]
@@ -456,7 +464,7 @@ class ImageFile(models.Model):
                 datetaken_tmp = self.exifDict[exifKey] if exifKey in self.exifDict.keys() else None
                 # Remediations for occasional problems - I've seen \x00\x00... in the string 
                 # and date lines that are just spaces.
-                if datetaken_tmp is None or re.match('^\s+$', datetaken_tmp) or re.match('0000:00:00 00:00:00', datetaken_tmp):
+                if datetaken_tmp is None or re.match('^\s+$', datetaken_tmp) or re.match('0000:00:00 00:00:00', datetaken_tmp) or re.match('[\s:-]+', datetaken_tmp):
                     continue  # No value at this EXIF key
                 else:
                     datetaken_tmp = datetaken_tmp.replace('\x00', '')

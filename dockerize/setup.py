@@ -75,6 +75,7 @@ print(client_port)
 
 print("TODO: Test file location")
 print("TODO: explicit ports for postgres and redis")
+print("TODO: email address")
 
 shutil.copy(os.path.join(project_path, 'requirements.txt'), script_path)
 
