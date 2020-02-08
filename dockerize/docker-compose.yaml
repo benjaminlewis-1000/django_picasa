@@ -36,6 +36,7 @@ services:
       - db_django
     networks:
       - traefik_proxy
+    restart: always
     labels:
 #      - "traefik.backend=picasa"
 #      - "traefik.enable=true"

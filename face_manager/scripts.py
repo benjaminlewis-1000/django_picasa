@@ -10,8 +10,10 @@ from django.core.files.base import ContentFile
 import numpy as np
 import logging
 
+def establish_server_connection():
+    server_conn = image_face_extractor.ip_finder.server_finder()
 
-
+    return server_conn
 
 def placeInDatabase(foreign_key, face_data):
 
@@ -91,7 +93,13 @@ def placeInDatabase(foreign_key, face_data):
         new_face.save()
 
 
-def populateFromImage(filename):
+def populateFromImage(filename, server_conn = None):
+
+    if server_conn is None:
+        server_conn = establish_server_connection()
+    else:
+        if server_conn.check_ip() is False:
+            server_conn.find_external_server()
 
     settings.LOGGER.error("Need better handling on foreign_key")
     foreign_key = ImageFile.objects.get(filename = filename)
@@ -104,4 +112,5 @@ def populateFromImage(filename):
     
     placeInDatabase(foreign_key, face_data)
 
-    return face_data
+    return face_data, server_conn
+
