@@ -200,7 +200,9 @@ REST_FRAMEWORK = {
         # 'rest_framework.authentication.BasicAuthentication',
         'rest_framework.authentication.SessionAuthentication',
         'rest_framework.authentication.TokenAuthentication',  # <-- And here
-    ]
+    ],
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
+    'PAGE_SIZE': 100, 
 }
 
 
@@ -231,8 +233,8 @@ if production:
     CELERY_BEAT_SCHEDULE = {
         'filepopulate_root': {
             'task': 'filepopulator.populate_files_from_root',
-            # 'schedule': crontab(minute=0, hour='*/6'),
-            'schedule': crontab(minute='*/10'),
+            'schedule': crontab(minute=0, hour='*/6'),
+            # 'schedule': crontab(minute='*/10'),
         },
         'dirs_datetimes': {
             'task': 'filepopulator.update_dir_dates',

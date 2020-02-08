@@ -1,22 +1,28 @@
 from django.test import TestCase
 from django.core.exceptions import ValidationError
 from django.conf import settings
+from django.test import override_settings
 
 import os
 import cv2
+import random
 import shutil
 import numpy as np
 
 from filepopulator import scripts
 from filepopulator.models import ImageFile
-from .scripts import populateFromImage
+from .scripts import populateFromImage, placeInDatabase
 from .models import Face, Person
+import image_face_extractor
+from image_face_extractor import face_extraction
 # Create your tests here.
 
 class FaceManageTests(TestCase):
 
+    @override_settings(MEDIA_ROOT='/tmp')
+
     def setUp(self):
-        pass
+        settings.MEDIA_ROOT='/tmp'
 
     @classmethod
     def setUpTestData(cls):
@@ -118,10 +124,127 @@ class FaceManageTests(TestCase):
     def test_addtwice(self):
         pass
 
+class FakeFacesTests(TestCase):
+
+    @override_settings(MEDIA_ROOT='/tmp')
+    def setUp(self):
+        self.names = ['Alpha', 'Beta', 'Gamma', 'Charlie', 'Epsilon', 'Ragnar', 'Tiger', 'Wolf',\
+                'Genni', 'Einstein', 'Bravo']
+        settings.MEDIA_ROOT='/tmp'
+
+    def tearDown(self): 
+        allFaces = Face.objects.all()
+        for obj in allFaces:
+            obj.delete()
+
+    @classmethod
+    def setUpTestData(cls):
+
+        cls.validation_dir = settings.FILEPOPULATOR_VAL_DIRECTORY 
+
+        assert os.path.isdir(cls.validation_dir), 'Validation directory in FaceManageTests does not exist.'
+
+        # Copy the validation files to the /tmp directory
+        cls.tmp_valid_dir = '/tmp/img_validation'
+
+        if os.path.exists(cls.tmp_valid_dir):
+            shutil.rmtree(cls.tmp_valid_dir)
+
+        shutil.copytree(cls.validation_dir, cls.tmp_valid_dir)
+
+        cls.face_file = os.path.join(cls.tmp_valid_dir, 'has_face_tags.jpg')
+        cls.same_faces_file = os.path.join(cls.tmp_valid_dir, 'has_same_faces.jpg')
+
+        scripts.create_image_file(cls.face_file)
+        scripts.add_from_root_dir(cls.tmp_valid_dir)
+
+    @classmethod
+    def tearDownClass(cls):
+
+        allObjects = ImageFile.objects.all()
+        for obj in allObjects:
+            obj.delete()
+
+        shutil.rmtree(cls.tmp_valid_dir)
+
+    def generate_fake_face_list(self):
+        num_faces = random.randint(0, 5)
+        name_idcs = random.sample(range(len(self.names)), num_faces)  
+
+        face_list = []
+
+        for i in range(num_faces):
+            if random.randint(0, 1): 
+                name = self.names[name_idcs[i]]
+            else:
+                name = None
+            encoding = np.random.rand(128)
+            face_w = random.randint(20, 40)
+            face_h = random.randint(20, 40)
+            face_thumbnail = np.random.rand(face_h, face_w, 3)
+            square_face = np.random.rand(face_w, face_w, 3)
+            box_center = (40, 40) 
+            bounding_rect = face_extraction.Rectangle(face_h, face_w, centerX=box_center[0], centerY=box_center[1])
+            face_rect = face_extraction.FaceRect(bounding_rect, face_thumbnail, 1, encoding=encoding, name=name, square_face=square_face)
+            face_list.append(face_rect)
+
+        return face_list
+            
+    def test_fake_faces(self):
+        all_imgs = ImageFile.objects.all()
+        settings.MEDIA_ROOT='/tmp'
+    
+        for img in all_imgs:
+            face_list = self.generate_fake_face_list()
+            placeInDatabase(img, face_list)
+            
+            # Get the faces attached to this image
+            relevant_faces = Face.objects.filter(source_image_file = img)
+            all_faces = Face.objects.all()
+
+            for each_db in all_faces:
+                self.assertTrue(os.path.exists(each_db.face_thumbnail.path))
+
+            for each_input in face_list:
+                name = each_input.name
+                enc = each_input.encoding
+                allclose = False
+                for each_db in all_faces:
+                    declared_name = each_db.declared_name
+                    if declared_name is not None:
+                        declared_name = declared_name.person_name 
+                    if declared_name != name:
+                        continue
+                    # Else
+                    # Allclose -- for names that are None, there may be multiple
+                    # faces in an image with a "none" name. At least one of them
+                    # must have an encoding that is close to this face's encoding.
+                    allclose = allclose or  (np.allclose(enc, each_db.face_encoding))
+
+                    self.assertEqual(each_db.poss_ident1, None)
+                    self.assertEqual(each_db.poss_ident2, None)
+                    self.assertEqual(each_db.poss_ident3, None)
+                    self.assertEqual(each_db.poss_ident4, None)
+                    self.assertEqual(each_db.poss_ident5, None)
+            
+                self.assertTrue(allclose)
+            
+        all_names = Person.objects.all()
+        print(all_names)
+        name_list = []
+        for name in all_names:
+            name_list.append(name)
+        
+        self.assertEqual(len(name_list), len(set(name_list)))
+        self.assertTrue(len(name_list) <= len(self.names))
+
+
 class MLTrainTests(TestCase):
 
+    @override_settings(MEDIA_ROOT='/tmp')
+
     def setUp(self):
-        pass
+        settings.MEDIA_ROOT='/tmp'
 
     @classmethod
     def setUpTestData(cls):

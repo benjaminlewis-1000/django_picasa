@@ -549,9 +549,18 @@ class ImageFile(models.Model):
     def delete(self):
         # file = ImageFile.objects.filter(id=self.id)
         # os.remove(file[0].thumbnail_small.path)
-        os.remove(self.thumbnail_big.path)
-        os.remove(self.thumbnail_medium.path)
-        os.remove(self.thumbnail_small.path)
+        try:
+            os.remove(self.thumbnail_big.path)
+        except Exception as e: 
+            pass
+        try:
+            os.remove(self.thumbnail_medium.path)
+        except Exception as e: 
+            pass
+        try:
+            os.remove(self.thumbnail_small.path)
+        except Exception as e: 
+            pass
         super(ImageFile, self).delete()
 
 

@@ -16,12 +16,16 @@ services:
       bash /startup.sh
     env_file:
       - .env
-    ports:
+    environment:
+      # Add the following line to your /etc/profile:
+      # HOST_IP=`ip route | grep default | awk '{print $9}'`
+      - DOCKER_HOST_IP=${HOST_IP} 
+    # ports:
       #- "${CLIENT_FACE_PORT}:${CLIENT_FACE_PORT}/udp"
       #- "5001:5001/udp"
-      - 5000:5000
-      - 5001:5001
-      - 44444:44444
+     # - 5000:5000
+     # - 5001:5001
+     # - 44444:44444
     volumes:
       - ${DJANGO_FILES_ROOT}:/code
       - ${PHOTO_ROOT}:/photos:ro
@@ -50,9 +54,9 @@ services:
       - "traefik.http.services.picasa.loadbalancer.server.port=8000"
       - "traefik.http.services.picasa.loadbalancer.healthcheck.hostname=${WEBAPP_DOMAIN}"
 
-      - "traefik.http.routers.flower.rule=Host(`flower.${DOMAINNAME}`)"
-      - "traefik.http.routers.flower.tls.certresolver=leresolver"
-      - "traefik.http.routers.flower.entrypoints=websecure"
+#      - "traefik.http.routers.flower.rule=Host(`flower.${DOMAINNAME}`)"
+#      - "traefik.http.routers.flower.tls.certresolver=leresolver"
+#      - "traefik.http.routers.flower.entrypoints=websecure"
 #      - "traefik.http.services.flower.loadbalancer.server.port=5555"
       # Need to start postgresql service
 

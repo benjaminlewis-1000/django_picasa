@@ -10,16 +10,10 @@ from django.core.files.base import ContentFile
 import numpy as np
 import logging
 
-def populateFromImage(filename):
 
-    settings.LOGGER.error("Need better handling on foreign_key")
-    foreign_key = ImageFile.objects.get(filename = filename)
-    print(foreign_key.isProcessed)
-    if foreign_key.isProcessed:
-        return None
 
-    # def face_from_facerect(self, filename):
-    face_data = image_face_extractor.image_client.face_extract_client(filename)
+
+def placeInDatabase(foreign_key, face_data):
 
     if len(face_data) == 0:
         foreign_key.isProcessed = True
@@ -51,13 +45,15 @@ def populateFromImage(filename):
                 new_person.save()
                 person_key = Person.objects.filter(person_name = name)
                 assert len(person_key) == 1
-                new_face.written_to_photo_metadata = False
-            else:
-                new_face.written_to_photo_metadata = True
 
             person_key = person_key[0]
 
             new_face.declared_name = person_key
+            new_face.written_to_photo_metadata = True
+
+        else:
+            new_face.declared_name = None
+            new_face.written_to_photo_metadata = False
 
         if encoding is not None:
             new_face.face_encoding = encoding
@@ -66,6 +62,8 @@ def populateFromImage(filename):
         new_face.box_bottom = r_bot
         new_face.box_left = r_left
         new_face.box_right = r_right
+
+        new_face.source_image_file = foreign_key
 
         # new_face.face_thumbnail = square_face
         # Save the thumbnail
@@ -92,5 +90,18 @@ def populateFromImage(filename):
 
         new_face.save()
 
+
+def populateFromImage(filename):
+
+    settings.LOGGER.error("Need better handling on foreign_key")
+    foreign_key = ImageFile.objects.get(filename = filename)
+    print(foreign_key.isProcessed)
+    if foreign_key.isProcessed:
+        return None
+
+    # def face_from_facerect(self, filename):
+    face_data = image_face_extractor.image_client.face_extract_client(filename)
+    
+    placeInDatabase(foreign_key, face_data)
 
     return face_data

@@ -30,6 +30,13 @@ class Person(models.Model):
     def delete(self):
         super(Person, self).delete()
 
+    def __str__(self):
+        return self.person_name
+
+def face_thumbnail_path(instance, filename):
+    first_dir = filename[:2]
+    second_dir = filename[2]
+    return f"face_thumbnails/{first_dir}/{second_dir}/{filename}"
 
 class Face(models.Model):
     # Primary key comes for free
@@ -49,10 +56,6 @@ class Face(models.Model):
     poss_ident3 = models.ForeignKey('Person', on_delete=models.PROTECT, related_name='face_poss3', blank=True, null=True)
     poss_ident4 = models.ForeignKey('Person', on_delete=models.PROTECT, related_name='face_poss4', blank=True, null=True)
     poss_ident5 = models.ForeignKey('Person', on_delete=models.PROTECT, related_name='face_poss5', blank=True, null=True)
-         #                    size=5,
-         #                    blank=True,
-         #                    null=True
-                        # )
 
     written_to_photo_metadata = models.BooleanField(default=False)
 
@@ -61,11 +64,11 @@ class Face(models.Model):
     box_left = models.IntegerField(validators=[MinValueValidator(1)], default=-1)
     box_right = models.IntegerField(validators=[MinValueValidator(1)], default=-1)
 
-    face_thumbnail = models.ImageField(upload_to='face_thumbnails', default=None)
+    face_thumbnail = models.ImageField(upload_to=face_thumbnail_path, default=None)
 
 
     def __str__(self):
-        return "{}".format(self.declared_name)
+        return "Instance of {}".format(self.declared_name)
 
     def delete(self):
         os.remove(self.face_thumbnail.path)

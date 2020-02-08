@@ -1,4 +1,5 @@
 from django.test import TestCase
+from django.test import override_settings
 from django.core.exceptions import ValidationError
 from django import forms
 from django.conf import settings
@@ -24,6 +25,7 @@ from .scripts import create_image_file, add_from_root_dir, delete_removed_photos
 
 
 class ImageFileTests(TestCase):
+    @override_settings(MEDIA_ROOT='/tmp')
 
     def setUp(self):
         # Get the validation directory, copy it to /tmp so we don't have to worry about destroying it,
@@ -699,6 +701,7 @@ class ImageFileTests(TestCase):
 
 
 class DirectoryTests(TestCase):
+    @override_settings(MEDIA_ROOT='/tmp')
 
     def setUp(self):
         pass
