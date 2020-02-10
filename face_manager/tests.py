@@ -11,10 +11,10 @@ import numpy as np
 
 from filepopulator import scripts
 from filepopulator.models import ImageFile
-from .scripts import populateFromImage, placeInDatabase
+from .scripts import populateFromImage, placeInDatabase, establish_server_connection
 from .models import Face, Person
 import image_face_extractor
-from image_face_extractor import face_extraction
+from image_face_extractor
 # Create your tests here.
 
 class FaceManageTests(TestCase):
@@ -23,6 +23,7 @@ class FaceManageTests(TestCase):
 
     def setUp(self):
         settings.MEDIA_ROOT='/tmp'
+        self.server_conn = establish_server_connection()
 
     @classmethod
     def setUpTestData(cls):
@@ -66,7 +67,7 @@ class FaceManageTests(TestCase):
 
     def test_add_file(self):
         first_file = ImageFile.objects.get(filename=self.face_file)
-        face_data = populateFromImage(first_file.filename)
+        face_data = populateFromImage(first_file.filename, self.server_conn)
 
         faces = Face.objects.all()
         self.assertEqual(len(faces), len(face_data))
@@ -88,12 +89,12 @@ class FaceManageTests(TestCase):
 
     def test_same_faces(self):
         first_file = ImageFile.objects.get(filename=self.face_file)
-        face_data1 = populateFromImage(first_file.filename)
+        face_data1 = populateFromImage(first_file.filename, self.server_conn)
         pers = Person.objects.all()
         pers_len_first = len(pers)
         print(pers)
         second_file = ImageFile.objects.get(filename=self.same_faces_file)
-        face_data2 = populateFromImage(second_file.filename)
+        face_data2 = populateFromImage(second_file.filename, self.server_conn)
 
         faces = Face.objects.all()
         pers = Person.objects.all()
@@ -109,7 +110,7 @@ class FaceManageTests(TestCase):
         all_files = ImageFile.objects.all()
         for photo in all_files:
             print(photo.filename)
-            face_data = populateFromImage(photo.filename)
+            face_data = populateFromImage(photo.filename, self.server_conn)
             if face_data is not None:
                 print(face_data)
                 for f in face_data:
@@ -131,6 +132,7 @@ class FakeFacesTests(TestCase):
         self.names = ['Alpha', 'Beta', 'Gamma', 'Charlie', 'Epsilon', 'Ragnar', 'Tiger', 'Wolf',\
                 'Genni', 'Einstein', 'Bravo']
         settings.MEDIA_ROOT='/tmp'
+        self.server_conn = establish_server_connection()
 
     def tearDown(self): 
         allFaces = Face.objects.all()
@@ -196,6 +198,7 @@ class FakeFacesTests(TestCase):
     
         for img in all_imgs:
             face_list = self.generate_fake_face_list()
+            self.assertFalse(img.isProcessed)
             placeInDatabase(img, face_list)
             
             # Get the faces attached to this image
@@ -265,10 +268,14 @@ class MLTrainTests(TestCase):
 
         all_files = ImageFile.objects.all()
 
-        populateFromImage('/tmp/img_validation/naming/good/challenge dírectôry_with_repeats/1.JPG')
+        populateFromImage('/tmp/img_validation/naming/good/challenge dírectôry_with_repeats/1.JPG', self.server_conn)
         for photo in all_files:
             print(photo.filename)
-            face_data = populateFromImage(photo.filename)
+            self.assertFalse(photo.isProcessed)
+            face_data = populateFromImage(photo.filename, self.server_conn)
+            this_face = ImageFile.objects.get(filename = photo.filename)
+            self.assertTrue(this_face[0].isProcessed)
+
 
     @classmethod
     def tearDownClass(cls):

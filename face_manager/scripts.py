@@ -21,8 +21,6 @@ def placeInDatabase(foreign_key, face_data):
         foreign_key.isProcessed = True
         foreign_key.save()
         return None
-    # implied else
-
 
     for idx in range(len(face_data)):
         eachface = face_data[idx]
