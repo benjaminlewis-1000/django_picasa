@@ -15,16 +15,25 @@ sys.path.append(path_to_script)
 
 import logging
 import filepopulator
-# import image_face_extractor
-
 
 # Create your models here
-# logging.basicConfig(level=settings.LOG_LEVEL)
 
 settings.LOGGER.warning("TODO: Implement model for faces")
 
+def face_thumbnail_path(instance, filename):
+    first_dir = filename[:2]
+    second_dir = filename[2]
+    return f"face_thumbnails/{first_dir}/{second_dir}/{filename}"
+
+def face_highlight_path(instance, filename):
+    first_dir = filename[:1]
+    return f"face_highlights/{first_dir}/{filename}"
+
 class Person(models.Model):
     person_name = models.CharField(max_length=256)
+    # I'd rather the highlight be its own image rather than
+    # a link to a face in case the face gets deleted or moved.
+    highlight_img = models.ImageField(upload_to=face_highlight_path, default=None)
 
     # id field has a primary key
     def delete(self):
@@ -32,11 +41,6 @@ class Person(models.Model):
 
     def __str__(self):
         return self.person_name
-
-def face_thumbnail_path(instance, filename):
-    first_dir = filename[:2]
-    second_dir = filename[2]
-    return f"face_thumbnails/{first_dir}/{second_dir}/{filename}"
 
 class Face(models.Model):
     # Primary key comes for free

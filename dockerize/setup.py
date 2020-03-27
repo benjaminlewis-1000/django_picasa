@@ -99,6 +99,8 @@ while choice.lower() == 'n':
 	username = input("What would you like your username to be for the admin console? ")
 	choice = input(f"Are you sure you want your username to be {username}? [Y/n] ")
 
+user_email = input("What is your email address?  ")
+user_email = user_email.strip()
 
 pw1 = ''
 pw2 = 'ghjk'
@@ -155,6 +157,7 @@ out_file_path = os.path.join(script_path, '.env')
 with open(out_file_path, 'w') as fh:
 	fh.write(f"ADMIN_PW={pw1}\n")
 	fh.write(f"ADMIN_USERNAME={username}\n")
+	fh.write(f"ADMIN_EMAIL={user_email}\n")
 	fh.write(f"CLIENT_FACE_PORT={client_port}\n")
 	fh.write(f"DB_FILES_LOCATION={db_dir}\n")
 	fh.write(f"DB_NAME={db_name}\n")

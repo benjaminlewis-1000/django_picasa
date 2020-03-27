@@ -3,6 +3,7 @@ from django.conf import settings
 from django.forms import ModelForm
 from django.core.validators import MinValueValidator, MaxValueValidator, RegexValidator
 from django.core.exceptions import ValidationError
+from django.contrib.postgres.fields import ArrayField
 # from django.core.validators import *
 import re
 from datetime import datetime
@@ -63,7 +64,7 @@ def validate_lon(value):
             )
 
 class Directory(models.Model): 
-    dir_path = models.CharField(max_length=255, unique=True)
+    dir_path = models.CharField(max_length=512, unique=True)
     mean_datetime = models.DateTimeField(default = timezone.now)
     mean_datesec = models.FloatField(default = -1)
     first_datetime = models.DateTimeField(default = timezone.now)
@@ -138,11 +139,13 @@ def thumbnail_small_path(instance, filename):
 # Lots ripped from https://github.com/hooram/ownphotos/blob/dev/api/models.py 
 class ImageFile(models.Model):
 
-    filename = models.CharField(max_length=255, validators=[RegexValidator(regex="\.[j|J][p|P][e|E]?[g|G]$", message="Filename must be a JPG")], db_index = True)
+    filename = models.CharField(max_length=1024, validators=[RegexValidator(regex="\.[j|J][p|P][e|E]?[g|G]$", message="Filename must be a JPG")], db_index = True)
     # CASCADE is expected; if delete directory, delete images.
     directory = models.ForeignKey(Directory, on_delete=models.PROTECT, related_name='image_set')
     pixel_hash = models.CharField(max_length = 64, null = False, default = -1)
     file_hash = models.CharField(max_length = 64, null = False, default = -1)
+
+    full_res_path = models.CharField(max_length=1024, null=True, default=None)
 
     # Thumbnails 
     # thumbnail_big = models.ImageField(upload_to='thumbnails_big', editable=False, default=None)
@@ -187,6 +190,14 @@ class ImageFile(models.Model):
     # isProcessed -- whether the photo has had faces detected.
     isProcessed = models.BooleanField(default=False)
     orientation = models.IntegerField(default=-8008)
+
+    # For storing tags
+    tags = ArrayField(
+        models.CharField(max_length = 128, null=True, blank = True),
+        blank=True, null=True
+    )
+
+    description = models.CharField(max_length = 1024, null=True, blank = True)
 
     # thumbnail = models.ImageField(upload_to = settings.FILEPOPULATOR_THUMBNAIL_DIR, default = str(timezone.now) + '_thumbnail.jpg' )
 
@@ -270,6 +281,7 @@ class ImageFile(models.Model):
         # # https://www.blog.pythonlibrary.org/2010/03/28/getting-photo-metadata-exif-using-python/
         # # Uses PIL to get a named dictionary of EXIF metadata.
 
+        self.full_res_path = 'https://' + os.environ['MEDIA_DOMAIN'] + '/full_res' + self.filename.replace(settings.PHOTO_ROOT, '').replace(' ', '%20')
 
         s = time.time()
         try:
@@ -337,11 +349,11 @@ class ImageFile(models.Model):
             if 'Make' in self.exifDict.keys():
                 make = self.exifDict['Make']
 #                self.camera_make = make
-                self.camera_make = make.replace('\x00', '')
+                self.camera_make = make.replace('\x00', '').rstrip().lstrip()
             if 'Model' in self.exifDict.keys():
                 model = self.exifDict['Model']
 #                self.camera_model = model
-                self.ccamera_model = model.replace('\x00', '')
+                self.camera_model = model.replace('\x00', '').rstrip().lstrip()
             if 'Flash' in self.exifDict.keys():
                 flash = self.exifDict['Flash']
                 self.flash_info = flash

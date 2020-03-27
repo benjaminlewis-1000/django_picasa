@@ -209,7 +209,10 @@ def add_from_root_dir(root_dir):
                         settings.LOGGER.error(cur_file)
                         settings.LOGGER.error(stack_trace) 
         finally:
-            os.remove(lockfile)
+            try:
+                os.remove(lockfile)
+            except FileNotFoundError:
+                pass
 
 def delete_removed_photos():
     all_photos = ImageFile.objects.all()

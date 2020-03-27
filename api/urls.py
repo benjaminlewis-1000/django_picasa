@@ -11,6 +11,9 @@ router.register(r'users', views.UserViewSet)
 router.register(r'mygroups', views.GroupViewSet)
 router.register(r'images', views.ImageViewSet)
 router.register(r'directories', views.DirectoryViewSet)
+router.register(r'faces', views.FaceViewSet)
+router.register(r'people', views.PersonViewSet)
+router.register(r'parameters', views.ParameterViewSet, basename='')
 # router.register(r'hello', views.HelloView)
 # router.register(r'request-token', obtain_auth_token)
 
@@ -21,6 +24,8 @@ router.register(r'directories', views.DirectoryViewSet)
 # http post https://picasa.exploretheworld.tech/api/request-token/ username=benjamin password=********
 urlpatterns = [
     path('request-token/', obtain_auth_token, name='api_token_auth'),  
-    url(r'^', include(router.urls)),
+    # url(r'^', include(router.urls)),
+    path('', include(router.urls)),
+    # path('api-auth/', include('rest_framework.urls', namespace='rest_framework'))
     # path(r'hello/', views.HelloView.as_view(), name='hello'),
 ]

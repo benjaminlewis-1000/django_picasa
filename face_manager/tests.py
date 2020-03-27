@@ -14,7 +14,6 @@ from filepopulator.models import ImageFile
 from .scripts import populateFromImage, placeInDatabase, establish_server_connection
 from .models import Face, Person
 import image_face_extractor
-from image_face_extractor
 # Create your tests here.
 
 class FaceManageTests(TestCase):
@@ -67,7 +66,7 @@ class FaceManageTests(TestCase):
 
     def test_add_file(self):
         first_file = ImageFile.objects.get(filename=self.face_file)
-        face_data = populateFromImage(first_file.filename, self.server_conn)
+        face_data, server_conn, changed_fk = populateFromImage(first_file.filename, self.server_conn)
 
         faces = Face.objects.all()
         self.assertEqual(len(faces), len(face_data))
@@ -89,18 +88,17 @@ class FaceManageTests(TestCase):
 
     def test_same_faces(self):
         first_file = ImageFile.objects.get(filename=self.face_file)
-        face_data1 = populateFromImage(first_file.filename, self.server_conn)
+        face_data1, _, changed_fk = populateFromImage(first_file.filename, self.server_conn)
         pers = Person.objects.all()
         pers_len_first = len(pers)
         print(pers)
         second_file = ImageFile.objects.get(filename=self.same_faces_file)
-        face_data2 = populateFromImage(second_file.filename, self.server_conn)
+        face_data2, _, changed_fk = populateFromImage(second_file.filename, self.server_conn)
 
         faces = Face.objects.all()
         pers = Person.objects.all()
 
         self.assertEqual(len(pers), pers_len_first)
-        print(pers)
          
         pass
 
@@ -110,20 +108,31 @@ class FaceManageTests(TestCase):
         all_files = ImageFile.objects.all()
         for photo in all_files:
             print(photo.filename)
-            face_data = populateFromImage(photo.filename, self.server_conn)
+            self.assertFalse(photo.isProcessed)
+            face_data, _, changed_fk = populateFromImage(photo.filename, self.server_conn)
             if face_data is not None:
-                print(face_data)
                 for f in face_data:
                     name = f.name
                     face_set = face_set.union(set([name]))
+            self.assertTrue(changed_fk)
 
         persons = Person.objects.all()
+        print(persons)
+        print(face_set)
         self.assertEqual(len(persons), len(face_set))
         for p in persons:
             self.assertTrue(p.person_name in face_set)
 
     def test_addtwice(self):
-        pass
+        photo = ImageFile.objects.all()[0]
+        self.assertFalse(photo.isProcessed)
+        face_data, _, changed_fk = populateFromImage(photo.filename, self.server_conn)
+        self.assertTrue(changed_fk)
+        print(photo.filename)
+#         photo_get_again = ImageFile.objects.get(filename=photo.filename)[0]
+        face_data, _, changed_fk = populateFromImage(photo.filename, self.server_conn)
+        self.assertFalse(changed_fk)
+        
 
 class FakeFacesTests(TestCase):
 
@@ -186,8 +195,8 @@ class FakeFacesTests(TestCase):
             face_thumbnail = np.random.rand(face_h, face_w, 3)
             square_face = np.random.rand(face_w, face_w, 3)
             box_center = (40, 40) 
-            bounding_rect = face_extraction.Rectangle(face_h, face_w, centerX=box_center[0], centerY=box_center[1])
-            face_rect = face_extraction.FaceRect(bounding_rect, face_thumbnail, 1, encoding=encoding, name=name, square_face=square_face)
+            bounding_rect = image_face_extractor.Rectangle(face_h, face_w, centerX=box_center[0], centerY=box_center[1])
+            face_rect = image_face_extractor.FaceRect(bounding_rect, face_thumbnail, 1, encoding=encoding, name=name, square_face=square_face)
             face_list.append(face_rect)
 
         return face_list
@@ -197,16 +206,34 @@ class FakeFacesTests(TestCase):
         settings.MEDIA_ROOT='/tmp'
     
         for img in all_imgs:
+            print(img.filename)
             face_list = self.generate_fake_face_list()
             self.assertFalse(img.isProcessed)
             placeInDatabase(img, face_list)
             
             # Get the faces attached to this image
             relevant_faces = Face.objects.filter(source_image_file = img)
+            for i in range(len(relevant_faces)):
+                rectangle = face_list[i].rectangle
+                rface = relevant_faces[i]
+                self.assertEqual(rectangle.left, rface.box_left) 
+                self.assertEqual(rectangle.right, rface.box_right) 
+                self.assertEqual(rectangle.top, rface.box_top) 
+                self.assertEqual(rectangle.bottom, rface.box_bottom) 
+                
             all_faces = Face.objects.all()
 
-            for each_db in all_faces:
+            for each_db in relevant_faces : # all_faces:
                 self.assertTrue(os.path.exists(each_db.face_thumbnail.path))
+                self.assertEqual(each_db.source_image_file, img)
+                if each_db.declared_name is not settings.BLANK_FACE_NAME:
+                    self.assertTrue(each_db.written_to_photo_metadata)
+                else:
+                    self.assertFalse(each_db.written_to_photo_metadata)
+                thumb = cv2.imread(each_db.face_thumbnail.path)
+                # print(thumb.shape)
+                self.assertEqual(thumb.shape[0], thumb.shape[1])
+
 
             for each_input in face_list:
                 name = each_input.name
@@ -239,8 +266,30 @@ class FakeFacesTests(TestCase):
             name_list.append(name)
         
         self.assertEqual(len(name_list), len(set(name_list)))
-        self.assertTrue(len(name_list) <= len(self.names))
+        # +1 is for the '_NO_FACE_ASSIGNED_' key
+        self.assertTrue(len(name_list) <= len(self.names) + 1)
 
+    def test_change_assigned_name(self):
+        pass
+
+    def test_change_highlight(self):
+        # Highlight is the highlight image for the person, i.e. the
+        # one that we see in the web GUI.
+        pass
+
+    def test_choose_identity(self):
+        # Given a face with no identity, assign an identity. 
+        pass
+
+    def test_assign_highlight(self):
+        # Need to make sure that a highlight for the person is 
+        # assigned the first time the person is created.
+        pass
+
+    def test_make_new_person_from_nada(self):
+        # Test for when we have a none face and make a new person --
+        # i.e. someone new in our list of people that aren't tagged yet
+        pass
 
 class MLTrainTests(TestCase):
 
@@ -253,6 +302,7 @@ class MLTrainTests(TestCase):
     def setUpTestData(cls):
 
         cls.validation_dir = settings.FILEPOPULATOR_VAL_DIRECTORY 
+        cls.server_conn = establish_server_connection()
 
         assert os.path.isdir(cls.validation_dir), 'Validation directory in FaceManageTests does not exist.'
 
@@ -268,13 +318,13 @@ class MLTrainTests(TestCase):
 
         all_files = ImageFile.objects.all()
 
-        populateFromImage('/tmp/img_validation/naming/good/challenge dírectôry_with_repeats/1.JPG', self.server_conn)
+        populateFromImage('/tmp/img_validation/naming/good/challenge dírectôry_with_repeats/1.JPG', cls.server_conn)
         for photo in all_files:
             print(photo.filename)
-            self.assertFalse(photo.isProcessed)
-            face_data = populateFromImage(photo.filename, self.server_conn)
+            #cls.assertFalse(photo.isProcessed)
+            face_data, _, changed_fk = populateFromImage(photo.filename, cls.server_conn)
             this_face = ImageFile.objects.get(filename = photo.filename)
-            self.assertTrue(this_face[0].isProcessed)
+            #cls.assertTrue(this_face[0].isProcessed)
 
 
     @classmethod

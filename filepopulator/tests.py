@@ -734,12 +734,6 @@ class DirectoryTests(TestCase):
             print(tln, d.top_level_name())
             self.assertEqual(tln, d.top_level_name())
 
-    def test_get_imgs(self):
-
-        dirs = Directory.objects.all()
-        for d in dirs:
-            print(d.imgs_in_dir())
-
     def test_get_average_age(self):
 
         dirs = Directory.objects.all()

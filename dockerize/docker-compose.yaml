@@ -119,8 +119,9 @@ services:
     restart: always
     volumes:
       # - ${MEDIA_FILES_LOCATION}:/usr/local/apache2/htdocs/
-      - ${MEDIA_FILES_LOCATION}:/var/www/media
-      - ${STATIC_LOCATION}:/var/www/static
+      - ${MEDIA_FILES_LOCATION}:/var/www/media:ro
+      - ${STATIC_LOCATION}:/var/www/static:ro
+      - ${PHOTO_ROOT}:/var/www/full_res:ro
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/000-default.config:/etc/apache2/sites-enabled/000-default.conf
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/vhost.conf:/usr/local/apache2/conf/extra/httpd-vhosts.conf
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/apache_pwd.pwd:/usr/local/apache2/.htpasswd 

@@ -1,12 +1,12 @@
 #! /bin/bash
 
-sleep 10
+sleep 5 
 
 python /code/manage.py makemigrations
 python /code/manage.py makemigrations filepopulator
 python /code/manage.py makemigrations face_manager
 python /code/manage.py migrate
-python /code/manage.py < /code/dockerize/make_superuser_once.py
+python /code/manage.py shell < /code/dockerize/make_superuser_once.py
 cat <(echo "yes") - | python /code/manage.py collectstatic
 
 rm /var/run/lock/celerybeat.pid

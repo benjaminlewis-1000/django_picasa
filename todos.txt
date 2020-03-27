@@ -1,0 +1,4 @@
+TODOS:
+
+-Extract existing tags (non-face) from image and add them in filepopulator
+-Method for adding a tag to an image via API

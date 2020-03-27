@@ -52,6 +52,8 @@ if in_docker:
     MEDIA_URL = 'https://' + os.environ['MEDIA_DOMAIN'] + '/media/'
     LOG_DIR = '/var/log/picasa'
     STATIC_ROOT = os.environ['STATIC_LOCATION']
+    MEDIA_URL_USER = os.environ['APACHE_USER']
+    MEDIA_URL_PW = os.environ['APACHE_PWD']
 else:
     DB_NAME = 'picasa'
     DB_USER = 'benjamin'
@@ -97,6 +99,8 @@ LOGGER.addHandler(ch)
 
 if in_docker:
     LOGGER.warning("Allowed hosts is wrong in docker")
+
+LOGGER.debug(f"Are we in production? {production}")
 
 SITE_ROOT = os.path.dirname(os.path.realpath(__file__))
 
@@ -240,6 +244,13 @@ if production:
             'task': 'filepopulator.update_dir_dates',
             'schedule': crontab(minute=0, hour='*/12')
         },
+        'face_add': {
+            'task': 'face_manager.face_extraction', 
+            'schedule': crontab(minute=0, hour = '*/2'),
+            'options': {
+                'expires': 1800,
+            }
+        }
 
     }
 
@@ -295,8 +306,7 @@ FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory 
 FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL =150 # Maximum size of the short edge for thumbnails.
 
 
-logging.error("TODO: Set up apache server. STATIC_URL needs to be served by it.")
+# logging.error("TODO: Set up apache server. STATIC_URL needs to be served by it.")
 logging.error('TODO: set up text alerts for client image handler and such.')
 
-
-
+BLANK_FACE_NAME='_NO_FACE_ASSIGNED_'

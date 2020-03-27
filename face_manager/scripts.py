@@ -2,6 +2,7 @@
 from django.conf import settings
 
 from filepopulator.models import ImageFile
+import shutil
 from .models import Person, Face
 import image_face_extractor
 import cv2
@@ -20,11 +21,15 @@ def placeInDatabase(foreign_key, face_data):
     if len(face_data) == 0:
         foreign_key.isProcessed = True
         foreign_key.save()
-        return None
+        return False
 
     for idx in range(len(face_data)):
         eachface = face_data[idx]
         name = eachface.name
+        if name is None:
+            face_data[idx].name = settings.BLANK_FACE_NAME
+            name = settings.BLANK_FACE_NAME
+
         encoding = eachface.encoding
         if encoding is not None:
             encoding = list(encoding)
@@ -90,6 +95,11 @@ def placeInDatabase(foreign_key, face_data):
 
         new_face.save()
 
+        foreign_key.isProcessed = True
+        foreign_key.save()
+        
+    return True
+
 
 def populateFromImage(filename, server_conn = None):
 
@@ -102,13 +112,23 @@ def populateFromImage(filename, server_conn = None):
     settings.LOGGER.error("Need better handling on foreign_key")
     foreign_key = ImageFile.objects.get(filename = filename)
     print(foreign_key.isProcessed)
+
+    changed_fk = False
+
     if foreign_key.isProcessed:
-        return None
+        return None, server_conn, changed_fk
+
+    changed_fk = True
 
     # def face_from_facerect(self, filename):
-    face_data = image_face_extractor.image_client.face_extract_client(filename)
+    face_data = image_face_extractor.image_client.face_extract_client(filename, server_conn)
     
     placeInDatabase(foreign_key, face_data)
 
-    return face_data, server_conn
+    return face_data, server_conn, changed_fk 
 
+def assignSourceImage(face_model, person_model):
+    savePath = person_model.highlight_img.path
+
+    shutil.copyfile(face_model.face_thumbnail.path, person_model.highlight_img.path)    
+    

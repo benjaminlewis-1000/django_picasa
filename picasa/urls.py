@@ -24,7 +24,8 @@ from django.conf.urls.static import static
 urlpatterns = [
     path('admin/', admin.site.urls),
     # path('periodic/', include('periodic.urls')),
-    path('filepopulator/', include('filepopulator.urls')),
+    # path('filepopulator/', include('filepopulator.urls')),
+    # path('face_manager/', include('face_manager.urls')),
     path(r'api/', include('api.urls')),
 ]
 
