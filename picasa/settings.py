@@ -105,8 +105,9 @@ LOGGER.debug(f"Are we in production? {production}")
 SITE_ROOT = os.path.dirname(os.path.realpath(__file__))
 
 LOCKFILE = os.path.join(PROJECT_ROOT, 'adding.lock')
-if os.path.isfile(LOCKFILE):
-    os.remove(LOCKFILE)
+FACE_LOCKFILE = '/face_add.lock'
+# if os.path.isfile(LOCKFILE):
+#     os.remove(LOCKFILE)
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/2.2/howto/deployment/checklist/
@@ -307,6 +308,7 @@ FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' 
 FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory that will have validation images when testing the app.
 FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL =150 # Maximum size of the short edge for thumbnails.
 
+FACE_THUMBNAIL_SIZE=(200, 200)
 
 # logging.error("TODO: Set up apache server. STATIC_URL needs to be served by it.")
 logging.error('TODO: set up text alerts for client image handler and such.')

@@ -28,7 +28,7 @@ if not settings.configured:
 def process_faces():
     settings.LOGGER.debug("Starting face extraction...")
 
-    face_lockfile = '/face_add.lock'
+    face_lockfile = settings.FACE_LOCKFILE
 
     if os.path.exists(face_lockfile):
         print("Face adding locked!")

@@ -7,13 +7,8 @@ from django.core.management.base import BaseCommand
 class Command(BaseCommand):
     def handle(self, *args, **options):
             
-        proc_files = file_models.ImageFile.filter(isProcessed=True)
-        print(len(proc_files))
-        proc_files = file_models.ImageFile.filter(isProcessed=False)
-        print(len(proc_files))
-
         yn = input("Warning! You are about to delete all faces. Would you like to continue? (y/N): ")
-        if yn.lower() != 'n': 
+        if yn.lower() != 'y': 
             print("Not deleting.")
             return
             
@@ -22,9 +17,18 @@ class Command(BaseCommand):
         people = face_models.Person.objects.all()
 
         for f in faces:
+            print(f.source_image_file)
             f.source_image_file.isProcessed = False
-            f.source_image_file.save()
+            super(file_models.ImageFile, f.source_image_file).save()
             f.delete()
 
         for p in people:
             p.delete()
+
+        proc_files = file_models.ImageFile.objects.filter(isProcessed=True)
+        for f in proc_files:
+            f.isProcessed = False
+            super(file_models.ImageFile, f).save()
+
+        proc_files = file_models.ImageFile.objects.filter(isProcessed=True)
+        assert len(proc_files) == 0

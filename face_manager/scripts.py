@@ -41,13 +41,32 @@ def placeInDatabase(foreign_key, face_data):
         r_top = rect.top
 
         new_face = Face()
-
+        
+        # Set up and save the thumbnail.        
+        # BGR to RGB by np.flip
+        sq_thumb = eachface.square_face
+        sq_thumb = cv2.cvtColor(sq_thumb, cv2.COLOR_BGR2RGB)
+        
         if name is not None:
             # Find the person, if possible
             person_key = Person.objects.filter(person_name = name)
             if len(person_key) == 0:
+                # No person was found. 
                 new_person = Person(person_name = name)
+
+                personal_thumbnail = cv2.resize(sq_thumb, (500, 500))
+                # encode the image
+                is_success, person_buff = cv2.imencode(".jpg", personal_thumbnail)
+                # Save thumbnail to in-memory file as BytesIO
+                person_byte_thumbnail = BytesIO(person_buff)
+
+                person_thumb_filename = f'{foreign_key.pixel_hash}_{name}.jpg'
+                person_byte_thumbnail.seek(0)
+                # Load a ContentFile into the thumbnail field so it gets saved
+                new_person.highlight_img.save(person_thumb_filename, ContentFile(person_byte_thumbnail.read())) 
+
                 new_person.save()
+                
                 person_key = Person.objects.filter(person_name = name)
                 assert len(person_key) == 1
 
@@ -70,26 +89,17 @@ def placeInDatabase(foreign_key, face_data):
 
         new_face.source_image_file = foreign_key
 
-        # new_face.face_thumbnail = square_face
-        # Save the thumbnail
-        
-        # BGR to RGB by np.flip
-        sq_thumb = np.flip(square_face, 2) 
 
-        print(sq_thumb.shape)
+        sq_thumb_resize = cv2.resize(sq_thumb, settings.FACE_THUMBNAIL_SIZE)
+        FTYPE = 'JPEG' # 'GIF' or 'PNG' are possible extensions
+        # encode the image
+        is_success, buffer_img = cv2.imencode(".jpg", sq_thumb_resize)
+        # Save thumbnail to in-memory file as BytesIO
+        temp_thumb = BytesIO(buffer_img)
+
         # sq_thumb = np.cv2.cvtColor(sq_thumb, cv2.COLOR_BGR2RGB)
         thumb_filename = f'{foreign_key.pixel_hash}_{foreign_key.file_hash}_face{idx}.jpg'
 
-        FTYPE = 'JPEG' # 'GIF' or 'PNG' are possible extensions
-
-        # Save thumbnail to in-memory file as StringIO
-
-        # encode
-        is_success, buffer_img = cv2.imencode(".jpg", sq_thumb)
-        temp_thumb = BytesIO(buffer_img)
-        # temp_thumb = BytesIO()
-        # cv2.imwrite(temp_thumb, sq_thumb)
-        # image.save(temp_thumb, FTYPE)
         temp_thumb.seek(0)
 
         # Load a ContentFile into the thumbnail field so it gets saved
@@ -98,9 +108,13 @@ def placeInDatabase(foreign_key, face_data):
         temp_thumb.close()
 
         new_face.save()
+        settings.LOGGER.debug(new_face.id)
+        print(new_face.id)
 
         foreign_key.isProcessed = True
-        foreign_key.save()
+        # Call the super because we just want to save the model,
+        # not re-save the image. 
+        super(ImageFile, foreign_key).save()
         
     return True
 
@@ -126,6 +140,9 @@ def populateFromImage(filename, server_conn = None):
 
     # def face_from_facerect(self, filename):
     face_data = image_face_extractor.image_client.face_extract_client(filename, server_conn)
+
+    if face_data is None:
+        print(filename)
     
     placeInDatabase(foreign_key, face_data)
 

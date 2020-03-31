@@ -11,6 +11,7 @@ cat <(echo "yes") - | python /code/manage.py collectstatic
 
 rm /var/run/lock/celerybeat.pid
 rm /code/adding.lock
+rm /face_add.lock
 
 # celery flower -A picasa --port=5555 &
 celery -A picasa beat -l info --pidfile="/var/run/lock/celerybeat.pid"  &

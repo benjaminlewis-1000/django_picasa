@@ -1,4 +1,5 @@
 thumbnails/*
+*.lock
 .env
 *.sublime*
 celerybeat* 
