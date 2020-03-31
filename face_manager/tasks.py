@@ -15,7 +15,6 @@ from filepopulator.models import ImageFile
 if not settings.configured:
     settings.configure()
 
-
 # If you don’t care about the results of a task, be sure to set the ignore_result option,
 # as storing results wastes time and resources.
 # Shared tasks are to make apps without any concrete app instance. 
@@ -29,13 +28,28 @@ if not settings.configured:
 def process_faces():
     settings.LOGGER.debug("Starting face extraction...")
 
-    server_conn = establish_server_connection()
-    if server_conn.server_ip is None:
-        settings.LOGGER.critical('No GPU server found')
-        return
+    face_lockfile = '/face_add.lock'
 
-    all_images = ImageFile.objects.all()
-    for img in all_images:
-        if not img.isProcessed:
-            # Then we need to schedule it to be processed.
-            populateFromImage(img_object.filename, server_conn = None)
+    if os.path.exists(face_lockfile):
+        print("Face adding locked!")
+        return
+    else:
+        f = open(face_lockfile, 'w')
+        f.close()
+
+    try:
+        server_conn = establish_server_connection()
+        if server_conn.server_ip is None:
+            settings.LOGGER.critical('No GPU server found')
+            return
+
+        all_images = ImageFile.objects.all()
+        for img in all_images:
+            if not img.isProcessed:
+                # Then we need to schedule it to be processed.
+                populateFromImage(img.filename, server_conn = server_conn)
+    finally:
+            try:
+                os.remove(face_lockfile)
+            except FileNotFoundError:
+                pass

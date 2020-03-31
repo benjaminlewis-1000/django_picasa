@@ -37,6 +37,13 @@ class Person(models.Model):
 
     # id field has a primary key
     def delete(self):
+        try:
+            os.remove(self.highlight_img.path)
+        except ValueError as ve:
+            if 'has no file associated' in ve.args[0]:
+                pass
+            else:
+                raise ve
         super(Person, self).delete()
 
     def __str__(self):

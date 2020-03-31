@@ -28,7 +28,7 @@ class ImageFileSerializer(serializers.HyperlinkedModelSerializer):
                   'flash_info', 'exposure_num', 'exposure_denom', 'focal_num', 'focal_denom', \
                   'fnumber_num', 'fnumber_denom', 'iso_value', 'light_source', 'gps_lat_decimal', \
                   'gps_lon_decimal', 'thumbnail_big', 'thumbnail_medium', 'thumbnail_small', \
-                  'full_res_path',  'exposure', 'directory', 'dateTaken', 'tags', 'description']
+                  'full_res_path',  'exposure', 'directory', 'dateTaken', 'tags', 'description', 'isProcessed']
 
       
 class DirectorySerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
@@ -59,22 +59,33 @@ class DirectorySerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializ
 #        fields = ['dir_path', 'top_level_name', 'mean_datetime', 'mean_datesec', \
 #        'first_datetime', 'first_datesec', ]
 
-class FaceSerializer(serializers.HyperlinkedModelSerializer):
+class FaceSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
     
     class Meta:
 
         model = Face
-        fields = ['source_image_file', 'written_to_photo_metadata', 'face_encoding',  \
+        # No face_encoding in this api -- it's not necessary. 
+        fields = ['url', 'source_image_file', 'written_to_photo_metadata',  \
             'declared_name', 'poss_ident1', 'poss_ident2', 'poss_ident3', \
             'poss_ident4', 'poss_ident5', 'box_top', 'box_bottom', 'box_left', \
             'box_right', 'face_thumbnail']
 
+class FaceSubsetSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
+    
+    class Meta:
+
+        model = Face
+        fields = ['url', 'source_image_file', 'face_thumbnail', \
+            'declared_name', 'poss_ident1', 'poss_ident2', 'poss_ident3', \
+            'poss_ident4', 'poss_ident5']
+
+
 class PersonSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
-    face_declared = FaceSerializer(read_only = True, many=True)
+    face_declared = FaceSubsetSerializer(read_only = True, many=True)
     class Meta:
 
         model = Person
-        fields = ['person_name', 'highlight_img', 'face_declared']
+        fields = ['url', 'person_name', 'highlight_img', 'face_declared']
 
 # Source : https://medium.com/django-rest-framework/django-rest-framework-viewset-when-you-don-t-have-a-model-335a0490ba6f
 class ParameterSerializer(serializers.Serializer):

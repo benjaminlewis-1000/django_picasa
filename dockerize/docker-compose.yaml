@@ -20,8 +20,8 @@ services:
       # Add the following line to your /etc/profile:
       # HOST_IP=`ip route | grep default | awk '{print $9}'`
       - DOCKER_HOST_IP=${HOST_IP} 
-    # ports:
-      #- "${CLIENT_FACE_PORT}:${CLIENT_FACE_PORT}/udp"
+    ports:
+      - "${CLIENT_FACE_PORT}:${CLIENT_FACE_PORT}/udp"
       #- "5001:5001/udp"
      # - 5000:5000
      # - 5001:5001

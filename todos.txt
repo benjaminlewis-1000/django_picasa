@@ -1,4 +1,14 @@
 TODOS:
 
+
+-The face clip from the image needs to be rotated appropriately. See /photos/Pictures_In_Progress/2019/Baltimore Trip/DSC_1209.JPG
+-- Sub: The bounding rectangle must be adjusted appropriately. 
 -Extract existing tags (non-face) from image and add them in filepopulator
 -Method for adding a tag to an image via API
+-Delete methods for face and person that delete it off the media files as well.
+-Automate a highlight image when first person is first detected
+-Downsize the face thumbnail resolution
+-Test that when picture deleted, so are faces (cascading?)
+
+## -A locking mechanism for adding faces (same as with filepopulator -- only one thread running)
+## -A cleanup script for faces/people when I want to reset that -- done. python manage.py clearfaces

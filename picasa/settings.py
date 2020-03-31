@@ -246,9 +246,11 @@ if production:
         },
         'face_add': {
             'task': 'face_manager.face_extraction', 
-            'schedule': crontab(minute=0, hour = '*/2'),
+            'schedule': crontab( minute = '*/1'),
+            # 'schedule': crontab( minute = '0', hour='*/2'),
             'options': {
-                'expires': 1800,
+                'expires': 30,
+                # 'expires': 1800,
             }
         }
 

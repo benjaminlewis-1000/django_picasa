@@ -81,5 +81,5 @@ class ParameterViewSet(viewsets.ViewSet):
     permission_classes = (IsAuthenticated,)
 
     def list(self, request):
-        serializer = api_ser.ParameterSerializer(instance=api_ser.Parameters(), many=False)
+        serializer = api_ser.ParameterSerializer(instance=api_ser.ParameterSerializer.Parameters(), many=False)
         return Response(serializer.data)

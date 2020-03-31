@@ -72,7 +72,11 @@ def placeInDatabase(foreign_key, face_data):
 
         # new_face.face_thumbnail = square_face
         # Save the thumbnail
-        sq_thumb = np.flip(square_face, 2) # BGR to RGB
+        
+        # BGR to RGB by np.flip
+        sq_thumb = np.flip(square_face, 2) 
+
+        print(sq_thumb.shape)
         # sq_thumb = np.cv2.cvtColor(sq_thumb, cv2.COLOR_BGR2RGB)
         thumb_filename = f'{foreign_key.pixel_hash}_{foreign_key.file_hash}_face{idx}.jpg'
 
