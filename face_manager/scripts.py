@@ -89,7 +89,6 @@ def placeInDatabase(foreign_key, face_data):
 
         new_face.source_image_file = foreign_key
 
-
         sq_thumb_resize = cv2.resize(sq_thumb, settings.FACE_THUMBNAIL_SIZE)
         FTYPE = 'JPEG' # 'GIF' or 'PNG' are possible extensions
         # encode the image
@@ -109,7 +108,7 @@ def placeInDatabase(foreign_key, face_data):
 
         new_face.save()
         settings.LOGGER.debug(new_face.id)
-        print(new_face.id)
+        print(f"New face: {new_face.id}")
 
         foreign_key.isProcessed = True
         # Call the super because we just want to save the model,
@@ -129,7 +128,6 @@ def populateFromImage(filename, server_conn = None):
 
     settings.LOGGER.error("Need better handling on foreign_key")
     foreign_key = ImageFile.objects.get(filename = filename)
-    print(foreign_key.isProcessed)
 
     changed_fk = False
 
@@ -140,10 +138,8 @@ def populateFromImage(filename, server_conn = None):
 
     # def face_from_facerect(self, filename):
     face_data = image_face_extractor.image_client.face_extract_client(filename, server_conn)
-
-    if face_data is None:
-        print(filename)
     
+    print(len(face_data))
     placeInDatabase(foreign_key, face_data)
 
     return face_data, server_conn, changed_fk 

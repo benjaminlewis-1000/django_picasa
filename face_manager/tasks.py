@@ -45,11 +45,18 @@ def process_faces():
 
         all_images = ImageFile.objects.all()
         for img in all_images:
+            if not server_conn.check_ip():
+                # Lost connection to server
+                try:
+                    os.remove(face_lockfile)
+                except FileNotFoundError:
+                    pass
+                raise IOError("Lost connection to server.")
             if not img.isProcessed:
                 # Then we need to schedule it to be processed.
                 populateFromImage(img.filename, server_conn = server_conn)
     finally:
-            try:
-                os.remove(face_lockfile)
-            except FileNotFoundError:
-                pass
+        try:
+            os.remove(face_lockfile)
+        except FileNotFoundError:
+            pass

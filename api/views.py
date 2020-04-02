@@ -83,3 +83,15 @@ class ParameterViewSet(viewsets.ViewSet):
     def list(self, request):
         serializer = api_ser.ParameterSerializer(instance=api_ser.ParameterSerializer.Parameters(), many=False)
         return Response(serializer.data)
+
+class StatsViewSet(viewsets.ViewSet):
+### NOTE###  Don't Use ViewSet for MODELS!!!
+###############################################
+    serializer_class = api_ser.ServerStatsSerializer
+
+    permission_classes = (IsAuthenticated,)
+
+    def list(self, request):
+        stat_serializer = api_ser.ServerStatsSerializer(instance=api_ser.ServerStatsSerializer.Stats(), many=False)
+        return Response(stat_serializer.data)
+

@@ -5,6 +5,7 @@ from face_manager import models as face_models
 from django.core.management.base import BaseCommand
 
 class Command(BaseCommand):
+    
     def handle(self, *args, **options):
             
         yn = input("Warning! You are about to delete all faces. Would you like to continue? (y/N): ")
