@@ -31,14 +31,14 @@ def process_faces():
     face_lockfile = settings.FACE_LOCKFILE
 
     if os.path.exists(face_lockfile):
-        print("Face adding locked!")
+        settings.LOGGER.debug("Face adding locked!")
         return
     else:
         f = open(face_lockfile, 'w')
         f.close()
 
     try:
-        server_conn = establish_server_connection()
+        server_conn = establish_server_connection(logger=settings.LOGGER)
         if server_conn.server_ip is None:
             settings.LOGGER.critical('No GPU server found')
             return

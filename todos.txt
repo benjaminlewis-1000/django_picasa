@@ -9,6 +9,9 @@ TODOS:
 -I'd like a status API -- how many images processed, how many faces, etc...
 -Map from image to all faces in image. 
 -Check if moving the photo means that we have to re-process faces -- and that faces remain linked!
+-- Also see if deleting the picture will cascade and delete the faces. I don't think I have this set up yet. 
+-Set up text alerts for the project
+-settings.LOGGER.error("Need better handling on foreign_key") -- This was in the face_manager task. Not sure what I meant.
 
 ## -The face clip from the image needs to be rotated appropriately. See /photos/Pictures_In_Progress/2019/Baltimore Trip/DSC_1209.JPG
 ## -- Sub-- face clip--: The bounding rectangle must be adjusted appropriately. 

@@ -311,6 +311,9 @@ FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL =150 # Maximum size of the short edge for
 FACE_THUMBNAIL_SIZE=(200, 200)
 
 # logging.error("TODO: Set up apache server. STATIC_URL needs to be served by it.")
-logging.error('TODO: set up text alerts for client image handler and such.')
 
 BLANK_FACE_NAME='_NO_FACE_ASSIGNED_'
+
+# Parameters for the machine learning model
+FACE_NUM_THRESH=50
+IGNORED_NAMES=[BLANK_FACE_NAME, '.ignore', '.realignore', '.jessicatodo']

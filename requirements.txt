@@ -1,4 +1,6 @@
 # NOTE: Only edit this file in the root directory
+torch==1.4.0
+torchvision==0.5.0 -f https://download.pytorch.org/whl/torch_stable.html
 celery>=4.0.2
 coloredlogs
 dj-database-url

@@ -108,7 +108,6 @@ def placeInDatabase(foreign_key, face_data):
 
         new_face.save()
         settings.LOGGER.debug(new_face.id)
-        print(f"New face: {new_face.id}")
 
         foreign_key.isProcessed = True
         # Call the super because we just want to save the model,
@@ -121,12 +120,11 @@ def placeInDatabase(foreign_key, face_data):
 def populateFromImage(filename, server_conn = None):
 
     if server_conn is None:
-        server_conn = establish_server_connection()
+        server_conn = establish_server_connection(logger=settings.LOGGER)
     else:
         if server_conn.check_ip() is False:
             server_conn.find_external_server()
 
-    settings.LOGGER.error("Need better handling on foreign_key")
     foreign_key = ImageFile.objects.get(filename = filename)
 
     changed_fk = False
@@ -137,9 +135,8 @@ def populateFromImage(filename, server_conn = None):
     changed_fk = True
 
     # def face_from_facerect(self, filename):
-    face_data = image_face_extractor.image_client.face_extract_client(filename, server_conn)
+    face_data = image_face_extractor.image_client.face_extract_client(filename, server_conn, logger=settings.LOGGER)
     
-    print(len(face_data))
     placeInDatabase(foreign_key, face_data)
 
     return face_data, server_conn, changed_fk 
