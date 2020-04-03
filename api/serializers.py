@@ -136,7 +136,7 @@ class PersonSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer)
     class Meta:
 
         model = Person
-        fields = ['url', 'person_name', 'highlight_img', 'face_declared', 'num_faces']
+        fields = ['url', 'person_name', 'highlight_img', 'num_faces', 'face_declared']
 
     def get_num_faces(self, obj):
         # face_declared is the related field of the ForeignKey.

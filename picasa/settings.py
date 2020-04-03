@@ -104,8 +104,8 @@ LOGGER.debug(f"Are we in production? {production}")
 
 SITE_ROOT = os.path.dirname(os.path.realpath(__file__))
 
-LOCKFILE = os.path.join(PROJECT_ROOT, 'adding.lock')
-FACE_LOCKFILE = '/face_add.lock'
+LOCKFILE = '/locks/adding.lock' # path.join(PROJECT_ROOT, 'adding.lock')
+FACE_LOCKFILE = '/locks/face_add.lock'
 # if os.path.isfile(LOCKFILE):
 #     os.remove(LOCKFILE)
 

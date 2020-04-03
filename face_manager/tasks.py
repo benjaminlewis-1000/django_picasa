@@ -38,7 +38,7 @@ def process_faces():
         f.close()
 
     try:
-        server_conn = establish_server_connection(logger=settings.LOGGER)
+        server_conn = establish_server_connection()
         if server_conn.server_ip is None:
             settings.LOGGER.critical('No GPU server found')
             return

@@ -12,7 +12,7 @@ import numpy as np
 import logging
 
 def establish_server_connection():
-    server_conn = image_face_extractor.ip_finder.server_finder()
+    server_conn = image_face_extractor.ip_finder.server_finder(logger=settings.LOGGER)
 
     return server_conn
 
@@ -120,7 +120,7 @@ def placeInDatabase(foreign_key, face_data):
 def populateFromImage(filename, server_conn = None):
 
     if server_conn is None:
-        server_conn = establish_server_connection(logger=settings.LOGGER)
+        server_conn = establish_server_connection()
     else:
         if server_conn.check_ip() is False:
             server_conn.find_external_server()
