@@ -1,4 +1,5 @@
 thumbnails/*
+*.set
 *.lock
 .env
 *.sublime*

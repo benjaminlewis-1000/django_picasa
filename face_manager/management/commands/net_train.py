@@ -16,6 +16,9 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import numpy as np
 import torch.nn as nn
+import io
+from PIL import Image
+import pickle
 
 class FaceLabelSet(data.Dataset):
     def __init__(self):
@@ -34,12 +37,16 @@ class FaceLabelSet(data.Dataset):
         self.face_id = []
 
     def add_person(self, person_name, person_id):
+        person_id = int(person_id)
+        person_name = str(person_name)
         self.label_to_DBid[self.label_idx] = person_id
         self.DBid_to_label[person_id] = self.label_idx
         self.DBid_to_name[person_id] = person_name
         self.label_idx += 1
 
     def add_datapoint(self, person_id, data, face_id = -1):
+        person_id = int(person_id)
+        face_id = int(face_id)
         label = self.DBid_to_label[person_id]
         if type(data) == type(None):
             return
@@ -84,7 +91,7 @@ def create_dataset():
     for ignf in ignored_faces:
         ignored_face_set.add_datapoint(1, ignf.face_encoding)
 
-    print("Ignored face length: ", len(ignored_face_set))
+    # print("Ignored face length: ", len(ignored_face_set))
 
     train_set = FaceLabelSet()
     val_set = FaceLabelSet()
@@ -97,7 +104,7 @@ def create_dataset():
         .exclude(person_name__in=settings.IGNORED_NAMES)
 
     print(len(people_filter))
-    
+  
     # Now to put things in a dataset! 
     for p in people_filter:
         train_set.add_person(p.person_name, p.id)
@@ -114,6 +121,8 @@ def create_dataset():
         for ii in range(0, num_train):
             idx = indices[ii]
             train_set.add_datapoint(p.id, faces_of_person[idx].face_encoding)
+
+
         for jj in range(num_train, len(faces_of_person)):
             idx = indices[jj]
             val_set.add_datapoint(p.id, faces_of_person[idx].face_encoding)
@@ -130,32 +139,56 @@ class FaceNetwork(nn.Module):
         
         # Input is 128-dimensional vector
         self.fc1 = nn.Linear(128, 512)
-        self.tanh1 = nn.Tanh()
-        self.fc2 = nn.Linear(512, 256)
-        self.tanh2 = nn.Tanh()
+        self.nl1 = nn.PReLU()
+        self.fc2 = nn.Linear(512, 512)
+        self.nl2 = nn.PReLU()
         # self.fc3 = nn.Linear(256, 512)
         # self.tanh3 = nn.Tanh()
-        self.fc4 = nn.Linear(256, n_classes)
+        self.fc4 = nn.Linear(512, n_classes)
         self.sm = nn.Softmax(dim=0)
 
     def forward(self, x):
         x = self.fc1(x)
-        x = self.tanh1(x)
+        x = self.nl1(x)
         x = self.fc2(x)
-        x = self.tanh2(x)
+        x = self.nl2(x)
         # x = self.fc3(x)
         # x = self.tanh3(x)
         x = self.fc4(x)
         # x = self.sm(x)
 
-        return x
+        return x, F.log_softmax(x, dim=1)
 
 class Command(BaseCommand):
     
     def handle(self, *args, **options):
 
+        devel = False
+
         train_set, val_set, ignored_face_set = create_dataset()
-        print(len(train_set))
+
+        with open('train.set', 'wb') as fh:
+            s = train_set
+            pickle.dump([s.label_to_DBid, s.DBid_to_label, \
+                s.DBid_to_name, s.label_idx, s.labels,\
+                s.data_points, s.counts_per_label, \
+                s.weight, s.face_id], fh)
+        with open('val.set', 'wb') as fh:
+            s = val_set
+            pickle.dump([s.label_to_DBid, s.DBid_to_label, \
+                s.DBid_to_name, s.label_idx, s.labels,\
+                s.data_points, s.counts_per_label, \
+                s.weight, s.face_id], fh)
+        with open('ingore.set', 'wb') as fh:
+            s = ignored_face_set
+            pickle.dump([s.label_to_DBid, s.DBid_to_label, \
+                s.DBid_to_name, s.label_idx, s.labels,\
+                s.data_points, s.counts_per_label, \
+                s.weight, s.face_id], fh)
+
+        exit()
+
+        num_classes = len(train_set.label_to_DBid)
 
         in_lib_mean = 0.9
         in_lib_std = 0.2
@@ -184,10 +217,10 @@ class Command(BaseCommand):
 
         ignored_loader = data.DataLoader(ignored_face_set, batch_size=128, shuffle=False)
 
-        epochs = 500
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(net.parameters(), lr = 1e-3, betas=(.9, .999))
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = max(1, epochs // 40), gamma = 0.95)
+        if devel:
+            epochs = 10
+        else:
+            epochs = 500
 
         def compact_loss(output, target):
             # print(output.shape)
@@ -200,6 +233,50 @@ class Command(BaseCommand):
 
             return loss
 
+        class ContrastiveCenterLoss(nn.Module):
+            def __init__(self, dim_hidden, num_classes, lambda_c=1.0, use_cuda=True):
+                super(ContrastiveCenterLoss, self).__init__()
+                self.dim_hidden = dim_hidden
+                self.num_classes = num_classes
+                self.lambda_c = lambda_c
+                self.centers = nn.Parameter(torch.randn(num_classes, dim_hidden))
+                self.use_cuda = use_cuda
+
+            # may not work due to flowing gradient. change center calculation to exp moving avg may work.
+            def forward(self, y, hidden):
+                batch_size = hidden.size()[0]
+                expanded_centers = self.centers.expand(batch_size, -1, -1)
+                expanded_hidden = hidden.expand(self.num_classes, -1, -1).transpose(1, 0)
+                distance_centers = (expanded_hidden - expanded_centers).pow(2).sum(dim=-1)
+                distances_same = distance_centers.gather(1, y.unsqueeze(1))
+                intra_distances = distances_same.sum()
+                inter_distances = distance_centers.sum().sub(intra_distances)
+                epsilon = 1e-6
+                loss = (self.lambda_c / 2.0 / batch_size) * intra_distances / \
+                       (inter_distances + epsilon) / 0.1
+                # logger.info('{},{},{}'.format(
+                #     intra_distances.data[0], inter_distances.data[0], loss.data[0]))
+                return loss
+
+            def cuda(self, device_id=None):
+                """Moves all model parameters and buffers to the GPU.
+                Arguments:
+                    device_id (int, optional): if specified, all parameters will be
+                        copied to that device
+                """
+                self.use_cuda = True
+                return self._apply(lambda t: t.cuda(device_id))
+
+
+        ccl = ContrastiveCenterLoss(dim_hidden = 45, num_classes = num_classes)
+
+        optimizer = optim.Adam(net.parameters(), lr = 1e-3, betas=(.9, .999))
+        optimizer_c = optim.SGD(ccl.parameters(), lr= 1e-4)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = max(1, epochs // 40), gamma = 0.95)
+
+        # criterion = 
+        criterion = [nn.CrossEntropyLoss(), ccl]
+        
         for epoch in range(epochs):
 
             print(f"{optimizer.param_groups[0]['lr']:.2e}")
@@ -215,9 +292,11 @@ class Command(BaseCommand):
                 label_batch = Variable(labels_tr)
 
                 optimizer.zero_grad()
+                optimizer_c.zero_grad()
 
-                outputs_tr = net(input_batch)
-                loss = criterion(outputs_tr, label_batch) + 0.15 * compact_loss(outputs_tr, label_batch)
+                outputs_tr, pred = net(input_batch)
+                # loss = criterion(outputs_tr, label_batch) + ccl(outputs_tr, label_batch) #  0.15 * compact_loss(outputs_tr, label_batch)
+                loss = criterion[0](pred, label_batch) + 0.8 * criterion[1](label_batch, outputs_tr) + 0.15 * compact_loss(outputs_tr, label_batch)
 
                 sm = nn.Softmax(dim=1)
                 sm_out_tr = sm(outputs_tr)
@@ -225,6 +304,7 @@ class Command(BaseCommand):
                 # print(compact_loss(outputs, label_batch))
                 loss.backward()
                 optimizer.step()
+                optimizer_c.step()
 
                 # _, predicted = torch.max(outputs.data, 1)
                 max_softmax_tr, predicted_tr = torch.max(sm_out_tr.data, 1)
@@ -249,9 +329,10 @@ class Command(BaseCommand):
             if evaluation_loader == debug_loader:
                 print("Warning! Debug loader")
             for j, batch_t in enumerate(evaluation_loader):
+                
                 input_t, label_t, _ = batch_t
 
-                outputs = net(Variable(input_t))
+                outputs, _ = net(Variable(input_t))
                 _, predicted = torch.max(outputs.data, 1)
 
                 sm = nn.Softmax(dim=1)
@@ -272,9 +353,11 @@ class Command(BaseCommand):
 
             ignore_sm = []
             for j, batch_i in enumerate(ignored_loader):
+                if not devel and j > 5:
+                    continue
                 input_i, label_i, _ = batch_i
 
-                outputs_i = net(Variable(input_i))
+                outputs_i, _ = net(Variable(input_i))
 
                 sm = nn.Softmax(dim=1)
                 sm_out_i = sm(outputs_i)
@@ -294,6 +377,22 @@ class Command(BaseCommand):
                 f"{in_lib_std:.2f}|{st2:.2f}|{out_of_lib_std:.2f}")
 
             scheduler.step()
+
+
+
+        ignore_sm = []
+        for j, batch_i in enumerate(ignored_loader):
+            input_i, label_i, _ = batch_i
+
+            outputs_i = net(Variable(input_i))
+
+            sm = nn.Softmax(dim=1)
+            sm_out_i = sm(outputs_i)
+            max_softmax_i, _ = torch.max(sm_out_i.data, 1)
+            ignore_sm += max_softmax_i.tolist()
+
+        out_of_lib_mean = np.mean(np.array(ignore_sm))
+        out_of_lib_std = np.std(np.array(ignore_sm))
 
         label_to_DBid = train_set.label_to_DBid
         for lbl in label_to_DBid.keys():

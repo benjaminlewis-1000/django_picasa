@@ -316,4 +316,4 @@ BLANK_FACE_NAME='_NO_FACE_ASSIGNED_'
 
 # Parameters for the machine learning model
 FACE_NUM_THRESH=50
-IGNORED_NAMES=[BLANK_FACE_NAME, '.ignore', '.realignore', '.jessicatodo']
+IGNORED_NAMES=[BLANK_FACE_NAME, '.ignore', '.realignore', '.jessicatodo', '.cutler_tbd']

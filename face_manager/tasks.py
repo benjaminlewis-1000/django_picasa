@@ -7,8 +7,12 @@ from django.conf import settings
 from celery import shared_task, task
 import time
 import os
+import random
 
-from .scripts import populateFromImage, establish_server_connection
+import queue
+import threading
+
+from .scripts import populateFromImage, populateFromImageMultiGPU, establish_server_connection, establish_multi_server_connection
 from .models import Person, Face
 from filepopulator.models import ImageFile
 
@@ -38,23 +42,93 @@ def process_faces():
         f.close()
 
     try:
-        server_conn = establish_server_connection()
-        if server_conn.server_ip is None:
-            settings.LOGGER.critical('No GPU server found')
+        settings.LOGGER.debug("Starting face extraction...")
+
+        face_lockfile = settings.FACE_LOCKFILE
+
+        server_conn = establish_multi_server_connection()
+
+        num_servers = len(server_conn.server_ips)
+        if num_servers == 0:
+            settings.LOGGER.critical('No GPU servers found')
             return
 
+        def worker(ip_num):
+            print("Hi, I'm worker # ", ip_num)
+            while True:
+                print(f"Queue size is {img_q.qsize()}, worker is {ip_num}")
+                if img_q.qsize() == 0:
+                    print("all done!")
+                    break
+                else:
+                    img = img_q.get()
+                # if 
+                is_ok = None
+                rndDelay = random.randrange(0, 10) * 0.03
+                time.sleep(rndDelay)
+                qs = img_q.qsize()
+                while is_ok is None:
+                    try:
+                        is_ok = server_conn.check_ip(ip_num)
+                    except OSError:
+                        timeDelay = random.randrange(0, 2)
+                        print("Failed in worker ", ip_num)
+                        time.sleep(timeDelay)
+                        
+                    if not is_ok[0]:
+                        break
+                    if not img.isProcessed:
+                        try:
+                            populateFromImageMultiGPU(img.filename, server_conn = server_conn, server_idx = ip_num, ip_checked=True)
+                        except OSError:
+                            break
+
+
         all_images = ImageFile.objects.all()
+        img_q = queue.Queue()
+        threads = []
         for img in all_images:
-            if not server_conn.check_ip():
-                # Lost connection to server
-                try:
-                    os.remove(face_lockfile)
-                except FileNotFoundError:
-                    pass
-                raise IOError("Lost connection to server.")
             if not img.isProcessed:
-                # Then we need to schedule it to be processed.
-                populateFromImage(img.filename, server_conn = server_conn)
+                img_q.put(img)
+
+        for i in range(num_servers):
+            t = threading.Thread(target=worker, args=(i,))
+            t.start()
+            threads.append(t)
+
+        # img_q.join()
+        for t in threads:
+            t.join()
+
+        # for img in all_images:
+        #     if not server_conn.check_ip():
+        #         # Lost connection to server
+        #         try:
+        #             os.remove(face_lockfile)
+        #         except FileNotFoundError:
+        #             pass
+        #         raise IOError("Lost connection to server.")
+        #     if not img.isProcessed:
+        #         # Then we need to schedule it to be processed.
+        #         populateFromImage(img.filename, server_conn = server_conn)
+
+        # num_servers = len(server_conn.server_ips)
+        # if server_conn.server_ip is None:
+        #     settings.LOGGER.critical('No GPU server found')
+        #     return
+
+        # all_images = ImageFile.objects.all()
+        # for img in all_images:
+        #     if not server_conn.check_ip():
+        #         # Lost connection to server
+        #         try:
+        #             os.remove(face_lockfile)
+        #         except FileNotFoundError:
+        #             pass
+        #         raise IOError("Lost connection to server.")
+        #     if not img.isProcessed:
+        #         # Then we need to schedule it to be processed.
+        #         populateFromImage(img.filename, server_conn = server_conn)
     finally:
         try:
             os.remove(face_lockfile)

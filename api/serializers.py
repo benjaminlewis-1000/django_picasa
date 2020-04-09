@@ -164,6 +164,7 @@ class ServerStatsSerializer(serializers.Serializer):
     num_faces = serializers.IntegerField()
     estimated_hours_facerec_left = serializers.FloatField()
     imgs_per_hour_est = serializers.IntegerField()
+    num_unlabeled_faces = serializers.IntegerField()
 
     class Stats(object):
         def __init__(self):
@@ -171,6 +172,7 @@ class ServerStatsSerializer(serializers.Serializer):
             self.num_face_processed = ImageFile.objects.filter(isProcessed=True).count()
             self.num_people = Person.objects.count()
             self.num_faces = Face.objects.count()
+            self.num_unlabeled_faces = Face.objects.filter(declared_name__person_name=settings.BLANK_FACE_NAME).count( )
             self.imgs_per_hour_est = 800 # An estimate -- I'm clocking 177 images in 26 minutes
             imgs_left_to_process = self.num_imgs - self.num_face_processed
             self.estimated_hours_facerec_left = imgs_left_to_process / self.imgs_per_hour_est

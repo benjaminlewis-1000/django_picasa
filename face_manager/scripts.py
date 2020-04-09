@@ -16,6 +16,12 @@ def establish_server_connection():
 
     return server_conn
 
+def establish_multi_server_connection():
+    # server_conn = image_face_extractor.ip_finder.server_finder(logger=settings.LOGGER)
+    server_conn = image_face_extractor.ip_finder_multi.server_finder(logger=settings.LOGGER)
+
+    return server_conn
+
 def placeInDatabase(foreign_key, face_data):
 
     if len(face_data) == 0:
@@ -140,6 +146,38 @@ def populateFromImage(filename, server_conn = None):
     placeInDatabase(foreign_key, face_data)
 
     return face_data, server_conn, changed_fk 
+
+
+def populateFromImageMultiGPU(filename, server_conn = None, server_idx = None, ip_checked=False):
+    if server_idx is None:
+        server_idx = 0
+    
+    if server_conn is None:
+        server_conn = establish_multi_server_connection()
+        server_idx = 0
+    else:
+        if server_conn.check_ip(server_idx) is False:
+            server_conn.find_external_server()
+            server_idx = 0
+
+    foreign_key = ImageFile.objects.get(filename = filename)
+
+    changed_fk = False
+
+    if foreign_key.isProcessed:
+        return None, server_conn, changed_fk
+
+    changed_fk = True
+
+    # def face_from_facerect(self, filename):
+    face_data = image_face_extractor.image_client_multi.face_extract_client(filename, server_conn, ip_idx=server_idx, logger=settings.LOGGER, ip_checked = ip_checked)
+    print(f"Worked! IP was {server_conn.server_ips[server_idx]}, length is {len(face_data)}, file is {filename}")
+    # return False
+    
+    placeInDatabase(foreign_key, face_data)
+
+    return face_data, server_conn, changed_fk 
+
 
 def assignSourceImage(face_model, person_model):
     savePath = person_model.highlight_img.path

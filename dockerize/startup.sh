@@ -17,13 +17,13 @@ rm /locks/face_add.lock
 
 mkdir -p /var/run/celery /var/log/celery
 chown -R nobody:nogroup /var/run/celery /var/log/celery
-chmod 777 -R /var/log/picasa
-chmod 777 -R /locks
-chmod 777 -R /media
+#chmod 777 -R /var/log/picasa
+#chmod 777 -R /locks
+#chmod 777 -R /media
 
 # celery flower -A picasa --port=5555 &
 celery -A picasa beat -l warning --pidfile="/locks/celerybeat.pid"  &
-celery -A picasa worker -l warning --uid=nobody --gid=nogroup &
+celery -A picasa worker -l warning & # --uid=nobody --gid=nogroup &
 gunicorn -b 0.0.0.0:8000 picasa.wsgi & 
 
 while true; do 
