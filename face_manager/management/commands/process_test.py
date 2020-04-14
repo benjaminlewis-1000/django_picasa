@@ -63,14 +63,14 @@ class Command(BaseCommand):
                 print(f"Queue size is {img_q.qsize()}, worker is {ip_num}, Image ID is {img.id}")
                 # if 
                 is_ok = None
-                simeDelay = random.randrange(0, 10) * 0.03
-                sleep(simeDelay)
+                randDelay = random.randrange(0, 10) * 0.004
+                sleep(randDelay)
                 qs = img_q.qsize()
                 while is_ok is None:
                     try:
                         is_ok = server_conn.check_ip(ip_num)
                     except OSError:
-                        timeDelay = random.randrange(0, 2)
+                        timeDelay = random.randrange(0, 10) * .03
                         print("Failed in worker ", ip_num)
                         sleep(timeDelay)
                         

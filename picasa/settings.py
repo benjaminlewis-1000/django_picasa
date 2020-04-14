@@ -38,9 +38,13 @@ if in_docker:
     DB_NAME = os.environ['DB_NAME']
     DB_USER = os.environ['DB_USER']
     DB_PASS = os.environ['DB_PWD']
-    DB_HOST = 'db_django'
     MEDIA_ROOT = '/media' # os.environ['MEDIA_FILES_LOCATION']
-    REDIS_HOST = 'task_redis'
+    if production:
+        REDIS_HOST = 'task_redis'
+        DB_HOST = 'db_django'
+    else:
+        REDIS_HOST = 'task_redis_dev'
+        DB_HOST = 'db_django_dev'
     PHOTO_ROOT = '/photos'
     TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
 #    ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['WEBAPP_DOMAIN']]
@@ -115,7 +119,7 @@ FACE_LOCKFILE = '/locks/face_add.lock'
 # SECURITY WARNING: keep the secret key used in production secret!
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True # False
+DEBUG = production # False
 
 # Application definition
 
@@ -129,6 +133,7 @@ INSTALLED_APPS = [
     # 'periodic.apps.PeriodicConfig',
     'rest_framework',
     'rest_framework.authtoken',
+    'corsheaders',
     'filepopulator',
     'face_manager',
     'api',
@@ -136,14 +141,29 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
+    'django.middleware.common.CommonMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+CORS_ORIGIN_WHITELIST = [
+    "https://192.168.1.15:8080",
+    "https://192.168.1.145:8080",
+    "https://facewire.exploretheworld.tech"
+]
+
+CORS_ORIGIN_REGEX_WHITELIST = [
+    r"^https://192.168.1.*",
+    r"^http://192.168.1.*",
+]
+
+CORS_ORIGIN_ALLOW_ALL=True
+LOGGER.critical("CORS allowing from all...")
 
 ROOT_URLCONF = 'picasa.urls'
 
@@ -238,7 +258,7 @@ if production:
     CELERY_BEAT_SCHEDULE = {
         'filepopulate_root': {
             'task': 'filepopulator.populate_files_from_root',
-            'schedule': crontab(minute=0, hour='*/6'),
+            'schedule': crontab(minute='*/30') # , hour='*/6'),
             # 'schedule': crontab(minute='*/10'),
         },
         'dirs_datetimes': {
@@ -259,23 +279,7 @@ if production:
 
 else:
     CELERY_BEAT_SCHEDULE = {
-
-#  'send-summary-every-hour': {
-#        'task': 'summary',
-#         # There are 4 ways we can handle time, read further 
-#        'schedule': 3.0,
-#         # If you're using any arguments
-#        'args': ("We don’t need any",),
-#     },
-    # # Executes every Friday at 4pm
-    # 'send-notification-on-friday-afternoon': { 
-    #      'task': 'periodic.tasks.send_notification', 
-    #  'schedule': crontab(minute=''),
-    # },   
-    # 'write-time-two-min': {
-    #     'task': 'time_write',
-    #     'schedule': 20.0, # crontab(minute='*/2'),
-    # },
+    
         'filepopulate_root': {
             'task': 'filepopulator.populate_files_from_root',
             'schedule': crontab(minute='*/1'),
@@ -284,6 +288,15 @@ else:
             'task': 'filepopulator.update_dir_dates',
             'schedule': crontab(minute='*/1')
         },
+        'face_add': {
+            'task': 'face_manager.face_extraction', 
+            'schedule': crontab( minute = '*/1'),
+            # 'schedule': crontab( minute = '0', hour='*/2'),
+            'options': {
+                'expires': 30,
+                # 'expires': 1800,
+            }
+        }
 
     }
 

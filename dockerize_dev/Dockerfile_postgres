@@ -1,0 +1,4 @@
+FROM postgres:12.1-alpine
+
+WORKDIR /docker-entrypoint-initdb.d
+ADD psql_init.sh .

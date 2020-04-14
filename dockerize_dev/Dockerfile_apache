@@ -1,0 +1,18 @@
+FROM httpd:alpine
+
+RUN sed -i -e 's%#Include conf/extra/httpd-vhosts.conf%Include conf/extra/httpd-vhosts.conf%g' /usr/local/apache2/conf/httpd.conf
+
+WORKDIR /var/www
+
+# Add entrypoint to create .htpasswd file.
+#COPY docker-entrypoint.sh /
+#RUN chmod +x /docker-entrypoint.sh
+
+#ENTRYPOINT ["/docker-entrypoint.sh"]
+
+# ADD apache_pwd.pwd /usr/local/apache2/htdocs/.htpasswd
+# ADD apache_pwd.pwd /usr/local/apache2/.htpasswd
+
+CMD ["httpd-foreground"]
+
+# COPY vhost.conf /usr/local/apache2/conf/extra/httpd-vhosts.conf

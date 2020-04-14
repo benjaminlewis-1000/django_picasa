@@ -34,4 +34,6 @@ coverage
 flake8
 mock
 djangorestframework-queryfields
+django-cors-headers
+djangorestframework-simplejwt
 # NOTE: Only edit this file in the root directory
