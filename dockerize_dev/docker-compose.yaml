@@ -3,7 +3,7 @@
 # https://github.com/DoTheEvo/Traefik-v2-examples
 version: "3.3"
 services:
-  picasa:
+  picasa_dev:
     build:
       context: .
       dockerfile: Dockerfile_picasa
@@ -11,14 +11,12 @@ services:
         buildno: 1
     image:
       picasa_img
-    container_name: picasa_api
+    container_name: picasa_api_dev
     command:
       bash /startup.sh
     env_file:
       - .env
     environment:
-      # Add the following line to your /etc/profile:
-      # HOST_IP=`ip route | grep default | awk '{print $9}'`
       - DOCKER_HOST_IP=${HOST_IP} 
     ports:
       - "${CLIENT_FACE_PORT}:${CLIENT_FACE_PORT}/udp"
@@ -33,45 +31,22 @@ services:
       - ${MEDIA_FILES_LOCATION}:/media
       - ${LOG_LOCATION}:/var/log/picasa
     depends_on:
-      - db_django
+      - db_picasa_dev
     networks:
       - traefik_proxy
     restart: always
     labels:
-#      - "traefik.backend=picasa"
-#      - "traefik.enable=true"
-##      - "traefik.webapp.enable=true"
-#      - "traefik.webapp.frontend.rule=Host:${WEBAPP_DOMAIN}"
-#      - "traefik.webapp.port=8000"
-##      - "traefik.flower.enable=true"
-#      - "traefik.flower.frontend.rule=Host:flower.${DOMAINNAME}"
-#      - "traefik.flower.port=5555"
-#      - "traefik.docker.network=traefik_proxy"
-
       - "traefik.enable=true"
-      - "traefik.http.routers.picasa.rule=Host(`${WEBAPP_DOMAIN}`)"
-      - "traefik.http.routers.picasa.tls.certresolver=leresolver"
-      - "traefik.http.routers.picasa.entrypoints=websecure"
-      - "traefik.http.services.picasa.loadbalancer.server.port=8000"
-      - "traefik.http.services.picasa.loadbalancer.healthcheck.hostname=${WEBAPP_DOMAIN}"
-      - "traefik.http.middlewares.picasa.redirectscheme.scheme=https"
-      - "traefik.http.middlewares.picasa.redirectscheme.permanent=true"
+      - "traefik.http.routers.picasa_dev.rule=Host(`${WEBAPP_DOMAIN}`)"
+      - "traefik.http.routers.picasa_dev.tls.certresolver=leresolver"
+      - "traefik.http.routers.picasa_dev.entrypoints=websecure"
+      - "traefik.http.services.picasa_dev.loadbalancer.server.port=8000"
+      - "traefik.http.services.picasa_dev.loadbalancer.healthcheck.hostname=${WEBAPP_DOMAIN}"
+      - "traefik.http.middlewares.picasa_dev.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.picasa_dev.redirectscheme.permanent=true"
 
-#      - "traefik.http.routers.flower.rule=Host(`flower.${DOMAINNAME}`)"
-#      - "traefik.http.routers.flower.tls.certresolver=leresolver"
-#      - "traefik.http.routers.flower.entrypoints=websecure"
-#      - "traefik.http.services.flower.loadbalancer.server.port=5555"
-      # Need to start postgresql service
 
-  db_django:
-#    build:
-#      context: .
-#      dockerfile: Dockerfile_postgres
-#    image: postgres_init
-#FROM postgres:12.1-alpine
-# WORKDIR /docker-entrypoint-initdb.d
-# ADD psql_init.sh .
-
+  db_picasa_dev:
     image: postgres:12.1-alpine
     env_file:
       - .env
@@ -82,27 +57,24 @@ services:
 #      PGDATA: /database
     volumes:
       - ${DB_FILES_LOCATION}:/var/lib/postgresql/data
-      - ${DJANGO_FILES_ROOT}/dockerize/psql_init.sh:/docker-entrypoint-initdb.d/psql_init.sh
+      - ${DJANGO_FILES_ROOT}/dockerize_dev/psql_init.sh:/docker-entrypoint-initdb.d/psql_init.sh
       # Initialization script - see Postgres Docker documentation.
-
     labels:
       - "user=postgres"
-    container_name: db_picasa  
+    container_name: db_picasa_dev
     networks:
       - traefik_proxy
 
-  task_redis:
+  task_redis_dev:
     image: redis:5.0-alpine
-    # env_file:
-    #   - .env_picasa
     restart: always
     env_file:
       - .env
     networks:
       - traefik_proxy
-    container_name: redis_picasa
+    container_name: redis_picasa_dev
 
-  apache_fileserve:
+  apache_fileserve_dev:
     # image: httpd:2.4-alpine
     build:
       context: . 
@@ -111,22 +83,17 @@ services:
         buildno: 1
     image:
       httpd_image
-    container_name: picasa_media_apache
+    container_name: picasa_media_apache_dev
     env_file:
       - .env
-#    expose:
-#      - '80'
-    # environment:
-    #   - MEDIA_FILES_LOCATION=${MEDIA_FILES_LOCATION}
     restart: always
     volumes:
-      # - ${MEDIA_FILES_LOCATION}:/usr/local/apache2/htdocs/
       - ${MEDIA_FILES_LOCATION}:/var/www/media:ro
       - ${STATIC_LOCATION}:/var/www/static:ro
       - ${PHOTO_ROOT}:/var/www/full_res:ro
-      - ${DJANGO_FILES_ROOT}/dockerize/apache_config_deploy/000-default.config:/etc/apache2/sites-enabled/000-default.conf
-      - ${DJANGO_FILES_ROOT}/dockerize/apache_config_deploy/vhost.conf:/usr/local/apache2/conf/extra/httpd-vhosts.conf
-      - ${DJANGO_FILES_ROOT}/dockerize/apache_config_deploy/apache_pwd.pwd:/usr/local/apache2/.htpasswd 
+      - ${DJANGO_FILES_ROOT}/dockerize_dev/apache_config/000-default.config:/etc/apache2/sites-enabled/000-default.conf
+      - ${DJANGO_FILES_ROOT}/dockerize_dev/apache_config/vhost.conf:/usr/local/apache2/conf/extra/httpd-vhosts.conf
+      - ${DJANGO_FILES_ROOT}/dockerize_dev/apache_config/apache_pwd.pwd:/usr/local/apache2/.htpasswd 
     networks:
       - traefik_proxy
     labels:
@@ -135,9 +102,9 @@ services:
       - "traefik.enable=true"
 #      - "traefik.port=80"
 #      - "traefik.docker.network=traefik_proxy"
-      - "traefik.http.routers.apache_fileserve.rule=Host(`${MEDIA_DOMAIN}`)"
-      - "traefik.http.routers.apache_fileserve.tls.certresolver=leresolver"
-      - "traefik.http.routers.apache_fileserve.entrypoints=websecure"
+      - "traefik.http.routers.apache_fileserve_dev.rule=Host(`${MEDIA_DOMAIN}`)"
+      - "traefik.http.routers.apache_fileserve_dev.tls.certresolver=leresolver"
+      - "traefik.http.routers.apache_fileserve_dev.entrypoints=websecure"
       #- "traefik.http.routers.traefik.middlewares=authtraefik"
       #- "traefik.http.middlewares.authtraefik.basicauth.users=admin:$apr1$ly25xhfg$d2eLiOIOnM.IbsZ6Cfb760" # admin/movie based one
 

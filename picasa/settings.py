@@ -14,6 +14,7 @@ import os
 from celery.schedules import crontab
 import logging
 from unipath import Path
+from datetime import timedelta
 
 # # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,7 +45,7 @@ if in_docker:
         DB_HOST = 'db_django'
     else:
         REDIS_HOST = 'task_redis_dev'
-        DB_HOST = 'db_django_dev'
+        DB_HOST = 'db_picasa_dev'
     PHOTO_ROOT = '/photos'
     TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
 #    ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['WEBAPP_DOMAIN']]
@@ -119,7 +120,7 @@ FACE_LOCKFILE = '/locks/face_add.lock'
 # SECURITY WARNING: keep the secret key used in production secret!
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = production # False
+DEBUG = False # True # not production # False
 
 # Application definition
 
@@ -151,18 +152,36 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-CORS_ORIGIN_WHITELIST = [
-    "https://192.168.1.15:8080",
-    "https://192.168.1.145:8080",
-    "https://facewire.exploretheworld.tech"
-]
+# CORS_ORIGIN_WHITELIST = [
+#     "https://192.168.1.15:8080",
+#     "https://192.168.1.145:8080",
+#     "https://facewire.exploretheworld.tech",
+#     "jsfiddle.net",
+# ]
 
-CORS_ORIGIN_REGEX_WHITELIST = [
-    r"^https://192.168.1.*",
-    r"^http://192.168.1.*",
-]
+# CORS_ORIGIN_WHITELIST = (
+#     "http://192.168.1.15:8080"
+# )
+
+# CORS_ORIGIN_REGEX_WHITELIST = [
+#     r"*jsfiddle\.net*",
+# ]
 
 CORS_ORIGIN_ALLOW_ALL=True
+CORS_ALLOW_CREDENTIALS = True
+
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+]
+
 LOGGER.critical("CORS allowing from all...")
 
 ROOT_URLCONF = 'picasa.urls'
@@ -188,7 +207,6 @@ WSGI_APPLICATION = 'picasa.wsgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/2.2/ref/settings/#databases
-
 
 DATABASES = {
     'default': {
@@ -225,11 +243,28 @@ REST_FRAMEWORK = {
         # 'rest_framework.authentication.BasicAuthentication',
         'rest_framework.authentication.SessionAuthentication',
         'rest_framework.authentication.TokenAuthentication',  # <-- And here
+        'rest_framework_simplejwt.authentication.JWTAuthentication'
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': 100, 
+    'DEFAULT_FILTER_BACKENDS': ['django_filters.rest_framework.DjangoFilterBackend'],
 }
 
+# JSON Web Tokens config
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=5),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=14),
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': False,
+    'ALGORITHM': 'HS256',
+    'SIGNING_KEY': SECRET_KEY,
+    'VERIFYING_KEY': None,
+    'AUTH_HEADER_TYPES': ('JWT',),
+    'USER_ID_FIELD': 'id',
+    'USER_ID_CLAIM': 'user_id',
+    'AUTH_TOKEN_CLASSES': ('rest_framework_simplejwt.tokens.AccessToken',),
+    'TOKEN_TYPE_CLAIM': 'token_type',
+}
 
 # Internationalization
 # https://docs.djangoproject.com/en/2.2/topics/i18n/
@@ -326,6 +361,7 @@ FACE_THUMBNAIL_SIZE=(200, 200)
 # logging.error("TODO: Set up apache server. STATIC_URL needs to be served by it.")
 
 BLANK_FACE_NAME='_NO_FACE_ASSIGNED_'
+BLANK_FACE_IMG_PATH=os.path.join(SITE_ROOT, 'blank_person.png')
 
 # Parameters for the machine learning model
 FACE_NUM_THRESH=50

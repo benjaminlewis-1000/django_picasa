@@ -9,12 +9,16 @@ from rest_framework import viewsets
 import api.serializers as api_ser
 # Authentication: https://simpleisbetterthancomplex.com/tutorial/2018/11/22/how-to-implement-token-authentication-using-django-rest-framework.html
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.views import APIView
+from rest_framework_simplejwt.views import TokenObtainPairView
 
 
 # Create your views here.
 
+class TokenPairWithUsername(TokenObtainPairView):
+    permission_classes = (AllowAny,)
+    serializer_class = api_ser.TokenPairSerializer
 
 class UserViewSet(viewsets.ModelViewSet):
     """

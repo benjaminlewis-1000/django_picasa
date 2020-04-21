@@ -141,7 +141,7 @@ class FakeFacesTests(TestCase):
         self.names = ['Alpha', 'Beta', 'Gamma', 'Charlie', 'Epsilon', 'Ragnar', 'Tiger', 'Wolf',\
                 'Genni', 'Einstein', 'Bravo']
         settings.MEDIA_ROOT='/tmp'
-        self.server_conn = establish_server_connection()
+        # self.server_conn = establish_server_connection()
 
     def tearDown(self): 
         allFaces = Face.objects.all()
@@ -179,7 +179,7 @@ class FakeFacesTests(TestCase):
         shutil.rmtree(cls.tmp_valid_dir)
 
     def generate_fake_face_list(self):
-        num_faces = random.randint(0, 5)
+        num_faces = random.randint(2, 5)
         name_idcs = random.sample(range(len(self.names)), num_faces)  
 
         face_list = []
@@ -192,8 +192,8 @@ class FakeFacesTests(TestCase):
             encoding = np.random.rand(128)
             face_w = random.randint(20, 40)
             face_h = random.randint(20, 40)
-            face_thumbnail = np.random.rand(face_h, face_w, 3)
-            square_face = np.random.rand(face_w, face_w, 3)
+            face_thumbnail = (np.random.rand(face_h, face_w, 3) * 255).astype(np.uint8)
+            square_face = (np.random.rand(face_w, face_w, 3) * 255).astype(np.uint8)
             box_center = (40, 40) 
             bounding_rect = image_face_extractor.Rectangle(face_h, face_w, centerX=box_center[0], centerY=box_center[1])
             face_rect = image_face_extractor.FaceRect(bounding_rect, face_thumbnail, 1, encoding=encoding, name=name, square_face=square_face)
@@ -268,6 +268,62 @@ class FakeFacesTests(TestCase):
         self.assertEqual(len(name_list), len(set(name_list)))
         # +1 is for the '_NO_FACE_ASSIGNED_' key
         self.assertTrue(len(name_list) <= len(self.names) + 1)
+
+    def test_delete_file_removes_faces(self):
+        all_imgs = ImageFile.objects.all()
+    
+        for img in all_imgs:
+            print(img.filename)
+            face_list = self.generate_fake_face_list()
+            self.assertFalse(img.isProcessed)
+            placeInDatabase(img, face_list)
+
+        img1 = all_imgs[0]
+        img1_faces = Face.objects.filter(source_image_file=img1)
+        print(img1_faces)
+        print(img1_faces[0].face_thumbnail.path)
+        assert os.path.exists(img1_faces[0].face_thumbnail.path)
+        img1.delete()
+        for f in img1_faces:
+            assert not os.path.exists(f.face_thumbnail.path)
+
+    def test_person_deleted(self):
+        # If the person model is deleted, individual faces should
+        # be preserved and revert to "no name assigned."
+        all_imgs = ImageFile.objects.all()
+    
+        for img in all_imgs:
+            face_list = self.generate_fake_face_list()
+            self.assertFalse(img.isProcessed)
+            placeInDatabase(img, face_list)
+
+        i = 0
+        p1_faces = Face.objects.filter(declared_name__person_name=self.names[i])
+        while len(p1_faces) == 0:
+            i += 1
+            p1_faces = Face.objects.filter(declared_name__person_name=self.names[i])
+            
+        for p in p1_faces:
+            self.assertEqual(p.declared_name.person_name, self.names[i])
+
+        # Try to delete the blank face name:
+        person_blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        self.assertTrue(os.path.exists(person_blank.highlight_img.path))
+        person_blank.delete()
+        self.assertTrue(os.path.exists(person_blank.highlight_img.path))
+        person_blank_test = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        self.assertNotEqual(person_blank_test, None)
+
+
+        # Delete the person:
+        person_1 = Person.objects.get(person_name=self.names[i])
+        self.assertTrue(os.path.exists(person_1.highlight_img.path))
+        person_1.delete()
+        self.assertFalse(os.path.exists(person_1.highlight_img.path))
+        for p in p1_faces:
+            face = Face.objects.get(id=p.id)
+            self.assertEqual(face.declared_name.person_name, settings.BLANK_FACE_NAME)
+            self.assertTrue(os.path.exists(p.face_thumbnail.path))
 
     def test_change_assigned_name(self):
         pass

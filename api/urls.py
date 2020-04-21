@@ -5,6 +5,7 @@ from rest_framework import routers
 from api import views
 from django.urls import path
 from rest_framework.authtoken.views import obtain_auth_token  # <-- Here
+from rest_framework_simplejwt import views as jwt_views
 
 router = routers.DefaultRouter()
 router.register(r'users', views.UserViewSet)
@@ -25,6 +26,8 @@ router.register(r'server_stats', views.StatsViewSet, basename='stats')
 # http post https://picasa.exploretheworld.tech/api/request-token/ username=benjamin password=********
 urlpatterns = [
     path('request-token/', obtain_auth_token, name='api_token_auth'),  
+    path('token/obtain/', views.TokenPairWithUsername.as_view(), name='token_create'),  # override sjwt stock token
+    path('token/refresh/', jwt_views.TokenRefreshView.as_view(), name='token_refresh'),
     # url(r'^', include(router.urls)),
     path('', include(router.urls)),
     # path('api-auth/', include('rest_framework.urls', namespace='rest_framework'))

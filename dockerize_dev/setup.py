@@ -70,7 +70,7 @@ assert os.path.exists(img_handle_params), f'Parameter file for image handler {im
 with open(img_handle_params) as p:
     config = xmltodict.parse(p.read())
 port_ip_disc = int(config['params']['ports']['server_port_ip_disc'])
-client_port = int(config['params']['ports']['client_return_port'])
+client_port = int(config['params']['ports']['client_return_port']) + 1
 print(client_port)
 
 print("TODO: Test file location")
@@ -165,10 +165,10 @@ with open(out_file_path, 'w') as fh:
 	fh.write(f"DB_USER={username}\n")
 	fh.write(f"DJANGO_SECRET_KEY={SECRET_KEY}\n")
 	fh.write(f"DOMAINNAME=exploretheworld.tech\n")
-	fh.write(f"MEDIA_DOMAIN=picasamedia.exploretheworld.tech\n")
+	fh.write(f"MEDIA_DOMAIN=picasamedia_dev.exploretheworld.tech\n")
 	fh.write(f"MEDIA_FILES_LOCATION={media_dir}\n")
 	fh.write(f"PHOTO_ROOT={photo_location}\n")
-	fh.write(f"WEBAPP_DOMAIN=picasa.exploretheworld.tech\n")
+	fh.write(f"WEBAPP_DOMAIN=picasadev.exploretheworld.tech\n")
 	fh.write(f"DJANGO_FILES_ROOT={project_path}\n")
 	fh.write(f"IN_DOCKER=True\n")
 	fh.write(f"TEST_PHOTOS_FILEPOPULATE={test_dir}\n")

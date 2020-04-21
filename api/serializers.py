@@ -6,9 +6,21 @@ from rest_framework import serializers
 from filepopulator.models import ImageFile, Directory
 from face_manager.models import Person, Face
 from drf_queryfields import QueryFieldsMixin
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 import datetime
 import dateutil.parser
 import json
+
+
+class TokenPairSerializer(TokenObtainPairSerializer):
+
+    @classmethod
+    def get_token(cls, user):
+        token = super(TokenPairSerializer, cls).get_token(user)
+
+        # Add custom claims
+        token['username'] = user.username
+        return token
 
 
 class FaceSubsetSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
