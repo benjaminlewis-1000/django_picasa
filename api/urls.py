@@ -16,7 +16,6 @@ router.register(r'faces', views.FaceViewSet)
 router.register(r'people', views.PersonViewSet)
 router.register(r'parameters', views.ParameterViewSet, basename='params')
 router.register(r'server_stats', views.StatsViewSet, basename='stats')
-# router.register(r'hello', views.HelloView)
 # router.register(r'request-token', obtain_auth_token)
 
 # TODO: Add a 'Help' section or something. 
@@ -31,5 +30,7 @@ urlpatterns = [
     # url(r'^', include(router.urls)),
     path('', include(router.urls)),
     # path('api-auth/', include('rest_framework.urls', namespace='rest_framework'))
-    # path(r'hello/', views.HelloView.as_view(), name='hello'),
+    path(r'slide_img/', views.ImageSlideshowView.as_view(), name='slide_img'),
+    path(r'image_list/', views.filteredImagesView.as_view(), name='image_list'),
+# router.register(r'slide_img', views.ImageSlideshowView, basename='slide_img')
 ]

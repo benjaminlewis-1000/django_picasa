@@ -158,12 +158,14 @@ class PersonSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer)
 class ParameterSerializer(serializers.Serializer):
     img_server_user = serializers.CharField(max_length=256)
     img_server_pw = serializers.CharField(max_length=256)
+    random_access_key = serializers.CharField(max_length=256)
 
     class Parameters(object):
         def __init__(self):
             self.img_server_pw = settings.MEDIA_URL_PW   
             self.img_server_user = settings.MEDIA_URL_USER
             self.img_server_address = settings.MEDIA_URL
+            self.random_access_key = settings.RANDOM_ACCESS_KEY
 
     def create(self, validated_data):
         return Parameters()

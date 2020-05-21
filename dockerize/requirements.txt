@@ -38,4 +38,5 @@ django-cors-headers
 djangorestframework-simplejwt
 django-filter
 django-filters
+drf-url-filters
 # NOTE: Only edit this file in the root directory

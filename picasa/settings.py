@@ -15,9 +15,12 @@ from celery.schedules import crontab
 import logging
 from unipath import Path
 from datetime import timedelta
+import random
+import string
 
 # # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # # Static files (CSS, JavaScript, Images)
 # # https://docs.djangoproject.com/en/2.2/howto/static-files/
@@ -75,6 +78,8 @@ else:
     MEDIA_URL  = 'http://localhost/media/'
     STATIC_SERVER = '/var/www/html/static'
     LOG_DIR = '/home/benjamin/git_repos/picasa_files/logs'
+
+RANDOM_ACCESS_KEY = ''.join([random.choice(string.ascii_letters + string.digits) for n in range(32)])
 
 # Set up logging
 formatter = logging.Formatter('%(levelname)s | %(asctime)s - %(message)s')
@@ -138,6 +143,7 @@ INSTALLED_APPS = [
     'filepopulator',
     'face_manager',
     'api',
+    'filters',
     # 'upload_img',
 ]
 
@@ -189,7 +195,7 @@ ROOT_URLCONF = 'picasa.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        'DIRS': [os.path.join(THIS_DIR, 'html')],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [

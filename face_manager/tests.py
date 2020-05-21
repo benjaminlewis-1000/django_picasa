@@ -286,6 +286,8 @@ class FakeFacesTests(TestCase):
         img1.delete()
         for f in img1_faces:
             assert not os.path.exists(f.face_thumbnail.path)
+            t = Face.objects.get(f.id)
+            self.assertEqual(t, None)
 
     def test_person_deleted(self):
         # If the person model is deleted, individual faces should
