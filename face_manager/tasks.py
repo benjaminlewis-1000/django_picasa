@@ -32,105 +32,91 @@ if not settings.configured:
 def process_faces():
     settings.LOGGER.debug("Starting face extraction...")
 
-    face_lockfile = settings.FACE_LOCKFILE
 
+    all_images = ImageFile.objects.all()
+    img_q = queue.Queue()
+    # threads = []
+    for img in all_images:
+        if not img.isProcessed:
+            img_q.put(img)
+
+    face_lockfile = settings.FACE_LOCKFILE
     if os.path.exists(face_lockfile):
-        settings.LOGGER.debug("Face adding locked!")
+        settings.LOGGER.warning("Face adding locked!")
         return
     else:
         f = open(face_lockfile, 'w')
         f.close()
+        
+    def worker(ip_addr):
+        print(f"Hi, I'm worker # {ip_addr}")
+        while True:
+            print(f"Queue size is {img_q.qsize()}, worker is {ip_addr}")
+            if img_q.qsize() == 0:
+                print("all done!")
+                break
+            else:
+                img = img_q.get()
 
-    try:
-        settings.LOGGER.debug("Starting face extraction...")
-
-        face_lockfile = settings.FACE_LOCKFILE
-
-        server_conn = establish_multi_server_connection()
-
-        num_servers = len(server_conn.server_ips)
-        if num_servers == 0:
-            settings.LOGGER.critical('No GPU servers found')
-            return
-
-        def worker(ip_num):
-            print("Hi, I'm worker # ", ip_num)
-            while True:
-                print(f"Queue size is {img_q.qsize()}, worker is {ip_num}")
-                if img_q.qsize() == 0:
-                    print("all done!")
+            is_ok = None
+            rndDelay = random.randrange(5, 10) * 0.03
+            time.sleep(rndDelay)
+            qs = img_q.qsize()
+            for _ in range(3):
+                try:
+                    is_ok = server_conn.check_ip(ip_addr)
                     break
-                else:
-                    img = img_q.get()
-                # if 
-                is_ok = None
-                rndDelay = random.randrange(0, 10) * 0.03
-                time.sleep(rndDelay)
-                qs = img_q.qsize()
-                while is_ok is None:
-                    try:
-                        is_ok = server_conn.check_ip(ip_num)
-                    except OSError:
-                        timeDelay = random.randrange(0, 2)
-                        print("Failed in worker ", ip_num)
-                        time.sleep(timeDelay)
-                        
-                    if not is_ok[0]:
-                        break
-                    if not img.isProcessed:
-                        try:
-                            populateFromImageMultiGPU(img.filename, server_conn = server_conn, server_idx = ip_num, ip_checked=True)
-                        except OSError:
-                            break
+                except OSError:
+                    timeDelay = random.randrange(0, 2)
+                    print(f"IS_OK failed in worker {ip_addr}")
+                    time.sleep(timeDelay)
 
-
-        all_images = ImageFile.objects.all()
-        img_q = queue.Queue()
-        threads = []
-        for img in all_images:
+            if not is_ok: 
+                break
+                    
             if not img.isProcessed:
-                img_q.put(img)
+                try:
+                    populateFromImageMultiGPU(img.filename, server_conn = server_conn, server_ip = ip_addr, ip_checked=True)
+                except OSError:
+                    print(f"IP {ip_addr} issue with populateFromImage")
+                    break
 
-        for i in range(num_servers):
-            t = threading.Thread(target=worker, args=(i,))
-            t.start()
-            threads.append(t)
+    # Put everything in a while loop that polls for new workers
+    # or dead workers every n (30 now) seconds
 
-        # img_q.join()
-        for t in threads:
-            t.join()
+    # idx = 0
+    running_threads = {}
 
-        # for img in all_images:
-        #     if not server_conn.check_ip():
-        #         # Lost connection to server
-        #         try:
-        #             os.remove(face_lockfile)
-        #         except FileNotFoundError:
-        #             pass
-        #         raise IOError("Lost connection to server.")
-        #     if not img.isProcessed:
-        #         # Then we need to schedule it to be processed.
-        #         populateFromImage(img.filename, server_conn = server_conn)
+    while True: 
 
-        # num_servers = len(server_conn.server_ips)
-        # if server_conn.server_ip is None:
-        #     settings.LOGGER.critical('No GPU server found')
-        #     return
-
-        # all_images = ImageFile.objects.all()
-        # for img in all_images:
-        #     if not server_conn.check_ip():
-        #         # Lost connection to server
-        #         try:
-        #             os.remove(face_lockfile)
-        #         except FileNotFoundError:
-        #             pass
-        #         raise IOError("Lost connection to server.")
-        #     if not img.isProcessed:
-        #         # Then we need to schedule it to be processed.
-        #         populateFromImage(img.filename, server_conn = server_conn)
-    finally:
         try:
-            os.remove(face_lockfile)
-        except FileNotFoundError:
-            pass
+
+            server_conn = establish_multi_server_connection()
+            # print(f"Servers are {server_conn.server_ips}")
+
+            num_servers = len(server_conn.server_ips)
+            if num_servers == 0:
+                settings.LOGGER.critical('No GPU servers found')
+                return
+
+            for i, ip in enumerate(running_threads.keys()):
+                if not running_threads[ip].is_alive():
+                    print(f"Killing thread {ip}")
+                    running_threads[ip].join()
+
+            for i, serv in enumerate(server_conn.server_ips):
+                if serv not in running_threads.keys() or not running_threads[serv].is_alive():
+                    t = threading.Thread(target=worker, args=(serv,))
+                    running_threads[serv] = t
+                    running_threads[serv].start()
+
+            time.sleep(30)
+            print(running_threads.keys())
+            # print("Time slept")
+
+        except:
+            try:
+                os.remove(face_lockfile)
+            except FileNotFoundError:
+                pass
+            break

@@ -19,8 +19,9 @@ class Command(BaseCommand):
 
         for f in faces:
             print(f.source_image_file)
-            f.source_image_file.isProcessed = False
-            super(file_models.ImageFile, f.source_image_file).save()
+            if f.source_image_file.isProcessed:
+                f.source_image_file.isProcessed = False
+                super(file_models.ImageFile, f.source_image_file).save()
             f.delete()
 
         for p in people:

@@ -1,4 +1,35 @@
 
-<a href='admin/'> Admin Page</a>
+<html>
+<head></head>
+<style>
+button{
+    margin: 0 auto;
+    height:60px; 
+    display: block;
+    width: 200px;
+}
+#buttons{
+    margin-top: 10%;
+}
+</style>
+
+<div id=buttons>
+<button onclick="location.href='admin/'" type="button">
+         Admin Page</button>
 <p></p>
-<a href='api/'> API</a>
+<button onclick="location.href='api/'" type="button">
+         API</button>
+<p></p>
+<button onclick="location.href='api/parameters/'" type="button">
+         API Parameters</button>
+<p></p>
+<button onclick="location.href='api/image_list/'" type="button"
+    title="Requires 'people', 'year_start', or 'year_end'">
+         Slideshow Image List</button>
+<p></p>
+<button onclick="location.href='api/slide_img/'" type="button"
+    title="Requires 'img_id' and 'access_key' plus optional 'height'">
+         Individual Image</button>
+<p></p>
+</div>
+</html>

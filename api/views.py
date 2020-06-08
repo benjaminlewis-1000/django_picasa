@@ -121,9 +121,11 @@ class ImageSlideshowView(APIView):
     def get(self, request, *args, **kwargs):
         # print(self.request.query_params)
         params = self.request.query_params
+        if len(params.keys()) == 0:
+            return render_404(request, "No parameters were passed. Must pass an 'access_key' and an 'img_id' with an optional 'height'.")
         if 'access_key' in params.keys():
             if params['access_key'] != settings.RANDOM_ACCESS_KEY:
-                print(params['access_key'], settings.RANDOM_ACCESS_KEY)
+                # print(params['access_key'], settings.RANDOM_ACCESS_KEY)
                 return render_404(request, "Incorrect access_key parameter passed")
         else:
             return render_404(request, "access_key parameter must be passed")
@@ -195,30 +197,36 @@ class filteredImagesView(APIView):
     def get(self, request, *args, **kwargs):
         # print(self.request.query_params)
         params = self.request.query_params
-        if 'people' in params.keys():
-            people = params['people'].split(',')
-            if len(people) > 0:
-                p_query = Q(face__declared_name__person_name=people[0])
-            for p in people[1:]:
-                p_query = p_query | Q(face__declared_name__person_name=p) 
+        if len(params.keys()) == 0:
+            # Return all objects!
+            obj = ImageFile.objects.all()
+            # return render_404(request, "No parameters were passed. Must pass a combination of 'people', 'year_start', 'year_end'...")
+        else:
+            if 'people' in params.keys():
+                people = params['people'].split(',')
+                if len(people) > 0:
+                    p_query = Q(face__declared_name__person_name=people[0])
+                for p in people[1:]:
+                    p_query = p_query | Q(face__declared_name__person_name=p) 
 
-        if 'year_start' in params.keys():
-            # print(params['year_start'])
-            # try:
-            #     p_query = p_query | Q()
-            # except NameError:
-            #     p_query = Q()
-            pass
-        if 'year_end' in params.keys():
-            # print(params['year_end'])
-            # try:
-            #     p_query = p_query | Q()
-            # except NameError:
-            #     p_query = Q()
-            pass
-        
+            if 'year_start' in params.keys():
+                # print(params['year_start'])
+                # try:
+                #     p_query = p_query | Q()
+                # except NameError:
+                #     p_query = Q()
+                pass
+            if 'year_end' in params.keys():
+                # print(params['year_end'])
+                # try:
+                #     p_query = p_query | Q()
+                # except NameError:
+                #     p_query = Q()
+                pass
+            
 
-        obj = ImageFile.objects.filter(p_query).distinct().order_by('dateTaken')
+            obj = ImageFile.objects.filter(p_query).distinct().order_by('dateTaken')
+            
         ids = list(([o.id for o in obj]))
         dates = list(([o.dateTaken.isoformat() for o in obj]))
         

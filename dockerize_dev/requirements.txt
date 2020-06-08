@@ -38,5 +38,6 @@ django-cors-headers
 djangorestframework-simplejwt
 django-filter
 django-filters
+python-xmp-toolkit
 drf-url-filters
 # NOTE: Only edit this file in the root directory
