@@ -23,6 +23,7 @@ psycopg2-binary
 redis
 requests
 scons
+scikit-learn
 unipath
 xmltodict
 gunicorn
@@ -37,7 +38,7 @@ djangorestframework-queryfields
 django-cors-headers
 djangorestframework-simplejwt
 django-filter
-django-filters
-python-xmp-toolkit
 drf-url-filters
+python-xmp-toolkit
+
 # NOTE: Only edit this file in the root directory

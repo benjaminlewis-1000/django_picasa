@@ -16,8 +16,22 @@ RUN apt remove cmake python3-pip -y
 
 RUN cp /usr/bin/python3 /usr/bin/python
 
-RUN apt-get install -y wget
+RUN apt install -y wget 
+
+RUN apt update -yq && apt upgrade -yq && \
+apt install -yq curl git nano
+
+RUN curl -sL https://deb.nodesource.com/setup_14.x | bash - && \
+apt install -yq nodejs build-essential
+
+RUN npm install -g npm
+
+WORKDIR /app
+ADD package.json .
+RUN npm install
 
 RUN rm -r /var/lib/apt/lists
 
 ADD startup.sh /startup.sh
+
+WORKDIR /code

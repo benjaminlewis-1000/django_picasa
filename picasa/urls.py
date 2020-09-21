@@ -21,13 +21,13 @@ from django.conf import settings
 from django.conf.urls.static import static
 from picasa import views
 
-
 urlpatterns = [
     path('admin/', admin.site.urls),
     # path('periodic/', include('periodic.urls')),
     # path('filepopulator/', include('filepopulator.urls')),
     # path('face_manager/', include('face_manager.urls')),
     path(r'api/', include('api.urls')),
+    path(r'app/', include('frontend.urls')),
     path(r'', views.index),
     path(r'index.html', views.index),
 ]

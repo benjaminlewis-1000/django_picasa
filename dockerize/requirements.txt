@@ -8,6 +8,7 @@ django-admin-thumbnails
 django-celery-beat
 django-celerybeat-status 
 django-rest-framework
+django-webpack-loader
 Django>=2.0.2
 exifread
 face_recognition
@@ -23,6 +24,7 @@ psycopg2-binary
 redis
 requests
 scons
+scikit-learn
 unipath
 xmltodict
 gunicorn
@@ -37,7 +39,6 @@ djangorestframework-queryfields
 django-cors-headers
 djangorestframework-simplejwt
 django-filter
-django-filters
 drf-url-filters
 python-xmp-toolkit
 

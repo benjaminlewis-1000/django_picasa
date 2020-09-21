@@ -124,20 +124,68 @@ class DirectorySerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializ
 
 class FaceSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
 
-    face_name = serializers.SerializerMethodField()
+    face_name = serializers.SerializerMethodField(read_only=True)
+    poss_face_name1 = serializers.SerializerMethodField(read_only=True)
+    poss_face_name2 = serializers.SerializerMethodField(read_only=True)
+    poss_face_name3 = serializers.SerializerMethodField(read_only=True)
+    poss_face_name4 = serializers.SerializerMethodField(read_only=True)
+    poss_face_name5 = serializers.SerializerMethodField(read_only=True)
 
     def get_face_name(self, obj):
+        # num_calls += 1
         # face_declared is the related field of the ForeignKey.
         return obj.declared_name.person_name
+
+    def get_poss_face_name1(self, obj):
+        if obj.poss_ident1 is not None:
+            return obj.poss_ident1.person_name
+        else:
+            return "N/A"
+
+    def get_poss_face_name2(self, obj):
+        if obj.poss_ident2 is not None:
+            return obj.poss_ident2.person_name
+        else:
+            return "N/A"
+            
+    def get_poss_face_name3(self, obj):
+        if obj.poss_ident3 is not None:
+            return obj.poss_ident3.person_name
+        else:
+            return "N/A"
+
+    def get_poss_face_name4(self, obj):
+        if obj.poss_ident4 is not None:
+            return obj.poss_ident4.person_name
+        else:
+            return "N/A"
+
+    def get_poss_face_name5(self, obj):
+        if obj.poss_ident5 is not None:
+            return obj.poss_ident5.person_name
+        else:
+            return "N/A"
+
 
     class Meta:
 
         model = Face
+        print("Getting")
         # No face_encoding in this api -- it's not necessary. 
         fields = ['url', 'source_image_file', 'written_to_photo_metadata',  \
-            'declared_name', 'face_name', 'poss_ident1', 'poss_ident2', 'poss_ident3', \
-            'poss_ident4', 'poss_ident5', 'box_top', 'box_bottom', 'box_left', \
+            'declared_name', 'face_name', \
+            'poss_ident1', 'poss_face_name1', 'weight_1', \
+            'poss_ident2', 'poss_face_name2', 'weight_2', \
+            'poss_ident3', 'poss_face_name3', 'weight_3', \
+            'poss_ident4', 'poss_face_name4', 'weight_4', \
+            'poss_ident5', 'poss_face_name5', 'weight_5', \
+            'box_top', 'box_bottom', 'box_left', \
             'box_right', 'face_thumbnail']
+        # fields = ['url', 'source_image_file', 'written_to_photo_metadata',  \
+        #     'declared_name', 'face_name', 'poss_ident1', 'weight_1', 'poss_face_name1', \
+        #     'poss_ident2', 'poss_face_name2', 'poss_ident3',  'poss_ident4', \
+        #     'poss_ident5', 'box_top', 'box_bottom', 'box_left', \
+        #     'box_right', 'face_thumbnail']
 
 
 class PersonSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):

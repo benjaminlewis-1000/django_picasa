@@ -109,14 +109,19 @@ class Face(models.Model):
     # the next time the FC network runs.
     poss_ident1 = models.ForeignKey('Person', on_delete=models.SET(get_default_blank_person), related_name='face_poss1', \
         blank=True, null=True)
+    weight_1 = models.FloatField(default=0.0)
     poss_ident2 = models.ForeignKey('Person', on_delete=models.SET(get_default_blank_person), related_name='face_poss2', \
         blank=True, null=True)
+    weight_2 = models.FloatField(default=0.0)
     poss_ident3 = models.ForeignKey('Person', on_delete=models.SET(get_default_blank_person), related_name='face_poss3', \
         blank=True, null=True)
+    weight_3 = models.FloatField(default=0.0)
     poss_ident4 = models.ForeignKey('Person', on_delete=models.SET(get_default_blank_person), related_name='face_poss4', \
         blank=True, null=True)
+    weight_4 = models.FloatField(default=0.0)
     poss_ident5 = models.ForeignKey('Person', on_delete=models.SET(get_default_blank_person), related_name='face_poss5', \
         blank=True, null=True)
+    weight_5 = models.FloatField(default=0.0)
 
     written_to_photo_metadata = models.BooleanField(default=False)
 

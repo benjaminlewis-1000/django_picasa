@@ -116,6 +116,7 @@ SITE_ROOT = os.path.dirname(os.path.realpath(__file__))
 
 LOCKFILE = '/locks/adding.lock' # path.join(PROJECT_ROOT, 'adding.lock')
 FACE_LOCKFILE = '/locks/face_add.lock'
+CLASSIFY_LOCKFILE = '/locks/classify.lock'
 # if os.path.isfile(LOCKFILE):
 #     os.remove(LOCKFILE)
 
@@ -144,6 +145,8 @@ INSTALLED_APPS = [
     'face_manager',
     'api',
     'filters',
+    'frontend',
+    'webpack_loader',
     # 'upload_img',
 ]
 
@@ -157,6 +160,25 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+#######################
+# Webpack Configuration 
+#######################
+STATICFILES_DIRS = (
+    os.path.join(BASE_DIR, 'frontend', 'static'),
+)
+
+WEBPACK_LOADER = {
+    'DEFAULT' : {
+    ##TOCHANGE
+        # 'dist' is the location of webpack generated files.
+        'BUNDLE_DIR_NAME': 'dist/',
+        'STATS_FILE': os.path.join(BASE_DIR, 'frontend',  'webpack-stats.json')
+    }
+}
+#######################
+# /Webpack Configuration 
+#######################
 
 # CORS_ORIGIN_WHITELIST = [
 #     "https://192.168.1.15:8080",
@@ -299,7 +321,7 @@ if production:
     CELERY_BEAT_SCHEDULE = {
         'filepopulate_root': {
             'task': 'filepopulator.populate_files_from_root',
-            'schedule': crontab(minute='*/30') # , hour='*/6'),
+            'schedule': crontab(minute='*/10') # , hour='*/6'),
             # 'schedule': crontab(minute='*/10'),
         },
         'dirs_datetimes': {
@@ -314,6 +336,11 @@ if production:
                 'expires': 30,
                 # 'expires': 1800,
             }
+        },
+        'classify_unlabeled': {
+            'task': 'face_manager.classify_unlabeled',
+            'schedule': crontab(day_of_month = '*/5', minute=0, hour=0)
+            # 'schedule': crontab(minute='*/2')
         }
 
     }
