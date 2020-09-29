@@ -4,7 +4,7 @@ from django.contrib.auth.models import User
 from django.utils.crypto import get_random_string
 from django.conf import settings
 
-from celery import shared_task, task
+from celery import shared_task
 import time
 import os
 import random
@@ -28,7 +28,7 @@ if not settings.configured:
 # app.config_from_object('django.conf:settings', namespace='CELERY')
 # app.autodiscover_tasks() 
 
-@task(ignore_result=True, name='face_manager.face_extraction')
+@shared_task(ignore_result=True, name='face_manager.face_extraction')
 def process_faces():
     settings.LOGGER.debug("Starting face extraction...")
     print('Starting face extraction...')
@@ -193,7 +193,7 @@ def process_faces():
         pass
 
 from net_train import classify_unlabeled_faces
-@task(ignore_result=True, name='face_manager.classify_unlabeled')
+@shared_task(ignore_result=True, name='face_manager.classify_unlabeled')
 def thistask():
     classify_lockfile = settings.CLASSIFY_LOCKFILE
     print(f"Classify lockfile is {classify_lockfile}")

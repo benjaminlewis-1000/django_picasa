@@ -25,6 +25,7 @@ import pytz
 import logging
 import cv2
 import numpy as np
+from fractions import Fraction
 from dateutil import parser
 
 # Image thumbnail processing
@@ -327,9 +328,9 @@ class ImageFile(models.Model):
                         if 'GPS'+key in info and 'GPS'+key+'Ref' in info:
                             e = info['GPS'+key]
                             ref = info['GPS'+key+'Ref']
-                            info[key] = ( e[0][0]/e[0][1] +
-                                          e[1][0]/e[1][1] / 60 +
-                                          e[2][0]/e[2][1] / 3600
+                            info[key] = ( e[0] +
+                                          e[1] / 60 +
+                                          e[2] / 3600
                                         ) * (-1 if ref in ['S','W'] else 1)
 
                     if 'Latitude' in info and 'Longitude' in info:
@@ -346,6 +347,16 @@ class ImageFile(models.Model):
             # We can - and should - decode the flash and light source 
             # values elsewhere, rather than putting that logic here. Plus 
             # I'm not feeling it right now. 
+            def to_num_den(float_val, limit=5000):
+                try:
+                    frac = Fraction(float_val).limit_denominator(limit)
+                except:
+                    print(f"Exception! {float_val}, {limit}")
+                    print(Fraction(float_val))
+                    frac = Fraction(float_val)
+                
+                return frac.numerator, frac.denominator
+
             if 'Make' in self.exifDict.keys():
                 make = self.exifDict['Make']
 #                self.camera_make = make
@@ -359,19 +370,16 @@ class ImageFile(models.Model):
                 self.flash_info = flash
             if 'ExposureTime' in self.exifDict.keys():
                 exposureTime = self.exifDict['ExposureTime']
-                self.exposure_num = exposureTime[0]
-                self.exposure_denom = exposureTime[1]
+                self.exposure_num, self.exposure_denom = to_num_den(exposureTime)
             if 'FocalLength' in self.exifDict.keys():
                 focalLength = self.exifDict['FocalLength']
-                self.focal_num = focalLength[0]
-                self.focal_denom = focalLength[1]
+                self.focal_num, self.focal_denom = to_num_den(focalLength, 1000)
             if 'ISOSpeedRatings' in self.exifDict.keys():
                 iso = self.exifDict['ISOSpeedRatings']
                 self.iso_value = iso
             if 'FNumber' in self.exifDict.keys():
                 fnumber = self.exifDict['FNumber']
-                self.fnumber_num = fnumber[0]
-                self.fnumber_denom = fnumber[1]
+                self.fnumber_num, self.fnumber_denom = to_num_den(fnumber, 100)
             if 'LightSource' in self.exifDict.keys():
                 light_source = self.exifDict['LightSource']
                 self.light_source = light_source

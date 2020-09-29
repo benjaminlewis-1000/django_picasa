@@ -22,8 +22,8 @@ chown -R nobody:nogroup /var/run/celery /var/log/celery
 #chmod 777 -R /media
 
 # celery flower -A picasa --port=5555 &
-celery -A picasa beat -l info --pidfile="/locks/celerybeat.pid"  &
-celery -A picasa worker -l info & # --uid=nobody --gid=nogroup &
+celery -A picasa beat -l INFO --pidfile="/locks/celerybeat.pid"  &
+celery -A picasa worker -l INFO & # --uid=nobody --gid=nogroup &
 gunicorn -b 0.0.0.0:8000 picasa.wsgi & 
 
 while true; do 

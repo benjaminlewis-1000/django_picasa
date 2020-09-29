@@ -9,5 +9,5 @@ for process in `ps uax | grep celery | grep -v grep  | awk '{print $2}'`; do
 	kill -9 $process
 done
 
-celery -A picasa beat -l info --pidfile="/locks/celerybeat.pid"  &
-celery -A picasa worker -l info & # --uid=nobody --gid=nogroup &
+celery -A picasa beat -l INFO --pidfile="/locks/celerybeat.pid"  &
+celery -A picasa worker -l INFO & # --uid=nobody --gid=nogroup &

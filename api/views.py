@@ -19,9 +19,13 @@ import PIL
 from PIL import Image, ExifTags
 from django.http import HttpResponse, Http404
 from django.shortcuts import render
+from django.core.paginator import Paginator
+from rest_framework.reverse import reverse, reverse_lazy
 from django_filters.rest_framework import DjangoFilterBackend
+from django.db.models import Q
 
 import json
+from io import BytesIO
 from django.db.models import Q
 from filters.mixins import (
     FiltersMixin,
@@ -107,80 +111,189 @@ class PersonViewSet(viewsets.ModelViewSet):
     
     serializer_class = api_ser.PersonSerializer
 
+
+    def get_serializer_context(self):
+        context = super(PersonViewSet, self).get_serializer_context()
+        print(context)
+        context.update({"request": self.request})
+        return context
+
+
+
+class PersonParamView(APIView):
+    permission_classes = (IsAuthenticated,) 
+    def get(self, request, *args, **kwargs):
+
+        params = self.request.query_params
+        if 'page' in params.keys():
+            try:
+                page = int(params['page'])
+            except:
+                return render_404(request, 'Page requested is not an integer.')
+        else:
+            page = 1
+
+        id_key = kwargs['id']
+        field = kwargs['field']
+
+        if field not in ['face_declared', 'face_poss', 'directory']:
+            return render_404(request, f"Requested type '{field}' not in ['face_declared', 'face_poss', 'directory']")
+
+        if field in ['face_declared', 'face_poss']:
+            try:
+                person_obj = Person.objects.get(id=id_key)
+            except Exception as e:
+                return render_404(request, f"Error: Requested ID {id_key} not available in database.")
+
+            if field == 'face_declared':
+                faces = Face.objects.filter(declared_name=person_obj).values_list('id', flat=True)
+            else:
+                p1 = Q(poss_ident1=person_obj)
+                p2 = Q(poss_ident2=person_obj)
+                p3 = Q(poss_ident3=person_obj)
+                p4 = Q(poss_ident4=person_obj)
+                p5 = Q(poss_ident5=person_obj)
+                faces = Face.objects.filter(p1 | p2 | p3 | p4 | p5).values_list('id', flat=True)
+                
+            id_list = list(faces)
+        else:
+            try:
+                dir_obj = Directory.objects.get(id=id_key)
+            except Exception as e:
+                return render_404(request, f"Error: Requested ID {id_key} not available in database.")
+
+
+            image_set = ImageFile.objects.filter(directory=dir_obj).values_list('id', flat=True)
+            id_list = list(image_set)
+
+        js = {'num_results': len(id_list), 'type': field, 'id_list': id_list,}
+
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+
 class FaceViewSet(viewsets.ModelViewSet):
     permission_classes = (IsAuthenticated,) 
 
     queryset = Face.objects.all()
     serializer_class = api_ser.FaceSerializer
+    print(queryset[0].face_thumbnail)
 
-class ImageSlideshowView(APIView):
-    # queryset = Session.objects.all()
-    # serializer_class = SessionSerializer
-    # permission_classes = (IsAuthenticated,)             # <-- And here
-
+class KeyedImageView(APIView):
     def get(self, request, *args, **kwargs):
-        # print(self.request.query_params)
+
         params = self.request.query_params
-        if len(params.keys()) == 0:
-            return render_404(request, "No parameters were passed. Must pass an 'access_key' and an 'img_id' with an optional 'height'.")
-        if 'access_key' in params.keys():
+        valid_types = ['face_highlight', 'face_array', 'face_source', 'slideshow', 'full_big', 'full_medium', 'full_small']
+        
+        def err_404(message=""):
+            msg_start = f'Invalid request. Url is of format (/keyed_image/<type>/?id=<int>&access_key=<string>). Valid types include {valid_types}. \n\n'
+            msg_start += message
+            err_404 = render_404(request, msg_start)
+            return err_404
+
+
+        if 'type' not in kwargs.keys():
+            return err_404('You did not provide a type variable.')
+
+        image_type = kwargs['type']
+        if not image_type in valid_types:
+            return err_404('You did not provide a valid type.')
+
+        if 'id' not in params.keys():
+            return err_404('ID key not passed as parameter.')
+        else:
+            id_key = params['id']
+
+        if 'access_key' not in params.keys():
+            return err_404('Access key not provided.')
+        else:
             if params['access_key'] != settings.RANDOM_ACCESS_KEY:
                 # print(params['access_key'], settings.RANDOM_ACCESS_KEY)
-                return render_404(request, "Incorrect access_key parameter passed")
-        else:
-            return render_404(request, "access_key parameter must be passed")
-        if 'img_id' in params.keys():
-            img_id = params['img_id']
-        else:
-            return render_404(request, "No img_id tag was passed")
-        if 'height' in params.keys():
-            height = int(params['height'])
-        else:
-            height = 1080
+                return err_404('Invalid access key.')
 
-        width = 1920 / 1080 * height
-
-        try:
-            img_obj = ImageFile.objects.get(id=img_id)
-        except Exception as e:
-            return render_404(request, e)
-        
-        s = time.time()
-        try:
-            image = PIL.Image.open(img_obj.filename)
-        except Exception as e:
-            return render_404(request, e)
-
-        for orientation in ExifTags.TAGS.keys():
-            if ExifTags.TAGS[orientation]=='Orientation':
-                break
+        def getAndCheckID(obj_type, id_key):
+            print(obj_type)
+            if obj_type == 'person':
+                obj = Person
+            elif obj_type == 'face':
+                obj = Face
+            elif obj_type == 'image':
+                obj = ImageFile
+            print(obj)
+            try:
+                return obj.objects.get(id=id_key)
+            except:
+                return None# err_404(f"Invalid object id of type {image_type}")
 
         try:
-            exif=dict(image._getexif().items())
-        except Exception as e:
-            exif = {}
+            if image_type == 'face_highlight':
+                person = getAndCheckID('person', id_key)
+                image = person.highlight_img
+            elif image_type == 'face_array':
+                face = getAndCheckID('face', id_key)
+                image = face.face_thumbnail
+            elif image_type == 'face_source':
+                face = getAndCheckID('face', id_key)
+                source = face.source_image_file
+                image = source.filename
+                height = 700
+                width = 1920 / 1080 * height
+            elif image_type == 'slideshow':
+                img_obj = getAndCheckID('image', id_key)
+                image = img_obj.filename
+                if 'height' in params.keys():
+                    height = int(params['height'])
+                else:
+                    height = 1080
 
-        if orientation in exif.keys():
-            # print(exif[orientation])
-            if exif[orientation] in [6, 8]:
-                image.thumbnail( (height, width), Image.ANTIALIAS)
+                width = 1920 / 1080 * height
+            elif image_type in ['full_big', 'full_medium', 'full_small']:
+                img_obj = getAndCheckID('image', id_key)
+                if image_type == 'full_big':
+                    image = img_obj.thumbnail_big
+                elif image_type == 'full_medium':
+                    image = img_obj.thumbnail_medium
+                elif image_type == 'full_small':
+                    image = img_obj.thumbnail_small
+                print(image)
+
+        except:
+            return err_404(f'Bad id for object of type {image_type}')
+
+        try:
+            image = PIL.Image.open(image)
+        except Exception as e:
+            return err_404('Unable to open image.')
+
+        if image_type in ['slideshow', 'face_source']: 
+            # Resize the image dynamically
+            for orientation in ExifTags.TAGS.keys():
+                if ExifTags.TAGS[orientation]=='Orientation':
+                    break
+
+            try:
+                exif=dict(image._getexif().items())
+            except Exception as e:
+                exif = {}
+
+            if orientation in exif.keys():
+                # print(exif[orientation])
+                if exif[orientation] in [6, 8]:
+                    image.thumbnail( (height, width), Image.ANTIALIAS)
+                else:
+                    image.thumbnail( (width,height), Image.ANTIALIAS)
+
+                if exif[orientation] == 3:
+                    image=image.rotate(180, expand=True)
+                elif exif[orientation] == 6:
+                    image=image.rotate(270, expand=True)
+                elif exif[orientation] == 8:
+                    image=image.rotate(90, expand=True)
+
             else:
-                image.thumbnail( (width,height), Image.ANTIALIAS)
+                image.thumbnail( (width, height), Image.ANTIALIAS)
 
-            if exif[orientation] == 3:
-                image=image.rotate(180, expand=True)
-            elif exif[orientation] == 6:
-                image=image.rotate(270, expand=True)
-            elif exif[orientation] == 8:
-                image=image.rotate(90, expand=True)
-
-        else:
-            image.thumbnail( (width, height), Image.ANTIALIAS)
             
-        # print(time.time()-s)
-        # print(image.size)
         FTYPE = 'JPEG'
-        from io import BytesIO
         temp_thumb = BytesIO()
         # print(time.time()-s)
         image.save(temp_thumb, FTYPE)
@@ -188,18 +301,19 @@ class ImageSlideshowView(APIView):
         temp_thumb.seek(0)
         
         return HttpResponse(temp_thumb.read(), content_type="image/jpeg")
-
+        return HttpResponse('asdf')
 
 class filteredImagesView(APIView):
 
     permission_classes = (IsAuthenticated,)
-    
+
     def get(self, request, *args, **kwargs):
+        print("Hey")
         # print(self.request.query_params)
         params = self.request.query_params
-        if len(params.keys()) == 0:
+        if len(params.keys()) == 0 or 'people' not in params.keys():
             # Return all objects!
-            obj = ImageFile.objects.all()
+            obj = ImageFile.objects.all().order_by('dateTaken').values_list('id', 'dateTaken')
             # return render_404(request, "No parameters were passed. Must pass a combination of 'people', 'year_start', 'year_end'...")
         else:
             if 'people' in params.keys():
@@ -225,10 +339,10 @@ class filteredImagesView(APIView):
                 pass
             
 
-            obj = ImageFile.objects.filter(p_query).distinct().order_by('dateTaken')
+            obj = ImageFile.objects.filter(p_query).distinct().order_by('dateTaken').values_list('id', 'dateTaken')
             
-        ids = list(([o.id for o in obj]))
-        dates = list(([o.dateTaken.isoformat() for o in obj]))
+        ids = list(([o[0] for o in obj]))
+        dates = list(([o[1].isoformat() for o in obj]))
         
         zip_list = list(zip(ids, dates))
             

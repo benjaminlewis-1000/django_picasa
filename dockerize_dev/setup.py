@@ -128,6 +128,12 @@ if production_choice.lower() != 'y':
 else:
     production = "True"
 
+dev_choice = input(f"Is this a dev build? [y/N]")
+if dev_choice.lower() != 'y':
+    dev = "False"
+else:
+    dev = "True"
+
 # Remove the database directory. 
 if os.path.isdir(db_dir):
 	rmd = input("This script needs to remove the all files in the app file directory to get the initialization to work properly. OK? (y/N) ")
@@ -174,6 +180,7 @@ with open(out_file_path, 'w') as fh:
 	fh.write(f"TEST_PHOTOS_FILEPOPULATE={test_dir}\n")
 	fh.write(f"LOG_LOCATION={log_dir}\n")
 	fh.write(f"PRODUCTION={production}\n")
+	fh.write(f"DEV={dev}\n")
 	fh.write(f"APACHE_USER={APACHE_USER}\n")
 	fh.write(f"APACHE_PWD={APACHE_PWD}\n")
 	fh.write(f"STATIC_LOCATION={project_path}/picasa/static\n")

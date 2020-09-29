@@ -20,7 +20,7 @@ import io
 from PIL import Image
 import pickle
 import face_classifier
-from celery import task
+from celery import shared_task
 
 def classify_unlabeled_faces():
 
@@ -31,16 +31,15 @@ def classify_unlabeled_faces():
     devel = False
 
     train_set, val_set, ignored_face_set = face_classifier.create_dataset(settings, devel)
-    print(len(train_set))
 
     with open('/code/train.set', 'wb') as fh:
         this_set = train_set
-        data = [this_set.labels, this_set.data_points, this_set.weight, this_set.face_id]
-        pickle.dump(data, fh)
+        data_list = [this_set.labels, this_set.data_points, this_set.weight, this_set.face_id]
+        pickle.dump(data_list, fh)
     with open('/code/val.set', 'wb') as fh:
         this_set = val_set
-        data = [this_set.labels, this_set.data_points, this_set.weight, this_set.face_id]
-        pickle.dump(data, fh)
+        data_list = [this_set.labels, this_set.data_points, this_set.weight, this_set.face_id]
+        pickle.dump(data_list, fh)
 
     num_classes = len(train_set.label_to_DBid)
 

@@ -176,6 +176,7 @@ with open(out_file_path, 'w') as fh:
 	fh.write(f"PRODUCTION={production}\n")
 	fh.write(f"APACHE_USER={APACHE_USER}\n")
 	fh.write(f"APACHE_PWD={APACHE_PWD}\n")
+	fh.write(f"DEV=False\n")
 	fh.write(f"STATIC_LOCATION={project_path}/picasa/static\n")
 
 PSQL_SCRIPT = '''

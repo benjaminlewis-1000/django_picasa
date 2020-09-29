@@ -6,18 +6,22 @@ RUN apt update
 
 RUN apt install cmake -y
 RUN apt install python3-pip -y
+RUN apt install -y postgresql # postgresql-contrib
+RUN apt install -y wget 
 
 # Add our requirements.txt
 RUN pip3 install face_recognition
 ADD requirements.txt /code/requirements.txt
 RUN pip3 install -r /code/requirements.txt
 
-RUN apt remove cmake python3-pip -y
+RUN apt remove cmake -y
 
 RUN cp /usr/bin/python3 /usr/bin/python
 
-RUN apt-get install -y wget
+# RUN echo "deb http://apt.postgresql.org/pub/repos/apt/ precise-pgdg main" > /etc/apt/sources.list.d/pgdg.list
 
 RUN rm -r /var/lib/apt/lists
 
 ADD startup.sh /startup.sh
+
+WORKDIR /code

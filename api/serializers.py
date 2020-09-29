@@ -1,11 +1,12 @@
 #! /usr/bin/env python
 
-from django.contrib.auth.models import User, Group
 from django.conf import settings
-from rest_framework import serializers
-from filepopulator.models import ImageFile, Directory
-from face_manager.models import Person, Face
+from django.contrib.auth.models import User, Group
+from django.core.paginator import Paginator
 from drf_queryfields import QueryFieldsMixin
+from face_manager.models import Person, Face
+from filepopulator.models import ImageFile, Directory
+from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 import datetime
 import dateutil.parser
@@ -25,17 +26,19 @@ class TokenPairSerializer(TokenObtainPairSerializer):
 
 class FaceSubsetSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
     
-    face_name = serializers.SerializerMethodField()
+    # face_name = serializers.SerializerMethodField()
 
     class Meta:
 
         model = Face
-        fields = ['url', 'source_image_file', 'face_thumbnail', \
-            'declared_name', 'face_name']
+        print(model)
+        # fields = ['url', 'source_image_file', 'face_thumbnail', \
+        #     'declared_name', 'face_name']
+        fields = ['url']
 
-    def get_face_name(self, obj):
-        # face_declared is the related field of the ForeignKey.
-        return obj.declared_name.person_name
+    # def get_face_name(self, obj):
+    #     # face_declared is the related field of the ForeignKey.
+    #     return obj.declared_name.person_name
 
 
 class UserSerializer(serializers.HyperlinkedModelSerializer):
@@ -191,16 +194,28 @@ class FaceSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
 class PersonSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
 
     num_faces = serializers.SerializerMethodField()
-    face_declared = FaceSubsetSerializer(read_only = True, many=True)
+    num_possibilities = serializers.SerializerMethodField()
+    face_declared = FaceSubsetSerializer(read_only = True, many=True) 
 
     class Meta:
 
         model = Person
-        fields = ['url', 'person_name', 'highlight_img', 'num_faces', 'face_declared']
+        fields = ['url', 'person_name', 'highlight_img', 'num_faces', 'num_possibilities', 'face_declared', 'id']
+        # fields = ['url', 'person_name', 'highlight_img', 'num_faces', 'id']
 
     def get_num_faces(self, obj):
         # face_declared is the related field of the ForeignKey.
         return obj.face_declared.count()
+
+    def get_num_possibilities(self, obj):
+        # face_declared is the related field of the ForeignKey.
+        f1 = obj.face_poss1.count()
+        f2 = obj.face_poss2.count()
+        f3 = obj.face_poss3.count()
+        f4 = obj.face_poss4.count()
+        f5 = obj.face_poss5.count()
+
+        return  f1 + f2 + f3 + f4 + f5
 
 # Source : https://medium.com/django-rest-framework/django-rest-framework-viewset-when-you-don-t-have-a-model-335a0490ba6f
 class ParameterSerializer(serializers.Serializer):

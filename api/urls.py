@@ -29,8 +29,7 @@ urlpatterns = [
     path('token/refresh/', jwt_views.TokenRefreshView.as_view(), name='token_refresh'),
     # url(r'^', include(router.urls)),
     path('', include(router.urls)),
-    # path('api-auth/', include('rest_framework.urls', namespace='rest_framework'))
-    path(r'slide_img/', views.ImageSlideshowView.as_view(), name='slide_img'),
     path(r'image_list/', views.filteredImagesView.as_view(), name='image_list'),
-# router.register(r'slide_img', views.ImageSlideshowView, basename='slide_img')
+    path(r'paginate_obj_ids/<int:id>/<slug:field>', views.PersonParamView.as_view(), name='face_pages'),
+    path(r'keyed_image/<slug:type>/', views.KeyedImageView.as_view(), name='keyed_image')
 ]

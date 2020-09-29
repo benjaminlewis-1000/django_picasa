@@ -4,7 +4,7 @@ from django.contrib.auth.models import User
 from django.utils.crypto import get_random_string
 from django.conf import settings
 
-from celery import shared_task, task
+from celery import shared_task
 import time
 import os
 # import scripts
@@ -23,7 +23,7 @@ if not settings.configured:
 # app.config_from_object('django.conf:settings', namespace='CELERY')
 # app.autodiscover_tasks() 
 
-@task(ignore_result=True, name='filepopulator.populate_files_from_root')
+@shared_task(ignore_result=True, name='filepopulator.populate_files_from_root')
 def load_images_into_db():
     base_directory = settings.FILEPOPULATOR_SERVER_IMG_DIR
     # fname = os.path.join(os.environ['HOME'], 'filepopulate.txt')
@@ -34,7 +34,7 @@ def load_images_into_db():
     delete_removed_photos()
 
 
-@task(name='filepopulator.update_dir_dates')
+@shared_task(name='filepopulator.update_dir_dates')
 def update_dir_dates():
     print("Updates")
     update_dirs_datetime()
