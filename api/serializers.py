@@ -31,7 +31,6 @@ class FaceSubsetSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSeriali
     class Meta:
 
         model = Face
-        print(model)
         # fields = ['url', 'source_image_file', 'face_thumbnail', \
         #     'declared_name', 'face_name']
         fields = ['url']
@@ -183,12 +182,14 @@ class FaceSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
             'poss_ident4', 'poss_face_name4', 'weight_4', \
             'poss_ident5', 'poss_face_name5', 'weight_5', \
             'box_top', 'box_bottom', 'box_left', \
-            'box_right', 'face_thumbnail']
+            'box_right', 'face_thumbnail', 'rejected_fields']
         # fields = ['url', 'source_image_file', 'written_to_photo_metadata',  \
         #     'declared_name', 'face_name', 'poss_ident1', 'weight_1', 'poss_face_name1', \
         #     'poss_ident2', 'poss_face_name2', 'poss_ident3',  'poss_ident4', \
         #     'poss_ident5', 'box_top', 'box_bottom', 'box_left', \
         #     'box_right', 'face_thumbnail']
+
+
 
 
 class PersonSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
@@ -216,6 +217,10 @@ class PersonSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer)
         f5 = obj.face_poss5.count()
 
         return  f1 + f2 + f3 + f4 + f5
+
+    
+    # def update(self, instance, validated_data):
+    #     print("Seri update")
 
 # Source : https://medium.com/django-rest-framework/django-rest-framework-viewset-when-you-don-t-have-a-model-335a0490ba6f
 class ParameterSerializer(serializers.Serializer):

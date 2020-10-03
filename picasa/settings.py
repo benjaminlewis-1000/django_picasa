@@ -151,7 +151,6 @@ INSTALLED_APPS = [
     'face_manager',
     'api',
     'filters',
-    'frontend',
     # 'webpack_loader',
     # 'upload_img',
 ]
@@ -330,7 +329,7 @@ CELERY_TIMEZONE = TIME_ZONE
 CELERY_BEAT_SCHEDULE = {
     'filepopulate_root': {
         'task': 'filepopulator.populate_files_from_root',
-        'schedule': crontab(minute='*/10') # , hour='*/6'),
+        'schedule': crontab(hour='*/6', minute=0) # , hour='*/6'),
         # 'schedule': crontab(minute='*/10'),
     },
     'dirs_datetimes': {
@@ -339,18 +338,18 @@ CELERY_BEAT_SCHEDULE = {
     },
     'face_add': {
         'task': 'face_manager.face_extraction', 
-        'schedule': crontab( minute = '*/1'),
+        'schedule': crontab( hour = '*/6', minute=0),
         # 'schedule': crontab( minute = '0', hour='*/2'),
         'options': {
             'expires': 30,
             # 'expires': 1800,
         }
     },
-    'classify_unlabeled': {
-        'task': 'face_manager.classify_unlabeled',
-        'schedule': crontab(day_of_month = '*/5', minute=0, hour=0)
-        # 'schedule': crontab(minute='*/2')
-    }
+#    'classify_unlabeled': {
+#        'task': 'face_manager.classify_unlabeled',
+#        'schedule': crontab(day_of_month = '*/5', minute=0, hour=0)
+#        # 'schedule': crontab(minute='*/2')
+#    }
 
 }
 
@@ -411,3 +410,5 @@ if DEV:
 else:
     FACE_NUM_THRESH=50
 IGNORED_NAMES=[BLANK_FACE_NAME, '.ignore', '.realignore', '.jessicatodo', '.cutler_tbd']
+
+print("STATIC is : ", STATIC_URL)

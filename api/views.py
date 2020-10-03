@@ -14,12 +14,15 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
 import base64
 import cv2
+from rest_framework.decorators import action
 import time
+import numpy as np
 import PIL
 from PIL import Image, ExifTags
 from django.http import HttpResponse, Http404
 from django.shortcuts import render
 from django.core.paginator import Paginator
+from django.core.files.base import ContentFile
 from rest_framework.reverse import reverse, reverse_lazy
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q
@@ -30,6 +33,35 @@ from django.db.models import Q
 from filters.mixins import (
     FiltersMixin,
 )
+
+
+def open_img_oriented(filename):
+
+    try:
+        image = PIL.Image.open(filename)
+    except Exception as e:
+        return None
+
+    # if image_type in ['slideshow', 'face_source']: 
+    #     # Resize the image dynamically
+    for orientation in ExifTags.TAGS.keys():
+        if ExifTags.TAGS[orientation]=='Orientation':
+            break
+
+    try:
+        exif=dict(image._getexif().items())
+    except Exception as e:
+        exif = {}
+
+    if orientation in exif.keys():
+        if exif[orientation] == 3:
+            image=image.rotate(180, expand=True)
+        elif exif[orientation] == 6:
+            image=image.rotate(270, expand=True)
+        elif exif[orientation] == 8:
+            image=image.rotate(90, expand=True)
+
+    return image
 
 # Create your views here.
 
@@ -114,9 +146,23 @@ class PersonViewSet(viewsets.ModelViewSet):
 
     def get_serializer_context(self):
         context = super(PersonViewSet, self).get_serializer_context()
-        print(context)
+        print("Context: ", context)
         context.update({"request": self.request})
         return context
+
+    
+    # def patch(self, request, pk):
+    #     print("Patched")
+    #     print(request, pk)
+    
+    # def perform_update(self, serializer):
+    #     print("Update")
+
+    # def update(self, request, pk=None):
+    #     print("UPdate ser method")
+
+    # def create(self, instance, data):
+    #     print("Create face")
 
 
 
@@ -176,7 +222,308 @@ class FaceViewSet(viewsets.ModelViewSet):
 
     queryset = Face.objects.all()
     serializer_class = api_ser.FaceSerializer
-    print(queryset[0].face_thumbnail)
+
+    def get_serializer_context(self):
+        context = super(FaceViewSet, self).get_serializer_context()
+        # print("Context for face: ", context, dir(context['request']))
+        context.update({"request": self.request})
+        return context
+
+
+    def highlight_from_face(self, face, person_name):
+        # Helper method to extract a 500x500 pixel highlight
+        # image from the face. Uses the source_image_file
+        # of the face to get the original image, extracts the
+        # highlight given the face borders, and resizes. Returns
+        # the face as a ContentFile, which is used in the 
+        # save method for the person.highlight_image
+
+        # Get the borders
+        r_left = face.box_left
+        r_right = face.box_right
+        r_bot = face.box_bottom
+        r_top = face.box_top
+
+        # Make the borders a square
+        top_to_bot = r_bot - r_top
+        left_to_right = r_right - r_left
+        lr_cent = r_left + left_to_right // 2
+        tb_cent = r_top + top_to_bot // 2
+
+        extent = min(top_to_bot, left_to_right) // 2
+        r_left = lr_cent - extent
+        r_right = lr_cent + extent
+        r_top = tb_cent - extent
+        r_bot = tb_cent + extent
+
+        # Extract the source file, oriented. 
+        source_file = face.source_image_file.filename
+        pixel_hash = face.source_image_file.pixel_hash
+        image = open_img_oriented(source_file)
+        # Crop out the image, resize, encode in ByteIO, etc.
+        img_thmb = image.crop((r_left, r_top, r_right, r_bot))
+        img_thmb = np.array(img_thmb)
+        img_thmb = cv2.resize(img_thmb, (500, 500))
+        # Convert color space
+        img_thmb = cv2.cvtColor(img_thmb, cv2.COLOR_BGR2RGB)
+
+        is_success, person_buff = cv2.imencode(".jpg", img_thmb)
+
+        # Save thumbnail to in-memory file as BytesIO
+        person_byte_thumbnail = BytesIO(person_buff)
+
+        person_thumb_filename = f'{pixel_hash}_{person_name}.jpg'
+        
+        person_byte_thumbnail.seek(0)
+        person_content_file = ContentFile(person_byte_thumbnail.read())
+
+        # Return the filename to write and the content file.
+        return person_thumb_filename, person_content_file
+
+    def assign_face(self, face, declared_name):
+        # Set the face declared_name to the
+        # declared_name and zero out all the 
+        # possible identity parameters.
+
+        face.declared_name = declared_name
+        face.poss_ident1 = None
+        face.poss_ident2 = None
+        face.poss_ident3 = None
+        face.poss_ident4 = None
+        face.poss_ident5 = None
+        face.weight_1 = 0.0
+        face.weight_2 = 0.0
+        face.weight_3 = 0.0
+        face.weight_4 = 0.0
+        face.weight_5 = 0.0
+
+        return face
+
+
+    @action(detail=True, methods=['patch'])
+    def assign_face_to_person(self, request, pk=None):
+        # Accessible as <root>/api/faces/<face_id>/assign_face_to_person/
+        # Accept: HTML PATCH
+        # Requires a declared_name parameter in the body which
+        # has the pk for a desired person with which to associate
+        # the face.
+        # Given the face to set to a person, changes the face's 
+        # declared_name to point to the person and zeros
+        # out any possible identity fields and associated 
+        # weights. 
+
+        # Get the face object and the request data
+        face = self.get_object()
+        data = request.data
+
+        def err_404(message=""):
+            msg_start = f'Invalid face update request. \n\n'
+            msg_start += message
+            err_404 = render_404(request, msg_start)
+            return err_404
+
+        if 'declared_name_key' not in request.data.keys():
+            return err_404("declared_name_key not set in body")
+
+        # Get the person to associate and ensure the value
+        # passed is an integer
+        name_key = request.data['declared_name_key']
+        try:
+            name_key = int(name_key)
+        except:
+            return err_404("declared_name_key passed was not an integer.")
+
+        # Given the name key, try to find the appropriate person. 
+        # Return a 404 if that person pk is not in the database. 
+        try:
+            identity = Person.objects.get(id=name_key)
+        except:
+            return err_404("Desired declared name key is not a key found in the database.")
+            
+        # Update the face object fields accordingly
+        face = self.assign_face(face, identity)
+        face.save()
+
+        # Return a json block with success=true, the new key (passed as
+        # an argument), and the declared human-meaningful name. 
+        js = {'success': True, 'new_key': name_key, 'new_name': face.declared_name.person_name}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+    @action(detail=True, methods=['put'])
+    def face_to_new_person(self, request, pk=None):
+        # Accessible as <root>/api/faces/<face_id>/face_to_new_person/
+        # Accept: HTML PUT
+        # Given face_id in the URL and person_name in the request
+        # body, create a new person of name person_name. Extract
+        # the face highlight image from the original source image
+        # of face.source_image and resize it to 500 px. Save the
+        # highlight image to the new person, assign the name
+        # to the new person, and assign this face to the new person
+        # and zero out all proposed images. 
+        face = self.get_object()
+        data = request.data
+
+        def err_404(message=""):
+            msg_start = f'Invalid face update request. \n\n'
+            msg_start += message
+            err_404 = render_404(request, msg_start)
+            return err_404
+
+        if 'person_name' not in data.keys():
+            return err_404("person_name not set in body")
+        else:
+            person_name = data['person_name']
+
+
+        new_person = Person(person_name = person_name)
+        
+        filename, person_content_file = self.highlight_from_face(face, person_name)
+        # Load a ContentFile into the thumbnail field so it gets saved
+        new_person.highlight_img.save(filename, person_content_file) 
+
+        new_person.save()
+
+        face = self.assign_face(face, new_person)
+        face.save()
+
+        js = {'success': True, 'new_id': new_person.id, 'new_name': person_name}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+    @action(detail=True, methods=['patch'])
+    def set_as_person_thumbnail(self, request, pk=None):
+        # Accessible as <root>/api/faces/<face_id>/set_as_person_thumbnail/
+        # Accept: HTML PUT
+        # No body parameters
+        # Given the face, sets the associated person's thumbnail to be
+        # that face. 
+        face = self.get_object()
+        person = face.declared_name
+
+        print(person.person_name)
+        filename, person_content_file = self.highlight_from_face(face, person.person_name)
+        person.highlight_img.save(filename, person_content_file) 
+
+        person.save()
+        js = {'success': True}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+
+    @action(detail=True, methods=['put'])
+    def ignore_face(self, request, pk=None):
+        # Accessible as <root>/api/faces/<face_id>/ignore_face/
+        # Accept: HTML PUT
+        # Body parameter : ignore_type in ['soft', 'hard']
+        # Given the face, set the assigned name to '.ignore'
+        def err_404(message=""):
+            msg_start = f'Invalid face ignore request. \n\n'
+            msg_start += message
+            err_404 = render_404(request, msg_start)
+            return err_404
+
+        if 'ignore_type' not in request.data.keys():
+            return err_404("ignore_type not set in body")
+        else:
+            ignore_type = request.data['ignore_type']
+
+        if ignore_type.lower() not in ['soft', 'hard']:
+            return err_404("ignore_type body parameter must be either 'soft' or 'hard'.")
+
+        face = self.get_object()
+        if ignore_type == 'soft':
+            ignore_person = Person.objects.filter(person_name='.ignore')
+        else:
+            soft_person = Person.objects.filter(person_name='.ignore')[0]
+            hard_person = Person.objects.filter(person_name='.realignore')[0]
+            if face.declared_name == soft_person or face.declared_name == hard_person:
+                # print("Good to go")
+                pass
+            else:
+                #print("Not good")
+                js = {'success': False}
+                #return HttpResponse(json.dumps(js), content_type='application/json')
+                return err_404("Person currently assigned is not .ignore or .realignore.")
+            
+            ignore_person = Person.objects.filter(person_name='.realignore')
+            
+        face = self.assign_face(face, ignore_person[0])
+        face.save()
+
+        js = {'success': True}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+    @action(detail=True, methods=['put'])
+    def unassign_face(self, request, pk=None):
+        # Accessible as <root>/api/faces/<face_id>/unassign_face/
+        # Accept: HTML PUT
+        # Body parameter : None
+        # Given the face, remove any assigned face
+
+        face = self.get_object()
+        unassigned_person = Person.objects.filter(declared_name=settings.BLANK_FACE_NAME)
+        
+        face = self.assign_face(face, unassigned_person)
+        face.save()
+
+        js = {'success': True}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+
+    @action(detail=True, methods=['put'])
+    def reject_association(self, request, pk=None):
+        # Accessible as <root>/api/faces/<face_id>/reject_association/
+        # Accept: HTML PUT
+        # Body parameter : unassociate_id (person_id)
+        # Given the face, remove association to the given
+        # person and add the person_id to the rejected_fields. 
+        
+        def err_404(message=""):
+            msg_start = f'Invalid reject association request. \n\n'
+            msg_start += message
+            err_404 = render_404(request, msg_start)
+            return err_404
+
+        if 'unassociate_id' not in request.data.keys():
+            return err_404("unassociate_id not set in body")
+        else:
+            unassociate_id = request.data['unassociate_id']
+
+        try:
+            unassociate_id = int(unassociate_id)
+        except:
+            return err_404("unassociate_id passed was not an integer.")
+
+        face = self.get_object()
+        disown_person = Person.objects.get(id=unassociate_id)
+
+        if face.poss_ident1 == disown_person:
+            face.poss_ident1 = None
+            face.weight_1 = 0.0
+        elif face.poss_ident2 == disown_person:
+            face.poss_ident2 = None
+            face.weight_2 = 0.0
+        elif face.poss_ident3 == disown_person:
+            face.poss_ident3 = None
+            face.weight_3 = 0.0
+        elif face.poss_ident4 == disown_person:
+            face.poss_ident4 = None
+            face.weight_4 = 0.0
+        elif face.poss_ident5 == disown_person:
+            face.poss_ident5 = None
+            face.weight_5 = 0.0
+
+        reject_list = face.rejected_fields
+        if reject_list is None:
+            reject_list = []
+
+        reject_list.append(unassociate_id)
+        # Remove duplicates
+        reject_list = list(set(reject_list))
+
+        face.rejected_fields = reject_list
+        face.save()
+
+        js = {'success': True}
+        return HttpResponse(json.dumps(js), content_type='application/json')
 
 class KeyedImageView(APIView):
     def get(self, request, *args, **kwargs):
@@ -189,7 +536,6 @@ class KeyedImageView(APIView):
             msg_start += message
             err_404 = render_404(request, msg_start)
             return err_404
-
 
         if 'type' not in kwargs.keys():
             return err_404('You did not provide a type variable.')
@@ -211,14 +557,14 @@ class KeyedImageView(APIView):
                 return err_404('Invalid access key.')
 
         def getAndCheckID(obj_type, id_key):
-            print(obj_type)
+            # print(obj_type)
             if obj_type == 'person':
                 obj = Person
             elif obj_type == 'face':
                 obj = Face
             elif obj_type == 'image':
                 obj = ImageFile
-            print(obj)
+            # print(obj)
             try:
                 return obj.objects.get(id=id_key)
             except:
@@ -254,45 +600,19 @@ class KeyedImageView(APIView):
                     image = img_obj.thumbnail_medium
                 elif image_type == 'full_small':
                     image = img_obj.thumbnail_small
-                print(image)
-
+                    
         except:
             return err_404(f'Bad id for object of type {image_type}')
 
+
+        # print(image)
+        image = open_img_oriented(image)
+        # print(image)
         try:
-            image = PIL.Image.open(image)
-        except Exception as e:
-            return err_404('Unable to open image.')
+            image.thumbnail( (width, height), Image.ANTIALIAS)
+        except:
+            pass
 
-        if image_type in ['slideshow', 'face_source']: 
-            # Resize the image dynamically
-            for orientation in ExifTags.TAGS.keys():
-                if ExifTags.TAGS[orientation]=='Orientation':
-                    break
-
-            try:
-                exif=dict(image._getexif().items())
-            except Exception as e:
-                exif = {}
-
-            if orientation in exif.keys():
-                # print(exif[orientation])
-                if exif[orientation] in [6, 8]:
-                    image.thumbnail( (height, width), Image.ANTIALIAS)
-                else:
-                    image.thumbnail( (width,height), Image.ANTIALIAS)
-
-                if exif[orientation] == 3:
-                    image=image.rotate(180, expand=True)
-                elif exif[orientation] == 6:
-                    image=image.rotate(270, expand=True)
-                elif exif[orientation] == 8:
-                    image=image.rotate(90, expand=True)
-
-            else:
-                image.thumbnail( (width, height), Image.ANTIALIAS)
-
-            
         FTYPE = 'JPEG'
         temp_thumb = BytesIO()
         # print(time.time()-s)

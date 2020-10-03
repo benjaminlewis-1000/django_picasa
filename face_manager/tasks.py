@@ -30,8 +30,8 @@ if not settings.configured:
 
 @shared_task(ignore_result=True, name='face_manager.face_extraction')
 def process_faces():
-    settings.LOGGER.debug("Starting face extraction...")
     print('Starting face extraction...')
+    settings.LOGGER.debug("Starting face extraction...")
 
 
     face_lockfile = settings.FACE_LOCKFILE

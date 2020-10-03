@@ -191,11 +191,16 @@ def add_from_root_dir(root_dir):
         f = open(lockfile, 'w')
         f.close()
 
+        count = 0
+
         try:
             for root, dirs, files in os.walk(root_dir):
                 for f in files:
                 # Try/catch block only on individual file; lets the rest of the files be added regardless
                 # of a failure on one. 
+                    count += 1
+                    if count > 0 and count % 10000 == 0:
+                        print(f"Processed {count:,} images in add from root directory")
                     try:
                         cur_file = os.path.join(root, f)
                         cur_parts = cur_file.split(os.sep)[:-1]

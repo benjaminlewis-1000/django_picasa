@@ -30,8 +30,11 @@ def load_images_into_db():
     # logger.info("Write time")
     # with open(fname, 'a') as fh:
     #     fh.write('The time is : {}\n'.format( time.time() ) )
+    print("Loading images into database...")
     add_from_root_dir(base_directory)
+    print("Finished adding photos")
     delete_removed_photos()
+    print("Done! Finished removing photos that aren't there.")
 
 
 @shared_task(name='filepopulator.update_dir_dates')

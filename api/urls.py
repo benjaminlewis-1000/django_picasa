@@ -24,7 +24,7 @@ router.register(r'server_stats', views.StatsViewSet, basename='stats')
 # Requesting a token: https://simpleisbetterthancomplex.com/tutorial/2018/11/22/how-to-implement-token-authentication-using-django-rest-framework.html#user-requesting-a-token
 # http post https://picasa.exploretheworld.tech/api/request-token/ username=benjamin password=********
 urlpatterns = [
-    path('request-token/', obtain_auth_token, name='api_token_auth'),  
+    # path('request-token/', obtain_auth_token, name='api_token_auth'),  
     path('token/obtain/', views.TokenPairWithUsername.as_view(), name='token_create'),  # override sjwt stock token
     path('token/refresh/', jwt_views.TokenRefreshView.as_view(), name='token_refresh'),
     # url(r'^', include(router.urls)),

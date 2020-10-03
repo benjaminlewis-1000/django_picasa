@@ -125,6 +125,12 @@ class Face(models.Model):
 
     written_to_photo_metadata = models.BooleanField(default=False)
 
+    rejected_fields = ArrayField(
+                            models.IntegerField(),
+                            size=128, blank=True, null=True
+                        )
+
+
     # Preserve the values of the face's bounding box.
     box_top = models.IntegerField(validators=[MinValueValidator(1)], default=-1)
     box_bottom = models.IntegerField(validators=[MinValueValidator(1)], default=-1)
@@ -137,7 +143,7 @@ class Face(models.Model):
 
 
     def __str__(self):
-        return "Instance of {}".format(self.declared_name)
+        return "Face instance of {}".format(self.declared_name)
 
     def delete(self):
         os.remove(self.face_thumbnail.path)
