@@ -1,3 +1,23 @@
+######### Steps to get this Docker container working ##################
+
+# Set up the IP address for the Picasa host machine so that Docker can get the appropriate
+# return host address for the face detection:
+# Add to your /etc/profile on the django host:
+export HOST_IP=`ip route | grep default | awk '{print $9}'`
+### (This may not work exactly, but you can google around and find the right thing)
+
+- Install docker and docker-compose
+
+- Clone the module and submodule (git submodule update --init)
+
+- Run setup.py in the dockerize directory.
+
+- Run docker-compose up
+
+- May need to initialize the database: docker-compose up, then in another window:
+- docker exec -it db_django /bin/sh
+- bash /docker-entrypoint-initdb.d/psql_init.sh
+
 # Install django
 pip install Django
  
