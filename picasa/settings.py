@@ -338,18 +338,18 @@ CELERY_BEAT_SCHEDULE = {
     },
     'face_add': {
         'task': 'face_manager.face_extraction', 
-        'schedule': crontab( hour = '*/6', minute=0),
+        'schedule': crontab( hour = '*', minute='*/2'),
         # 'schedule': crontab( minute = '0', hour='*/2'),
         'options': {
             'expires': 30,
             # 'expires': 1800,
         }
     },
-#    'classify_unlabeled': {
-#        'task': 'face_manager.classify_unlabeled',
-#        'schedule': crontab(day_of_month = '*/5', minute=0, hour=0)
-#        # 'schedule': crontab(minute='*/2')
-#    }
+    'classify_unlabeled': {
+        'task': 'face_manager.classify_unlabeled',
+        'schedule': crontab(day_of_month = '*/5', minute=0, hour=0)
+        # 'schedule': crontab(minute='*/2')
+    }
 
 }
 

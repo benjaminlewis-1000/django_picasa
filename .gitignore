@@ -1,4 +1,6 @@
 thumbnails/*
+labels/*
+dep/*
 *.set
 *.lock
 .env
@@ -13,3 +15,4 @@ static/*
 */migrations/*
 media/*
 gdrive_credentials.json
+*.npy

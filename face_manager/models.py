@@ -100,6 +100,11 @@ class Face(models.Model):
                             models.FloatField(),
                             size=128, blank=True, null=True
                         )
+    
+    face_encoding_512 = ArrayField(
+                            models.FloatField(),
+                            size=512, blank=True, null=True
+                        )
 
     # This field will contain the top 5 possible identities as categorized
     # by the FC network.

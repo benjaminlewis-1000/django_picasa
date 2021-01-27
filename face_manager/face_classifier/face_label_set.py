@@ -5,8 +5,11 @@ import numpy as np
 import torch
 
 class FaceLabelSet(data.Dataset):
-    def __init__(self):
+    def __init__(self, which_features):
         super(FaceLabelSet, self).__init__()
+        
+        assert which_features in ['short', 'long']
+        self.which_features = which_features
 
         self.label_to_DBid = {}
         self.DBid_to_label = {}
@@ -34,7 +37,14 @@ class FaceLabelSet(data.Dataset):
         label = self.DBid_to_label[person_id]
         if type(data) == type(None):
             return
-        assert len(data) == 128
+        if self.which_features == 'short':
+            assert len(data) == 128
+        else:
+            assert len(data) == 512 
+
+#        print(np.linalg.norm(data))
+        data = data / np.linalg.norm(data)
+
         self.labels.append(label)
         self.face_id.append(face_id)
         self.data_points.append(torch.Tensor(data))
@@ -64,6 +74,6 @@ class FaceLabelSet(data.Dataset):
         return len(self.data_points)
 
     def __getitem__(self, index):
-        data = self.data_points[index]
+        data = torch.Tensor(self.data_points[index])
         face_db_id = self.face_id[index]
         return data, self.labels[index], face_db_id

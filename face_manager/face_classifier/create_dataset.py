@@ -5,20 +5,24 @@ from .face_label_set import FaceLabelSet
 from django.db.models import Count
 import random
 
-def create_dataset(settings, devel=False):
+def create_dataset(settings, devel=False, which_features='short'):
 
+    assert which_features in ['short', 'long']
     ignore_filter = face_models.Person.objects.filter(person_name='.realignore')
     ignored_faces = face_models.Face.objects.filter(declared_name=ignore_filter[0].id)
 
-    ignored_face_set = FaceLabelSet()
+    ignored_face_set = FaceLabelSet(which_features)
     ignored_face_set.add_person('ignore', 1)
     for ignf in ignored_faces:
-        ignored_face_set.add_datapoint(1, ignf.face_encoding, ignf.id)
+        if which_features == 'short':
+            ignored_face_set.add_datapoint(1, ignf.face_encoding, ignf.id)
+        else:
+            ignored_face_set.add_datapoint(1, ignf.face_encoding_512, ignf.id)
 
     # print("Ignored face length: ", len(ignored_face_set))
 
-    train_set = FaceLabelSet()
-    val_set = FaceLabelSet()
+    train_set = FaceLabelSet(which_features)
+    val_set = FaceLabelSet(which_features)
     # Get all the faces that have an assigned name and that
     # have enough faces for us to be interested in training.
     # How to filter on foreign key: 
@@ -49,14 +53,23 @@ def create_dataset(settings, devel=False):
 
         num_train = int(len(indices) * 0.9)
         
-        for ii in range(0, num_train):
-            idx = indices[ii]
-            train_set.add_datapoint(p.id, faces_of_person[idx].face_encoding, faces_of_person[idx].id)
+        try:
+            for ii in range(0, num_train):
+                idx = indices[ii]
+                if which_features == 'short':
+                    train_set.add_datapoint(p.id, faces_of_person[idx].face_encoding, faces_of_person[idx].id)
+                else:
+                    train_set.add_datapoint(p.id, faces_of_person[idx].face_encoding_512, faces_of_person[idx].id)
 
 
-        for jj in range(num_train, len(indices)):
-            idx = indices[jj]
-            val_set.add_datapoint(p.id, faces_of_person[idx].face_encoding, faces_of_person[idx].id)
+            for jj in range(num_train, len(indices)):
+                idx = indices[jj]
+                if which_features == 'short':
+                    val_set.add_datapoint(p.id, faces_of_person[idx].face_encoding, faces_of_person[idx].id)
+                else:
+                    val_set.add_datapoint(p.id, faces_of_person[idx].face_encoding_512, faces_of_person[idx].id)
+        except:
+            pass
 
             # nn += 1
             # if nn > 20:

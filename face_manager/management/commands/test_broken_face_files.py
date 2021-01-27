@@ -15,13 +15,13 @@ class Command(BaseCommand):
     
     def handle(self, *args, **options):
 
-    	# Get the list of files that are not processed
+        # Get the list of files that are not processed
 
-    	all_images = ImageFile.objects.filter(isProcessed=False)
-    	print(len(all_images))
+        all_images = ImageFile.objects.filter(isProcessed=False)
+        print(len(all_images))
 
-    	server_conn = establish_multi_server_connection()
-    	
-    	print(server_conn.server_ips, dir(server_conn))
-    	for img in all_images:
-    		populateFromImageMultiGPU(img.filename,  server_conn = server_conn, server_ip = server_conn.server_ips[1])
+        server_conn = establish_multi_server_connection()
+        
+        print(server_conn.server_ips, dir(server_conn))
+        for img in all_images:
+            populateFromImageMultiGPU(img.filename,  server_conn = server_conn, server_ip = server_conn.server_ips[1])

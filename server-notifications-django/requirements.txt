@@ -1,0 +1,14 @@
+# Requirements for server-notifications-django
+
+Django==2.2.5
+twilio==6.30.0
+python-dotenv==0.10.3
+
+# Production dependencies
+gunicorn
+
+# Test dependencies
+black
+coverage
+flake8
+mock

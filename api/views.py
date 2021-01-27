@@ -194,12 +194,22 @@ class PersonParamView(APIView):
             if field == 'face_declared':
                 faces = Face.objects.filter(declared_name=person_obj).values_list('id', flat=True)
             else:
-                p1 = Q(poss_ident1=person_obj)
-                p2 = Q(poss_ident2=person_obj)
-                p3 = Q(poss_ident3=person_obj)
-                p4 = Q(poss_ident4=person_obj)
-                p5 = Q(poss_ident5=person_obj)
-                faces = Face.objects.filter(p1 | p2 | p3 | p4 | p5).values_list('id', flat=True)
+                # p1 = Q(poss_ident1=person_obj)
+                # p2 = Q(poss_ident2=person_obj)
+                # p3 = Q(poss_ident3=person_obj)
+                # p4 = Q(poss_ident4=person_obj)
+                # p5 = Q(poss_ident5=person_obj)
+                # faces = Face.objects.filter(p1 | p2 | p3 | p4 | p5).values_list('id', flat=True)
+
+                faces1 = list(Face.objects.filter(poss_ident1=person_obj).values_list('id', 'weight_1'))
+                faces2 = list(Face.objects.filter(poss_ident2=person_obj).values_list('id', 'weight_2'))
+                faces3 = list(Face.objects.filter(poss_ident3=person_obj).values_list('id', 'weight_3'))
+                faces4 = list(Face.objects.filter(poss_ident4=person_obj).values_list('id', 'weight_4'))
+                faces5 = list(Face.objects.filter(poss_ident5=person_obj).values_list('id', 'weight_5'))
+
+                f = faces1 + faces2 + faces3 + faces4 + faces5
+                faces = sorted(f, key=lambda tup: tup[1], reverse=True)
+                faces = [f[0] for f in faces]
                 
             id_list = list(faces)
         else:
@@ -286,6 +296,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         # possible identity parameters.
 
         face.declared_name = declared_name
+        face.written_to_photo_metadata = False
         face.poss_ident1 = None
         face.poss_ident2 = None
         face.poss_ident3 = None
@@ -304,7 +315,7 @@ class FaceViewSet(viewsets.ModelViewSet):
     def assign_face_to_person(self, request, pk=None):
         # Accessible as <root>/api/faces/<face_id>/assign_face_to_person/
         # Accept: HTML PATCH
-        # Requires a declared_name parameter in the body which
+        # Requires a declared_name_key parameter in the body which
         # has the pk for a desired person with which to associate
         # the face.
         # Given the face to set to a person, changes the face's 
@@ -328,6 +339,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         # Get the person to associate and ensure the value
         # passed is an integer
         name_key = request.data['declared_name_key']
+        print(name_key)
         try:
             name_key = int(name_key)
         except:
@@ -389,13 +401,14 @@ class FaceViewSet(viewsets.ModelViewSet):
         js = {'success': True, 'new_id': new_person.id, 'new_name': person_name}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
-    @action(detail=True, methods=['patch'])
+    @action(detail=True, methods=['put'])
     def set_as_person_thumbnail(self, request, pk=None):
         # Accessible as <root>/api/faces/<face_id>/set_as_person_thumbnail/
         # Accept: HTML PUT
         # No body parameters
         # Given the face, sets the associated person's thumbnail to be
         # that face. 
+        print("Thumb")
         face = self.get_object()
         person = face.declared_name
 
@@ -434,8 +447,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         else:
             soft_person = Person.objects.filter(person_name='.ignore')[0]
             hard_person = Person.objects.filter(person_name='.realignore')[0]
-            if face.declared_name == soft_person or face.declared_name == hard_person:
-                # print("Good to go")
+            if face.declared_name == soft_person or face.declared_name == hard_person or face.poss_ident1 == soft_person:
                 pass
             else:
                 #print("Not good")
@@ -459,7 +471,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         # Given the face, remove any assigned face
 
         face = self.get_object()
-        unassigned_person = Person.objects.filter(declared_name=settings.BLANK_FACE_NAME)
+        unassigned_person = Person.objects.filter(person_name=settings.BLANK_FACE_NAME)[0]
         
         face = self.assign_face(face, unassigned_person)
         face.save()
@@ -527,6 +539,17 @@ class FaceViewSet(viewsets.ModelViewSet):
 
 class KeyedImageView(APIView):
     def get(self, request, *args, **kwargs):
+        '''
+        Call to get an image defined by a given key.
+        Method: GET
+        URL: /api/keyed_image/<key_value>/?=<request_type>&access_key=<key>
+        Valid types:
+        face_highlight: key type - person. Gets the highlight image of that person
+        face_array: key type - face. Gets the cropped image of just that face
+        face_source: key type: face. Gets the full image containing that face.
+        slideshow: key type: image. Gets a reduced resolution image for the slideshow.
+        full_big/medium/small: key type: image. Gets the corresponding thumbnail image. 
+        '''
 
         params = self.request.query_params
         valid_types = ['face_highlight', 'face_array', 'face_source', 'slideshow', 'full_big', 'full_medium', 'full_small']
@@ -574,6 +597,8 @@ class KeyedImageView(APIView):
             if image_type == 'face_highlight':
                 person = getAndCheckID('person', id_key)
                 image = person.highlight_img
+                height = 700
+                width = 1920 / 1080 * height
             elif image_type == 'face_array':
                 face = getAndCheckID('face', id_key)
                 image = face.face_thumbnail
@@ -628,39 +653,55 @@ class filteredImagesView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request, *args, **kwargs):
-        print("Hey")
         # print(self.request.query_params)
         params = self.request.query_params
-        if len(params.keys()) == 0 or 'people' not in params.keys():
+
+        if len(params.keys()) == 0 : # or 'people' not in params.keys():
             # Return all objects!
             obj = ImageFile.objects.all().order_by('dateTaken').values_list('id', 'dateTaken')
             # return render_404(request, "No parameters were passed. Must pass a combination of 'people', 'year_start', 'year_end'...")
         else:
+            p_query = None
+            years_query = None
             if 'people' in params.keys():
                 people = params['people'].split(',')
                 if len(people) > 0:
-                    p_query = Q(face__declared_name__person_name=people[0])
+                    people_query = Q(face__declared_name__person_name=people[0])
                 for p in people[1:]:
-                    p_query = p_query | Q(face__declared_name__person_name=p) 
+                    people_query = people_query | Q(face__declared_name__person_name=p) 
+
+                # people_query = (people_query) & ~Q(face__declared_name__person_name='Charlotte Lewis')
+                if p_query is None:
+                    p_query = people_query
+
+
 
             if 'year_start' in params.keys():
-                # print(params['year_start'])
-                # try:
-                #     p_query = p_query | Q()
-                # except NameError:
-                #     p_query = Q()
-                pass
+                year_start = int(params['year_start'])
+                year_start_query = Q(face__source_image_file__dateTaken__year__gte = year_start)
+                if years_query is None:
+                    years_query = year_start_query
+                else:
+                    years_query = years_query & year_start_query
+
             if 'year_end' in params.keys():
-                # print(params['year_end'])
-                # try:
-                #     p_query = p_query | Q()
-                # except NameError:
-                #     p_query = Q()
-                pass
+                year_end = int(params['year_end'])
+                year_end_query = Q(face__source_image_file__dateTaken__year__lte = year_end)
+                if years_query is None:
+                    years_query = year_end_query
+                else:
+                    years_query = years_query & year_end_query
             
 
-            obj = ImageFile.objects.filter(p_query).distinct().order_by('dateTaken').values_list('id', 'dateTaken')
-            
+            if p_query is None:
+                p_query = years_query
+            else:
+                if years_query is not None:
+                    p_query = p_query | years_query
+
+            print(p_query)
+            obj = ImageFile.objects.filter(p_query).exclude(face__declared_name__person_name='Charlotte Lewis').distinct().order_by('dateTaken').values_list('id', 'dateTaken')
+
         ids = list(([o[0] for o in obj]))
         dates = list(([o[1].isoformat() for o in obj]))
         
