@@ -14,7 +14,7 @@ django-webpack-loader==0.7.0
 Django==3.1.1
 djangorestframework-queryfields==1.0.0
 djangorestframework-simplejwt==4.4.0
-djangorestframework==3.11.1
+djangorestframework==3.11.2
 drf-url-filters==0.5.1
 editdistance==0.3.1
 ExifRead==2.3.1
