@@ -43,4 +43,4 @@ class FaceNetwork(nn.Module):
         logits = self.fc5(x)
 
        # return hidden_out, logits, F.softmax(logits, dim=1)
-        return None, logits, F.softmax(logits, dim=1)
+        return logits

@@ -1,15 +1,17 @@
+#! /usr/bin/env python
 
-from django.conf import settings
-
-from filepopulator.models import ImageFile
-import shutil
 from .models import Person, Face
-import image_face_extractor
-import cv2
-from io import BytesIO
+from django.conf import settings
 from django.core.files.base import ContentFile
-import numpy as np
+from facenet_pytorch import MTCNN, InceptionResnetV1
+from filepopulator.models import ImageFile
+from io import BytesIO
+import cv2
+import image_face_extractor
 import logging
+import numpy as np
+import shutil
+import torch
 
 def establish_server_connection():
     server_conn = image_face_extractor.ip_finder.server_finder(logger=settings.LOGGER)
@@ -21,6 +23,18 @@ def establish_multi_server_connection():
     server_conn = image_face_extractor.ip_finder_multi.server_finder(logger=settings.LOGGER)
 
     return server_conn
+
+
+def get_inception_embedding(highlight):
+
+    image = (highlight - 127.5) / 128
+    image = torch.Tensor(image)
+    resnet = InceptionResnetV1(pretrained='vggface2').eval()
+    encoding = resnet(image.unsqueeze(0))
+    encoding = encoding.detach().numpy().astype(np.float32)
+    encoding = list(encoding[0])
+
+    return encoding
 
 def placeInDatabase(foreign_key, face_data):
 
@@ -86,7 +100,22 @@ def placeInDatabase(foreign_key, face_data):
             new_face.written_to_photo_metadata = False
 
         if encoding is not None:
+            # Then write the encodings to the database. 
+
+            ########################################
+            # Extract inception features
+            detected_face_nonsquare = eachface.square_face
+            img_thmb = np.array(detected_face_nonsquare)
+            assert np.abs(img_thmb.shape[0] - img_thmb.shape[1]) < 3, f"{img_thmb.shape[0]} != {img_thmb.shape[1]}"
+            img_thmb = cv2.resize(img_thmb, (160, 160))
+            # Convert color space
+            img_thmb = cv2.cvtColor(img_thmb, cv2.COLOR_BGR2RGB)
+            img_thmb = np.moveaxis(img_thmb, 2, 0)
+            enc_512 = get_inception_embedding(img_thmb)
+            ########################################
+
             new_face.face_encoding = encoding
+            new_face.face_encoding_512 = enc_512
 
         new_face.box_top = r_top
         new_face.box_bottom = r_bot

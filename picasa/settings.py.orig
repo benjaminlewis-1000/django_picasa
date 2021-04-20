@@ -13,10 +13,13 @@ https://docs.djangoproject.com/en/2.2/ref/settings/
 import os
 from celery.schedules import crontab
 import logging
-from unipath import Path
-from datetime import timedelta
+from datetime import timedelta, datetime
 import random
 import string
+
+today = datetime.today()
+random_seed = today.year * 10000 + today.month * 100 + today.day
+random.seed(random_seed)
 
 # # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,6 +55,7 @@ if in_docker:
         DB_HOST = 'db_django'
         
     PHOTO_ROOT = '/photos'
+    PHOTO_ROOT_RW = '/photos_rw'
     TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
 #    ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['WEBAPP_DOMAIN']]
     ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['DOMAINNAME'], os.environ['WEBAPP_DOMAIN'], 'flower.' + os.environ['DOMAINNAME']]
@@ -81,9 +85,8 @@ else:
     STATIC_SERVER = '/var/www/html/static'
     LOG_DIR = '/home/benjamin/git_repos/picasa_files/logs'
 
-print(DB_NAME, DB_USER, DB_PASS, DB_HOST)
-
 RANDOM_ACCESS_KEY = ''.join([random.choice(string.ascii_letters + string.digits) for n in range(32)])
+print(MEDIA_URL)
 
 # Set up logging
 formatter = logging.Formatter('%(levelname)s | %(asctime)s - %(message)s')
@@ -149,7 +152,6 @@ INSTALLED_APPS = [
     'face_manager',
     'api',
     'filters',
-    'frontend',
     # 'webpack_loader',
     # 'upload_img',
 ]
@@ -198,6 +200,22 @@ MIDDLEWARE = [
 # CORS_ORIGIN_REGEX_WHITELIST = [
 #     r"*jsfiddle\.net*",
 # ]
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'loggers': {
+        'django': {
+            'handlers': ['console'],
+            'level': os.getenv('DJANGO_LOG_LEVEL', 'DEBUG'),
+        },
+    },
+}
 
 # Get the Django Rest Framework to use https in pagination links
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
@@ -316,19 +334,19 @@ USE_L10N = True
 USE_TZ = True
 
 # CELERY STUFF
-CELERY_BROKER_URL = f'redis://{REDIS_HOST}:6379'
-CELERY_RESULT_BACKEND = f'redis://{REDIS_HOST}:6379'
+broker_url = f'redis://{REDIS_HOST}:6379'
+result_backend = f'redis://{REDIS_HOST}:6379'
 CELERY_ACCEPT_CONTENT = ['application/json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
-
+MAX_CELERY_TIME = 60 * 60 * 3 # 3 hours
 
 # if production: 
-CELERY_BEAT_SCHEDULE = {
+beat_schedule = {
     'filepopulate_root': {
         'task': 'filepopulator.populate_files_from_root',
-        'schedule': crontab(minute='*/10') # , hour='*/6'),
+        'schedule': crontab(hour='*/6', minute=0) # , hour='*/6'),
         # 'schedule': crontab(minute='*/10'),
     },
     'dirs_datetimes': {
@@ -337,18 +355,17 @@ CELERY_BEAT_SCHEDULE = {
     },
     'face_add': {
         'task': 'face_manager.face_extraction', 
-        'schedule': crontab( minute = '*/1'),
+        'schedule': crontab( hour = '*', minute='*/2'),
         # 'schedule': crontab( minute = '0', hour='*/2'),
         'options': {
             'expires': 30,
-            # 'expires': 1800,
         }
     },
-    'classify_unlabeled': {
-        'task': 'face_manager.classify_unlabeled',
-        'schedule': crontab(day_of_month = '*/5', minute=0, hour=0)
-        # 'schedule': crontab(minute='*/2')
-    }
+#    'classify_unlabeled': {
+#        'task': 'face_manager.classify_unlabeled',
+#        'schedule': crontab(day_of_month = '*/5', minute=0, hour=0)
+#        # 'schedule': crontab(minute='*/2')
+#    }
 
 }
 
@@ -375,10 +392,10 @@ CELERY_BEAT_SCHEDULE = {
 
 #     }
 
-if not 'filepopulate_root' in CELERY_BEAT_SCHEDULE.keys():
+if not 'filepopulate_root' in beat_schedule.keys():
     LOGGER.error("Filepopulate celery task not instantiated.")
     raise ValueError('Filepopulate celery task not instantiated.')
-if not 'dirs_datetimes' in CELERY_BEAT_SCHEDULE.keys():
+if not 'dirs_datetimes' in beat_schedule.keys():
     LOGGER.error("Dirs_datetimes celery task not instantiated.")
     raise ValueError('Dirs_datetimes celery task not instantiated.')
 
@@ -404,5 +421,13 @@ BLANK_FACE_NAME='_NO_FACE_ASSIGNED_'
 BLANK_FACE_IMG_PATH=os.path.join(SITE_ROOT, 'blank_person.png')
 
 # Parameters for the machine learning model
-FACE_NUM_THRESH=50
+if DEV:
+    FACE_NUM_THRESH = 1
+else:
+    FACE_NUM_THRESH=50
 IGNORED_NAMES=[BLANK_FACE_NAME, '.ignore', '.realignore', '.jessicatodo', '.cutler_tbd']
+SOFT_IGNORE_NAME = '.ignore'
+CLASSIFY_MODEL_PATH = '/code/face_manager/face_classifier/models'
+DEFAULT_RESOLUTION_HEIGHT = 2160 # For 4k screens
+
+print("STATIC is : ", STATIC_URL)

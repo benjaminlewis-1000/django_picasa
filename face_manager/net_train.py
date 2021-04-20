@@ -1,26 +1,25 @@
 #! /usr/bin/env python
 
-
+from celery import shared_task
 from django.conf import settings
-# from django.core.management.base import BaseCommand
 from face_manager import models as face_models
 from filepopulator import models as file_models
+from PIL import Image
+from sklearn.preprocessing import StandardScaler
+from torch.autograd import Variable
+import face_classifier
+import io
+import numpy as np
+import os
+import pickle
+import random
 import sys
 import time
 import torch
-import os
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data as data
-import random
-from torch.autograd import Variable
-import torch.nn.functional as F
-import numpy as np
-import torch.nn as nn
-import io
-from PIL import Image
-import pickle
-import face_classifier
-from celery import shared_task
 
 def classify_unlabeled_faces():
 
@@ -28,11 +27,34 @@ def classify_unlabeled_faces():
     hidden_size = 300
     batch_size = 128
     which_features = 'short'
-    which_features = 'long'
+    # which_features = 'long'
 
     devel = False
 
     train_set, val_set, ignored_face_set = face_classifier.create_dataset(settings, devel, which_features)
+
+    train_feat = np.array([np.array(x) for x in train_set.data_points])
+
+    scaler = StandardScaler()
+    scaler.fit(train_feat)
+
+    def transform_and_reassign(features):
+            
+        scaled_feat = scaler.transform(features)
+        scaled_feat = [torch.Tensor(x) for x in scaled_feat]
+        return scaled_feat
+
+    train_transformed = transform_and_reassign(train_feat)
+    train_set.data_points = train_transformed
+    val_feat = np.array([np.array(x) for x in val_set.data_points])
+    val_transformed = transform_and_reassign(val_feat)
+    val_set.data_points = val_transformed
+    ign_feat = np.array([np.array(x) for x in ignored_face_set.data_points])
+    ign_transformed = transform_and_reassign(ign_feat)
+    ignored_face_set.data_points = ign_transformed
+
+    print("Built dataset")
+
     """
     b = [x.numpy() for x in train_set.data_points]
     train_data = np.vstack(b)
@@ -125,8 +147,6 @@ def classify_unlabeled_faces():
     # criterion = [nn.CrossEntropyLoss(), ccl]
     
     for epoch in range(epochs):
-
-        # print(f"{optimizer.param_groups[0]['lr']:.2e}")
         print(f"Training epoch {epoch} with learning rate {optimizer.param_groups[0]['lr']:.2e}")
         total_tr = 0
         correct_tr = 0
@@ -142,6 +162,7 @@ def classify_unlabeled_faces():
 #            input_noise = torch.rand(inputs_tr.shape).normal_() * torch.mean(torch.abs(inputs_tr)) * 0.1
             # input_noise = torch.rand(inputs_tr.shape).normal_() * 0.05
 #            input_batch = Variable(inputs_tr + input_noise)
+
             input_batch = (inputs_tr)
             label_batch = (labels_tr)
             el_0 = time.time() - s1
@@ -151,12 +172,14 @@ def classify_unlabeled_faces():
 #            optimizer_c.zero_grad()
 
             s1 = time.time()
-            hidden, logits, pred = net(input_batch)
+            logits = net(input_batch)
+            pred = F.softmax(logits, dim=1)
             el_1 = time.time() - s1
             pt_1 += el_1
 
             s1 = time.time()
             # loss = criterion(outputs_tr, label_batch) + ccl(outputs_tr, label_batch) #  0.15 * compact_loss(outputs_tr, label_batch)
+
             loss =  criterion(logits, label_batch) #  + 0.08 * criterion[1](label_batch, hidden)#  + 0.15 * compact_loss(logits)
             el_2 = time.time() - s1
             pt_2 += el_2
@@ -179,6 +202,7 @@ def classify_unlabeled_faces():
             # optimizer_c.step()
 
             # _, predicted = torch.max(outputs.data, 1)
+
             s1 = time.time()
             max_softmax_tr, predicted_tr = torch.max(pred.data, 1)
             el_5 = time.time() - s1
@@ -195,6 +219,7 @@ def classify_unlabeled_faces():
             # print(label_batch)
             # print(predicted == label_batch)
             # print((predicted == label_batch).sum())
+
             s1 = time.time()
             total_tr += label_batch.size(0)
             el_7 = time.time() - s1
@@ -211,10 +236,8 @@ def classify_unlabeled_faces():
             del input_batch 
             del label_batch 
             del batchCorrect_tr
-            del hidden
             del logits
             del pred
-        
         
         print(f'Train done, time was {time.time() - s} sec, len is {len(train_loader)}')
         print(f'{pt_0:.2f}, {pt_1:.2f}, {pt_2:.2f}, {pt_3:.2f}, {pt_4:.2f}, {pt_5:.2f}, {pt_6:.2f}, {pt_7:.2f}, {pt_8:.2f} ')
@@ -292,7 +315,10 @@ def classify_unlabeled_faces():
     for j, batch_i in enumerate(ignored_loader):
         input_i, label_i, _ = batch_i
 
-        _, logits, preds = net(Variable(input_i))
+        # _, logits, preds = net(Variable(input_i))
+
+        logits = net(input_i)
+        pred = F.softmax(logits, dim=1)
 
         max_softmax_i, _ = torch.max(preds.data, 1)
         ignore_sm += max_softmax_i.tolist()
@@ -344,6 +370,8 @@ def classify_unlabeled_faces():
     print("Classifying unidentified faces.")
     for j, batch_u in enumerate(unassigned_loader):
         input_u, label_u, face_ids = batch_u
+
+        input_u = scaler.transform(input_u)
 
         _, logits, preds = net(Variable(input_u))
 

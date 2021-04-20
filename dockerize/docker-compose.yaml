@@ -29,24 +29,17 @@ services:
     volumes:
       - ${DJANGO_FILES_ROOT}:/code
       - ${PHOTO_ROOT}:/photos:ro
+      - ${PHOTO_ROOT}:/photos_rw
       - ${TEST_PHOTOS_FILEPOPULATE}:/test_imgs_filepopulate
       - ${MEDIA_FILES_LOCATION}:/media
       - ${LOG_LOCATION}:/var/log/picasa
+      - ${MODEL_LOCATION}:/models
     depends_on:
       - db_django
     networks:
       - traefik_proxy
     restart: always
     labels:
-#      - "traefik.backend=picasa"
-#      - "traefik.enable=true"
-##      - "traefik.webapp.enable=true"
-#      - "traefik.webapp.frontend.rule=Host:${WEBAPP_DOMAIN}"
-#      - "traefik.webapp.port=8000"
-##      - "traefik.flower.enable=true"
-#      - "traefik.flower.frontend.rule=Host:flower.${DOMAINNAME}"
-#      - "traefik.flower.port=5555"
-#      - "traefik.docker.network=traefik_proxy"
 
       - "traefik.enable=true"
       - "traefik.http.routers.picasa.rule=Host(`${WEBAPP_DOMAIN}`)"
@@ -57,11 +50,26 @@ services:
       - "traefik.http.middlewares.picasa.redirectscheme.scheme=https"
       - "traefik.http.middlewares.picasa.redirectscheme.permanent=true"
 
-#      - "traefik.http.routers.flower.rule=Host(`flower.${DOMAINNAME}`)"
-#      - "traefik.http.routers.flower.tls.certresolver=leresolver"
-#      - "traefik.http.routers.flower.entrypoints=websecure"
-#      - "traefik.http.services.flower.loadbalancer.server.port=5555"
       # Need to start postgresql service
+
+  flower:
+    image: mher/flower
+    command: ["flower", "--broker=redis://task_redis:6379/0", "--port=8888"]  
+    ports:
+      - 8888:8888
+    networks:
+      - traefik_proxy
+    labels:
+
+      - "traefik.enable=true"
+      - "traefik.http.routers.flower.rule=Host(`flower.exploretheworld.tech`)"
+      - "traefik.http.routers.flower.tls.certresolver=leresolver"
+      - "traefik.http.routers.flower.entrypoints=websecure"
+      - "traefik.http.services.flower.loadbalancer.server.port=8888"
+      - "traefik.http.middlewares.flower.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.flower.redirectscheme.permanent=true"
+      - "traefik.http.routers.flower.middlewares=authflower"
+      - "traefik.http.middlewares.authflower.basicauth.users=benjamin:$$apr1$$ly25xhfg$$d2eLiOIOnM.IbsZ6Cfb760" # admin/movie based one
 
   db_django:
 #    build:

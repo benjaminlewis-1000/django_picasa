@@ -7,6 +7,8 @@ from django.urls import path
 from rest_framework.authtoken.views import obtain_auth_token  # <-- Here
 from rest_framework_simplejwt import views as jwt_views
 
+# app_name = 'api'
+
 router = routers.DefaultRouter()
 router.register(r'users', views.UserViewSet)
 router.register(r'mygroups', views.GroupViewSet)
@@ -31,5 +33,7 @@ urlpatterns = [
     path('', include(router.urls)),
     path(r'image_list/', views.filteredImagesView.as_view(), name='image_list'),
     path(r'paginate_obj_ids/<int:id>/<slug:field>', views.PersonParamView.as_view(), name='face_pages'),
+    path(r'person_list/', views.PersonListView.as_view(), name='person_list'),
+    path(r'folder_list/', views.FolderListView.as_view(), name='folder_list'),
     path(r'keyed_image/<slug:type>/', views.KeyedImageView.as_view(), name='keyed_image')
 ]

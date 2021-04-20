@@ -11,6 +11,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 import datetime
 import dateutil.parser
 import json
+from django.db.models import Q
 
 
 class TokenPairSerializer(TokenObtainPairSerializer):
@@ -182,7 +183,7 @@ class FaceSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
             'poss_ident4', 'poss_face_name4', 'weight_4', \
             'poss_ident5', 'poss_face_name5', 'weight_5', \
             'box_top', 'box_bottom', 'box_left', \
-            'box_right', 'face_thumbnail', 'rejected_fields']
+            'box_right', 'face_thumbnail', 'rejected_fields', 'validated']
         # fields = ['url', 'source_image_file', 'written_to_photo_metadata',  \
         #     'declared_name', 'face_name', 'poss_ident1', 'weight_1', 'poss_face_name1', \
         #     'poss_ident2', 'poss_face_name2', 'poss_ident3',  'poss_ident4', \
@@ -247,6 +248,9 @@ class ServerStatsSerializer(serializers.Serializer):
     estimated_hours_facerec_left = serializers.FloatField()
     imgs_per_hour_est = serializers.IntegerField()
     num_unlabeled_faces = serializers.IntegerField()
+    num_verified = serializers.IntegerField()
+    num_tagged = serializers.IntegerField()
+    verified_progress = serializers.CharField(max_length=256)
 
     class Stats(object):
         def __init__(self):
@@ -254,12 +258,16 @@ class ServerStatsSerializer(serializers.Serializer):
             self.num_face_processed = ImageFile.objects.filter(isProcessed=True).count()
             self.num_people = Person.objects.count()
             self.num_faces = Face.objects.count()
-            self.num_unlabeled_faces = Face.objects.filter(declared_name__person_name=settings.BLANK_FACE_NAME).count( )
+            self.num_unlabeled_faces = Face.objects.filter(declared_name__person_name=settings.BLANK_FACE_NAME).count()
             self.imgs_per_hour_est = 800 # An estimate -- I'm clocking 177 images in 26 minutes
             imgs_left_to_process = self.num_imgs - self.num_face_processed
             self.estimated_hours_facerec_left = imgs_left_to_process / self.imgs_per_hour_est
             proc_percent = self.num_face_processed / self.num_imgs * 100
             self.percent_face_processed = f'{proc_percent:.2f}%'
+
+            self.num_verified = Face.objects.filter(validated=True).count()
+            self.num_tagged = Face.objects.filter(~Q(declared_name__person_name__in=settings.IGNORED_NAMES) ).count()
+            self.verified_progress = f'{self.num_verified / self.num_tagged * 100:.2f}%'
 
     def create(self, validated_data):
         return Stats()

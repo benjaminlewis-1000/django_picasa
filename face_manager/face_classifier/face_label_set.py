@@ -43,7 +43,7 @@ class FaceLabelSet(data.Dataset):
             assert len(data) == 512 
 
 #        print(np.linalg.norm(data))
-        data = data / np.linalg.norm(data)
+        # data = data / np.linalg.norm(data)
 
         self.labels.append(label)
         self.face_id.append(face_id)

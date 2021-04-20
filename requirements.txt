@@ -17,10 +17,8 @@ djangorestframework-queryfields==1.0.0
 djangorestframework-simplejwt==4.4.0
 dlib==19.21.0
 drf-url-filters==0.5.1
+editdistance==0.3.1
 ExifRead==2.3.1
-face-recognition==1.3.0
-face-recognition-models==0.3.0
-facenet-pytorch==2.5.0
 gpsphoto==2.2.3
 gunicorn==20.0.4
 imageio==2.9.0
@@ -34,6 +32,7 @@ Pillow==7.2.0
 postgres==3.0.0
 psycopg2-binary==2.8.6
 psycopg2-pool==1.1
+PyJWT==1.7.1
 python-crontab==2.5.1
 python-dateutil==2.8.1
 python-dotenv==0.14.0
@@ -45,7 +44,8 @@ requests==2.24.0
 scikit-learn==0.23.2
 scipy==1.5.2
 SCons==4.0.1
-torch==1.4.0
+thundersvm-cpu==0.3.3
+torch==1.8.0
 torchvision==0.5.0
 twilio==6.45.3
 xmltodict==0.12.0

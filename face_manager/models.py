@@ -146,6 +146,7 @@ class Face(models.Model):
     # that this is a square thumbnail.
     face_thumbnail = models.ImageField(upload_to=face_thumbnail_path, default=None)
 
+    validated = models.BooleanField(default=False)
 
     def __str__(self):
         return "Face instance of {}".format(self.declared_name)

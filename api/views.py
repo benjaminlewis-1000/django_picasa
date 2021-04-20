@@ -15,7 +15,9 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 import base64
 import cv2
 from rest_framework.decorators import action
+import datetime
 import time
+import os
 import numpy as np
 import PIL
 from PIL import Image, ExifTags
@@ -26,10 +28,10 @@ from django.core.files.base import ContentFile
 from rest_framework.reverse import reverse, reverse_lazy
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q
+from time import sleep
 
 import json
 from io import BytesIO
-from django.db.models import Q
 from filters.mixins import (
     FiltersMixin,
 )
@@ -150,27 +152,63 @@ class PersonViewSet(viewsets.ModelViewSet):
         context.update({"request": self.request})
         return context
 
+class PersonListView(APIView):
+    permission_classes = (IsAuthenticated,) 
+    def get(self, request, *args, **kwargs):
+        params = self.request.query_params
+
+        all_people = Person.objects.all()
+
+        result_list = []
+        domain_name = 'https://' + os.environ['WEBAPP_DOMAIN'] + '/api/people'
+        # from django.urls import reverse, reverse_lazy
+        for p in all_people:
+            p_dict = {}
+            p_dict['url'] = f'{domain_name}/{p.id}/'
+            p_dict['num_faces'] = p.face_declared.count()
+            p_dict['num_possibilities'] = p.face_poss1.count()
+            p_dict['num_unverified_faces'] = p.face_declared.filter(validated=False).count()
+            p_dict['id'] = p.id
+            p_dict['person_name'] = p.person_name
+            result_list.append(p_dict)
+
+        js = {'count': len(all_people), 'next': None, 'previous': None, 'results': result_list,}
+
+        return HttpResponse(json.dumps(js), content_type='application/json')
     
-    # def patch(self, request, pk):
-    #     print("Patched")
-    #     print(request, pk)
-    
-    # def perform_update(self, serializer):
-    #     print("Update")
+class FolderListView(APIView):
+    permission_classes = (IsAuthenticated,) 
+    def get(self, request, *args, **kwargs):
+        params = self.request.query_params
 
-    # def update(self, request, pk=None):
-    #     print("UPdate ser method")
+        all_folders = Directory.objects.all()
 
-    # def create(self, instance, data):
-    #     print("Create face")
+        result_list = []
+        domain_name = 'https://' + os.environ['WEBAPP_DOMAIN'] + '/api/directories'
+        # from django.urls import reverse, reverse_lazy
 
+        # /directories/?fields=id,url,top_level_name,first_datesec,mean_datesec,num_images,year&limit=2000
+        for fold in all_folders:
+            f_dict = {}
+            f_dict['id'] = fold.id
+            f_dict['url'] = f'{domain_name}/{fold.id}/'
+            f_dict['top_level_name'] = fold.dir_path.split('/')[-1]
+            f_dict['first_datesec'] = fold.first_datesec
+            f_dict['mean_datesec'] = fold.mean_datesec
+            f_dict['num_images'] = fold.image_set.count()
+            f_dict['year'] = datetime.datetime.fromtimestamp(fold.first_datesec).year
+            result_list.append(f_dict)
 
+        js = {'count': len(all_folders), 'next': None, 'previous': None, 'results': result_list,}
+
+        return HttpResponse(json.dumps(js), content_type='application/json')
 
 class PersonParamView(APIView):
     permission_classes = (IsAuthenticated,) 
     def get(self, request, *args, **kwargs):
 
         params = self.request.query_params
+        
         if 'page' in params.keys():
             try:
                 page = int(params['page'])
@@ -178,6 +216,13 @@ class PersonParamView(APIView):
                 return render_404(request, 'Page requested is not an integer.')
         else:
             page = 1
+
+        if 'only_unverified' in params.keys():
+            value = params['only_unverified']
+            # Invert it for the DB query.
+            do_only_unverified = (value.lower() == 'true')
+        else:
+            do_only_unverified = False
 
         id_key = kwargs['id']
         field = kwargs['field']
@@ -192,22 +237,22 @@ class PersonParamView(APIView):
                 return render_404(request, f"Error: Requested ID {id_key} not available in database.")
 
             if field == 'face_declared':
-                faces = Face.objects.filter(declared_name=person_obj).values_list('id', flat=True)
+
+                default_query = Q(declared_name=person_obj)
+                unverified_query = Q(validated=False)
+                if do_only_unverified:
+                    faces = Face.objects.filter(default_query & unverified_query).values_list('id', flat=True)
+                else:
+                    faces = Face.objects.filter(default_query).values_list('id', flat=True)
             else:
-                # p1 = Q(poss_ident1=person_obj)
-                # p2 = Q(poss_ident2=person_obj)
-                # p3 = Q(poss_ident3=person_obj)
-                # p4 = Q(poss_ident4=person_obj)
-                # p5 = Q(poss_ident5=person_obj)
-                # faces = Face.objects.filter(p1 | p2 | p3 | p4 | p5).values_list('id', flat=True)
 
                 faces1 = list(Face.objects.filter(poss_ident1=person_obj).values_list('id', 'weight_1'))
                 faces2 = list(Face.objects.filter(poss_ident2=person_obj).values_list('id', 'weight_2'))
-                faces3 = list(Face.objects.filter(poss_ident3=person_obj).values_list('id', 'weight_3'))
-                faces4 = list(Face.objects.filter(poss_ident4=person_obj).values_list('id', 'weight_4'))
-                faces5 = list(Face.objects.filter(poss_ident5=person_obj).values_list('id', 'weight_5'))
+                # faces3 = list(Face.objects.filter(poss_ident3=person_obj).values_list('id', 'weight_3'))
+                # faces4 = list(Face.objects.filter(poss_ident4=person_obj).values_list('id', 'weight_4'))
+                # faces5 = list(Face.objects.filter(poss_ident5=person_obj).values_list('id', 'weight_5'))
 
-                f = faces1 + faces2 + faces3 + faces4 + faces5
+                f = faces1 + faces2  #+ faces3 + faces4 + faces5
                 faces = sorted(f, key=lambda tup: tup[1], reverse=True)
                 faces = [f[0] for f in faces]
                 
@@ -307,9 +352,37 @@ class FaceViewSet(viewsets.ModelViewSet):
         face.weight_3 = 0.0
         face.weight_4 = 0.0
         face.weight_5 = 0.0
+        face.validated = False
 
         return face
 
+
+    @action(detail=True, methods=['patch'])
+    def verify_face(self, request, pk=None):
+        # Accessible as <root>/api/faces/<face_id>/verify_face/
+        # Accept: HTML PATCH
+        # Set the face's 'verified' status to True. 
+        face = self.get_object()
+        data = request.data
+
+        # print('verify face', face, face.id)
+
+        def err_404(message=""):
+            msg_start = f'Invalid face update request. \n\n'
+            msg_start += message
+            err_404 = render_404(request, msg_start)
+            return err_404
+            
+        dn = face.declared_name
+        face.validated = True
+        face.declared_name = dn
+        try:
+            face.save()
+        except:
+            pass
+
+        js = {'success': True}
+        return HttpResponse(json.dumps(js), content_type='application/json')
 
     @action(detail=True, methods=['patch'])
     def assign_face_to_person(self, request, pk=None):
@@ -442,6 +515,8 @@ class FaceViewSet(viewsets.ModelViewSet):
             return err_404("ignore_type body parameter must be either 'soft' or 'hard'.")
 
         face = self.get_object()
+
+        # print('ignore face', face, face.id)
         if ignore_type == 'soft':
             ignore_person = Person.objects.filter(person_name='.ignore')
         else:
@@ -614,7 +689,7 @@ class KeyedImageView(APIView):
                 if 'height' in params.keys():
                     height = int(params['height'])
                 else:
-                    height = 1080
+                    height = settings.DEFAULT_RESOLUTION_HEIGHT
 
                 width = 1920 / 1080 * height
             elif image_type in ['full_big', 'full_medium', 'full_small']:
@@ -655,6 +730,7 @@ class filteredImagesView(APIView):
     def get(self, request, *args, **kwargs):
         # print(self.request.query_params)
         params = self.request.query_params
+        print(params)
 
         if len(params.keys()) == 0 : # or 'people' not in params.keys():
             # Return all objects!

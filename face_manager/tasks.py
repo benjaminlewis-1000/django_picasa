@@ -30,10 +30,13 @@ if not settings.configured:
 
 @shared_task(ignore_result=True, name='face_manager.face_extraction')
 def process_faces():
+    starttime = time.time()
+
     print('Starting face extraction...')
     settings.LOGGER.debug("Starting face extraction...")
 
 
+    # Set up a lock on this function so that it doesn't have more than one running at once. 
     face_lockfile = settings.FACE_LOCKFILE
     print(f"Face lockfile is {face_lockfile}")
     if os.path.exists(face_lockfile):
@@ -44,20 +47,24 @@ def process_faces():
         f = open(face_lockfile, 'w')
         f.close()
         
-    all_images = ImageFile.objects.all()
-    img_q = queue.Queue()
-    # threads = []
-    for img in all_images:
-        if not img.isProcessed:
-            img_q.put(img)
+    # all_images = ImageFile.objects.all()
+    unprocessed_imgs = ImageFile.objects.filter(isProcessed=False).all()
+    unprocessed_count =  ImageFile.objects.filter(isProcessed=False).count()
 
-    if img_q.qsize() == 0:
+    if unprocessed_count == 0:
         print("No images to extract! Exiting." )
         try:
             os.remove(face_lockfile)
         except FileNotFoundError:
             pass
         return
+
+    img_q = queue.Queue()
+
+    for img in unprocessed_imgs:
+        if not img.isProcessed:
+            img_q.put(img)
+
 
 
     print("Going to start workers...")
@@ -126,6 +133,7 @@ def process_faces():
     print("Starting to try...")
 
     def end_threads(running_threads):
+        print("End the threads")
         keys = list(running_threads.keys())
         for key in keys:
             # print(running_threads[key])
@@ -138,7 +146,8 @@ def process_faces():
         print("True loop")
         cur_time = time.time()
         
-        if cur_time - start_time > (6 * 3600):
+        if cur_time - start_time > (45 * 60): # 45 minutes
+            print("KILLING Current time")
             end_threads(running_threads)
             break
 

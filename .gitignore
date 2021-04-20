@@ -1,6 +1,8 @@
 thumbnails/*
+server-notifications-django/
+MISC_DATA/
 labels/*
-dep/*
+dep/
 *.set
 *.lock
 .env
