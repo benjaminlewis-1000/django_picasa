@@ -1,7 +1,7 @@
 celery==5.0.0
 coloredlogs==14.0
 coverage==5.3
-cryptography==2.6.1
+cryptography==3.3.2
 dj-database-url==0.5.0
 django-admin-thumbnails==0.2.5
 django-celery-beat==2.0.0
@@ -11,10 +11,10 @@ django-filter==2.3.0
 django-rest-framework==0.1.0
 django-timezone-field==4.0
 django-webpack-loader==0.7.0
-Django==3.1.1
+Django==3.1.8
 djangorestframework-queryfields==1.0.0
 djangorestframework-simplejwt==4.4.0
-djangorestframework==3.11.1
+djangorestframework==3.11.2
 drf-url-filters==0.5.1
 editdistance==0.3.1
 ExifRead==2.3.1
