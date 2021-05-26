@@ -26,39 +26,37 @@ class Command(BaseCommand):
     
     def handle(self, *args, **options):
 
-        # ignore_dir = '/code/MISC_DATA/ignore_chips'
-        # try:
-        #     os.makedirs(ignore_dir)
-        # except:
-        #     pass
+        ignore_dir = '/code/MISC_DATA/ignore_chips'
+        try:
+            os.makedirs(ignore_dir)
+        except:
+            pass
 
-        # ignored_faces = Face.objects.filter(declared_name__person_name__in=['.ignore', '.realignore'])
-        # num_to_process = ignored_faces.count()
-        # print(num_to_process)
+        ignored_faces = Face.objects.filter(declared_name__person_name__in=['.ignore', '.realignore'])
+        num_to_process = ignored_faces.count()
+        print(num_to_process)
 
-        # ignored_iterator = ignored_faces.iterator()
+        ignored_iterator = ignored_faces.iterator()
 
-        # try:
-        #     first_face = next(ignored_iterator)
-        # except StopIteration:
-        #     # No rows were found, so do nothing.
-        #     pass
-        # else:
-        #     # At least one row was found, so iterate over
-        #     # all the rows, including the first one.
-        #     num = 0
-        #     for f in chain([first_face], ignored_iterator):
-        #         print(f"{num} / {num_to_process}, {num/num_to_process * 100:.4f}%")
-        #         num += 1
-        #         img_chip_path = f.face_thumbnail.path
-        #         person_id = f.declared_name.id
-        #         folder_name = ignore_dir
+        try:
+            first_face = next(ignored_iterator)
+        except StopIteration:
+            # No rows were found, so do nothing.
+            pass
+        else:
+            # At least one row was found, so iterate over
+            # all the rows, including the first one.
+            num = 0
+            for f in chain([first_face], ignored_iterator):
+                print(f"{num} / {num_to_process}, {num/num_to_process * 100:.4f}%")
+                num += 1
+                img_chip_path = f.face_thumbnail.path
+                person_id = f.declared_name.id
+                folder_name = ignore_dir
 
-        #         new_chip_name = os.path.join(folder_name, os.path.basename(img_chip_path))
-        #         # shutil.copy(img_chip_path, new_chip_name)
-        #         get_and_resize(img_chip_path, new_chip_name)
-
-        # exit()
+                new_chip_name = os.path.join(folder_name, os.path.basename(img_chip_path))
+                # shutil.copy(img_chip_path, new_chip_name)
+                get_and_resize(img_chip_path, new_chip_name)
 
         outdir = '/code/MISC_DATA/face_chips'
         try:

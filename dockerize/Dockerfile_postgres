@@ -1,4 +1,7 @@
 FROM postgres:12.1-alpine
 
-WORKDIR /docker-entrypoint-initdb.d
-ADD psql_init.sh .
+RUN apk add --no-cache supervisor
+RUN mkdir /etc/supervisor.d
+COPY postgres_cron.ini /etc/supervisor.d/postgres_cron.ini
+
+ENTRYPOINT ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]

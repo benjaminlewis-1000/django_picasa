@@ -75,7 +75,7 @@ else:
     DB_HOST = 'localhost'
     REDIS_HOST = 'localhost'
     MEDIA_ROOT = os.path.join(PROJECT_ROOT, 'media')
-    SECRET_KEY = '46r=!b*lkf2-^#a=40kq(9nxkfz53d7!ft7_iccd1!2aa%q@6z'
+    SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
     ALLOWED_HOSTS = ['localhost', '127.0.0.1']
     PHOTO_ROOT = '/home/benjamin/git_repos/picasa_files/actual_imgs'
     TEST_IMG_DIR_FILEPOPULATE = '/home/benjamin/git_repos/picasa_files/test_imgs'

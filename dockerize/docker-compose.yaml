@@ -71,16 +71,15 @@ services:
       - "traefik.http.routers.flower.middlewares=authflower"
       - "traefik.http.middlewares.authflower.basicauth.users=benjamin:$$apr1$$ly25xhfg$$d2eLiOIOnM.IbsZ6Cfb760" # admin/movie based one
 
-  db_django:
-#    build:
-#      context: .
-#      dockerfile: Dockerfile_postgres
 #    image: postgres_init
 #FROM postgres:12.1-alpine
 # WORKDIR /docker-entrypoint-initdb.d
 # ADD psql_init.sh .
-
-    image: postgres:12.1-alpine
+  db_django:
+    build:
+      context: .
+      dockerfile: Dockerfile_postgres
+    image: postgres_w_cron
     env_file:
       - .env
     restart: always
@@ -90,9 +89,13 @@ services:
 #      PGDATA: /database
     volumes:
       - ${DB_FILES_LOCATION}:/var/lib/postgresql/data
-      - ${DJANGO_FILES_ROOT}/dockerize/psql_init.sh:/docker-entrypoint-initdb.d/psql_init.sh
       # Initialization script - see Postgres Docker documentation.
-
+      - ${DJANGO_FILES_ROOT}/dockerize/psql_init.sh:/docker-entrypoint-initdb.d/psql_init.sh
+      # Add a file to the weekly crontab directory that backs up the database. 
+      # Run by the run-parts command, which hates periods in filenames, hence why 
+      # I don't make a .sh suffix in the container. 
+      - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/weekly/postgres_bak_sh
+      - /mnt/fast_storage/appdata/django_picasa/backups:/backup
     labels:
       - "user=postgres"
     container_name: db_picasa  

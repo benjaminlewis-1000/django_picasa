@@ -41,10 +41,20 @@ def classify_unassigned_faces(do_all=False, do_ignore=False, unassigned_external
     else:
         unassigned = unassigned_external
 
+    # if do_all:
+    #     for u in unassigned:
+    #         print(u)
+    #         u.poss_ident1 = None
+    #         u.weight_1 = 0
+    #         u.poss_ident2 = None
+    #         u.weight_2 = 0
+
+    #         u.save()
+
 
     # print(unassigned.count())
-    if do_all:
-        unassigned = unassigned[:200]
+    # if do_all:
+    #     unassigned = unassigned[:200]
     # unassigned = Face.objects.filter(pk=512185)
     # Make the unassigned images into a dataset. Use the same
     # normalizations as during training.
@@ -118,6 +128,7 @@ def classify_unassigned_faces(do_all=False, do_ignore=False, unassigned_external
         elif network_type == 'shuffle':
             model = models.shufflenet_v2_x2_0(num_classes=num_classes)
 
+        print(network_type)
         model_params = torch.load(model_file, map_location='cpu')
         model.load_state_dict(model_params)
         model.eval()
@@ -132,14 +143,11 @@ def classify_unassigned_faces(do_all=False, do_ignore=False, unassigned_external
         with torch.no_grad():
             start = time.time()
             for i, imgs in enumerate(img_loader):
-                if i % 5 == 0:
+                if i % 2 == 0:
                     print(f"{i}/{len(img_loader)}")
                 pred = model(imgs.cpu())
                 pred = s(pred)
-                # print(pred)
                 confidence, class_pred = torch.max(pred, 1)
-                # print(class_pred)
-                # print(labels)
                 if conf_all is None:
                     conf_all = confidence
                     class_pred_all = class_pred
@@ -154,8 +162,8 @@ def classify_unassigned_faces(do_all=False, do_ignore=False, unassigned_external
     def do_inference():
 
         n1_confidence, n1_pred, n1_raw_preds = process_network('shuffle', '/models/shuffle.ptw', num_classes)
-        n2_confidence, n2_pred, n2_raw_preds = process_network('densenet', '/models/densenet.ptw', num_classes)
         n3_confidence, n3_pred, n3_raw_preds = process_network('resnet', '/models/resnet.ptw', num_classes)
+        n2_confidence, n2_pred, n2_raw_preds = process_network('densenet', '/models/densenet.ptw', num_classes)
 
         summed_raw = (n1_raw_preds + n2_raw_preds + n3_raw_preds) / 3
 
@@ -180,8 +188,8 @@ def classify_unassigned_faces(do_all=False, do_ignore=False, unassigned_external
                 likely_class = np.argmax(summed_raw[index, :])
                 lookup_db = net_class_to_id[likely_class]
                 print("IGN", likely_class, db_id)
-                face_obj.poss_ident2 = Person.objects.get(pk=lookup_db)
-                face_obj.weight_2 = 0.1
+                # face_obj.poss_ident2 = Person.objects.get(pk=lookup_db)
+                # face_obj.weight_2 = 0.1
                 face_obj.save()
 
         for enum_i, val in enumerate(idcs_out_lib):
@@ -192,7 +200,7 @@ def classify_unassigned_faces(do_all=False, do_ignore=False, unassigned_external
         conf_2 = n2_confidence[idcs_in_lib]
         conf_3 = n3_confidence[idcs_in_lib]
 
-        threshold = 0.9
+        threshold = 0.95
         cond_1 = np.where( (n1_pred[idcs_in_lib] == n2_pred[idcs_in_lib]) & (conf_1 > threshold) & (conf_2 > threshold))[0]
         cond_2 = np.where( (n1_pred[idcs_in_lib] == n3_pred[idcs_in_lib]) & (conf_1 > threshold) & (conf_3 > threshold))[0]
         cond_3 = np.where( (n2_pred[idcs_in_lib] == n3_pred[idcs_in_lib]) & (conf_2 > threshold) & (conf_3 > threshold))[0]
@@ -226,7 +234,7 @@ def classify_unassigned_faces(do_all=False, do_ignore=False, unassigned_external
     if batch_processing_size > 0:
         num_to_process = len(dataset)
         num_batches = int(np.ceil(num_to_process / batch_processing_size))
-        print(num_to_process)
+        print('Num: ', num_to_process, num_batches)
         for i in range(num_batches):
             start = i * batch_processing_size
             end = (i + 1) * batch_processing_size

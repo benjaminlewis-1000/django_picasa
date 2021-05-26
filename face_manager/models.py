@@ -74,6 +74,9 @@ class Person(models.Model):
         # then delete the person object. 
         try:
             os.remove(self.highlight_img.path)
+
+        except FileNotFoundError:
+            pass
         except ValueError as ve:
             if 'has no file associated' in ve.args[0]:
                 pass

@@ -3,6 +3,7 @@ from django.shortcuts import render
 from django.contrib.auth.models import User, Group
 from filepopulator.models import ImageFile, Directory
 from face_manager.models import Person, Face
+from django.db.models import Count
 from django.conf import settings
 from rest_framework import viewsets, filters
 #from api.serializers import UserSerializer, GroupSerializer, ImageFileSerializer, DirectorySerializer, ParameterSerializer
@@ -19,6 +20,8 @@ import datetime
 import time
 import os
 import numpy as np
+import threading
+from queue import Queue
 import PIL
 from PIL import Image, ExifTags
 from django.http import HttpResponse, Http404
@@ -159,18 +162,32 @@ class PersonListView(APIView):
 
         all_people = Person.objects.all()
 
-        result_list = []
         domain_name = 'https://' + os.environ['WEBAPP_DOMAIN'] + '/api/people'
-        # from django.urls import reverse, reverse_lazy
+        result_list = []
+        p_queue = Queue()
+
         for p in all_people:
-            p_dict = {}
-            p_dict['url'] = f'{domain_name}/{p.id}/'
-            p_dict['num_faces'] = p.face_declared.count()
-            p_dict['num_possibilities'] = p.face_poss1.count()
-            p_dict['num_unverified_faces'] = p.face_declared.filter(validated=False).count()
-            p_dict['id'] = p.id
-            p_dict['person_name'] = p.person_name
-            result_list.append(p_dict)
+            p_queue.put(p)
+
+        def worker():
+            while not p_queue.empty():
+                p = p_queue.get()
+                p_dict = {}
+                p_dict['url'] = f'{domain_name}/{p.id}/'
+                p_dict['num_faces'] = p.face_declared.count()
+                # p_dict['num_faces'] = p.num_faces
+                p_dict['num_possibilities'] = p.face_poss1.count() + p.face_poss2.count()
+                # p_dict['num_possibilities'] = p.poss_1 + p.poss_2
+                p_dict['num_unverified_faces'] = p.face_declared.filter(validated=False).count()
+                p_dict['id'] = p.id
+                p_dict['person_name'] = p.person_name
+                result_list.append(p_dict)
+                p_queue.task_done()
+                # return p_dict
+        
+        for i in range(4):
+            threading.Thread(target=worker).start()
+        p_queue.join()
 
         js = {'count': len(all_people), 'next': None, 'previous': None, 'results': result_list,}
 
@@ -182,22 +199,33 @@ class FolderListView(APIView):
         params = self.request.query_params
 
         all_folders = Directory.objects.all()
+        f_queue = Queue()
+
+        for f in all_folders:
+            f_queue.put(f)
 
         result_list = []
         domain_name = 'https://' + os.environ['WEBAPP_DOMAIN'] + '/api/directories'
-        # from django.urls import reverse, reverse_lazy
+
+        def worker():
+            while not f_queue.empty():
+                fold = f_queue.get()
+                f_dict = {}
+                f_dict['id'] = fold.id
+                f_dict['url'] = f'{domain_name}/{fold.id}/'
+                f_dict['top_level_name'] = fold.dir_path.split('/')[-1]
+                f_dict['first_datesec'] = fold.first_datesec
+                f_dict['mean_datesec'] = fold.mean_datesec
+                f_dict['num_images'] = fold.image_set.count()
+                f_dict['year'] = datetime.datetime.fromtimestamp(fold.first_datesec).year
+                result_list.append(f_dict)
+                f_queue.task_done()
+
+        for i in range(4):
+            threading.Thread(target=worker).start()
+        f_queue.join()
 
         # /directories/?fields=id,url,top_level_name,first_datesec,mean_datesec,num_images,year&limit=2000
-        for fold in all_folders:
-            f_dict = {}
-            f_dict['id'] = fold.id
-            f_dict['url'] = f'{domain_name}/{fold.id}/'
-            f_dict['top_level_name'] = fold.dir_path.split('/')[-1]
-            f_dict['first_datesec'] = fold.first_datesec
-            f_dict['mean_datesec'] = fold.mean_datesec
-            f_dict['num_images'] = fold.image_set.count()
-            f_dict['year'] = datetime.datetime.fromtimestamp(fold.first_datesec).year
-            result_list.append(f_dict)
 
         js = {'count': len(all_folders), 'next': None, 'previous': None, 'results': result_list,}
 

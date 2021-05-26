@@ -43,18 +43,21 @@ class Command(BaseCommand):
         with open("/code/epochs.txt", "r") as fh:
             data = fh.read()
             data = data.split('\n')
-            if data[-1] == '':
-                epoch = int(data[-2])
-            else:
-                epoch = int(data[-1])
+            try:
+                if data[-1] == '':
+                    epoch = int(data[-2])
+                else:
+                    epoch = int(data[-1])
+            except:
+                epoch = 0                    
 
-        face_classifier.classify_unassigned_faces(batch_processing_size=128)
+        # face_classifier.classify_unassigned_faces(batch_processing_size=128, do_all=True)
 
         criterion_ign = Q(declared_name__person_name__in=settings.IGNORED_NAMES)
         ignored = Face.objects.filter(criterion_ign)
         # print(ignored.count())
         total_todo = 127300
-        num_batches = 500
+        num_batches = 1500
         batch_size = int(total_todo // num_batches) + 1
         start_batch = epoch
         from_end = (num_batches - start_batch) * (batch_size)
