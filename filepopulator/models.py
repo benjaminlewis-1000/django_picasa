@@ -51,18 +51,12 @@ settings.LOGGER.warning("TODO: More logic is needed to see if the file has chang
 def validate_lat(value):
     if value != -999:
         if not -90 < value < 90:
-            raise ValidationError(
-                _('%(value)s is not a valid latitude'),
-                params={'value': value},
-            )
+            raise ValidationError(f'{value} is not a valid latitude')
 
 def validate_lon(value):
     if value != -999:
         if not -180 < value < 180:
-            raise ValidationError(
-                _('%(value)s is not a valid latitude'),
-                params={'value': value},
-            )
+            raise ValidationError(f'{value} is not a valid latitude')
 
 class Directory(models.Model): 
     dir_path = models.CharField(max_length=512, unique=True)
@@ -70,6 +64,7 @@ class Directory(models.Model):
     mean_datesec = models.FloatField(default = -1)
     first_datetime = models.DateTimeField(default = timezone.now)
     first_datesec = models.FloatField(default = -1)
+    num_images = models.IntegerField(default=0)
 
     def __str__(self):
         return "{} --- ({})".format(self.dir_path.split('/')[-1], self.dir_path)

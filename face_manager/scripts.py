@@ -7,6 +7,7 @@ from facenet_pytorch import MTCNN, InceptionResnetV1
 from filepopulator.models import ImageFile
 from io import BytesIO
 import cv2
+import os
 import image_face_extractor
 import logging
 import numpy as np
@@ -116,6 +117,7 @@ def placeInDatabase(foreign_key, face_data):
 
             new_face.face_encoding = encoding
             new_face.face_encoding_512 = enc_512
+            new_face.reencoded = True
 
         new_face.box_top = r_top
         new_face.box_bottom = r_bot
@@ -173,6 +175,7 @@ def populateFromImage(filename, server_conn = None):
     face_data = image_face_extractor.image_client.face_extract_client(filename, server_conn, logger=settings.LOGGER)
     
     placeInDatabase(foreign_key, face_data)
+    print(f"Image {filename} has been placed in database.")
 
     return face_data, server_conn, changed_fk 
 
@@ -198,13 +201,13 @@ def populateFromImageMultiGPU(filename, server_conn = None, server_ip = None, ip
 
     changed_fk = True
 
-    # def face_from_facerect(self, filename):
+    if not os.path.isfile(filename): #could have moved
+        raise OSError(f"File {filename} not found.")
+
     face_data = image_face_extractor.image_client_multi.face_extract_client(filename, server_conn, ip_address=server_ip, logger=settings.LOGGER, ip_checked = ip_checked)
     print(f"Worked! IP was {server_ip}, length is {len(face_data)}, file is {filename}")
-    # print(face_data)
-    # return False
-    
     placeInDatabase(foreign_key, face_data)
+    print(f"Image {filename} has been placed in database.")
 
     return face_data, server_conn, changed_fk 
 

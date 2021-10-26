@@ -64,6 +64,12 @@ class Person(models.Model):
     # a link to a face in case the face gets deleted or moved.
     highlight_img = models.ImageField(upload_to=face_highlight_path, default=None)
 
+    further_images_unlikely = models.BooleanField(default=False)
+
+    num_faces = models.IntegerField(default=0)
+    num_possibilities = models.IntegerField(default=0)
+    num_unverified_faces = models.IntegerField(default=0)
+
     # id field has a primary key
     def delete(self):
         # Protect the no face assigned person from
@@ -87,6 +93,30 @@ class Person(models.Model):
     def __str__(self):
         return self.person_name
 
+    def increment_assigned(self):
+        self.num_faces += 1
+        self.save()
+
+    def decrement_assigned(self):
+        self.num_faces -= 1
+        self.save()
+
+    def decrement_unverified(self):
+        self.num_unverified_faces -= 1
+        self.save()
+
+    def increment_unverified(self):
+        self.num_unverified_faces += 1
+        self.save()
+
+    def increment_possible_num(self):
+        self.num_possibilities += 1
+        self.save()
+
+    def decrement_possible_num(self):
+        self.num_possibilities -= 1
+        self.save()
+
 class Face(models.Model):
     
     # Primary key (id) comes for free.
@@ -99,6 +129,8 @@ class Face(models.Model):
         blank=True, null=True)
     source_image_file = models.ForeignKey('filepopulator.ImageFile', on_delete=models.CASCADE, blank=True, null=True)
     # ArrayField supported in PostGres
+
+    reencoded = models.BooleanField(default=False)
     face_encoding = ArrayField(
                             models.FloatField(),
                             size=128, blank=True, null=True
@@ -157,3 +189,123 @@ class Face(models.Model):
     def delete(self):
         os.remove(self.face_thumbnail.path)
         super(Face, self).delete()
+
+
+    def remove_poss_ident(self, poss_idx):
+        if self.__dict__[f'poss_ident{poss_idx}_id'] != None:
+            ident_id_person = self.__dict__[f'poss_ident{poss_idx}_id']
+            person = Person.objects.get(id=ident_id_person)
+            person.decrement_possible_num()
+            self.__dict__[f'poss_ident{poss_idx}_id'] = None
+            self.__dict__[f'weight_{poss_idx}'] = 0.0
+
+    def associate_person(self, person_id):
+        # A one-stop-shop function to assign a Face to a given
+        # Person. Unassociates the face with the old Person, if
+        # any, and decrements the counts of assigned faces. 
+        # Also removes values for possible identities. Increments
+        # counts for the new person appropriately.
+
+        # Change the numbers for assigned to the old and new person objects
+        if self.declared_name.id != person_id:
+            self.declared_name.decrement_assigned()
+            if not self.validated: 
+                self.declared_name.decrement_unverified()
+
+        new_id = Person.objects.get(id=person_id)
+        self.declared_name = new_id
+        new_id.increment_assigned()
+        new_id.increment_unverified()
+        self.validated = False
+        self.written_to_photo_metadata = False
+
+
+        self.remove_poss_ident(1)
+        self.remove_poss_ident(2)
+        self.remove_poss_ident(3)
+        self.remove_poss_ident(4)
+        self.remove_poss_ident(5)
+
+        self.save()
+
+    def verify_person_in_image(self):
+        self.declared_name.decrement_unverified()
+
+        self.validated = True
+        self.save()
+
+    def set_possible_person(self, person_id, poss_idx, weight):
+
+        new_poss_id = Person.objects.get(id=person_id)
+        new_poss_id.increment_possible_num()
+        self.__dict__[f'weight_{poss_idx}'] = weight
+
+        if poss_idx == 1:
+            self.poss_ident1 = new_poss_id
+        elif poss_idx == 2:
+            self.poss_ident2 = new_poss_id
+        elif poss_idx == 3:
+            self.poss_ident3 = new_poss_id
+        elif poss_idx == 4:
+            self.poss_ident4 = new_poss_id
+        elif poss_idx == 5:
+            self.poss_ident5 = new_poss_id
+
+        self.save()
+
+    def set_possibles_zero(self):
+        self.remove_poss_ident(1)
+        self.remove_poss_ident(2)
+        self.remove_poss_ident(3)
+        self.remove_poss_ident(4)
+        self.remove_poss_ident(5)
+
+        self.save()
+
+
+    def reject_association(self, person_unassociate_id):
+
+        disown_person = Person.objects.get(id=person_unassociate_id)
+
+        if self.poss_ident1 == disown_person:
+            self.poss_ident1.decrement_possible_num()
+            self.poss_ident1 = None
+            self.weight_1 = 0.0
+        elif self.poss_ident2 == disown_person:
+            self.poss_ident2.decrement_possible_num()
+            self.poss_ident2 = None
+            self.weight_2 = 0.0
+        elif self.poss_ident3 == disown_person:
+            self.poss_ident3.decrement_possible_num()
+            self.poss_ident3 = None
+            self.weight_3 = 0.0
+        elif self.poss_ident4 == disown_person:
+            self.poss_ident4.decrement_possible_num()
+            self.poss_ident4 = None
+            self.weight_4 = 0.0
+        elif self.poss_ident5 == disown_person:
+            self.poss_ident5.decrement_possible_num()
+            self.poss_ident5 = None
+            self.weight_5 = 0.0
+
+        reject_list = self.rejected_fields
+        if reject_list is None:
+            reject_list = []
+
+        reject_list.append(person_unassociate_id)
+        # Remove duplicates
+        reject_list = list(set(reject_list))
+
+        self.rejected_fields = reject_list
+        self.save()
+
+'''
+from face_manager.models import Person
+people = Person.objects.all()
+for p in people:
+    print(p)
+    num_faces = p.face_declared.count()
+    num_possibilities = p.face_poss1.count() + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
+    num_unverified_faces = p.face_declared.filter(validated=False).count()
+    p.save()
+'''

@@ -155,14 +155,53 @@ class PersonViewSet(viewsets.ModelViewSet):
         context.update({"request": self.request})
         return context
 
+
+    @action(detail=True, methods=['put'])
+    def toggle_further_unlikely(self, request, pk=None):
+        # Accessible as <root>/api/people/<face_id>/toggle_further_unlikely/
+        # Accept: HTML PUT
+        # Given face_id in the URL, toggle the further_images_unlikely property. 
+        person = self.get_object()
+
+        def err_404(message=""):
+            msg_start = f'Invalid toggle unlikely request. \n\n'
+            msg_start += message
+            err_404 = render_404(request, msg_start)
+            return err_404
+
+        unlikely = person.further_images_unlikely
+        person.further_images_unlikely = not unlikely
+        person.save()
+
+        js = {'success': True, }
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
 class PersonListView(APIView):
     permission_classes = (IsAuthenticated,) 
     def get(self, request, *args, **kwargs):
         params = self.request.query_params
 
         all_people = Person.objects.all()
-
+        num_people = all_people.count()
         domain_name = 'https://' + os.environ['WEBAPP_DOMAIN'] + '/api/people'
+
+        # ###############
+        # s = time.time()
+        # all_people = Person.objects.all().order_by('id')
+        # p_facecount = Person.objects.annotate(n=Count('face_declared'))
+        # num_faces = [p.n for p in p_facecount]
+        # urls = [f'{domain_name}/{p.id}/' for p in all_people]
+        # p_poss1 = Person.objects.annotate(n=Count('face_poss1'))
+        # p_poss2 = Person.objects.annotate(n=Count('face_poss2'))
+        # num_possibilities = [p_poss1[x].n + p_poss2[x].n for x in range(num_people)]
+        # ids = [p.id for p in all_people]
+        # names = [p.person_name for p in all_people]
+        # further_images_unlikely = [p.further_images_unlikely for p in all_people]
+        # unvalidated_q = all_people.filter(face_declared__validated=False).annotate(n=Count('face_declared'))
+        # unvalidated = [p.n for p in unvalidated_q]
+        # print(time.time() - s)
+
+
         result_list = []
         p_queue = Queue()
 
@@ -173,23 +212,27 @@ class PersonListView(APIView):
             while not p_queue.empty():
                 p = p_queue.get()
                 p_dict = {}
+                p_dict['num_faces'] = p.num_faces # face_declared.count()
                 p_dict['url'] = f'{domain_name}/{p.id}/'
-                p_dict['num_faces'] = p.face_declared.count()
-                # p_dict['num_faces'] = p.num_faces
-                p_dict['num_possibilities'] = p.face_poss1.count() + p.face_poss2.count()
-                # p_dict['num_possibilities'] = p.poss_1 + p.poss_2
-                p_dict['num_unverified_faces'] = p.face_declared.filter(validated=False).count()
+                p_dict['num_possibilities'] = p.num_possibilities # face_poss1.count() + p.face_poss2.count()
                 p_dict['id'] = p.id
                 p_dict['person_name'] = p.person_name
+                p_dict['further_images_unlikely'] = p.further_images_unlikely
+
+                # p_dict['num_faces'] = p.num_faces
+                # p_dict['num_possibilities'] = p.poss_1 + p.poss_2
+                p_dict['num_unverified_faces'] = p.num_unverified_faces # face_declared.filter(validated=False).count()
                 result_list.append(p_dict)
                 p_queue.task_done()
                 # return p_dict
         
         for i in range(4):
             threading.Thread(target=worker).start()
+        
+
         p_queue.join()
 
-        js = {'count': len(all_people), 'next': None, 'previous': None, 'results': result_list,}
+        js = {'count': num_people, 'next': None, 'previous': None, 'results': result_list,}
 
         return HttpResponse(json.dumps(js), content_type='application/json')
     
@@ -216,7 +259,7 @@ class FolderListView(APIView):
                 f_dict['top_level_name'] = fold.dir_path.split('/')[-1]
                 f_dict['first_datesec'] = fold.first_datesec
                 f_dict['mean_datesec'] = fold.mean_datesec
-                f_dict['num_images'] = fold.image_set.count()
+                f_dict['num_images'] = fold.num_images
                 f_dict['year'] = datetime.datetime.fromtimestamp(fold.first_datesec).year
                 result_list.append(f_dict)
                 f_queue.task_done()
@@ -363,28 +406,6 @@ class FaceViewSet(viewsets.ModelViewSet):
         # Return the filename to write and the content file.
         return person_thumb_filename, person_content_file
 
-    def assign_face(self, face, declared_name):
-        # Set the face declared_name to the
-        # declared_name and zero out all the 
-        # possible identity parameters.
-
-        face.declared_name = declared_name
-        face.written_to_photo_metadata = False
-        face.poss_ident1 = None
-        face.poss_ident2 = None
-        face.poss_ident3 = None
-        face.poss_ident4 = None
-        face.poss_ident5 = None
-        face.weight_1 = 0.0
-        face.weight_2 = 0.0
-        face.weight_3 = 0.0
-        face.weight_4 = 0.0
-        face.weight_5 = 0.0
-        face.validated = False
-
-        return face
-
-
     @action(detail=True, methods=['patch'])
     def verify_face(self, request, pk=None):
         # Accessible as <root>/api/faces/<face_id>/verify_face/
@@ -401,13 +422,7 @@ class FaceViewSet(viewsets.ModelViewSet):
             err_404 = render_404(request, msg_start)
             return err_404
             
-        dn = face.declared_name
-        face.validated = True
-        face.declared_name = dn
-        try:
-            face.save()
-        except:
-            pass
+        face.verify_person_in_image()
 
         js = {'success': True}
         return HttpResponse(json.dumps(js), content_type='application/json')
@@ -454,8 +469,7 @@ class FaceViewSet(viewsets.ModelViewSet):
             return err_404("Desired declared name key is not a key found in the database.")
             
         # Update the face object fields accordingly
-        face = self.assign_face(face, identity)
-        face.save()
+        face.associate_person(name_key)
 
         # Return a json block with success=true, the new key (passed as
         # an argument), and the declared human-meaningful name. 
@@ -496,8 +510,7 @@ class FaceViewSet(viewsets.ModelViewSet):
 
         new_person.save()
 
-        face = self.assign_face(face, new_person)
-        face.save()
+        face.associate_person(new_person.id)
 
         js = {'success': True, 'new_id': new_person.id, 'new_name': person_name}
         return HttpResponse(json.dumps(js), content_type='application/json')
@@ -560,8 +573,8 @@ class FaceViewSet(viewsets.ModelViewSet):
             
             ignore_person = Person.objects.filter(person_name='.realignore')
             
-        face = self.assign_face(face, ignore_person[0])
-        face.save()
+
+        face.associate_person(ignore_person[0].id)
 
         js = {'success': True}
         return HttpResponse(json.dumps(js), content_type='application/json')
@@ -576,8 +589,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         face = self.get_object()
         unassigned_person = Person.objects.filter(person_name=settings.BLANK_FACE_NAME)[0]
         
-        face = self.assign_face(face, unassigned_person)
-        face.save()
+        face.associate_person(unassigned_person.id)
 
         js = {'success': True}
         return HttpResponse(json.dumps(js), content_type='application/json')
@@ -591,6 +603,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         # Given the face, remove association to the given
         # person and add the person_id to the rejected_fields. 
         
+        print(request.data, request.data.keys())
         def err_404(message=""):
             msg_start = f'Invalid reject association request. \n\n'
             msg_start += message
@@ -608,34 +621,7 @@ class FaceViewSet(viewsets.ModelViewSet):
             return err_404("unassociate_id passed was not an integer.")
 
         face = self.get_object()
-        disown_person = Person.objects.get(id=unassociate_id)
-
-        if face.poss_ident1 == disown_person:
-            face.poss_ident1 = None
-            face.weight_1 = 0.0
-        elif face.poss_ident2 == disown_person:
-            face.poss_ident2 = None
-            face.weight_2 = 0.0
-        elif face.poss_ident3 == disown_person:
-            face.poss_ident3 = None
-            face.weight_3 = 0.0
-        elif face.poss_ident4 == disown_person:
-            face.poss_ident4 = None
-            face.weight_4 = 0.0
-        elif face.poss_ident5 == disown_person:
-            face.poss_ident5 = None
-            face.weight_5 = 0.0
-
-        reject_list = face.rejected_fields
-        if reject_list is None:
-            reject_list = []
-
-        reject_list.append(unassociate_id)
-        # Remove duplicates
-        reject_list = list(set(reject_list))
-
-        face.rejected_fields = reject_list
-        face.save()
+        face.reject_association(unassociate_id)
 
         js = {'success': True}
         return HttpResponse(json.dumps(js), content_type='application/json')

@@ -173,7 +173,6 @@ class FaceSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
     class Meta:
 
         model = Face
-        print("Getting")
         # No face_encoding in this api -- it's not necessary. 
         fields = ['url', 'source_image_file', 'written_to_photo_metadata',  \
             'declared_name', 'face_name', \
@@ -202,7 +201,8 @@ class PersonSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer)
     class Meta:
 
         model = Person
-        fields = ['url', 'person_name', 'highlight_img', 'num_faces', 'num_possibilities', 'face_declared', 'id']
+        fields = ['url', 'person_name', 'highlight_img', 'num_faces', \
+        'num_possibilities', 'id', 'further_images_unlikely', 'face_declared']
         # fields = ['url', 'person_name', 'highlight_img', 'num_faces', 'id']
 
     def get_num_faces(self, obj):

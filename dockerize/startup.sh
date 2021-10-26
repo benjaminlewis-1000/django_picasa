@@ -23,7 +23,10 @@ chown -R nobody:nogroup /var/run/celery /var/log/celery
 
 # celery flower -A picasa --port=5555 &
 celery -A picasa beat -l INFO --pidfile="/locks/celerybeat.pid"  &
-celery -A picasa worker -l INFO & # --uid=nobody --gid=nogroup &
+celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker1 & # --uid=nobody --gid=nogroup &
+celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker2 & # --uid=nobody --gid=nogroup &
+celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker3 & # --uid=nobody --gid=nogroup &
+celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker4 & # --uid=nobody --gid=nogroup &
 gunicorn -b 0.0.0.0:8000 picasa.wsgi & 
 
 while true; do 

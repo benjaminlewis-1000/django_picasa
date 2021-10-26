@@ -4,6 +4,7 @@ from django.contrib.auth.models import User
 from django.utils.crypto import get_random_string
 from django.conf import settings
 
+from django.db.models import Q
 from celery import shared_task
 import time
 import os
@@ -16,6 +17,8 @@ from .scripts import populateFromImage, populateFromImageMultiGPU, establish_ser
 from .models import Person, Face
 from filepopulator.models import ImageFile
 
+from image_face_extractor import reencoder, ip_finder 
+
 if not settings.configured:
     settings.configure()
 
@@ -27,6 +30,45 @@ if not settings.configured:
 # celery.py in the <PROJECT> directory and putting the following:
 # app.config_from_object('django.conf:settings', namespace='CELERY')
 # app.autodiscover_tasks() 
+
+@shared_task(ignore_result=False, name='face_manager.reencode')
+def reencode_face():
+    print("Reencoding!")
+    settings.LOGGER.warning("Reencoding!")
+
+    start_time = time.time()
+
+    criterion_ign = ~Q(declared_name__person_name__in=['.ignore', '.realignore', '.jessicatodo', '.cutler_tbd'] )
+    criterion_2 = Q(reencoded=False)
+
+    all_faces = Face.objects.filter(criterion_ign&criterion_2).order_by('?')
+
+    num_faces = all_faces.count()
+    print(f"There are {num_faces} faces to reencode.")
+
+    client_ip = ip_finder.server_finder()
+    print("Found client IP")
+
+    iter_num = 1
+    for face in all_faces.iterator():
+        print(f'{iter_num}/{num_faces}, {iter_num / num_faces * 100:.4f}%')
+        iter_num += 1
+        if face.reencoded:
+            continue
+
+        face_location = [(face.box_top, face.box_right, face.box_bottom, face.box_right)]
+        source_image_file = face.source_image_file.filename
+
+        encoding = reencoder.face_encoding_client(source_image_file, face_location, client_ip)
+        # print(source_image_file, face_location, encoding)
+
+        face.encoding = encoding
+        face.reencoded = True
+        face.save()
+
+        # Kill after 5 minutes
+        if time.time() - start_time > 15 * 60:
+            return
 
 @shared_task(ignore_result=True, name='face_manager.face_extraction')
 def process_faces():
@@ -63,7 +105,8 @@ def process_faces():
 
     for img in unprocessed_imgs:
         if not img.isProcessed:
-            img_q.put(img)
+            if os.path.isfile(img.filename):
+                img_q.put(img)
 
 
 
@@ -117,8 +160,8 @@ def process_faces():
                 if not img.isProcessed:
                     try:
                         populateFromImageMultiGPU(img.filename, server_conn = server_conn, server_ip = self.ip_addr, ip_checked=True)
-                    except OSError:
-                        print(f"IP {self.ip_addr} issue with populateFromImage, filename {img.filename}, img id {img.id}")
+                    except OSError as ose:
+                        print(f"IP {self.ip_addr} issue with populateFromImage, filename {img.filename}, img id {img.id}. Error: {ose}")
                         break
 
     # Put everything in a while loop that polls for new workers

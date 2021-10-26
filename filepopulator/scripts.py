@@ -108,7 +108,7 @@ def create_image_file(file_path):
         # This way with established database (no hashing): ~.5 seconds. 
         # That's a 40x speedup.
         else:
-            print(file_path)
+            print(f"Working with {file_path}")
             settings.LOGGER.debug(f"Updating file {file_path} in database due to changed timestamp")
             new_photo.process_new_no_md5()
             new_photo._generate_md5_hash()
@@ -136,7 +136,7 @@ def create_image_file(file_path):
 
     # Case 2: No photo exists at this location.
     else:
-        print(file_path)
+        print(f"Working with {file_path}")
         settings.LOGGER.debug(f"Adding new file {file_path} to database.")
         new_photo.process_new_no_md5()
         new_photo._generate_md5_hash()
@@ -157,10 +157,11 @@ def create_image_file(file_path):
 
             elif len(exist_with_same_hash) > 1:
                 # raise NotImplementedError('More than one...')
-                print(exist_with_same_hash)
-                logging.error('This is not how I want it -- I want more matching validation. But getting here was right.')
+                print(f"Same hash: {exist_with_same_hash}")
+                # logging.error('This is not how I want it -- I want more matching validation. But getting here was right.')
                 for each in exist_with_same_hash:
                     if not os.path.exists(each.filename):
+                        print(f"Deleting file {each.filename} since it is no longer in the file path.")
                         each.filename = file_path
                         each.dateAdded = timezone.now()
                         each.dateModified = datetime.fromtimestamp(os.path.getmtime(file_path))
@@ -204,6 +205,11 @@ def add_from_root_dir(root_dir):
                     try:
                         cur_file = os.path.join(root, f)
                         cur_parts = cur_file.split(os.sep)[:-1]
+                        filename = cur_file.split(os.sep)[-1]
+                        if re.match('\.', filename):
+                            # Don't try to add files starting with a period - they're often
+                            # just system files. 
+                            continue
                         # Check if a folder starts with '.'.
                         if not True in set(map(lambda x: x.startswith('.'), cur_parts) ):
                             create_image_file(cur_file)
@@ -236,4 +242,5 @@ def update_dirs_datetime():
     #     print(d)
         d.average_date_taken()
         d.beginning_date_taken()
+        d.num_images = d.image_set.count()
         d.save()

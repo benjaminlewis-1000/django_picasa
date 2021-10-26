@@ -35,6 +35,7 @@ def load_images_into_db():
     print("Finished adding photos")
     delete_removed_photos()
     print("Done! Finished removing photos that aren't there.")
+    update_dirs_datetime()
 
 
 @shared_task(name='filepopulator.update_dir_dates')
