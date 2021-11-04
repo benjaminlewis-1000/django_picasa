@@ -97,14 +97,6 @@ class Person(models.Model):
         self.num_faces += 1
         self.save()
 
-    def decrement_assigned(self):
-        self.num_faces -= 1
-        self.save()
-
-    def decrement_unverified(self):
-        self.num_unverified_faces -= 1
-        self.save()
-
     def increment_unverified(self):
         self.num_unverified_faces += 1
         self.save()
@@ -113,8 +105,22 @@ class Person(models.Model):
         self.num_possibilities += 1
         self.save()
 
+    def decrement_assigned(self):
+        self.num_faces -= 1
+        if self.num_faces < 0:
+            self.num_faces = 0
+        self.save()
+
+    def decrement_unverified(self):
+        self.num_unverified_faces -= 1
+        if self.num_unverified_faces < 0:
+            self.num_unverified_faces = 0
+        self.save()
+
     def decrement_possible_num(self):
         self.num_possibilities -= 1
+        if self.num_possibilities < 0:
+            self.num_possibilities = 0
         self.save()
 
 class Face(models.Model):
@@ -129,6 +135,7 @@ class Face(models.Model):
         blank=True, null=True)
     source_image_file = models.ForeignKey('filepopulator.ImageFile', on_delete=models.CASCADE, blank=True, null=True)
     # ArrayField supported in PostGres
+    dateTakenUTC = models.FloatField(default=0)
 
     reencoded = models.BooleanField(default=False)
     face_encoding = ArrayField(
@@ -304,8 +311,8 @@ from face_manager.models import Person
 people = Person.objects.all()
 for p in people:
     print(p)
-    num_faces = p.face_declared.count()
-    num_possibilities = p.face_poss1.count() + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
-    num_unverified_faces = p.face_declared.filter(validated=False).count()
+    p.num_faces = p.face_declared.count()
+    p.num_possibilities = p.face_poss1.count() + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
+    p.num_unverified_faces = p.face_declared.filter(validated=False).count()
     p.save()
 '''

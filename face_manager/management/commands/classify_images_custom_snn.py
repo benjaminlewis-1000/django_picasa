@@ -541,7 +541,7 @@ class Command(BaseCommand):
 
         # Now we want to get each unassigned image
         unassigned_crit = Q(declared_name__person_name=settings.BLANK_FACE_NAME)
-        unassigned = Face.objects.filter(unassigned_crit)
+        unassigned = Face.objects.filter(unassigned_crit).order_by('?')
         self.person_keys_list = list(self.person_encodings_short.keys())
         self.ignore_person = Person.objects.filter(person_name=settings.SOFT_IGNORE_NAME)[0]
 
@@ -552,6 +552,7 @@ class Command(BaseCommand):
                 print(f"Assigning: {u_idx+1}/{unassigned.count()}")
                 u_idx += 1
                 self.classify_unassigned(u_img)
+                sleep(0.2)
             except Exception as e:
                 print(f"Exception! {e}")
                 # 

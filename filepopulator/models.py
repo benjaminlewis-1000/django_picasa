@@ -181,6 +181,7 @@ class ImageFile(models.Model):
 
     # Default for date take in January 1, 1899.
     dateTaken = models.DateTimeField( default=datetime(2018, 1, 1) )
+    dateTakenUTC = models.FloatField(default=0)
     dateTakenValid = models.BooleanField(default=False)
 
     # isProcessed -- whether the photo has had faces detected.
@@ -495,6 +496,7 @@ class ImageFile(models.Model):
                     if date < self.dateTaken: 
                         self.dateTaken = date
                         self.dateTakenValid = True
+                        self.dateTakenUTC = date.timestamp()
         else:
         #    self.dateTaken = timezone.now()
         #    self.dateTakenValid = False
@@ -603,3 +605,5 @@ class ImageFile(models.Model):
         return f"{self.exposure_num}/{self.exposure_denom}"
         
     exposure.short_description = 'Exposure'
+
+

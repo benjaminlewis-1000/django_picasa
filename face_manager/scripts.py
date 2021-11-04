@@ -125,6 +125,7 @@ def placeInDatabase(foreign_key, face_data):
         new_face.box_right = r_right
 
         new_face.source_image_file = foreign_key
+        new_face.dateTakenUTC = foreign_key.dateTakenUTC
 
         sq_thumb_resize = cv2.resize(sq_thumb, settings.FACE_THUMBNAIL_SIZE)
         FTYPE = 'JPEG' # 'GIF' or 'PNG' are possible extensions
