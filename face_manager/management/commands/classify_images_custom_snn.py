@@ -241,6 +241,9 @@ class Command(BaseCommand):
         elif len(test_encoding) == 512:
             enc_net = self.long_enc_net
             merge_net = self.long_merge_net
+        elif len(test_encoding) == 640:
+            enc_net = self.combined_enc_net
+            merge_net = self.combined_merge_net
         else:
             raise ValueError('Length of encoding is not in [128, 512]')
 
@@ -349,10 +352,14 @@ class Command(BaseCommand):
                 dist_per_category.append(self.IGN_VALUE)
             else:
                 # Compute the distance
+                # temporally_closest_encodings_c = np.concatenate((temporally_closest_encodings_l, temporally_closest_encodings_s), 1)
+                # cmb_encoding = np.concatenate((long_encoding, short_encoding))
                 if self.DISTANCE_SIAMESE:
-                    distances_long = self.compute_distance(temporally_closest_encodings_l, long_encoding)
+                    distances_computed = self.compute_distance(temporally_closest_encodings_l, long_encoding)
+                    # distances_computed = self.compute_distance(temporally_closest_encodings_c, cmb_encoding)
                 else:
-                    distances_long = self.compute_distance_cosine(temporally_closest_encodings_l, long_encoding)
+                    distances_computed = self.compute_distance_cosine(temporally_closest_encodings_l, long_encoding)
+                    # distances_computed = self.compute_distance(temporally_closest_encodings_c, cmb_encoding)
                 # distances_short = self.compute_distance(temporally_closest_encodings_s, short_encoding)
                 # distances_long = np.sort(distances_long)
 
@@ -364,9 +371,9 @@ class Command(BaseCommand):
                 # print(distances_long[:5])                
                 if self.DEBUG:
                     # print(np.max(distances_short), np.max(distances_long))
-                    print(np.min(distances_long))
+                    print(np.min(distances_computed))
                     # print(np.mean(distances_short), np.mean(distances_long))
-                    print(np.mean(distances_long))
+                    print(np.mean(distances_computed))
 
                 # # dist_idcs_short = np.argsort(distances_short)
                 # distances_short.sort()
@@ -375,11 +382,11 @@ class Command(BaseCommand):
                 #    print(distances_short[:20])
                 # mean_short = np.mean(distances_short[6:])
                 # dist_idcs_long = np.argsort(distances_long)
-                distances_long.sort()
+                distances_computed.sort()
                 if not self.USE_MIN_VALUE:
-                    distances_long = distances_long[::-1]
-                mean_long = np.mean(distances_long[:10])
-                min_long = np.min(distances_long)
+                    distances_computed = distances_computed[::-1]
+                mean_long = np.mean(distances_computed[:10])
+                min_long = np.min(distances_computed)
 
                 if self.DISTANCE_SIAMESE:
                     array_val = mean_long
@@ -387,7 +394,7 @@ class Command(BaseCommand):
                     array_val = min_long
 
                 if self.DEBUG:
-                    print(distances_long[:20])
+                    print(distances_computed[:20])
                 # min_dist_per_category.append(np.max((mean_long, mean_short)))
                 if self.USE_MIN_VALUE:
                     dist_per_category.append(array_val)
@@ -547,12 +554,14 @@ class Command(BaseCommand):
 
 
         u_idx = 0
+        num_unassigned = unassigned.count()
         for u_img in unassigned.iterator():
             try:
-                print(f"Assigning: {u_idx+1}/{unassigned.count()}")
+                print(f"Assigning: {u_idx+1}/{num_unassigned}")
                 u_idx += 1
                 self.classify_unassigned(u_img)
                 sleep(0.2)
             except Exception as e:
                 print(f"Exception! {e}")
+                u_idx += 1
                 # 

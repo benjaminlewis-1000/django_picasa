@@ -75,7 +75,7 @@ else:
     DB_HOST = 'localhost'
     REDIS_HOST = 'localhost'
     MEDIA_ROOT = os.path.join(PROJECT_ROOT, 'media')
-    SECRET_KEY = '46r=!b*lkf2-^#a=40kq(9nxkfz53d7!ft7_iccd1!2aa%q@6z'
+    SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
     ALLOWED_HOSTS = ['localhost', '127.0.0.1']
     PHOTO_ROOT = '/home/benjamin/git_repos/picasa_files/actual_imgs'
     TEST_IMG_DIR_FILEPOPULATE = '/home/benjamin/git_repos/picasa_files/test_imgs'
@@ -86,7 +86,7 @@ else:
     LOG_DIR = '/home/benjamin/git_repos/picasa_files/logs'
 
 RANDOM_ACCESS_KEY = ''.join([random.choice(string.ascii_letters + string.digits) for n in range(32)])
-print(MEDIA_URL)
+# print(MEDIA_URL)
 
 # Set up logging
 formatter = logging.Formatter('%(levelname)s | %(asctime)s - %(message)s')
@@ -235,7 +235,7 @@ CORS_ALLOW_HEADERS = [
     'x-requested-with',
 ]
 
-LOGGER.critical("CORS allowing from all...")
+LOGGER.debug("CORS allowing from all...")
 
 ROOT_URLCONF = 'picasa.urls'
 
@@ -334,8 +334,8 @@ USE_L10N = True
 USE_TZ = True
 
 # CELERY STUFF
-broker_url = f'redis://{REDIS_HOST}:6379'
-result_backend = f'redis://{REDIS_HOST}:6379'
+CELERY_BROKER_URL = f'redis://{REDIS_HOST}:6379'
+CELERY_RESULT_BACKEND = f'redis://{REDIS_HOST}:6379'
 CELERY_ACCEPT_CONTENT = ['application/json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
@@ -343,7 +343,7 @@ CELERY_TIMEZONE = TIME_ZONE
 MAX_CELERY_TIME = 60 * 60 * 3 # 3 hours
 
 # if production: 
-beat_schedule = {
+CELERY_BEAT_SCHEDULE = {
     'filepopulate_root': {
         'task': 'filepopulator.populate_files_from_root',
         'schedule': crontab(hour='*/6', minute=0) # , hour='*/6'),
@@ -353,13 +353,19 @@ beat_schedule = {
         'task': 'filepopulator.update_dir_dates',
         'schedule': crontab(minute=0, hour='*/12')
     },
-    'face_add': {
-        'task': 'face_manager.face_extraction', 
-        'schedule': crontab( hour = '*', minute='*/2'),
-        # 'schedule': crontab( minute = '0', hour='*/2'),
-        'options': {
-            'expires': 30,
-        }
+   'face_add': {
+       'task': 'face_manager.face_extraction', 
+       'schedule': crontab( hour = '*', minute='*/2'),
+        # OK to schedule every 2 minutes, because it will
+        # either get locked by the lock file, or it will
+        # die and get restarted pretty quickly.
+       # 'options': {
+       #     'expires': 30,
+       # }
+   },
+   'reencode_images': {
+        'task': 'face_manager.reencode', 
+        'schedule': crontab( minute = '*/5', hour='*'),
     },
 #    'classify_unlabeled': {
 #        'task': 'face_manager.classify_unlabeled',
@@ -369,33 +375,11 @@ beat_schedule = {
 
 }
 
-# else:
-#     CELERY_BEAT_SCHEDULE = {
-    
-#         'filepopulate_root': {
-#             'task': 'filepopulator.populate_files_from_root',
-#             'schedule': crontab(minute='*/1'),
-#         },
-#         'dirs_datetimes': {
-#             'task': 'filepopulator.update_dir_dates',
-#             'schedule': crontab(minute='*/1')
-#         },
-#         'face_add': {
-#             'task': 'face_manager.face_extraction', 
-#             'schedule': crontab( minute = '*/1'),
-#             # 'schedule': crontab( minute = '0', hour='*/2'),
-#             'options': {
-#                 'expires': 30,
-#                 # 'expires': 1800,
-#             }
-#         }
 
-#     }
-
-if not 'filepopulate_root' in beat_schedule.keys():
+if not 'filepopulate_root' in CELERY_BEAT_SCHEDULE.keys():
     LOGGER.error("Filepopulate celery task not instantiated.")
     raise ValueError('Filepopulate celery task not instantiated.')
-if not 'dirs_datetimes' in beat_schedule.keys():
+if not 'dirs_datetimes' in CELERY_BEAT_SCHEDULE.keys():
     LOGGER.error("Dirs_datetimes celery task not instantiated.")
     raise ValueError('Dirs_datetimes celery task not instantiated.')
 
@@ -425,9 +409,9 @@ if DEV:
     FACE_NUM_THRESH = 1
 else:
     FACE_NUM_THRESH=50
-IGNORED_NAMES=[BLANK_FACE_NAME, '.ignore', '.realignore', '.jessicatodo', '.cutler_tbd']
-SOFT_IGNORE_NAME = '.ignore'
+SOFT_IGNORE_NAME = '.another_ignore'
+IGNORED_NAMES=[BLANK_FACE_NAME, SOFT_IGNORE_NAME, '.ignore', '.realignore', '.jessicatodo', '.cutler_tbd']
 CLASSIFY_MODEL_PATH = '/code/face_manager/face_classifier/models'
 DEFAULT_RESOLUTION_HEIGHT = 2160 # For 4k screens
 
-print("STATIC is : ", STATIC_URL)
+# print("STATIC is : ", STATIC_URL)

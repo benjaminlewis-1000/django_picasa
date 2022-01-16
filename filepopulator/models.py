@@ -380,8 +380,19 @@ class ImageFile(models.Model):
                 light_source = self.exifDict['LightSource']
                 self.light_source = light_source
             if 'GPSInfo' in self.exifDict.keys():
+
                 self.gps_lat_decimal = self.exifDict['GPSInfo']['GPSLatDec']
+                if type(self.gps_lat_decimal) == Fraction:
+                    self.gps_lat_decimal = float(self.gps_lat_decimal)
+                if np.isnan(self.gps_lat_decimal):
+                    self.gps_lat_decimal = 0
+
                 self.gps_lon_decimal = self.exifDict['GPSInfo']['GPSLonDec']
+                if type(self.gps_lon_decimal) == Fraction:
+                    self.gps_lon_decimal = float(self.gps_lon_decimal)
+                if np.isnan(self.gps_lon_decimal):
+                    self.gps_lon_decimal = 0
+                    
             if 'Orientation' in self.exifDict.keys():
                 self.orientation = self.exifDict['Orientation']
             else:

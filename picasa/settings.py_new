@@ -334,12 +334,12 @@ USE_L10N = True
 USE_TZ = True
 
 # CELERY STUFF
-CELERY_BROKER_URL = f'redis://{REDIS_HOST}:6379'
-CELERY_RESULT_BACKEND = f'redis://{REDIS_HOST}:6379'
-CELERY_ACCEPT_CONTENT = ['application/json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = TIME_ZONE
+CELERY_broker_url = f'redis://{REDIS_HOST}:6379'
+result_backend = f'redis://{REDIS_HOST}:6379'
+accept_content = ['application/json']
+task_serializer = 'json'
+result_serializer = 'json'
+timezone = TIME_ZONE
 MAX_CELERY_TIME = 60 * 60 * 3 # 3 hours
 
 # if production: 
@@ -367,28 +367,11 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'face_manager.reencode', 
         'schedule': crontab( minute = '*/5', hour='*'),
     },
-   'set_face_counts': {
-       'task': 'face_manager.set_face_counts',
-       'schedule': crontab( minute = '0', hour='*/4'),
-   },
-   'classify_unlabeled': {
-       'task': 'face_manager.assign_faces',
-       'schedule': crontab( minute = '*/5', hour='*'),
-       'args': (False, ), # Don't reassign all of them.
-   },
-   'classify_unlabeled_all_weekly': {
-       'task': 'face_manager.assign_faces',
-       # This schedule should be sufficient to
-       # break race conditions with the more frequent
-       # task, which executes every 5 minutes. That
-       # should have very little to do on a run-to-run basis,
-       # so it should finish quickly and be done by the 
-       # time that minute 4 comes along and asks to 
-       # reclassify all of the faces. 
-       'schedule': crontab( minute = '4', hour='1', day_of_week=1),
-       'args': (True, ), # Reassign all faces. 
-   },
-
+#    'classify_unlabeled': {
+#        'task': 'face_manager.classify_unlabeled',
+#        'schedule': crontab(day_of_month = '*/5', minute=0, hour=0)
+#        # 'schedule': crontab(minute='*/2')
+#    }
 
 }
 
@@ -412,7 +395,7 @@ FILEPOPULATOR_THUMBNAIL_SIZE_SMALL = (100, 100)
 FILEPOPULATOR_SERVER_IMG_DIR = PHOTO_ROOT # root location of images you want to index into. (This maybe will change)
 FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code. 
 FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory that will have validation images when testing the app.
-FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL = 150 # Maximum size of the short edge for thumbnails.
+FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL =150 # Maximum size of the short edge for thumbnails.
 
 FACE_THUMBNAIL_SIZE=(200, 200)
 

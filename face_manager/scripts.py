@@ -176,7 +176,7 @@ def populateFromImage(filename, server_conn = None):
     face_data = image_face_extractor.image_client.face_extract_client(filename, server_conn, logger=settings.LOGGER)
     
     placeInDatabase(foreign_key, face_data)
-    print(f"Image {filename} has been placed in database.")
+    print(f"Faces from image {filename} have been placed in database.")
 
     return face_data, server_conn, changed_fk 
 

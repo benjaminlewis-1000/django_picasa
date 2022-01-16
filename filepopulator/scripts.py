@@ -108,7 +108,7 @@ def create_image_file(file_path):
         # This way with established database (no hashing): ~.5 seconds. 
         # That's a 40x speedup.
         else:
-            print(f"Working with {file_path}")
+            print(f"Working with {file_path} - photo exists")
             settings.LOGGER.debug(f"Updating file {file_path} in database due to changed timestamp")
             new_photo.process_new_no_md5()
             new_photo._generate_md5_hash()
@@ -136,7 +136,7 @@ def create_image_file(file_path):
 
     # Case 2: No photo exists at this location.
     else:
-        print(f"Working with {file_path}")
+        print(f"Working with {file_path} - no photo exists")
         settings.LOGGER.debug(f"Adding new file {file_path} to database.")
         new_photo.process_new_no_md5()
         new_photo._generate_md5_hash()

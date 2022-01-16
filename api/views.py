@@ -214,14 +214,22 @@ class PersonListView(APIView):
                 p_dict = {}
                 p_dict['num_faces'] = p.num_faces # face_declared.count()
                 p_dict['url'] = f'{domain_name}/{p.id}/'
-                p_dict['num_possibilities'] = p.num_possibilities # face_poss1.count() + p.face_poss2.count()
                 p_dict['id'] = p.id
                 p_dict['person_name'] = p.person_name
                 p_dict['further_images_unlikely'] = p.further_images_unlikely
 
-                # p_dict['num_faces'] = p.num_faces
-                # p_dict['num_possibilities'] = p.poss_1 + p.poss_2
-                p_dict['num_unverified_faces'] = p.num_unverified_faces # face_declared.filter(validated=False).count()
+                if p.person_name == settings.BLANK_FACE_NAME:
+                    num_blanks = Face.objects.filter(declared_name__person_name=settings.BLANK_FACE_NAME).count()
+                    # p.num_unverified_faces = num_blanks
+                    # p.num_possibilities = num_blanks
+                    p_dict['num_possibilities'] = num_blanks# face_poss1.count() + p.face_poss2.count()
+                    p_dict['num_unverified_faces'] = num_blanks# face_declared.filter(validated=False).count()
+                    p_dict['num_faces'] = num_blanks# face_declared.filter(validated=False).count()
+                    # print(p_dict, num_blanks)
+                else:
+                    p_dict['num_possibilities'] = p.num_possibilities # face_poss1.count() + p.face_poss2.count()
+                    p_dict['num_unverified_faces'] = p.num_unverified_faces # face_declared.filter(validated=False).count()
+                    
                 result_list.append(p_dict)
                 p_queue.task_done()
                 # return p_dict
@@ -455,7 +463,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         # Get the person to associate and ensure the value
         # passed is an integer
         name_key = request.data['declared_name_key']
-        print(name_key)
+        # print(name_key)
         try:
             name_key = int(name_key)
         except:
@@ -526,7 +534,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         face = self.get_object()
         person = face.declared_name
 
-        print(person.person_name)
+        # print(person.person_name)
         filename, person_content_file = self.highlight_from_face(face, person.person_name)
         person.highlight_img.save(filename, person_content_file) 
 

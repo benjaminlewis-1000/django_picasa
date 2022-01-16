@@ -70,6 +70,8 @@ class Person(models.Model):
     num_possibilities = models.IntegerField(default=0)
     num_unverified_faces = models.IntegerField(default=0)
 
+    gender = models.CharField(max_length=15, default="unknown")
+
     # id field has a primary key
     def delete(self):
         # Protect the no face assigned person from
@@ -189,6 +191,11 @@ class Face(models.Model):
     face_thumbnail = models.ImageField(upload_to=face_thumbnail_path, default=None)
 
     validated = models.BooleanField(default=False)
+
+    detected_gender = models.CharField(max_length=15, default="unknown")
+    detected_gender_prob = models.FloatField(default=-1)
+    detected_age_group = models.IntegerField(default=-1)
+    detected_age_prob = models.FloatField(default=-1)
 
     def __str__(self):
         return "Face instance of {}".format(self.declared_name)

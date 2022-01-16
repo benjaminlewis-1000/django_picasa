@@ -244,9 +244,9 @@ def process_faces():
     except FileNotFoundError:
         pass
 
-from net_train import classify_unlabeled_faces
-@shared_task(ignore_result=True, name='face_manager.classify_unlabeled')
-def thistask():
+from face_classify import faceAssigner
+@shared_task(ignore_result=True, name='face_manager.assign_faces')
+def thistask(redo_all=False):
     classify_lockfile = settings.CLASSIFY_LOCKFILE
     print(f"Classify lockfile is {classify_lockfile}")
     if os.path.exists(classify_lockfile):
@@ -258,7 +258,8 @@ def thistask():
         f.close()
 
     try:
-        classify_unlabeled_faces()
+        classer = faceAssigner()
+        classer.execute(redo_all)
     except:
         print("Image classification failed!")
     
@@ -266,3 +267,13 @@ def thistask():
         os.remove(classify_lockfile)
     except FileNotFoundError:
         pass
+
+
+@shared_task(ignore_result=True, name='face_manager.set_face_counts')
+def reset_task():
+    people = Person.objects.all()
+    for p in people:
+        p.num_faces = p.face_declared.count()
+        p.num_possibilities = p.face_poss1.count() + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
+        p.num_unverified_faces = p.face_declared.filter(validated=False).count()
+        p.save()
