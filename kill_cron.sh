@@ -11,8 +11,8 @@ done
 
 celery -A picasa beat -l INFO --pidfile="/locks/celerybeat.pid"  &
 # celery -A picasa worker -l INFO & # --uid=nobody --gid=nogroup &
-celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker1 & # --uid=nobody --gid=nogroup &
-celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker2 & # --uid=nobody --gid=nogroup &
-celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker3 & # --uid=nobody --gid=nogroup &
-celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker4 & # --uid=nobody --gid=nogroup &
+celery -A picasa worker -l INFO  -c 16 --max-tasks-per-child 10 -n worker1  & # --uid=nobody --gid=nogroup &
+#celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker2 & # --uid=nobody --gid=nogroup &
+#celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker3 & # --uid=nobody --gid=nogroup &
+#celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker4 & # --uid=nobody --gid=nogroup &
 

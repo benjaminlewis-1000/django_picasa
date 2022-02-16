@@ -155,7 +155,7 @@ def placeInDatabase(foreign_key, face_data):
     return True
 
 
-def populateFromImage(filename, server_conn = None):
+def populateFromImage(img_object, server_conn = None):
 
     if server_conn is None:
         server_conn = establish_server_connection()
@@ -163,7 +163,8 @@ def populateFromImage(filename, server_conn = None):
         if server_conn.check_ip() is False:
             server_conn.find_external_server()
 
-    foreign_key = ImageFile.objects.get(filename = filename)
+    filename = img_object.filename
+    foreign_key = img_object
 
     changed_fk = False
 
@@ -181,7 +182,11 @@ def populateFromImage(filename, server_conn = None):
     return face_data, server_conn, changed_fk 
 
 
-def populateFromImageMultiGPU(filename, server_conn = None, server_ip = None, ip_checked=False):
+def populateFromImageMultiGPU(img_object, server_conn = None, server_ip = None, ip_checked=False):
+
+    filename = img_object.filename
+    foreign_key = img_object
+    
     if server_ip is None:
         server_ip = 0
     
@@ -193,7 +198,6 @@ def populateFromImageMultiGPU(filename, server_conn = None, server_ip = None, ip
             server_conn.find_external_server()
             server_ip = 0
 
-    foreign_key = ImageFile.objects.get(filename = filename)
 
     changed_fk = False
 
@@ -208,7 +212,7 @@ def populateFromImageMultiGPU(filename, server_conn = None, server_ip = None, ip
     face_data = image_face_extractor.image_client_multi.face_extract_client(filename, server_conn, ip_address=server_ip, logger=settings.LOGGER, ip_checked = ip_checked)
     print(f"Worked! IP was {server_ip}, length is {len(face_data)}, file is {filename}")
     placeInDatabase(foreign_key, face_data)
-    print(f"Image {filename} has been placed in database.")
+    print(f"Faces from {filename} have been placed in database.")
 
     return face_data, server_conn, changed_fk 
 

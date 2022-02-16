@@ -346,8 +346,8 @@ MAX_CELERY_TIME = 60 * 60 * 3 # 3 hours
 CELERY_BEAT_SCHEDULE = {
     'filepopulate_root': {
         'task': 'filepopulator.populate_files_from_root',
-        'schedule': crontab(hour='*/6', minute=0) # , hour='*/6'),
-        # 'schedule': crontab(minute='*/10'),
+        'schedule': crontab(hour='*/6', minute=0),
+        # 'schedule': crontab(minute='*'),
     },
     'dirs_datetimes': {
         'task': 'filepopulator.update_dir_dates',
@@ -355,7 +355,7 @@ CELERY_BEAT_SCHEDULE = {
     },
    'face_add': {
        'task': 'face_manager.face_extraction', 
-       'schedule': crontab( hour = '*', minute='*/2'),
+       'schedule': crontab( hour = '*', minute='*/30'),
         # OK to schedule every 2 minutes, because it will
         # either get locked by the lock file, or it will
         # die and get restarted pretty quickly.
@@ -365,7 +365,7 @@ CELERY_BEAT_SCHEDULE = {
    },
    'reencode_images': {
         'task': 'face_manager.reencode', 
-        'schedule': crontab( minute = '*/5', hour='*'),
+        'schedule': crontab( minute = '5', hour='*/6'),
     },
    'set_face_counts': {
        'task': 'face_manager.set_face_counts',

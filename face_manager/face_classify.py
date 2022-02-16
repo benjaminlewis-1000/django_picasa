@@ -64,6 +64,16 @@ class faceAssigner():
         # Get earliest date for each person. 
         self.known_persons_to_dates()
 
+        self.reset_task()
+
+    def reset_task(self):
+        people = Person.objects.all()
+        for p in people:
+            p.num_faces = p.face_declared.count()
+            p.num_possibilities = p.face_poss1.count() + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
+            p.num_unverified_faces = p.face_declared.filter(validated=False).count()
+            p.save()
+
     def execute(self, redo_all=False):
         
         # Now we want to get each unassigned image

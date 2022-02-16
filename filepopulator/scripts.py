@@ -16,6 +16,47 @@ import re
 import time
 import traceback
 
+def delete_old_thumbnails(instance):
+    os.remove(instance.thumbnail_big.path)
+    os.remove(instance.thumbnail_medium.path)
+    os.remove(instance.thumbnail_small.path)
+
+def instance_clean_and_save(instance):
+    #            print(cur_file)
+    file_path = instance.filename
+    try:
+        instance.full_clean()
+    except ValidationError as ve:
+        if file_path.lower().endswith(('.jpg', '.jpeg')):
+            settings.LOGGER.critical("Did not add JPEG-type photo {}: {}".format(file_path, ve))
+        else:
+            settings.LOGGER.debug("Did not add photo {}: {}".format(file_path, ve) )
+    else:
+        try:
+            instance.save()
+        except ValueError as ve:
+            print(dir(instance))
+            print(instance.__dict__)
+#                for field in dir(instance):
+#                    if not field.startwith('_'):
+#                    print(field, instance.__dict__[field])
+            raise ve
+        settings.LOGGER.debug(f"Saved file {file_path} to database")
+
+        assert os.path.isfile(instance.thumbnail_big.path), \
+            'Thumbnail {} wasn''t generated for {}.'.\
+            format(instance.thumbnail_big.name, file_path)
+        assert os.path.isfile(instance.thumbnail_medium.path), \
+            'Thumbnail {} wasn''t generated for {}.'.\
+            format(instance.thumbnail_medium.name, file_path)
+        assert os.path.isfile(instance.thumbnail_small.path), \
+            'Thumbnail {} wasn''t generated for {}.'.\
+            format(instance.thumbnail_small.name, file_path)
+
+# def add_new_photo(file_path):
+#     # This is for images where this file is not in the database.
+#     pass
+
 
 def create_image_file(file_path):
 
@@ -23,59 +64,19 @@ def create_image_file(file_path):
         settings.LOGGER.debug('File {} is not a file path. Will not insert.'.format(file_path))
         return
 
+    if not re.match(".*\.[j|J][p|P][e|E]?[g|G]$", file_path):
+        settings.LOGGER.debug("File {} does not have a jpeg-type ending.".format(file_path))
+        return # Success value
+
     # Check if this photo already exists:
     exist_photo = ImageFile.objects.filter(filename=file_path)
 
     new_photo = ImageFile(filename=file_path)
 
-    # success = new_photo.process_new_no_md5()
-    # if not success:
-    #     return
-
-    if not re.match(".*\.[j|J][p|P][e|E]?[g|G]$", file_path):
-        settings.LOGGER.debug("File {} does not have a jpeg-type ending.".format(file_path))
-        return # Success value
-
-
-    def instance_clean_and_save(instance):
-        #            print(cur_file)
-        try:
-            instance.full_clean()
-        except ValidationError as ve:
-            if file_path.lower().endswith(('.jpg', '.jpeg')):
-                settings.LOGGER.critical("Did not add JPEG-type photo {}: {}".format(file_path, ve))
-            else:
-                settings.LOGGER.debug("Did not add photo {}: {}".format(file_path, ve) )
-        else:
-            try:
-                instance.save()
-            except ValueError as ve:
-                print(dir(instance))
-                print(instance.__dict__)
-#                for field in dir(instance):
-#                    if not field.startwith('_'):
-#                    print(field, instance.__dict__[field])
-                raise ve
-            settings.LOGGER.debug(f"Saved file {file_path} to database")
-
-            assert os.path.isfile(instance.thumbnail_big.path), \
-                'Thumbnail {} wasn''t generated for {}.'.\
-                format(instance.thumbnail_big.name, file_path)
-            assert os.path.isfile(instance.thumbnail_medium.path), \
-                'Thumbnail {} wasn''t generated for {}.'.\
-                format(instance.thumbnail_medium.name, file_path)
-            assert os.path.isfile(instance.thumbnail_small.path), \
-                'Thumbnail {} wasn''t generated for {}.'.\
-                format(instance.thumbnail_small.name, file_path)
-
-    def delete_old_thumbnails(instance):
-        os.remove(instance.thumbnail_big.path)
-        os.remove(instance.thumbnail_medium.path)
-        os.remove(instance.thumbnail_small.path)
-
 
     # Case 1: photo exists at this location.
     if len(exist_photo):
+        print("Photo exists!")
         if len(exist_photo) > 1:
             settings.LOGGER.critical(f"You have multiple instances of file {file_path} in the database.")
             raise ValueError('Should only have at most one instance of a file {}. You have {}'.format(file_path, len(exist_photo)))
@@ -85,6 +86,7 @@ def create_image_file(file_path):
         exist_timestamp = exist_photo.dateModified.timestamp()
         new_photo._get_mod_time()
         adding_timestamp = new_photo.dateModified.timestamp()
+        print("Check: ", datetime.fromtimestamp(os.path.getctime(file_path)).timestamp(), adding_timestamp)
 
         # Check the timestamp between the database and the file 
         # under consideration. If they are exactly the same, 
@@ -94,6 +96,7 @@ def create_image_file(file_path):
         # values) and some not (most pictures). Timestamp simply
         # turns it into a float of UTC seconds. 
         if exist_timestamp == adding_timestamp:
+            print(exist_timestamp, adding_timestamp)
             return
         # Only if the files are *not* the same do we compute the
         # md5 hash of the file. This is because reading in the 
@@ -118,14 +121,14 @@ def create_image_file(file_path):
             # The photo is already in place, and the pixel hash hasn't changed, and it hasn't rotated
             # Don't want to delete it -- they reference the same picture in distinct locations.
             # However, our modification timestamps are off, so let's update that. 
-                exist_photo.dateModified = datetime.fromtimestamp(os.path.getmtime(file_path))
+                exist_photo.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
                 instance_clean_and_save(exist_photo)
                 return
             else:
                 exist_photo = new_photo
                 exist_photo.orientation = new_photo.orientation
                 exist_photo.dateAdded = timezone.now()
-                exist_photo.dateModified = datetime.fromtimestamp(os.path.getmtime(file_path))
+                exist_photo.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
                 exist_photo.isProcessed = False
                 instance_clean_and_save(exist_photo)
                 return
@@ -150,7 +153,7 @@ def create_image_file(file_path):
                 settings.LOGGER.debug(f"Found a file like {file_path} with the same hash. The old file is {instance.filename} .")
                 instance.filename = file_path
                 instance.dateAdded = timezone.now()
-                instance.dateModified = datetime.fromtimestamp(os.path.getmtime(file_path))
+                instance.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
                 delete_old_thumbnails(instance)
                 instance_clean_and_save(instance)
                 return
@@ -164,7 +167,7 @@ def create_image_file(file_path):
                         print(f"Deleting file {each.filename} since it is no longer in the file path.")
                         each.filename = file_path
                         each.dateAdded = timezone.now()
-                        each.dateModified = datetime.fromtimestamp(os.path.getmtime(file_path))
+                        each.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
                         delete_old_thumbnails(each)
                         instance_clean_and_save(each)
                         return
@@ -182,8 +185,8 @@ def create_image_file(file_path):
 def add_from_root_dir(root_dir):
 
     lockfile = settings.LOCKFILE
-
-    print(lockfile)
+    
+    print(f"Adding lockfile is {lockfile}")
     if os.path.isfile(lockfile):
         print("Locked!")
         return
@@ -194,36 +197,126 @@ def add_from_root_dir(root_dir):
 
         count = 0
 
+        # if False:
+        # Under development
         try:
+            # Get a list of all images in the root_dir
+            actual_file_list = []
+            metadata_time = {}
             for root, dirs, files in os.walk(root_dir):
                 for f in files:
-                # Try/catch block only on individual file; lets the rest of the files be added regardless
-                # of a failure on one. 
-                    count += 1
-                    if count > 0 and count % 10000 == 0:
-                        print(f"Processed {count:,} images in add from root directory")
-                    try:
+                    if f.lower().endswith(('.jpg', '.jpeg')):
                         cur_file = os.path.join(root, f)
+
+                        # Don't try to add files starting with a period - they're often
+                        # just system files. 
                         cur_parts = cur_file.split(os.sep)[:-1]
                         filename = cur_file.split(os.sep)[-1]
                         if re.match('\.', filename):
-                            # Don't try to add files starting with a period - they're often
-                            # just system files. 
                             continue
-                        # Check if a folder starts with '.'.
+
+                        # Check if a folder starts with '.'. Otherwise, add it in!
                         if not True in set(map(lambda x: x.startswith('.'), cur_parts) ):
-                            create_image_file(cur_file)
-                    except Exception as e:
-                        stack_trace = traceback.format_exc()
-                        settings.LOGGER.error(type(e).__name__)
-                        settings.LOGGER.error(e)
-                        settings.LOGGER.error(cur_file)
-                        settings.LOGGER.error(stack_trace) 
+                            actual_file_list.append(cur_file)
+                            # print(cur_file)
+
+                            metadata = {}
+                            mod_time = datetime.fromtimestamp(os.path.getctime(cur_file))
+                            metadata_time[cur_file] = mod_time
+
+            # Get a list of files in the database
+            db_files = ImageFile.objects.all().values()
+            db_file_list = list(db_files.values_list('filename', flat=True))
+            db_files = list(db_files)
+
+            # New files: 
+            new_files = list(set(actual_file_list) - set(db_file_list))
+            print(f"New file length is {len(new_files)}")
+
+
+            # Now go through and find any that have been modified more recently 
+            # than database:
+            modded_files = []
+            t = 0
+            for file in db_files:
+                db_mod_time = file['dateModified']
+                # if t % 1000 == 0:
+                #     print(f"{t} files scanned, {len(modded_files)} mod files found")
+                t += 1
+                filename = file['filename']
+                if filename in actual_file_list:
+                    os_mod_time = metadata_time[filename]
+                    if db_mod_time.timestamp() >= os_mod_time.timestamp():
+                        # No problems -- DB has most up-to-date.
+                        pass
+                    else:
+                        modded_files.append(filename)
+
+                # else:
+                    # Don't worry about it -- it's in new_files
+                    
+            print(f"Mod file length is {len(modded_files)}")
+            # Now process the new and modded files. 
+            for filename in new_files:
+                try:
+                    create_image_file(filename)
+                except Exception:
+                    print(f'{filename} was not processed.')
+
+            for modfile in modded_files:
+                try:
+                    create_image_file(modfile)
+                except Exception:
+                    print(f'{filename} was not processed.')
+
+        except Exception as e:
+            stack_trace = traceback.format_exc()
+            settings.LOGGER.error(type(e).__name__)
+            settings.LOGGER.error(e)
+            settings.LOGGER.error(cur_file)
+            settings.LOGGER.error(stack_trace) 
         finally:
+            print("Finished adding from root!")
             try:
                 os.remove(lockfile)
             except FileNotFoundError:
                 pass
+
+
+
+
+
+
+        # try:
+        #     for root, dirs, files in os.walk(root_dir):
+        #         for f in files:
+        #         # Try/catch block only on individual file; lets the rest of the files be added regardless
+        #         # of a failure on one. 
+        #             count += 1
+        #             if count > 0 and count % 10000 == 0:
+        #                 print(f"Processed {count:,} images in add from root directory")
+        #             try:
+        #                 cur_file = os.path.join(root, f)
+        #                 cur_parts = cur_file.split(os.sep)[:-1]
+        #                 filename = cur_file.split(os.sep)[-1]
+        #                 if re.match('\.', filename):
+        #                     # Don't try to add files starting with a period - they're often
+        #                     # just system files. 
+        #                     continue
+        #                 # Check if a folder starts with '.'.
+        #                 if not True in set(map(lambda x: x.startswith('.'), cur_parts) ):
+        #                     create_image_file(cur_file)
+        #             except Exception as e:
+        #                 stack_trace = traceback.format_exc()
+        #                 settings.LOGGER.error(type(e).__name__)
+        #                 settings.LOGGER.error(e)
+        #                 settings.LOGGER.error(cur_file)
+        #                 settings.LOGGER.error(stack_trace) 
+        # finally:
+        #     try:
+        #         os.remove(lockfile)
+        #     except FileNotFoundError:
+        #         pass
 
 def delete_removed_photos():
     all_photos = ImageFile.objects.all()

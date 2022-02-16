@@ -13,7 +13,7 @@ import random
 import queue
 import threading
 
-from .scripts import populateFromImage, populateFromImageMultiGPU, establish_server_connection, establish_multi_server_connection
+from .scripts import populateFromImageMultiGPU, establish_server_connection, establish_multi_server_connection
 from .models import Person, Face
 from filepopulator.models import ImageFile
 
@@ -159,7 +159,7 @@ def process_faces():
                         
                 if not img.isProcessed:
                     try:
-                        populateFromImageMultiGPU(img.filename, server_conn = server_conn, server_ip = self.ip_addr, ip_checked=True)
+                        populateFromImageMultiGPU(img, server_conn = server_conn, server_ip = self.ip_addr, ip_checked=True)
                     except OSError as ose:
                         print(f"IP {self.ip_addr} issue with populateFromImage, filename {img.filename}, img id {img.id}. Error: {ose}")
                         break
