@@ -363,10 +363,10 @@ CELERY_BEAT_SCHEDULE = {
        #     'expires': 30,
        # }
    },
-   'reencode_images': {
-        'task': 'face_manager.reencode', 
-        'schedule': crontab( minute = '5', hour='*/6'),
-    },
+   # 'reencode_images': {
+   #      'task': 'face_manager.reencode', 
+   #      'schedule': crontab( minute = '5', hour='*/6'),
+   #  },
    'set_face_counts': {
        'task': 'face_manager.set_face_counts',
        'schedule': crontab( minute = '0', hour='*/4'),

@@ -674,6 +674,7 @@ class KeyedImageView(APIView):
         else:
             if params['access_key'] != settings.RANDOM_ACCESS_KEY:
                 # print(params['access_key'], settings.RANDOM_ACCESS_KEY)
+                print(settings.RANDOM_ACCESS_KEY)
                 return err_404('Invalid access key.')
 
         def getAndCheckID(obj_type, id_key):
@@ -700,6 +701,7 @@ class KeyedImageView(APIView):
                 face = getAndCheckID('face', id_key)
                 image = face.face_thumbnail
             elif image_type == 'face_source':
+                print("Here")
                 face = getAndCheckID('face', id_key)
                 source = face.source_image_file
                 image = source.filename
@@ -727,7 +729,7 @@ class KeyedImageView(APIView):
             return err_404(f'Bad id for object of type {image_type}')
 
 
-        # print(image)
+        print(image)
         image = open_img_oriented(image)
         # print(image)
         try:
@@ -737,6 +739,7 @@ class KeyedImageView(APIView):
 
         FTYPE = 'JPEG'
         temp_thumb = BytesIO()
+        print(type(image))
         # print(time.time()-s)
         image.save(temp_thumb, FTYPE)
         # print("Here")

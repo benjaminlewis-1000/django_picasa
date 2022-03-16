@@ -76,7 +76,7 @@ def create_image_file(file_path):
 
     # Case 1: photo exists at this location.
     if len(exist_photo):
-        print("Photo exists!")
+        print(f"Photo exists! {file_path}")
         if len(exist_photo) > 1:
             settings.LOGGER.critical(f"You have multiple instances of file {file_path} in the database.")
             raise ValueError('Should only have at most one instance of a file {}. You have {}'.format(file_path, len(exist_photo)))
@@ -143,39 +143,48 @@ def create_image_file(file_path):
         settings.LOGGER.debug(f"Adding new file {file_path} to database.")
         new_photo.process_new_no_md5()
         new_photo._generate_md5_hash()
+        # print(new_photo.pixel_hash)
         exist_with_same_hash = ImageFile.objects.filter(pixel_hash = new_photo.pixel_hash)
-        if len(exist_with_same_hash):
-            if len(exist_with_same_hash) == 1 and not os.path.exists(exist_with_same_hash[0].filename) :
-                # Exactly one other, but it's been deleted or moved.
-                # In this case, update the filename and the date added
-                # and save it back to the database. 
-                instance = exist_with_same_hash[0]
-                settings.LOGGER.debug(f"Found a file like {file_path} with the same hash. The old file is {instance.filename} .")
-                instance.filename = file_path
-                instance.dateAdded = timezone.now()
-                instance.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
-                delete_old_thumbnails(instance)
-                instance_clean_and_save(instance)
-                return
+        # print(exist_with_same_hash, len(exist_with_same_hash), exist_with_same_hash[0])
+        # if len(exist_with_same_hash):
+        if len(exist_with_same_hash) == 1 and not os.path.exists(exist_with_same_hash[0].filename) :
+            # Exactly one other, but it's been deleted or moved.
+            # In this case, update the filename and the date added
+            # and save it back to the database. 
+            instance = exist_with_same_hash[0]
+            print(f"Found a file like {file_path} with the same hash. The old file is {instance.filename} .")
+            settings.LOGGER.debug(f"Found a file like {file_path} with the same hash. The old file is {instance.filename} .")
+            instance.filename = file_path
+            instance.dateAdded = timezone.now()
+            instance.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
+            delete_old_thumbnails(instance)
+            instance_clean_and_save(instance)
+            return
 
-            elif len(exist_with_same_hash) > 1:
-                # raise NotImplementedError('More than one...')
-                print(f"Same hash: {exist_with_same_hash}")
-                # logging.error('This is not how I want it -- I want more matching validation. But getting here was right.')
-                for each in exist_with_same_hash:
-                    if not os.path.exists(each.filename):
-                        print(f"Deleting file {each.filename} since it is no longer in the file path.")
-                        each.filename = file_path
-                        each.dateAdded = timezone.now()
-                        each.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
-                        delete_old_thumbnails(each)
-                        instance_clean_and_save(each)
-                        return
-            elif os.path.exists(exist_with_same_hash[0].filename) and len(exist_with_same_hash) == 1:
-                pass
-                # Should just create it.
-            else:
-                raise NotImplementedError('You shouldn''t be here... the logic should be watertight.')
+        elif len(exist_with_same_hash) > 1:
+            # raise NotImplementedError('More than one...')
+            print(f"Same hash: {exist_with_same_hash}")
+            # logging.error('This is not how I want it -- I want more matching validation. But getting here was right.')
+            for each in exist_with_same_hash:
+                if not os.path.exists(each.filename):
+                    print(f"Deleting file {each.filename} since it is no longer in the file path.")
+                    each.filename = file_path
+                    each.dateAdded = timezone.now()
+                    each.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
+                    delete_old_thumbnails(each)
+                    instance_clean_and_save(each)
+                    return
+        elif len(exist_with_same_hash) == 1 and os.path.exists(exist_with_same_hash[0].filename):
+            print("File exists...")
+            raise NotImplementedError("File exists")
+            pass
+            # Should just ignore file. 
+        elif len(exist_with_same_hash) == 0:
+            print("New photo should be created")
+        else:
+            pass
+            # The photo should be created
+
 
     new_photo.dateAdded = timezone.now()
 
@@ -233,6 +242,11 @@ def add_from_root_dir(root_dir):
             new_files = list(set(actual_file_list) - set(db_file_list))
             print(f"New file length is {len(new_files)}")
 
+            for filename in new_files:
+                try:
+                    create_image_file(filename)
+                except Exception:
+                    print(f'{filename} was not processed.')
 
             # Now go through and find any that have been modified more recently 
             # than database:
@@ -254,14 +268,9 @@ def add_from_root_dir(root_dir):
 
                 # else:
                     # Don't worry about it -- it's in new_files
-                    
             print(f"Mod file length is {len(modded_files)}")
+                    
             # Now process the new and modded files. 
-            for filename in new_files:
-                try:
-                    create_image_file(filename)
-                except Exception:
-                    print(f'{filename} was not processed.')
 
             for modfile in modded_files:
                 try:
