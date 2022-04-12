@@ -9,6 +9,10 @@ services:
       dockerfile: Dockerfile_picasa
       args:
         buildno: 1
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
     image:
       picasa_img
     container_name: picasa_api

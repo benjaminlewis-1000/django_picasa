@@ -729,17 +729,24 @@ class KeyedImageView(APIView):
             return err_404(f'Bad id for object of type {image_type}')
 
 
-        print(image)
         image = open_img_oriented(image)
-        # print(image)
+
+        # Resize image. Allow for upsampling now. 
+        w, h = image.size[:2]
+        width = int(w / h * height)
+
         try:
-            image.thumbnail( (width, height), Image.ANTIALIAS)
+            # image.thumbnail( (width, height), Image.ANTIALIAS)
+            if width > w : # Upsampling
+                image = image.resize( (width, height) )
+            else:
+                image = image.resize( (width, height), resample=Image.Resampling.BICUBIC)
         except:
             pass
 
         FTYPE = 'JPEG'
         temp_thumb = BytesIO()
-        print(type(image))
+        
         # print(time.time()-s)
         image.save(temp_thumb, FTYPE)
         # print("Here")
