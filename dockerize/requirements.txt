@@ -18,7 +18,7 @@ djangorestframework==3.11.2
 drf-url-filters==0.5.1
 editdistance==0.3.1
 ExifRead==2.3.1
-flower==0.9.7
+flower==1.2.0
 gpsphoto==2.2.3
 gunicorn==20.0.4
 imageio==2.9.0
