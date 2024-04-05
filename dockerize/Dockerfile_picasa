@@ -1,22 +1,24 @@
-FROM debian
-
+# FROM debian:buster
+FROM ubuntu
 WORKDIR /code
 
 RUN apt update
 
 RUN apt install cmake -y
 RUN apt install python3-pip -y
-RUN apt install -y postgresql # postgresql-contrib
 RUN apt install -y wget 
 RUN apt install exiv2 -y
 RUN apt install -y gir1.2-gexiv2-0.10
+# RUN apt install python3.11-venv -y
+
+# RUN python3 -m venv /code/venv
 
 # Add our requirements.txt
-# RUN pip3 install face_recognition
-RUN pip3 install face-recognition==1.3.0 \
-    face-recognition-models==0.3.0 \
-    facenet-pytorch==2.5.0  \
-    opencv-python-headless==4.4.0.44
+RUN pip3 install opencv-python-headless>=4.4.0.44
+RUN pip3 install face_recognition 
+RUN pip3 install face-recognition-models==0.3.0 
+RUN pip3 install facenet-pytorch==2.5.0  
+
 ADD requirements.txt /code/requirements.txt
 RUN apt install libffi-dev
 RUN pip3 install -r /code/requirements.txt
@@ -34,6 +36,7 @@ RUN apt install -y python3-gi
 
 # RUN pip3 install PyJWT==1.7.1
 
+RUN DEBIAN_FRONTEND=noninteractive apt install -y postgresql # postgresql-contrib
 RUN rm -r /var/lib/apt/lists
 
 ADD startup.sh /startup.sh

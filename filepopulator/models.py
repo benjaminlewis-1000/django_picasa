@@ -310,11 +310,13 @@ class ImageFile(models.Model):
 
             if 'GPSInfo' in self.exifDict.keys():
 
-                for key in self.exifDict['GPSInfo'].keys():
+                gps_keys = list(self.exifDict['GPSInfo'].keys())
+                for key in gps_keys:
                     name = GPSTAGS.get(key,key)
                     self.exifDict['GPSInfo'][name] = self.exifDict['GPSInfo'].pop(key)
                 # For *whatever* reason, some of the keys don't convert on the first pass.
-                for key in self.exifDict['GPSInfo'].keys():
+                gps_keys = list(self.exifDict['GPSInfo'].keys())
+                for key in gps_keys:
                     name = GPSTAGS.get(key,key)
                     self.exifDict['GPSInfo'][name] = self.exifDict['GPSInfo'].pop(key)
 
@@ -539,7 +541,7 @@ class ImageFile(models.Model):
 
             image = self.image
 
-            image.thumbnail(size, Image.ANTIALIAS)
+            image.thumbnail(size, Image.LANCZOS)
 
 #            thumb_dir = self.pixel_hash[:2]
             thumb_filename = f'{self.pixel_hash}_{self.file_hash}.jpg'

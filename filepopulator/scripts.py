@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+import sys
 import traceback
 
 def delete_old_thumbnails(instance):
@@ -41,6 +42,7 @@ def instance_clean_and_save(instance):
 #                    if not field.startwith('_'):
 #                    print(field, instance.__dict__[field])
             raise ve
+        print(f"Saved file {file_path} to database")
         settings.LOGGER.debug(f"Saved file {file_path} to database")
 
         assert os.path.isfile(instance.thumbnail_big.path), \
@@ -245,8 +247,11 @@ def add_from_root_dir(root_dir):
             for filename in new_files:
                 try:
                     create_image_file(filename)
-                except Exception:
-                    print(f'{filename} was not processed.')
+                except Exception as e:
+                    exc_type, exc_obj, exc_tb = sys.exc_info()
+                    fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+                    print(f'{filename} was not processed. {e}, {exc_type}, {exc_tb.tb_lineno}')
+                    print(traceback.format_exc())
 
             # Now go through and find any that have been modified more recently 
             # than database:
@@ -275,8 +280,11 @@ def add_from_root_dir(root_dir):
             for modfile in modded_files:
                 try:
                     create_image_file(modfile)
-                except Exception:
-                    print(f'{filename} was not processed.')
+                except Exception as e:
+                    exc_type, exc_obj, exc_tb = sys.exc_info()
+                    fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+                    print(f'{filename} was not processed. {e}, {exc_type}, {exc_tb.tb_lineno}')
+                    print(traceback.format_exc())
 
         except Exception as e:
             stack_trace = traceback.format_exc()

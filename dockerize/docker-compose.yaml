@@ -20,12 +20,13 @@ services:
       bash /startup.sh
     env_file:
       - .env
-    environment:
+    # environment:
       # Add the following line to your /etc/profile:
       # HOST_IP=`ip route | grep default | awk '{print $9}'`
-      - DOCKER_HOST_IP=${HOST_IP} 
+      # - DOCKER_HOST_IP=${HOST_IP} 
     ports:
       - "${CLIENT_FACE_PORT}:${CLIENT_FACE_PORT}/udp"
+      - 44480:8000
       #- "5001:5001/udp"
      # - 5000:5000
      # - 5001:5001
@@ -56,24 +57,26 @@ services:
 
       # Need to start postgresql service
 
-  flower:
-    image: mher/flower
-    command: ["flower", "--broker=redis://task_redis:6379/0", "--port=8888"]  
-    ports:
-      - 8888:8888
-    networks:
-      - traefik_proxy
-    labels:
-
-      - "traefik.enable=true"
-      - "traefik.http.routers.flower.rule=Host(`flower.exploretheworld.tech`)"
-      - "traefik.http.routers.flower.tls.certresolver=leresolver"
-      - "traefik.http.routers.flower.entrypoints=websecure"
-      - "traefik.http.services.flower.loadbalancer.server.port=8888"
-      - "traefik.http.middlewares.flower.redirectscheme.scheme=https"
-      - "traefik.http.middlewares.flower.redirectscheme.permanent=true"
-      - "traefik.http.routers.flower.middlewares=authflower"
-      - "traefik.http.middlewares.authflower.basicauth.users=benjamin:$$apr1$$ly25xhfg$$d2eLiOIOnM.IbsZ6Cfb760" # admin/movie based one
+#  flower:
+#    image: mher/flower
+#    command: ["flower", "--broker=redis://task_redis:6379/0", "--port=8888"]  
+#    ports:
+#      - 8888:8888
+#    networks:
+#      - traefik_proxy
+#    environment:
+#      - ub:50
+#    labels:
+#
+#      - "traefik.enable=true"
+#      - "traefik.http.routers.flower.rule=Host(`flower.exploretheworld.tech`)"
+#      - "traefik.http.routers.flower.tls.certresolver=leresolver"
+#      - "traefik.http.routers.flower.entrypoints=websecure"
+#      - "traefik.http.services.flower.loadbalancer.server.port=8888"
+#      - "traefik.http.middlewares.flower.redirectscheme.scheme=https"
+#      - "traefik.http.middlewares.flower.redirectscheme.permanent=true"
+#      - "traefik.http.routers.flower.middlewares=authflower"
+#      - "traefik.http.middlewares.authflower.basicauth.users=benjamin:$$apr1$$ly25xhfg$$d2eLiOIOnM.IbsZ6Cfb760" # admin/movie based one
 
 #    image: postgres_init
 #FROM postgres:12.1-alpine
@@ -98,7 +101,8 @@ services:
       # Add a file to the weekly crontab directory that backs up the database. 
       # Run by the run-parts command, which hates periods in filenames, hence why 
       # I don't make a .sh suffix in the container. 
-      - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/weekly/postgres_bak_sh
+#      - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/weekly/postgres_bak_sh
+      - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/daily/postgres_bak_sh
       - /mnt/fast_storage/appdata/django_picasa/backups:/backup
     labels:
       - "user=postgres"

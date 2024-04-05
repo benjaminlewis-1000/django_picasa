@@ -149,10 +149,19 @@ DB_PWD = randomString(25)
 APACHE_PWD = randomString(25)
 APACHE_USER = 'picasa_data'
 
+APACHE_STEADY_USER = 'app_login'
+APACHE_STEADY_PWD = 'LetMyAppGoAndLogin123!@#'
+
 os.system(f'htpasswd -cb {script_path}/apache_config/apache_pwd.pwd {APACHE_USER} {APACHE_PWD}')
+os.system(f'htpasswd -b {script_path}/apache_config/apache_pwd.pwd {APACHE_STEADY_USER} {APACHE_STEADY_PWD}')
 print(f'htpasswd -cb {script_path}/apache_config/apache_pwd.pwd {APACHE_USER} {APACHE_PWD}')
 
 out_file_path = os.path.join(script_path, '.env')
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+# connect() for UDP doesn't send packets
+s.connect(('10.0.0.0', 0)) 
+HOST_IP=s.getsockname()[0]
 
 with open(out_file_path, 'w') as fh:
 	fh.write(f"ADMIN_PW={pw1}\n")
@@ -176,8 +185,11 @@ with open(out_file_path, 'w') as fh:
 	fh.write(f"PRODUCTION={production}\n")
 	fh.write(f"APACHE_USER={APACHE_USER}\n")
 	fh.write(f"APACHE_PWD={APACHE_PWD}\n")
+	fh.write(f"APACHE_STEADY_USER={APACHE_STEADY_USER}\n")
+	fh.write(f"APACHE_STEADY_PWD={APACHE_STEADY_PWD}\n")
 	fh.write(f"DEV=False\n")
 	fh.write(f"STATIC_LOCATION={project_path}/picasa/static\n")
+    fh.write(f"DOCKER_HOST_IP={HOST_IP}\n"
 
 PSQL_SCRIPT = '''
 #!/bin/bash

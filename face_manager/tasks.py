@@ -16,6 +16,8 @@ import threading
 from .scripts import populateFromImageMultiGPU, establish_server_connection, establish_multi_server_connection
 from .models import Person, Face
 from filepopulator.models import ImageFile
+import traceback
+
 
 from image_face_extractor import reencoder, ip_finder 
 
@@ -50,25 +52,31 @@ def reencode_face():
     print("Found client IP")
 
     iter_num = 1
-    for face in all_faces.iterator():
-        print(f'{iter_num}/{num_faces}, {iter_num / num_faces * 100:.4f}%')
-        iter_num += 1
-        if face.reencoded:
-            continue
+    try:
+        for face in all_faces.iterator():
+            print(f'{iter_num}/{num_faces}, {iter_num / num_faces * 100:.4f}%')
+            settings.LOGGER.debug(f'Reencode: {iter_num}/{num_faces}, {iter_num / num_faces * 100:.4f}%')
+            iter_num += 1
+            if face.reencoded:
+                continue
 
-        face_location = [(face.box_top, face.box_right, face.box_bottom, face.box_right)]
-        source_image_file = face.source_image_file.filename
+            face_location = [(face.box_top, face.box_left, face.box_bottom, face.box_right)]
+            source_image_file = face.source_image_file.filename
 
-        encoding = reencoder.face_encoding_client(source_image_file, face_location, client_ip)
-        # print(source_image_file, face_location, encoding)
+            encoding = reencoder.face_encoding_client(source_image_file, face_location, client_ip)
+            # print(source_image_file, face_location, encoding)
 
-        face.encoding = encoding
-        face.reencoded = True
-        face.save()
+            face.face_encoding = encoding
+            face.reencoded = True
+            face.save()
 
-        # Kill after 5 minutes
-        if time.time() - start_time > 15 * 60:
-            return
+            # Kill after 5 minutes
+            if time.time() - start_time > 54 * 60:
+                settings.LOGGER.debug(f"Ending reencode, running for {time.time() - start_time:.2f} seconds")
+                return
+                
+    except Exception as e:
+        settings.LOGGER.warning(f"reencode_face has failed: {e}")
 
 @shared_task(ignore_result=True, name='face_manager.face_extraction')
 def process_faces():
@@ -228,6 +236,7 @@ def process_faces():
 
         except Exception as e:
             print(f"Exception in face extraction found : {e}")
+            print(traceback.format_exc())
             try:
                 os.remove(face_lockfile)
                 end_threads(running_threads)

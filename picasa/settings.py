@@ -335,18 +335,23 @@ USE_TZ = True
 
 # CELERY STUFF
 CELERY_BROKER_URL = f'redis://{REDIS_HOST}:6379'
-CELERY_RESULT_BACKEND = f'redis://{REDIS_HOST}:6379'
-CELERY_ACCEPT_CONTENT = ['application/json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = TIME_ZONE
+# CELERY_RESULT_BACKEND = f'redis://{REDIS_HOST}:6379'
+result_backend = f'redis://{REDIS_HOST}:6379'
+# CELERY_ACCEPT_CONTENT = ['application/json']
+accept_content = ['application/json']
+# CELERY_TASK_SERIALIZER = 'json'
+task_serializer = 'json'
+# CELERY_RESULT_SERIALIZER = 'json'
+result_serializer = 'json'
+# CELERY_TIMEZONE = TIME_ZONE
+time_zone = TIME_ZONE
 MAX_CELERY_TIME = 60 * 60 * 3 # 3 hours
 
 # if production: 
 CELERY_BEAT_SCHEDULE = {
     'filepopulate_root': {
         'task': 'filepopulator.populate_files_from_root',
-        'schedule': crontab(hour='*/6', minute=0),
+        'schedule': crontab(hour='*/1', minute=0),
         # 'schedule': crontab(minute='*'),
     },
     'dirs_datetimes': {
@@ -355,7 +360,7 @@ CELERY_BEAT_SCHEDULE = {
     },
    'face_add': {
        'task': 'face_manager.face_extraction', 
-       'schedule': crontab( hour = '*', minute='*/10'),
+       'schedule': crontab( hour = '*', minute='*/5'),
         # OK to schedule every 2 minutes, because it will
         # either get locked by the lock file, or it will
         # die and get restarted pretty quickly.
@@ -363,10 +368,10 @@ CELERY_BEAT_SCHEDULE = {
        #     'expires': 30,
        # }
    },
-   # 'reencode_images': {
-   #      'task': 'face_manager.reencode', 
-   #      'schedule': crontab( minute = '5', hour='*/6'),
-   #  },
+   'reencode_images': {
+        'task': 'face_manager.reencode', 
+        'schedule': crontab( minute = '15', hour='*/1'),
+    },
    'set_face_counts': {
        'task': 'face_manager.set_face_counts',
        'schedule': crontab( minute = '0', hour='*/4'),

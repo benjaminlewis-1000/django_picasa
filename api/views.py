@@ -701,7 +701,6 @@ class KeyedImageView(APIView):
                 face = getAndCheckID('face', id_key)
                 image = face.face_thumbnail
             elif image_type == 'face_source':
-                print("Here")
                 face = getAndCheckID('face', id_key)
                 source = face.source_image_file
                 image = source.filename
@@ -733,20 +732,26 @@ class KeyedImageView(APIView):
 
         # Resize image. Allow for upsampling now. 
         w, h = image.size[:2]
-        width = int(w / h * height)
 
         try:
-            # image.thumbnail( (width, height), Image.ANTIALIAS)
-            if width > w : # Upsampling
-                image = image.resize( (width, height) )
-            else:
-                image = image.resize( (width, height), resample=Image.Resampling.BICUBIC)
+            width = int(w / h * height)
+
+            try:
+                # image.thumbnail( (width, height), Image.ANTIALIAS)
+                if width > w : # Upsampling
+                    image = image.resize( (width, height) )
+                else:
+                    image = image.resize( (width, height), resample=Image.Resampling.BICUBIC)
+            except:
+                pass
+
         except:
             pass
 
+
         FTYPE = 'JPEG'
         temp_thumb = BytesIO()
-        
+
         # print(time.time()-s)
         image.save(temp_thumb, FTYPE)
         # print("Here")

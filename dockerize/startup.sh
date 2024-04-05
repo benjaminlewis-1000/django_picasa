@@ -2,6 +2,7 @@
 
 sleep 5 
 
+
 python /code/manage.py makemigrations
 python /code/manage.py makemigrations filepopulator
 python /code/manage.py makemigrations face_manager
@@ -13,7 +14,9 @@ mkdir /locks
 
 rm /locks/celerybeat.pid
 rm /locks/adding.lock
+rm /locks/classify.lock
 rm /locks/face_add.lock
+rm /code/celerybeat-schedule.db
 
 mkdir -p /var/run/celery /var/log/celery
 chown -R nobody:nogroup /var/run/celery /var/log/celery
@@ -21,13 +24,24 @@ chown -R nobody:nogroup /var/run/celery /var/log/celery
 #chmod 777 -R /locks
 #chmod 777 -R /media
 
+for process in `ps uax | grep celery | grep -v grep  | awk '{print $2}'`; do
+    echo $process
+    kill -9 $process
+done
+
+sleep 10
+
 # celery flower -A picasa --port=5555 &
 celery -A picasa beat -l INFO --pidfile="/locks/celerybeat.pid"  &
-celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker1 & # --uid=nobody --gid=nogroup &
-celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker2 & # --uid=nobody --gid=nogroup &
-celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker3 & # --uid=nobody --gid=nogroup &
-celery -A picasa worker -l INFO  -c 10 --max-tasks-per-child 10 -n worker4 & # --uid=nobody --gid=nogroup &
+
+for i in {1..8}; do
+    celery -A picasa worker -l INFO -c 4 --max-tasks-per-child 3 -n worker${i}  & # --uid=nobody --gid=nogroup &
+done
+
 gunicorn -b 0.0.0.0:8000 picasa.wsgi & 
+
+
+
 
 while true; do 
     sleep 10

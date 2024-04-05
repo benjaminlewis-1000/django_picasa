@@ -133,7 +133,8 @@ class Face(models.Model):
     # a given object -- i.e. the "_NO_FACE_ASSIGNED_" person.
     # Importantly, the field takes a function rather than
     # an object. See above for the definition of the function.
-    declared_name = models.ForeignKey('Person', on_delete=models.SET(get_default_blank_person), related_name='face_declared', \
+    declared_name = models.ForeignKey('Person', \
+        on_delete=models.SET(get_default_blank_person), related_name='face_declared', \
         blank=True, null=True)
     source_image_file = models.ForeignKey('filepopulator.ImageFile', on_delete=models.CASCADE, blank=True, null=True)
     # ArrayField supported in PostGres

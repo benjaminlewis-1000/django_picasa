@@ -13,6 +13,7 @@ import logging
 import numpy as np
 import shutil
 import torch
+import traceback
 
 def establish_server_connection():
     server_conn = image_face_extractor.ip_finder.server_finder(logger=settings.LOGGER)
