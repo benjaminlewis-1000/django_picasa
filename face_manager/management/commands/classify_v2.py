@@ -34,6 +34,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
 
         classer = face_classify.faceAssigner()
+        classer.clear_unassigned_images()
         classer.execute(True)
 
 # class siameseModel(nn.Module):

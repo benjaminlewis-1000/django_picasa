@@ -414,6 +414,67 @@ class FaceViewSet(viewsets.ModelViewSet):
         # Return the filename to write and the content file.
         return person_thumb_filename, person_content_file
 
+
+    # Need to set detail=False to enable a URL without a <face_id> value. 
+    @action(detail=False, methods=['get'])
+    def random_face(self, request):
+        # Accessible as <root>/api/faces/random_face/
+
+        # This method is supporting an app to do bite-sized verification.
+        # You have to be logged in with JSON web token. It gets a 
+        # random unassigned face, then gets up to the top five possible 
+        # identities that it can be associated with and its ID. You can
+        # then use further requests to query for the face's image
+        # at <api_url>/keyed_image/face_array/?id={image_id}, then interact
+        # to verify one of the names or none of them. Or have a skip option
+        # I guess. 
+
+        unassigned = Q(declared_name__person_name=settings.BLANK_FACE_NAME)
+        random_face = Face.objects.filter(unassigned).order_by('?')[0]
+
+        js = {'id': random_face.id}
+        
+        if random_face.poss_ident1 is not None:
+            js['poss_ident1'] = random_face.poss_ident1.person_name
+            js['poss_ident1_id'] = random_face.poss_ident1_id
+        else:
+            js['poss_ident1'] = None
+            js['poss_ident1_id'] = None
+
+        if random_face.poss_ident2 is not None:
+            js['poss_ident2'] = random_face.poss_ident2.person_name
+            js['poss_ident2_id'] = random_face.poss_ident2_id
+        else:
+            js['poss_ident2'] = None
+            js['poss_ident2_id'] = None
+            
+        if random_face.poss_ident3 is not None:
+            js['poss_ident3'] = random_face.poss_ident3.person_name
+            js['poss_ident3_id'] = random_face.poss_ident3_id
+        else:
+            js['poss_ident3'] = None
+            js['poss_ident3_id'] = None
+
+        if random_face.poss_ident4 is not None:
+            js['poss_ident4'] = random_face.poss_ident4.person_name
+            js['poss_ident4_id'] = random_face.poss_ident4_id
+        else:
+            js['poss_ident4'] = None
+            js['poss_ident4_id'] = None
+
+        if random_face.poss_ident5 is not None:
+            js['poss_ident5'] = random_face.poss_ident5.person_name
+            js['poss_ident5_id'] = random_face.poss_ident5_id
+        else:
+            js['poss_ident5'] = None
+            js['poss_ident5_id'] = None
+
+        print(js)
+
+
+        # js = {'num_results': len(id_list), 'type': field, 'id_list': id_list,}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
     @action(detail=True, methods=['patch'])
     def verify_face(self, request, pk=None):
         # Accessible as <root>/api/faces/<face_id>/verify_face/
@@ -639,8 +700,8 @@ class KeyedImageView(APIView):
         '''
         Call to get an image defined by a given key.
         Method: GET
-        URL: /api/keyed_image/<key_value>/?=<request_type>&access_key=<key>
-        Valid types:
+        URL: /api/keyed_image/<key_value>/?id=<int>&access_key=<key>
+        Valid types for key_value:
         face_highlight: key type - person. Gets the highlight image of that person
         face_array: key type - face. Gets the cropped image of just that face
         face_source: key type: face. Gets the full image containing that face.
@@ -648,7 +709,10 @@ class KeyedImageView(APIView):
         full_big/medium/small: key type: image. Gets the corresponding thumbnail image. 
         '''
 
+        print("REquests", request)
+
         params = self.request.query_params
+        print("PARMA", params)
         valid_types = ['face_highlight', 'face_array', 'face_source', 'slideshow', 'full_big', 'full_medium', 'full_small']
         
         def err_404(message=""):
@@ -669,13 +733,16 @@ class KeyedImageView(APIView):
         else:
             id_key = params['id']
 
-        if 'access_key' not in params.keys():
-            return err_404('Access key not provided.')
-        else:
-            if params['access_key'] != settings.RANDOM_ACCESS_KEY:
-                # print(params['access_key'], settings.RANDOM_ACCESS_KEY)
-                print(settings.RANDOM_ACCESS_KEY)
-                return err_404('Invalid access key.')
+        if not request.user.is_authenticated:
+            if 'access_key' not in params.keys():
+                print("no access key")
+                print(request.user.is_authenticated)
+                return err_404('Access key not provided.')
+            else:
+                if params['access_key'] != settings.RANDOM_ACCESS_KEY:
+                    # print(params['access_key'], settings.RANDOM_ACCESS_KEY)
+                    print(settings.RANDOM_ACCESS_KEY)
+                    return err_404('Invalid access key.')
 
         def getAndCheckID(obj_type, id_key):
             # print(obj_type)
@@ -786,8 +853,6 @@ class filteredImagesView(APIView):
                 # people_query = (people_query) & ~Q(face__declared_name__person_name='Charlotte Lewis')
                 if p_query is None:
                     p_query = people_query
-
-
 
             if 'year_start' in params.keys():
                 year_start = int(params['year_start'])

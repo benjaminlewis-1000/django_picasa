@@ -124,6 +124,7 @@ SITE_ROOT = os.path.dirname(os.path.realpath(__file__))
 LOCKFILE = '/locks/adding.lock' # path.join(PROJECT_ROOT, 'adding.lock')
 FACE_LOCKFILE = '/locks/face_add.lock'
 CLASSIFY_LOCKFILE = '/locks/classify.lock'
+DUPLICATES_FILE = '/code/duplicates.csv'
 # if os.path.isfile(LOCKFILE):
 #     os.remove(LOCKFILE)
 
@@ -149,6 +150,7 @@ INSTALLED_APPS = [
     'rest_framework.authtoken',
     'corsheaders',
     'filepopulator',
+    'train_classify',
     'face_manager',
     'api',
     'filters',
@@ -360,7 +362,7 @@ CELERY_BEAT_SCHEDULE = {
     },
    'face_add': {
        'task': 'face_manager.face_extraction', 
-       'schedule': crontab( hour = '*', minute='*/5'),
+       'schedule': crontab( hour = '*', minute='*/1'),
         # OK to schedule every 2 minutes, because it will
         # either get locked by the lock file, or it will
         # die and get restarted pretty quickly.
@@ -370,7 +372,7 @@ CELERY_BEAT_SCHEDULE = {
    },
    'reencode_images': {
         'task': 'face_manager.reencode', 
-        'schedule': crontab( minute = '15', hour='*/1'),
+        'schedule': crontab( minute = '*/10', hour='*/1'),
     },
    'set_face_counts': {
        'task': 'face_manager.set_face_counts',
@@ -435,5 +437,6 @@ SOFT_IGNORE_NAME = '.another_ignore'
 IGNORED_NAMES=[BLANK_FACE_NAME, SOFT_IGNORE_NAME, '.ignore', '.realignore', '.jessicatodo', '.cutler_tbd']
 CLASSIFY_MODEL_PATH = '/code/face_manager/face_classifier/models'
 DEFAULT_RESOLUTION_HEIGHT = 2160 # For 4k screens
+DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
 
 # print("STATIC is : ", STATIC_URL)

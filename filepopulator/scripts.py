@@ -8,13 +8,15 @@ from django.core.files.base import ContentFile
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils import timezone
+from picasa import celery_app
 from PIL import Image
 from PIL.ExifTags import TAGS 
+import csv
 import logging
 import os
 import re
-import time
 import sys
+import time
 import traceback
 
 def delete_old_thumbnails(instance):
@@ -58,6 +60,28 @@ def instance_clean_and_save(instance):
 # def add_new_photo(file_path):
 #     # This is for images where this file is not in the database.
 #     pass
+
+def write_duplicates_csv(not_added_file, in_db_file):
+
+    titles = ['not_added', 'in_database']
+
+    if os.path.exists(settings.DUPLICATES_FILE):        
+        with open(settings.DUPLICATES_FILE, 'r') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                if row[titles[0]] == not_added_file and row[titles[1]] == in_db_file:
+                    print("We've got that one!")
+                    return
+
+    if os.path.exists(settings.DUPLICATES_FILE):
+        with open(settings.DUPLICATES_FILE, 'a') as csvfile:
+            writer = csv.writer(csvfile, delimiter=',')
+            writer.writerow([not_added_file, in_db_file])
+    else:
+        with open(settings.DUPLICATES_FILE, 'w') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=titles)
+            writer.writeheader()
+            writer.writerow({titles[0]: not_added_file, titles[1]: in_db_file})
 
 
 def create_image_file(file_path):
@@ -177,9 +201,9 @@ def create_image_file(file_path):
                     instance_clean_and_save(each)
                     return
         elif len(exist_with_same_hash) == 1 and os.path.exists(exist_with_same_hash[0].filename):
-            print("File exists...")
+            print("File exists...", file_path, exist_with_same_hash[0].filename)
+            write_duplicates_csv(file_path, exist_with_same_hash[0].filename)
             raise NotImplementedError("File exists")
-            pass
             # Should just ignore file. 
         elif len(exist_with_same_hash) == 0:
             print("New photo should be created")

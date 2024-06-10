@@ -3,6 +3,7 @@ from __future__ import absolute_import, unicode_literals
 from django.contrib.auth.models import User
 from django.utils.crypto import get_random_string
 from django.conf import settings
+from picasa import celery_app
 
 from celery import shared_task
 import time
@@ -25,6 +26,25 @@ if not settings.configured:
 
 @shared_task(ignore_result=True, name='filepopulator.populate_files_from_root')
 def load_images_into_db():
+
+    
+    i = celery_app.control.inspect()
+    active_tasks = i.active()
+    task_running = False
+    num_this_task_running = 0
+    for k in active_tasks.keys():
+        tasks = active_tasks[k]
+        if len(tasks) != 0:
+            for tt in tasks:
+                if tt['name'] == 'face_manager.populate_files_from_root':
+                    num_this_task_running += 1
+
+    if num_this_task_running > 1:
+        # This task will be one, so looking for other tasks.
+        settings.LOGGER.debug("Already running a task to load images, exiting.")
+        return
+
+        
     base_directory = settings.FILEPOPULATOR_SERVER_IMG_DIR
     # fname = os.path.join(os.environ['HOME'], 'filepopulate.txt')
     # logger.info("Write time")
@@ -42,27 +62,3 @@ def load_images_into_db():
 def update_dir_dates():
     print("Updates")
     update_dirs_datetime()
-
-# # Some test tasks:
-# @shared_task
-# #(name='filepopulator.add')
-# def add(x, y):
-#     return x + y
-
-
-# @shared_task#(name='filepopulator.mul')
-# def mul(x, y):
-#     return x * y
-
-
-# @shared_task#(name='filepopulator.xsum')
-# def xsum(numbers):
-#     return sum(numbers)
-
-# from datetime import datetime as dt
-# @shared_task#(name='filepopulator.xsum')
-# def log_time():
-#     string = 'Current time: {}'.format(dt.now())
-#     with open(os.path.join(settings.CODE_DIR, 'timelog.log'), 'a') as fh:
-#         print(string, file=fh)
-

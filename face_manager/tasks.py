@@ -6,6 +6,7 @@ from django.conf import settings
 
 from django.db.models import Q
 from celery import shared_task
+from picasa import celery_app
 import time
 import os
 import random
@@ -60,7 +61,7 @@ def reencode_face():
             if face.reencoded:
                 continue
 
-            face_location = [(face.box_top, face.box_left, face.box_bottom, face.box_right)]
+            face_location = [(face.box_top, face.box_right, face.box_bottom, face.box_left)]
             source_image_file = face.source_image_file.filename
 
             encoding = reencoder.face_encoding_client(source_image_file, face_location, client_ip)
@@ -82,189 +83,193 @@ def reencode_face():
 def process_faces():
     starttime = time.time()
 
-    print('Starting face extraction...')
-    settings.LOGGER.debug("Starting face extraction...")
-
-
-    # Set up a lock on this function so that it doesn't have more than one running at once. 
-    face_lockfile = settings.FACE_LOCKFILE
-    print(f"Face lockfile is {face_lockfile}")
-    if os.path.exists(face_lockfile):
-        print("Face file is locked, exiting.")
-        settings.LOGGER.warning("Face adding locked!")
-        return
-    else:
-        f = open(face_lockfile, 'w')
-        f.close()
-        
-    # all_images = ImageFile.objects.all()
-    unprocessed_imgs = ImageFile.objects.filter(isProcessed=False).all()
-    unprocessed_count =  ImageFile.objects.filter(isProcessed=False).count()
-
-    if unprocessed_count == 0:
-        print("No images to extract! Exiting." )
-        try:
-            os.remove(face_lockfile)
-        except FileNotFoundError:
-            pass
-        return
-
-    img_q = queue.Queue()
-
-    for img in unprocessed_imgs:
-        if not img.isProcessed:
-            if os.path.isfile(img.filename):
-                img_q.put(img)
-
-
-
-    print("Going to start workers...")
-        
-    # Develop a threaded function. 
-
-    class process_thread(threading.Thread):
-
-        def __init__(self, ip_addr, *args, **kwargs):
-            super(process_thread, self).__init__(*args, **kwargs)
-            self._stopper = threading.Event()
-
-            self.ip_addr = ip_addr
-
-        def stop(self):
-            self._stopper.set()
-            
-        def stopped(self): 
-            return self._stopper.isSet() 
-
-        def run(self):
-            print(f"Hi, I'm worker # {self.ip_addr}")
-            while True:
-                if self.stopped():
-                    return 
-                    
-                print(f"Queue size is {img_q.qsize()}, worker is {self.ip_addr}")
-                if img_q.qsize() == 0:
-                    print("all done!")
-                    break
-                else:
-                    img = img_q.get()
-
-                is_ok = None
-                rndDelay = random.randrange(5, 10) * 0.03
-                time.sleep(rndDelay)
-                qs = img_q.qsize()
-                for _ in range(3):
-                    try:
-                        is_ok = server_conn.check_ip(self.ip_addr)
-                        break
-                    except OSError:
-                        timeDelay = random.randrange(0, 2)
-                        print(f"IS_OK failed in worker {self.ip_addr}")
-                        time.sleep(timeDelay)
-
-                if not is_ok: 
-                    break
-                        
-                if not img.isProcessed:
-                    try:
-                        populateFromImageMultiGPU(img, server_conn = server_conn, server_ip = self.ip_addr, ip_checked=True)
-                    except OSError as ose:
-                        print(f"IP {self.ip_addr} issue with populateFromImage, filename {img.filename}, img id {img.id}. Error: {ose}")
-                        break
-
-    # Put everything in a while loop that polls for new workers
-    # or dead workers every n (30 now) seconds
-
-    running_threads = {}
-
-    # Kill the process once every 6 hours if it hasn't stopped already.
-
-    start_time = time.time()
-            
-    print("Starting to try...")
-
-    def end_threads(running_threads):
-        print("End the threads")
-        keys = list(running_threads.keys())
-        for key in keys:
-            # print(running_threads[key])
-            running_threads[key].stop()
-            # running_threads[key].join()
-            running_threads.pop(key)
-
-
-    while True: 
-        print("True loop")
-        cur_time = time.time()
-        
-        if cur_time - start_time > (45 * 60): # 45 minutes
-            print("KILLING Current time")
-            end_threads(running_threads)
-            break
-
-        if img_q.qsize() == 0:
-            end_threads(running_threads)            
-            break
-
-        try:
-            server_conn = establish_multi_server_connection()
-            # print(f"Servers are {server_conn.server_ips}")
-
-            num_servers = len(server_conn.server_ips)
-            # print(f"Number of servers is {num_servers}")
-            if num_servers == 0:
-                settings.LOGGER.critical('No GPU servers found')
-                return
-
-            for i, ip in enumerate(running_threads.keys()):
-                if not running_threads[ip].is_alive():
-                    print(f"Killing thread {ip}")
-                    running_threads[ip].stop()
-                    running_threads[ip].join()
-
-            for i, serv in enumerate(server_conn.server_ips):
-                if serv not in running_threads.keys() or not running_threads[serv].is_alive():
-                    t = process_thread(ip_addr = serv) # threading.Thread(target=worker, args=(serv,))
-                    # t.start()
-                    print(i, serv)
-                    running_threads[serv] = t
-                    running_threads[serv].start()
-
-            time.sleep(30)
-            print(running_threads.keys())
-            # print("Time slept")
-
-        except Exception as e:
-            print(f"Exception in face extraction found : {e}")
-            print(traceback.format_exc())
-            try:
-                os.remove(face_lockfile)
-                end_threads(running_threads)
-
-            except FileNotFoundError:
-                pass
-            break
-            
-
-
-    print("Ending face adding task")
     try:
-        os.remove(face_lockfile)
-    except FileNotFoundError:
-        pass
+        settings.LOGGER.debug("Starting face extraction...")
 
+        i = celery_app.control.inspect()
+        active_tasks = i.active()
+        task_running = False
+        num_this_task_running = 0
+        for k in active_tasks.keys():
+            tasks = active_tasks[k]
+            if len(tasks) != 0:
+                for tt in tasks:
+                    if tt['name'] == 'face_manager.face_extraction':
+                        num_this_task_running += 1
+
+        if num_this_task_running > 1:
+            # This task will be one, so looking for other tasks.
+            settings.LOGGER.debug("Face file is locked, exiting.")
+            settings.LOGGER.warning("Face adding locked!")
+            return
+            
+        # all_images = ImageFile.objects.all()
+        unprocessed_imgs = ImageFile.objects.filter(isProcessed=False).all()
+        unprocessed_count =  ImageFile.objects.filter(isProcessed=False).count()
+
+        if unprocessed_count == 0:
+            settings.LOGGER.debug("No images to extract! Exiting." )
+            return
+
+        img_q = queue.Queue()
+
+        for img in unprocessed_imgs:
+            if not img.isProcessed:
+                if os.path.isfile(img.filename):
+                    img_q.put(img)
+
+
+
+        settings.LOGGER.debug("Going to start workers...")
+            
+        # Develop a threaded function. 
+
+        class process_thread(threading.Thread):
+
+            def __init__(self, ip_addr, *args, **kwargs):
+                super(process_thread, self).__init__(*args, **kwargs)
+                self._stopper = threading.Event()
+
+                self.ip_addr = ip_addr
+
+            def stop(self):
+                self._stopper.set()
+                
+            def stopped(self): 
+                return self._stopper.isSet() 
+
+            def run(self):
+                settings.LOGGER.debug(f"Hi, I'm worker # {self.ip_addr}")
+                while True:
+                    if self.stopped():
+                        return 
+                        
+                    settings.LOGGER.debug(f"Queue size is {img_q.qsize()}, worker is {self.ip_addr}")
+                    if img_q.qsize() == 0:
+                        settings.LOGGER.debug("all done!")
+                        break
+                    else:
+                        img = img_q.get()
+
+                    is_ok = None
+                    rndDelay = random.randrange(5, 10) * 0.03
+                    time.sleep(rndDelay)
+                    qs = img_q.qsize()
+                    for _ in range(3):
+                        try:
+                            is_ok = server_conn.check_ip(self.ip_addr)
+                            break
+                        except OSError:
+                            timeDelay = random.randrange(0, 2)
+                            settings.LOGGER.debug(f"IS_OK failed in worker {self.ip_addr}")
+                            time.sleep(timeDelay)
+
+                    if not is_ok: 
+                        break
+                            
+                    if not img.isProcessed:
+                        try:
+                            populateFromImageMultiGPU(img, server_conn = server_conn, server_ip = self.ip_addr, ip_checked=True)
+                        except OSError as ose:
+                            settings.LOGGER.debug(f"IP {self.ip_addr} issue with populateFromImage, filename {img.filename}, img id {img.id}. Error: {ose}")
+                            break
+
+        # Put everything in a while loop that polls for new workers
+        # or dead workers every n (30 now) seconds
+
+        running_threads = {}
+
+        # Kill the process once every 6 hours if it hasn't stopped already.
+
+        start_time = time.time()
+                
+        settings.LOGGER.debug("Starting to try...")
+
+        def end_threads(running_threads):
+            settings.LOGGER.debug("End the threads")
+            keys = list(running_threads.keys())
+            for key in keys:
+                # print(running_threads[key])
+                running_threads[key].stop()
+                # running_threads[key].join()
+                running_threads.pop(key)
+
+
+        while True: 
+            settings.LOGGER.debug("True loop")
+            cur_time = time.time()
+            
+            if cur_time - start_time > (45 * 60): # 45 minutes
+                settings.LOGGER.debug("KILLING Current time")
+                end_threads(running_threads)
+                break
+
+            if img_q.qsize() == 0:
+                end_threads(running_threads)            
+                break
+
+            try:
+                server_conn = establish_multi_server_connection()
+                # print(f"Servers are {server_conn.server_ips}")
+
+                num_servers = len(server_conn.server_ips)
+                # print(f"Number of servers is {num_servers}")
+                if num_servers == 0:
+                    settings.LOGGER.critical('No GPU servers found')
+                    return
+
+                for i, ip in enumerate(running_threads.keys()):
+                    if not running_threads[ip].is_alive():
+                        settings.LOGGER.debug(f"Killing thread {ip}")
+                        running_threads[ip].stop()
+                        running_threads[ip].join()
+
+                for i, serv in enumerate(server_conn.server_ips):
+                    if serv not in running_threads.keys() or not running_threads[serv].is_alive():
+                        t = process_thread(ip_addr = serv) # threading.Thread(target=worker, args=(serv,))
+                        # t.start()
+                        settings.LOGGER.debug(i, serv)
+                        running_threads[serv] = t
+                        running_threads[serv].start()
+
+                time.sleep(30)
+                settings.LOGGER.debug(running_threads.keys())
+                # print("Time slept")
+
+            except Exception as e:
+                settings.LOGGER.debug(f"Exception in face extraction found : {e}")
+                settings.LOGGER.debug(traceback.format_exc())
+                try:
+                    end_threads(running_threads)
+                except FileNotFoundError:
+                    pass
+                break
+            
+
+    except:
+
+        settings.LOGGER.debug("Ending face adding task")
+        
 from face_classify import faceAssigner
 @shared_task(ignore_result=True, name='face_manager.assign_faces')
 def thistask(redo_all=False):
-    classify_lockfile = settings.CLASSIFY_LOCKFILE
-    print(f"Classify lockfile is {classify_lockfile}")
-    if os.path.exists(classify_lockfile):
-        print("Classification is locked, exiting.")
-        settings.LOGGER.warning("Classification is locked!")
+
+    i = celery_app.control.inspect()
+    active_tasks = i.active()
+    task_running = False
+    num_this_task_running = 0
+    for k in active_tasks.keys():
+        tasks = active_tasks[k]
+        if len(tasks) != 0:
+            for tt in tasks:
+                if tt['name'] == 'face_manager.assign_faces':
+                    num_this_task_running += 1
+
+    if num_this_task_running > 1:
+        # This task will be one, so looking for other tasks.
+        settings.LOGGER.debug("Classification is locked, exiting.")
+        settings.LOGGER.warning("Classification locked!")
         return
-    else:
-        f = open(classify_lockfile, 'w')
-        f.close()
 
     try:
         classer = faceAssigner()
@@ -272,11 +277,6 @@ def thistask(redo_all=False):
     except:
         print("Image classification failed!")
     
-    try:
-        os.remove(classify_lockfile)
-    except FileNotFoundError:
-        pass
-
 
 @shared_task(ignore_result=True, name='face_manager.set_face_counts')
 def reset_task():

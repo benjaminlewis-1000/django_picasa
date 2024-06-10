@@ -37,11 +37,12 @@ class Command(BaseCommand):
 
         # IMPORTANT: Don't uncomment these lines unless you want to 
         # start reendoding everything again.
-        #### all_faces = Face.objects.filter(criterion_ign).order_by('?')
-        #### all_faces.update(reencoded=False)
+        ### all_faces = Face.objects.filter(criterion_ign).order_by('?')
+        ### all_faces.update(reencoded=False)
 
         num_faces = all_faces.count()
-        print(f"There are {num_faces} faces left to do")
+       # print(f"There are {num_faces} faces left to do")
+        print("Faces obtained, ", num_faces)
 
         client_ip = ip_finder.server_finder()
 
@@ -52,7 +53,7 @@ class Command(BaseCommand):
             if face.reencoded:
                 continue
 
-            face_location = [(face.box_top, face.box_left, face.box_bottom, face.box_right)]
+            face_location = [(face.box_top, face.box_right, face.box_bottom, face.box_left)]
             source_image_file = face.source_image_file.filename
 
             encoding = reencoder.face_encoding_client(source_image_file, face_location, client_ip)
