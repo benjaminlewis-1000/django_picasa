@@ -23,14 +23,22 @@ class Command(BaseCommand):
     def __init__(self):
         super(Command, self).__init__()
 
-        self.max_dim = 600
+        self.max_dim = 800
+        self.bbox_pad = 0.4 
 
         self.out_dir = '/photos_rw/pkls'
-        # Get only people with a minimum of 50 images. 
-        self.min_faces = 50
+
+        if not os.path.exists(self.out_dir):
+            os.makedirs(self.out_dir)
+        # Get only people with a minimum of 20 images. 
+        self.min_faces = 20
+
+        self.test = False
 
         img_path = '/photos/Completed/Pictures_finished/Family Pictures/2017/Mom Phone/1478528587722.jpg'
-        # self.test_img(img_path)
+        img_path = '/photos/Completed/Pictures_finished/Family Pictures/2011/2011 (7) July/DSC_0364.JPG'
+        if self.test:
+            self.test_img(img_path)
         # exit()
 
     def test_img(self, img_path):
@@ -42,8 +50,14 @@ class Command(BaseCommand):
         print(file, faces)
 
         data = self.extract_chip(face)
+        
+        if self.test:
+            self.names_list = [face.declared_name]
+            self.img_to_pkl(face)
+            del self.names_list
+
         chip = data['chip']
-        bbox = data["bbox"]
+        bbox = data["bbox_trbl"]
         
         chip = cv2.cvtColor(chip, cv2.COLOR_BGR2RGB)
 
@@ -63,14 +77,27 @@ class Command(BaseCommand):
 
         names = Person.objects.annotate(c=Count('face_declared')) \
             .filter(c__gt=self.min_faces) \
-            .filter(~Q(person_name__in=settings.IGNORED_NAMES) ) 
+            .filter(~Q(person_name__in=settings.IGNORED_NAMES) )
+
+        if self.test:
+            print("Testing!!")
+            names = names[:10] 
 
         self.names_list = list(names)
 
-        self.in_library_images = Face.objects.filter(declared_name__in=names).order_by('?')
+        if self.test:
+            self.in_library_images = Face.objects.filter(declared_name__in=names)[:10] 
+        else:
+            self.in_library_images = Face.objects.filter(declared_name__in=names).order_by('?')
+
 
         criterion_rejected = Q( declared_name__person_name__in=['.ignore', '.realignore'])
-        self.ignore_images = Face.objects.filter(criterion_rejected).order_by('?')
+
+        if self.test:
+            self.ignore_images = Face.objects.filter(criterion_rejected)[:10] 
+        else:
+            self.ignore_images = Face.objects.filter(criterion_rejected).order_by('?')
+        
 
     def open_img_oriented(self, filename):
 
@@ -148,59 +175,102 @@ class Command(BaseCommand):
         assert bbox_width > 0
         assert bbox_ht > 0
 
-        bbox_pad = 0.25
 
-        t_adj = int(np.max((t - bbox_ht * bbox_pad, 0)))
-        b_adj = int(np.min((b + bbox_ht * bbox_pad, imh)))
-        l_adj = int(np.max((0, l - bbox_width * bbox_pad)))
-        r_adj = int(np.min((imw, r + bbox_width * bbox_pad)))
+        t_adj = int(np.max((t - bbox_ht * self.bbox_pad, 0)))
+        b_adj = int(np.min((b + bbox_ht * self.bbox_pad, imh)))
+        l_adj = int(np.max((0, l - bbox_width * self.bbox_pad)))
+        r_adj = int(np.min((imw, r + bbox_width * self.bbox_pad)))
         assert t_adj <= t, f"{t_adj}, {t} | {t} {r} {b} {l} {imh} {imw}"
         assert l_adj <= l, f"{l_adj}, {l} | {t} {r} {b} {l} {imh} {imw}"
         assert r_adj >= r, f"{r_adj}, {r} | {t} {r} {b} {l} {imh} {imw}"
         assert b_adj >= b, f"{b_adj}, {b} | {t} {r} {b} {l} {imh} {imw}"
 
-        # Chip out the image. 
 
-        bbox_new = [(t - t_adj, l - l_adj + (r - l), t - t_adj + (b - t), l - l_adj)]
-        t_diff = np.abs(bbox_new[0][0] - np.abs(t_adj - b_adj) / 6 )
-        r_diff = bbox_new[0][1] - np.abs( (r_adj - l_adj - np.abs(r_adj - l_adj) / 6 )) 
-        b_diff = bbox_new[0][2] - np.abs( (b_adj - t_adj - np.abs(t_adj - b_adj) / 6 ))
-        l_diff = np.abs(bbox_new[0][3] - np.abs(r_adj - l_adj) / 6 )
-        
-        if t_adj != 0 and b_adj != imh:
-            assert t_diff < 1, f'{bbox_new[0][0]} - np.abs({t_adj} - {b_adj}) / 6) | {t}, {r}, {b}, {l}'
-            assert b_diff < 1, f'{bbox_new[0][2]} - np.abs( ({b_adj} - {t_adj} - np.abs({t_adj} - {b_adj}) / 6 )) | {t}, {r}, {b}, {l}'
-        if l_adj != 0 and r_adj != imw:
-            assert r_diff < 1, f'{bbox_new[0][1]} - np.abs( ({r_adj} - {l_adj} - np.abs({r_adj} - {l_adj}) / 6 )) | {t}, {r}, {b}, {l}'
-            assert l_diff < 1, f'np.abs({bbox_new[0][3]} - np.abs({r_adj} - {l_adj}) / 6 ) | {t}, {r}, {b}, {l}'
-        
+
+        bbox_new_t = t - t_adj
+        bbox_new_b = b - t_adj # == t - t_adj + (b - t)
+        bbox_new_l = l - l_adj
+        bbox_new_r = r - l_adj # == l - l_adj + (r - l)
+
+        ## BBOX defined as top, right, bottom, left.
+        bbox_new = [(bbox_new_t, bbox_new_r, bbox_new_b, bbox_new_l)]
+
+        # Check assertion that new bounding box is same width
+        # and height
+        adj_bbox_w = np.abs(bbox_new_l - bbox_new_r)
+        adj_bbox_h = np.abs(bbox_new_t - bbox_new_b)
+        assert adj_bbox_w == bbox_width, f"Old width: {bbox_width}, new width: {adj_w}"
+        assert adj_bbox_h == bbox_ht, f"Old height: {bbox_ht}, new height: {adj_h}"
+
         # New image chip: 
         chip = image[t_adj:b_adj, l_adj:r_adj, :]
         assert chip.shape[0] == b_adj - t_adj
         assert chip.shape[1] == r_adj - l_adj
 
+        # Get the old image's face
+        old_face = image[t:b, l:r, :]
+        of_h, of_w, _ = old_face.shape
+        assert of_h == adj_bbox_h, f"Old face chip h: {of_h}, new h: {adj_bbox_h}"
+        assert of_w == adj_bbox_w, f"Old face chip w: {of_w}, new w: {adj_bbox_w}"
+
+        # Chip out from the new image chip
+        new_face = chip[bbox_new_t:bbox_new_b, bbox_new_l:bbox_new_r, :]
+        assert np.all(new_face == old_face)
+
         # RESIZING Function: If the chip is huge, it wastes storage space.
         # This will resize to a manageable size.
 
         ch, cw = chip.shape[:2]
+
         if (cw > self.max_dim or ch > self.max_dim):
+
+            # For error checking
+            h_w_ratio = ch / cw
+            hw_aspect = h_w_ratio > 1
+            old_bbox_aspect = adj_bbox_h / adj_bbox_w
+
             rescale = self.max_dim / np.max((ch, cw))
 
             new_h = int(ch * rescale)
             new_w = int(cw * rescale)
 
-            chip = cv2.resize(chip, dsize=(new_h, new_w), interpolation=cv2.INTER_CUBIC)
+            chip = cv2.resize(chip, dsize=(new_w, new_h), interpolation=cv2.INTER_CUBIC)
+
+            # Error checking
+            ch2, cw2, _ = chip.shape
+            new_hw_ratio = ch2 / cw2
+            new_hw_aspect = new_hw_ratio > 1
+            assert new_hw_aspect == hw_aspect
 
             # Rescale the bounding box
             bbox_new = [int(f * rescale) for f in bbox_new[0]]
             bbox_new = [tuple(bbox_new)]
 
+            new_bbox_h = np.abs(bbox_new[0][0] - bbox_new[0][2])
+            new_bbox_w = np.abs(bbox_new[0][1] - bbox_new[0][3])
+            new_bbox_aspect = new_bbox_h / new_bbox_w
+            assert np.abs(new_bbox_aspect - old_bbox_aspect) < 0.01
+
         ch, cw = chip.shape[:2]
         assert ch <= self.max_dim
         assert cw <= self.max_dim
-
+        
         return {'chip': chip,
-                'bbox': bbox_new}
+                'bbox_trbl': bbox_new}
+
+        # t_diff = np.abs(bbox_new[0][0] - np.abs(t_adj - b_adj) / 6 )
+        # r_diff = bbox_new[0][1] - np.abs( (r_adj - l_adj - np.abs(r_adj - l_adj) / 6 )) 
+        # b_diff = bbox_new[0][2] - np.abs( (b_adj - t_adj - np.abs(t_adj - b_adj) / 6 ))
+        # l_diff = np.abs(bbox_new[0][3] - np.abs(r_adj - l_adj) / 6 )
+            
+        # if t_adj != 0 and b_adj != imh:
+        #     assert t_diff < 1, f'{bbox_new[0][0]} - np.abs({t_adj} - {b_adj}) / 6) | {t}, {r}, {b}, {l}'
+        #     assert b_diff < 1, f'{bbox_new[0][2]} - np.abs( ({b_adj} - {t_adj} - np.abs({t_adj} - {b_adj}) / 6 )) | {t}, {r}, {b}, {l}'
+        # if l_adj != 0 and r_adj != imw:
+        #     assert r_diff < 1, f'{bbox_new[0][1]} - np.abs( ({r_adj} - {l_adj} - np.abs({r_adj} - {l_adj}) / 6 )) | {t}, {r}, {b}, {l}'
+        #     assert l_diff < 1, f'np.abs({bbox_new[0][3]} - np.abs({r_adj} - {l_adj}) / 6 ) | {t}, {r}, {b}, {l}'
+        
+        # Chip out the image.
 
 
     def img_to_pkl(self, face, set_ign_idx = False):
@@ -227,15 +297,20 @@ class Command(BaseCommand):
             return
 
         data['chip'] = chip_data['chip']
-        data['bbox'] = chip_data['bbox']
+        data['bbox_trbl'] = chip_data['bbox_trbl']
 
         data['face_id'] = face.id
         data['img_file'] = face.source_image_file.filename
         data['date_taken'] = face.source_image_file.dateTaken
         data['date_modified'] = face.source_image_file.dateModified
 
+        if self.test:
+            print("writing to ", out_file)
+            
         with open(out_file, 'wb') as fh:
             pickle.dump(data, fh)
+
+        os.chmod(out_file, 0o664)
 
 
     def handle(self, *args, **options):

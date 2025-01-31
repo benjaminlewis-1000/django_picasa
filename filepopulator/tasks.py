@@ -9,7 +9,7 @@ from celery import shared_task
 import time
 import os
 # import scripts
-from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime
+from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
 
 if not settings.configured:
     settings.configure()
@@ -55,8 +55,13 @@ def load_images_into_db():
     print("Finished adding photos")
     delete_removed_photos()
     print("Done! Finished removing photos that aren't there.")
-    update_dirs_datetime()
+    # update_dirs_datetime()
 
+    # TODO: Check duplicates
+
+@shared_task(ignore_result=True, name='filepopulator.check_mod_dates')
+def check_mod_dates():
+    check_file_mods()
 
 @shared_task(name='filepopulator.update_dir_dates')
 def update_dir_dates():

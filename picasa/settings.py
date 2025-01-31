@@ -353,7 +353,7 @@ MAX_CELERY_TIME = 60 * 60 * 3 # 3 hours
 CELERY_BEAT_SCHEDULE = {
     'filepopulate_root': {
         'task': 'filepopulator.populate_files_from_root',
-        'schedule': crontab(hour='*/1', minute=0),
+        'schedule': crontab(hour='*', minute='*/10'),
         # 'schedule': crontab(minute='*'),
     },
     'dirs_datetimes': {
@@ -370,6 +370,10 @@ CELERY_BEAT_SCHEDULE = {
        #     'expires': 30,
        # }
    },
+   'check_mods': {
+        'task': 'filepopulator.check_mod_dates',
+        'schedule': crontab(hour = '23'),
+    },
    'reencode_images': {
         'task': 'face_manager.reencode', 
         'schedule': crontab( minute = '*/10', hour='*/1'),

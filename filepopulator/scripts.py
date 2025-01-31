@@ -1,6 +1,6 @@
 #! /usr/bin/env python
 
-from .models import ImageFile, Directory
+from .models import ImageFile, Directory, DuplicateFile
 from datetime import datetime
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -96,7 +96,12 @@ def create_image_file(file_path):
 
     # Check if this photo already exists:
     exist_photo = ImageFile.objects.filter(filename=file_path)
+    duplicate_exists = DuplicateFile.objects.filter(filename=file_path)
 
+    if len(duplicate_exists) > 0:
+        # print("We already have a duplicate.")
+        return
+    
     new_photo = ImageFile(filename=file_path)
 
 
@@ -171,7 +176,8 @@ def create_image_file(file_path):
         new_photo._generate_md5_hash()
         # print(new_photo.pixel_hash)
         exist_with_same_hash = ImageFile.objects.filter(pixel_hash = new_photo.pixel_hash)
-        # print(exist_with_same_hash, len(exist_with_same_hash), exist_with_same_hash[0])
+        # print("Comparison, same hash: ", exist_with_same_hash, len(exist_with_same_hash), exist_with_same_hash[0])
+        # print(exist_with_same_hash[0].filename, file_path, exist_with_same_hash[0].filename == file_path)
         # if len(exist_with_same_hash):
         if len(exist_with_same_hash) == 1 and not os.path.exists(exist_with_same_hash[0].filename) :
             # Exactly one other, but it's been deleted or moved.
@@ -201,10 +207,13 @@ def create_image_file(file_path):
                     instance_clean_and_save(each)
                     return
         elif len(exist_with_same_hash) == 1 and os.path.exists(exist_with_same_hash[0].filename):
-            print("File exists...", file_path, exist_with_same_hash[0].filename)
-            write_duplicates_csv(file_path, exist_with_same_hash[0].filename)
-            raise NotImplementedError("File exists")
-            # Should just ignore file. 
+            # There is a duplicate already. 
+            # TODO 
+            new_dup = DuplicateFile(filename=file_path)
+            # print("Making a duplicate")
+            print("File exists...", file_path, exist_with_same_hash[0].filename, '. Marking as duplicate.')
+            new_dup.save()
+
         elif len(exist_with_same_hash) == 0:
             print("New photo should be created")
         else:
@@ -262,10 +271,14 @@ def add_from_root_dir(root_dir):
             # Get a list of files in the database
             db_files = ImageFile.objects.all().values()
             db_file_list = list(db_files.values_list('filename', flat=True))
-            db_files = list(db_files)
+            # db_files = list(db_files)
+
+            duplicate_files = DuplicateFile.objects.all().values()
+            dup_file_list = list(duplicate_files.values_list('filename', flat=True))
+            # dup_files = list(dup_file_list)
 
             # New files: 
-            new_files = list(set(actual_file_list) - set(db_file_list))
+            new_files = list(set(actual_file_list) - set(db_file_list) - set(dup_file_list))
             print(f"New file length is {len(new_files)}")
 
             for filename in new_files:
@@ -277,38 +290,7 @@ def add_from_root_dir(root_dir):
                     print(f'{filename} was not processed. {e}, {exc_type}, {exc_tb.tb_lineno}')
                     print(traceback.format_exc())
 
-            # Now go through and find any that have been modified more recently 
-            # than database:
-            modded_files = []
-            t = 0
-            for file in db_files:
-                db_mod_time = file['dateModified']
-                # if t % 1000 == 0:
-                #     print(f"{t} files scanned, {len(modded_files)} mod files found")
-                t += 1
-                filename = file['filename']
-                if filename in actual_file_list:
-                    os_mod_time = metadata_time[filename]
-                    if db_mod_time.timestamp() >= os_mod_time.timestamp():
-                        # No problems -- DB has most up-to-date.
-                        pass
-                    else:
-                        modded_files.append(filename)
-
-                # else:
-                    # Don't worry about it -- it's in new_files
-            print(f"Mod file length is {len(modded_files)}")
-                    
-            # Now process the new and modded files. 
-
-            for modfile in modded_files:
-                try:
-                    create_image_file(modfile)
-                except Exception as e:
-                    exc_type, exc_obj, exc_tb = sys.exc_info()
-                    fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-                    print(f'{filename} was not processed. {e}, {exc_type}, {exc_tb.tb_lineno}')
-                    print(traceback.format_exc())
+            print("Processed new_files")
 
         except Exception as e:
             stack_trace = traceback.format_exc()
@@ -322,6 +304,58 @@ def add_from_root_dir(root_dir):
                 os.remove(lockfile)
             except FileNotFoundError:
                 pass
+
+def check_file_mods():
+    try:
+        # Get a list of files in the database
+        db_files = ImageFile.objects.all().values()
+
+        # Now go through and find any that have been modified more recently 
+        # than database:
+        modded_files = []
+        t = 0
+        for file in db_files:
+            db_mod_time = file['dateModified']
+            # if t % 1000 == 0:
+            #     print(f"{t} files scanned, {len(modded_files)} mod files found")
+            t += 1
+            filename = file['filename']
+            if os.path.exists(filename): 
+#                os_mod_time = metadata_time[filename]
+                os_mod_time = datetime.fromtimestamp(os.path.getctime(filename))
+                if db_mod_time.timestamp() >= os_mod_time.timestamp():
+                    # No problems -- DB has most up-to-date.
+                    pass
+                else:
+                    modded_files.append(filename)
+
+            # else:
+                # Don't worry about it -- it's in new_files
+        print(f"Mod file length is {len(modded_files)}")
+                    
+        # Now process the new and modded files. 
+
+        for modfile in modded_files:
+            try:
+                create_image_file(modfile)
+            except Exception as e:
+                exc_type, exc_obj, exc_tb = sys.exc_info()
+                fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+                print(f'{filename} was not processed. {e}, {exc_type}, {exc_tb.tb_lineno}')
+                print(traceback.format_exc())
+
+    except Exception as e:
+        stack_trace = traceback.format_exc()
+        settings.LOGGER.error(type(e).__name__)
+        settings.LOGGER.error(e)
+#        settings.LOGGER.error(filename)
+        settings.LOGGER.error(stack_trace) 
+    finally:
+        print("Finished checking file mod times!")
+#        try:
+#            os.remove(lockfile)
+#        except FileNotFoundError:
+#            pass
 
 
 

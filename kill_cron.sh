@@ -13,7 +13,7 @@ done
 celery -A picasa beat -l INFO --pidfile="/locks/celerybeat.pid"  &
 # celery -A picasa worker -l INFO & # --uid=nobody --gid=nogroup &
 
-for i in {1..4}; do
+for i in {1..6}; do
     celery -A picasa worker -l INFO -c 4 --max-tasks-per-child 3 -n worker${i}  & # --uid=nobody --gid=nogroup &
 done
 

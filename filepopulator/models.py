@@ -132,6 +132,9 @@ def thumbnail_small_path(instance, filename):
     second_dir = filename[2]
     return f"thumbnails_small/{first_dir}/{second_dir}/{filename}"
 
+class DuplicateFile(models.Model):
+    filename = models.CharField(max_length=1024)
+
 # Lots ripped from https://github.com/hooram/ownphotos/blob/dev/api/models.py 
 class ImageFile(models.Model):
 
