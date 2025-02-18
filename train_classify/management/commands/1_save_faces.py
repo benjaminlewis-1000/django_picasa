@@ -52,9 +52,9 @@ class Command(BaseCommand):
         data = self.extract_chip(face)
         
         if self.test:
-            self.names_list = [face.declared_name]
+            # self.names_list = [face.declared_name]
             self.img_to_pkl(face)
-            del self.names_list
+            # del self.names_list
 
         chip = data['chip']
         bbox = data["bbox_trbl"]
@@ -83,7 +83,7 @@ class Command(BaseCommand):
             print("Testing!!")
             names = names[:10] 
 
-        self.names_list = list(names)
+        # self.names_list = list(names)
 
         if self.test:
             self.in_library_images = Face.objects.filter(declared_name__in=names)[:10] 
@@ -278,7 +278,7 @@ class Command(BaseCommand):
         data = {}
         data['person_name'] = face.declared_name.person_name
         if not set_ign_idx:
-            data['index'] = self.names_list.index(face.declared_name)
+            data['index'] = face.declared_name.id # self.names_list.index(face.declared_name)
         else:
             data['index'] = -999
 
