@@ -65,7 +65,7 @@ if in_docker:
     STATIC_URL = 'https://' + os.environ['MEDIA_DOMAIN'] + '/static/'
     MEDIA_URL = 'https://' + os.environ['MEDIA_DOMAIN'] + '/media/'
     LOG_DIR = '/var/log/picasa'
-    STATIC_ROOT = os.environ['STATIC_LOCATION']
+    STATIC_ROOT = os.environ['PICASA_STATIC_LOCATION']
     MEDIA_URL_USER = os.environ['APACHE_USER']
     MEDIA_URL_PW = os.environ['APACHE_PWD']
 else:
@@ -148,6 +148,8 @@ INSTALLED_APPS = [
     # 'periodic.apps.PeriodicConfig',
     'rest_framework',
     'rest_framework.authtoken',
+    'rest_framework_simplejwt', ## ADDED
+    'rest_framework_simplejwt.token_blacklist', ## Added
     'corsheaders',
     'filepopulator',
     'train_classify',
@@ -348,6 +350,9 @@ result_serializer = 'json'
 # CELERY_TIMEZONE = TIME_ZONE
 time_zone = TIME_ZONE
 MAX_CELERY_TIME = 60 * 60 * 3 # 3 hours
+
+CELERYD_USER = ""
+CELERYD_GROUP = ""
 
 # if production: 
 CELERY_BEAT_SCHEDULE = {

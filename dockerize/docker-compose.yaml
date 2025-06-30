@@ -1,8 +1,11 @@
 
 
 # https://github.com/DoTheEvo/Traefik-v2-examples
-version: "3.3"
+# version: "3.3"
 services:
+  # Now running with cloudflared, public hostname is
+  # picasa.exploretheworld.tech, with service at
+  # http://picasa_api:8000
   picasa:
     build:
       context: .
@@ -44,28 +47,28 @@ services:
     networks:
       - traefik_proxy
     restart: always
-    labels:
-
-      - "traefik.enable=true"
-      - "traefik.http.routers.picasa.rule=Host(`${WEBAPP_DOMAIN}`)"
-      - "traefik.http.routers.picasa.tls.certresolver=leresolver"
-      - "traefik.http.routers.picasa.entrypoints=websecure"
-      - "traefik.http.services.picasa.loadbalancer.server.port=8000"
-      - "traefik.http.services.picasa.loadbalancer.healthcheck.hostname=${WEBAPP_DOMAIN}"
-      - "traefik.http.middlewares.picasa.redirectscheme.scheme=https"
-      - "traefik.http.middlewares.picasa.redirectscheme.permanent=true"
+#    labels:
+#
+#      - "traefik.enable=true"
+#      - "traefik.http.routers.picasa.rule=Host(`${WEBAPP_DOMAIN}`)"
+#      - "traefik.http.routers.picasa.tls.certresolver=leresolver"
+#      - "traefik.http.routers.picasa.entrypoints=websecure"
+#      - "traefik.http.services.picasa.loadbalancer.server.port=8000"
+#      - "traefik.http.services.picasa.loadbalancer.healthcheck.hostname=${WEBAPP_DOMAIN}"
+#      - "traefik.http.middlewares.picasa.redirectscheme.scheme=https"
+#      - "traefik.http.middlewares.picasa.redirectscheme.permanent=true"
 
       # Need to start postgresql service
 
 #  flower:
 #    image: mher/flower
 #    command: ["flower", "--broker=redis://task_redis:6379/0", "--port=8888"]  
-#    ports:
-#      - 8888:8888
+#    container_name: flower
 #    networks:
 #      - traefik_proxy
 #    environment:
 #      - ub:50
+
 #    labels:
 #
 #      - "traefik.enable=true"
@@ -141,22 +144,22 @@ services:
     volumes:
       # - ${MEDIA_FILES_LOCATION}:/usr/local/apache2/htdocs/
       - ${MEDIA_FILES_LOCATION}:/var/www/media:ro
-      - ${STATIC_LOCATION}:/var/www/static:ro
+      - ${HOST_STATIC_LOCATION}:/var/www/static:ro
       - ${PHOTO_ROOT}:/var/www/full_res:ro
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/000-default.config:/etc/apache2/sites-enabled/000-default.conf
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/vhost.conf:/usr/local/apache2/conf/extra/httpd-vhosts.conf
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/apache_pwd.pwd:/usr/local/apache2/.htpasswd 
     networks:
       - traefik_proxy
-    labels:
+#    labels:
 #      - "traefik.backend=picasa_media"
 #      - "traefik.frontend.rule=Host:${MEDIA_DOMAIN}"
-      - "traefik.enable=true"
+#      - "traefik.enable=true"
 #      - "traefik.port=80"
 #      - "traefik.docker.network=traefik_proxy"
-      - "traefik.http.routers.apache_fileserve.rule=Host(`${MEDIA_DOMAIN}`)"
-      - "traefik.http.routers.apache_fileserve.tls.certresolver=leresolver"
-      - "traefik.http.routers.apache_fileserve.entrypoints=websecure"
+#      - "traefik.http.routers.apache_fileserve.rule=Host(`${MEDIA_DOMAIN}`)"
+#      - "traefik.http.routers.apache_fileserve.tls.certresolver=leresolver"
+#      - "traefik.http.routers.apache_fileserve.entrypoints=websecure"
       #- "traefik.http.routers.traefik.middlewares=authtraefik"
       #- "traefik.http.middlewares.authtraefik.basicauth.users=admin:$apr1$ly25xhfg$d2eLiOIOnM.IbsZ6Cfb760" # admin/movie based one
 

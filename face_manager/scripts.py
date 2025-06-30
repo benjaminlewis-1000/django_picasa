@@ -42,6 +42,7 @@ def placeInDatabase(foreign_key, face_data):
 
     if len(face_data) == 0:
         foreign_key.isProcessed = True
+        settings.LOGGER.debug(f"foreign key, {idx}")
         foreign_key.save()
         return False
 
@@ -101,6 +102,8 @@ def placeInDatabase(foreign_key, face_data):
             new_face.declared_name = None
             new_face.written_to_photo_metadata = False
 
+        settings.LOGGER.debug(f"Found a person, {idx}")
+
         if encoding is not None:
             # Then write the encodings to the database. 
 
@@ -119,6 +122,8 @@ def placeInDatabase(foreign_key, face_data):
             new_face.face_encoding = encoding
             new_face.face_encoding_512 = enc_512
             new_face.reencoded = True
+
+        settings.LOGGER.debug(f"Encoding done, {idx}")
 
         new_face.box_top = r_top
         new_face.box_bottom = r_bot
@@ -139,6 +144,7 @@ def placeInDatabase(foreign_key, face_data):
         thumb_filename = f'{foreign_key.pixel_hash}_{foreign_key.file_hash}_face{idx}.jpg'
 
         temp_thumb.seek(0)
+        settings.LOGGER.debug(f"New face object is populated, {idx}")
 
         # Load a ContentFile into the thumbnail field so it gets saved
         new_face.face_thumbnail.save(thumb_filename, ContentFile(temp_thumb.read())) #, save=False)
@@ -146,7 +152,7 @@ def placeInDatabase(foreign_key, face_data):
         temp_thumb.close()
 
         new_face.save()
-        settings.LOGGER.debug(new_face.id)
+        settings.LOGGER.debug(f"New face id is: {new_face.id}")
 
         foreign_key.isProcessed = True
         # Call the super because we just want to save the model,
@@ -212,8 +218,10 @@ def populateFromImageMultiGPU(img_object, server_conn = None, server_ip = None, 
 
     face_data = image_face_extractor.image_client_multi.face_extract_client(filename, server_conn, ip_address=server_ip, logger=settings.LOGGER, ip_checked = ip_checked)
     print(f"Worked! IP was {server_ip}, length is {len(face_data)}, file is {filename}")
+    settings.LOGGER.debug(f"Worked! IP was {server_ip}, length is {len(face_data)}, file is {filename}")
     placeInDatabase(foreign_key, face_data)
     print(f"Faces from {filename} have been placed in database.")
+    settings.LOGGER.debug(f"Faces from {filename} have been placed in database.")
 
     return face_data, server_conn, changed_fk 
 

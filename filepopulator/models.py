@@ -138,7 +138,7 @@ class DuplicateFile(models.Model):
 # Lots ripped from https://github.com/hooram/ownphotos/blob/dev/api/models.py 
 class ImageFile(models.Model):
 
-    filename = models.CharField(max_length=1024, validators=[RegexValidator(regex="\.[j|J][p|P][e|E]?[g|G]$", message="Filename must be a JPG")], db_index = True)
+    filename = models.CharField(max_length=1024, validators=[RegexValidator(regex=r"\.[j|J][p|P][e|E]?[g|G]$", message="Filename must be a JPG")], db_index = True)
     # CASCADE is expected; if delete directory, delete images.
     directory = models.ForeignKey(Directory, on_delete=models.PROTECT, related_name='image_set')
     pixel_hash = models.CharField(max_length = 64, null = False, default = -1)
@@ -212,7 +212,7 @@ class ImageFile(models.Model):
 
     def process_new_no_md5(self):
 
-        if not re.match(".*\.[j|J][p|P][e|E]?[g|G]$", self.filename):
+        if not re.match(r".*\.[j|J][p|P][e|E]?[g|G]$", self.filename):
             settings.LOGGER.debug("File {} does not have a jpeg-type ending.".format(self.filename))
             return False # Success value
 
@@ -352,8 +352,7 @@ class ImageFile(models.Model):
                 try:
                     frac = Fraction(float_val).limit_denominator(limit)
                 except:
-                    print(f"Exception! {float_val}, {limit}")
-                    print(Fraction(float_val))
+                    logging.debug(f"Exception! {float_val}, {limit}, {Fraction(float_val)}")
                     frac = Fraction(float_val)
                 
                 return frac.numerator, frac.denominator
@@ -496,7 +495,7 @@ class ImageFile(models.Model):
                 datetaken_tmp = self.exifDict[exifKey] if exifKey in self.exifDict.keys() else None
                 # Remediations for occasional problems - I've seen \x00\x00... in the string 
                 # and date lines that are just spaces.
-                if datetaken_tmp is None or re.match('^\s+$', datetaken_tmp) or re.match('0000:00:00 00:00:00', datetaken_tmp) or re.match('[\s:-]+', datetaken_tmp):
+                if datetaken_tmp is None or re.match(r'^\s+$', datetaken_tmp) or re.match(r'0000:00:00 00:00:00', datetaken_tmp) or re.match(r'[\s:-]+', datetaken_tmp):
                     continue  # No value at this EXIF key
                 else:
                     datetaken_tmp = datetaken_tmp.replace('\x00', '')

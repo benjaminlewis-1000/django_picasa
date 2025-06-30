@@ -26,6 +26,8 @@ def delete_old_thumbnails(instance):
 
 def instance_clean_and_save(instance):
     #            print(cur_file)
+
+    print("Saving an instance")
     file_path = instance.filename
     try:
         instance.full_clean()
@@ -40,11 +42,9 @@ def instance_clean_and_save(instance):
         except ValueError as ve:
             print(dir(instance))
             print(instance.__dict__)
-#                for field in dir(instance):
-#                    if not field.startwith('_'):
-#                    print(field, instance.__dict__[field])
+            
             raise ve
-        print(f"Saved file {file_path} to database")
+        settings.LOGGER.debug(f"Saved file {file_path} to database")
         settings.LOGGER.debug(f"Saved file {file_path} to database")
 
         assert os.path.isfile(instance.thumbnail_big.path), \
@@ -90,7 +90,7 @@ def create_image_file(file_path):
         settings.LOGGER.debug('File {} is not a file path. Will not insert.'.format(file_path))
         return
 
-    if not re.match(".*\.[j|J][p|P][e|E]?[g|G]$", file_path):
+    if not re.match(r".*\.[j|J][p|P][e|E]?[g|G]$", file_path):
         settings.LOGGER.debug("File {} does not have a jpeg-type ending.".format(file_path))
         return # Success value
 
@@ -107,7 +107,7 @@ def create_image_file(file_path):
 
     # Case 1: photo exists at this location.
     if len(exist_photo):
-        print(f"Photo exists! {file_path}")
+        settings.LOGGER.info(f"Photo exists! {file_path}")
         if len(exist_photo) > 1:
             settings.LOGGER.critical(f"You have multiple instances of file {file_path} in the database.")
             raise ValueError('Should only have at most one instance of a file {}. You have {}'.format(file_path, len(exist_photo)))
@@ -117,7 +117,7 @@ def create_image_file(file_path):
         exist_timestamp = exist_photo.dateModified.timestamp()
         new_photo._get_mod_time()
         adding_timestamp = new_photo.dateModified.timestamp()
-        print("Check: ", datetime.fromtimestamp(os.path.getctime(file_path)).timestamp(), adding_timestamp)
+        settings.LOGGER.info("Check: ", datetime.fromtimestamp(os.path.getctime(file_path)).timestamp(), adding_timestamp)
 
         # Check the timestamp between the database and the file 
         # under consideration. If they are exactly the same, 
@@ -127,7 +127,7 @@ def create_image_file(file_path):
         # values) and some not (most pictures). Timestamp simply
         # turns it into a float of UTC seconds. 
         if exist_timestamp == adding_timestamp:
-            print(exist_timestamp, adding_timestamp)
+            settings.LOGGER.info(exist_timestamp, adding_timestamp)
             return
         # Only if the files are *not* the same do we compute the
         # md5 hash of the file. This is because reading in the 
@@ -170,7 +170,7 @@ def create_image_file(file_path):
 
     # Case 2: No photo exists at this location.
     else:
-        print(f"Working with {file_path} - no photo exists")
+        settings.LOGGER.debug(f"Working with {file_path} - no photo exists")
         settings.LOGGER.debug(f"Adding new file {file_path} to database.")
         new_photo.process_new_no_md5()
         new_photo._generate_md5_hash()
@@ -215,7 +215,7 @@ def create_image_file(file_path):
             new_dup.save()
 
         elif len(exist_with_same_hash) == 0:
-            print("New photo should be created")
+            settings.LOGGER.info("New photo should be created")
         else:
             pass
             # The photo should be created
@@ -256,7 +256,7 @@ def add_from_root_dir(root_dir):
                         # just system files. 
                         cur_parts = cur_file.split(os.sep)[:-1]
                         filename = cur_file.split(os.sep)[-1]
-                        if re.match('\.', filename):
+                        if re.match(r'\.', filename):
                             continue
 
                         # Check if a folder starts with '.'. Otherwise, add it in!
@@ -374,7 +374,7 @@ def check_file_mods():
         #                 cur_file = os.path.join(root, f)
         #                 cur_parts = cur_file.split(os.sep)[:-1]
         #                 filename = cur_file.split(os.sep)[-1]
-        #                 if re.match('\.', filename):
+        #                 if re.match(r'\.', filename):
         #                     # Don't try to add files starting with a period - they're often
         #                     # just system files. 
         #                     continue

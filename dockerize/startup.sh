@@ -12,11 +12,11 @@ cat <(echo "yes") - | python /code/manage.py collectstatic
 
 mkdir /locks
 
-rm /locks/celerybeat.pid
-rm /locks/adding.lock
-rm /locks/classify.lock
-rm /locks/face_add.lock
-rm /code/celerybeat-schedule.db
+rm -f /locks/celerybeat.pid
+rm -f /locks/adding.lock
+rm -f /locks/classify.lock
+rm -f /locks/face_add.lock
+rm -f /code/celerybeat-schedule.db
 
 mkdir -p /var/run/celery /var/log/celery
 chown -R nobody:nogroup /var/run/celery /var/log/celery
@@ -35,7 +35,8 @@ sleep 10
 celery -A picasa beat -l INFO --pidfile="/locks/celerybeat.pid"  &
 
 for i in {1..8}; do
-    celery -A picasa worker -l INFO -c 4 --max-tasks-per-child 3 -n worker${i}  & # --uid=nobody --gid=nogroup &
+#     celery -A picasa worker -l INFO -c 4 --max-tasks-per-child 3 -n worker${i}  --uid=1001 --gid=1001 &
+     celery -A picasa worker -l INFO -c 4 --max-tasks-per-child 3 -n worker${i}  --uid=root --gid=root &
 done
 
 gunicorn -b 0.0.0.0:8000 picasa.wsgi & 

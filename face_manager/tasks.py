@@ -228,7 +228,7 @@ def process_faces():
                     if serv not in running_threads.keys() or not running_threads[serv].is_alive():
                         t = process_thread(ip_addr = serv) # threading.Thread(target=worker, args=(serv,))
                         # t.start()
-                        settings.LOGGER.debug(i, serv)
+                        settings.LOGGER.debug(f"{i}, {serv}")
                         running_threads[serv] = t
                         running_threads[serv].start()
 

@@ -1,5 +1,5 @@
 # FROM debian:buster
-FROM ubuntu
+FROM ubuntu:22.04
 WORKDIR /code
 
 RUN apt update
@@ -14,14 +14,15 @@ RUN apt install -y gir1.2-gexiv2-0.10
 # RUN python3 -m venv /code/venv
 
 # Add our requirements.txt
-RUN pip3 install opencv-python-headless>=4.4.0.44
+RUN pip3 install opencv-python-headless>=4.4.0.44 
 RUN pip3 install face_recognition 
-RUN pip3 install face-recognition-models==0.3.0 
-RUN pip3 install facenet-pytorch==2.5.0  
+RUN pip3 install face-recognition-models==0.3.0
+RUN pip3 install facenet-pytorch==2.5.0   
 
+RUN apt install libgirepository-1.0-1
 ADD requirements.txt /code/requirements.txt
 RUN apt install libffi-dev
-RUN pip3 install -r /code/requirements.txt
+RUN pip3 install -r /code/requirements.txt 
 
 RUN apt install exempi -y
 
@@ -41,5 +42,6 @@ RUN rm -r /var/lib/apt/lists
 
 ADD startup.sh /startup.sh
 
+RUN groupadd --gid 1001 usergrp && useradd --uid 1001 --gid usergrp -m user 
 
 WORKDIR /code
