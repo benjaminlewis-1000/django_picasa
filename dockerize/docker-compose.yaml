@@ -105,7 +105,7 @@ services:
       # Run by the run-parts command, which hates periods in filenames, hence why 
       # I don't make a .sh suffix in the container. 
 #      - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/weekly/postgres_bak_sh
-      - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/daily/postgres_bak_sh
+#      - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/daily/postgres_bak_sh
       - /mnt/fast_storage/appdata/django_picasa/backups:/backup
     labels:
       - "user=postgres"

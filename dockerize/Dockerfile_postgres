@@ -5,4 +5,9 @@ RUN apk add --no-cache supervisor
 RUN mkdir /etc/supervisor.d
 COPY postgres_cron.ini /etc/supervisor.d/postgres_cron.ini
 
+# ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/daily/postgres_bak_sh
+COPY postgres_bak.sh /etc/periodic/daily/postgres_bak_sh
+RUN chmod +x /etc/periodic/daily/postgres_bak_sh
+
+
 ENTRYPOINT ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
