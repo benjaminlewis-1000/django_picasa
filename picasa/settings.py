@@ -52,7 +52,7 @@ if in_docker:
         DB_HOST = 'db_picasa_dev'
     else:
         REDIS_HOST = 'task_redis'
-        DB_HOST = 'db_django'
+        DB_HOST = 'db_picasa'
         
     PHOTO_ROOT = '/photos'
     PHOTO_ROOT_RW = '/photos_rw'
@@ -68,6 +68,7 @@ if in_docker:
     STATIC_ROOT = os.environ['PICASA_STATIC_LOCATION']
     MEDIA_URL_USER = os.environ['APACHE_USER']
     MEDIA_URL_PW = os.environ['APACHE_PWD']
+    HOST_DOMAIN = 'https://' + os.environ['WEBAPP_DOMAIN']
 else:
     DB_NAME = 'picasa'
     DB_USER = 'benjamin'
@@ -84,6 +85,7 @@ else:
     MEDIA_URL  = 'http://localhost/media/'
     STATIC_SERVER = '/var/www/html/static'
     LOG_DIR = '/home/benjamin/git_repos/picasa_files/logs'
+    HOST_DOMAIN = 'http://localhost'
 
 RANDOM_ACCESS_KEY = ''.join([random.choice(string.ascii_letters + string.digits) for n in range(32)])
 # print(MEDIA_URL)
@@ -387,11 +389,11 @@ CELERY_BEAT_SCHEDULE = {
        'task': 'face_manager.set_face_counts',
        'schedule': crontab( minute = '0', hour='*/4'),
    },
-   'classify_unlabeled': {
-       'task': 'face_manager.assign_faces',
-       'schedule': crontab( minute = '*/5', hour='*'),
-       'args': (False, ), # Don't reassign all of them.
-   },
+  'classify_unlabeled': {
+      'task': 'face_manager.assign_faces',
+      'schedule': crontab( minute = '5', hour='*'),
+      'args': (False, ), # Don't reassign all of them.
+  },
    'classify_unlabeled_all_weekly': {
        'task': 'face_manager.assign_faces',
        # This schedule should be sufficient to
@@ -447,5 +449,8 @@ IGNORED_NAMES=[BLANK_FACE_NAME, SOFT_IGNORE_NAME, '.ignore', '.realignore', '.je
 CLASSIFY_MODEL_PATH = '/code/face_manager/face_classifier/models'
 DEFAULT_RESOLUTION_HEIGHT = 2160 # For 4k screens
 DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
+APPEND_SLASH=True # Allow URLs to append a trailing slash
+
+CSRF_TRUSTED_ORIGINS = ["http://picasa.exploretheworld.tech", "https://picasa.exploretheworld.tech"]
 
 # print("STATIC is : ", STATIC_URL)

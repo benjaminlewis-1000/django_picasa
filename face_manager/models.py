@@ -252,7 +252,8 @@ class Face(models.Model):
     def set_possible_person(self, person_id, poss_idx, weight):
 
         new_poss_id = Person.objects.get(id=person_id)
-        new_poss_id.increment_possible_num()
+        if poss_idx == 1:
+            new_poss_id.increment_possible_num()
         self.__dict__[f'weight_{poss_idx}'] = weight
 
         if poss_idx == 1:

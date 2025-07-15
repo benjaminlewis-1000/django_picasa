@@ -14,6 +14,7 @@ import numpy as np
 import shutil
 import torch
 import traceback
+torch.backends.nnpack.enabled = False
 
 def establish_server_connection():
     server_conn = image_face_extractor.ip_finder.server_finder(logger=settings.LOGGER)
@@ -42,7 +43,6 @@ def placeInDatabase(foreign_key, face_data):
 
     if len(face_data) == 0:
         foreign_key.isProcessed = True
-        settings.LOGGER.debug(f"foreign key, {idx}")
         foreign_key.save()
         return False
 

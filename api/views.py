@@ -1,10 +1,9 @@
 from django.shortcuts import render
-
 from django.contrib.auth.models import User, Group
 from filepopulator.models import ImageFile, Directory
 from face_manager.models import Person, Face
-from django.db.models import Count
 from django.conf import settings
+from django.db.models import Count
 from rest_framework import viewsets, filters
 #from api.serializers import UserSerializer, GroupSerializer, ImageFileSerializer, DirectorySerializer, ParameterSerializer
 import api.serializers as api_ser
@@ -326,14 +325,18 @@ class PersonParamView(APIView):
             else:
 
                 faces1 = list(Face.objects.filter(poss_ident1=person_obj).values_list('id', 'weight_1'))
-                faces2 = list(Face.objects.filter(poss_ident2=person_obj).values_list('id', 'weight_2'))
+                # faces2 = list(Face.objects.filter(poss_ident2=person_obj).values_list('id', 'weight_2'))
                 # faces3 = list(Face.objects.filter(poss_ident3=person_obj).values_list('id', 'weight_3'))
                 # faces4 = list(Face.objects.filter(poss_ident4=person_obj).values_list('id', 'weight_4'))
                 # faces5 = list(Face.objects.filter(poss_ident5=person_obj).values_list('id', 'weight_5'))
 
-                f = faces1 + faces2  #+ faces3 + faces4 + faces5
-                faces = sorted(f, key=lambda tup: tup[1], reverse=True)
-                faces = [f[0] for f in faces]
+                f = faces1  # + faces2  #+ faces3 + faces4 + faces5
+                if len(f) > 0:
+                    faces = sorted(f, key=lambda tup: tup[1], reverse=True)
+                    # print("Faces", len(faces1), faces1[0], faces)
+                    faces = [f[0] for f in faces]
+                else:
+                    faces = []
                 
             id_list = list(faces)
         else:
@@ -604,10 +607,10 @@ class FaceViewSet(viewsets.ModelViewSet):
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 
-    @action(detail=True, methods=['put'])
+    @action(detail=True, methods=['patch', 'put'])
     def ignore_face(self, request, pk=None):
         # Accessible as <root>/api/faces/<face_id>/ignore_face/
-        # Accept: HTML PUT
+        # Accept: HTML PATCH
         # Body parameter : ignore_type in ['soft', 'hard']
         # Given the face, set the assigned name to '.ignore'
         def err_404(message=""):
@@ -648,10 +651,10 @@ class FaceViewSet(viewsets.ModelViewSet):
         js = {'success': True}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
-    @action(detail=True, methods=['put'])
+    @action(detail=True, methods=['patch', 'put'])
     def unassign_face(self, request, pk=None):
         # Accessible as <root>/api/faces/<face_id>/unassign_face/
-        # Accept: HTML PUT
+        # Accept: HTML PATCH
         # Body parameter : None
         # Given the face, remove any assigned face
 
@@ -664,10 +667,10 @@ class FaceViewSet(viewsets.ModelViewSet):
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 
-    @action(detail=True, methods=['put'])
+    @action(detail=True, methods=['patch', 'put'])
     def reject_association(self, request, pk=None):
         # Accessible as <root>/api/faces/<face_id>/reject_association/
-        # Accept: HTML PUT
+        # Accept: HTML PATCH
         # Body parameter : unassociate_id (person_id)
         # Given the face, remove association to the given
         # person and add the person_id to the rejected_fields. 
@@ -709,10 +712,7 @@ class KeyedImageView(APIView):
         full_big/medium/small: key type: image. Gets the corresponding thumbnail image. 
         '''
 
-        print("REquests", request)
-
         params = self.request.query_params
-        print("PARMA", params)
         valid_types = ['face_highlight', 'face_array', 'face_source', 'slideshow', 'full_big', 'full_medium', 'full_small']
         
         def err_404(message=""):
@@ -921,4 +921,88 @@ class StatsViewSet(viewsets.ViewSet):
     def list(self, request):
         stat_serializer = api_ser.ServerStatsSerializer(instance=api_ser.ServerStatsSerializer.Stats(), many=False)
         return Response(stat_serializer.data)
+
+
+
+class ConfidentUnlabeledView(APIView):
+
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, *args, **kwargs):
+
+        # host_url = f'https://{request.get_host()}'
+        # print(host_url)
+        unlabeled = Face.objects.filter(declared_name__person_name=settings.BLANK_FACE_NAME).order_by('-weight_1')
+        first = unlabeled[0].weight_1
+        last = unlabeled.last().weight_1
+        assert first >= last
+#        print(first, unlabeled[0].id, last, 'filas')
+#        print('Unlabeled number', unlabeled.count())
+        unlabeled_ids = unlabeled.values_list('id', flat=True)
+#        print(unlabeled_ids[:5])
+        
+        js = {'unlabeled_ids': list(unlabeled_ids)}
+        return HttpResponse(json.dumps(js), content_type='application/json') 
+
+class UnlabeledMobileInfo(APIView):
+
+    # Take a single Face ID from the list returned by ConfidentUnlabeledView,
+    # and build all the data it would require to put that image on a page / 
+    # app screen with possible names and the URLs to assign the face that name.
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, *args, **kwargs):
+        
+        selected_id = kwargs['id']
+
+        host_url = f'https://{request.get_host()}/api'
+        
+        # Get: URL for full size image
+        # URL for small image (face_array)
+        # URL for large image (face_source)
+        # URL to assign the face to no-one.
+        # Names for various assignments and the URL and payload
+        # to assign the person to that. 
+
+        face_img = f"{host_url}/keyed_image/face_array/?id={selected_id}&access_key={settings.RANDOM_ACCESS_KEY}"
+        whole_img = f"{host_url}/keyed_image/face_source/?id={selected_id}&access_key={settings.RANDOM_ACCESS_KEY}"
+        ignore_url = f"{host_url}/faces/{selected_id}/ignore_face/"
+        ignore_payload = {'ignore_type': 'soft'}
+
+        face_object = Face.objects.get(id = selected_id)
+
+        people_foreign_keys = [face_object.poss_ident1, \
+            face_object.poss_ident2, \
+            face_object.poss_ident3, \
+            face_object.poss_ident4, \
+            face_object.poss_ident5, ]
+
+        names = []
+        for idx in range(len(people_foreign_keys)):
+            weight = face_object.__dict__[f'weight_{idx + 1}']
+            # Can't get a foreign key from the __dict__, so 
+            # use the list above
+            
+            person = people_foreign_keys[idx]
+            if person is not None:
+                name = person.person_name
+                pid = person.id
+                # store.get('api_url') + '/faces/' + faceId + '/assign_face_to_person/
+                person_info = {
+                    'name': name,
+                    'confirm_patch_url': f"{host_url}/faces/{selected_id}/assign_face_to_person/",
+                    'patch_data': {'declared_name_key': pid},
+                    'person_id': pid,
+                    'weight': weight,
+                }
+                names.append(person_info)
+
+        js = {'face_img_url': face_img,
+              'source_img_url': whole_img,
+              'names': names,
+              'ignore_url': ignore_url,
+              'ignore_payload': ignore_payload,
+              } 
+
+        return HttpResponse(json.dumps(js), content_type='application/json') 
 

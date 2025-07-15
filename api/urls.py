@@ -5,6 +5,7 @@ from api import views
 from django.urls import path
 from rest_framework.authtoken.views import obtain_auth_token  # <-- Here
 from rest_framework_simplejwt import views as jwt_views
+from django.views.generic import RedirectView
 
 # app_name = 'api'
 
@@ -26,13 +27,16 @@ router.register(r'server_stats', views.StatsViewSet, basename='stats')
 # http post https://picasa.exploretheworld.tech/api/request-token/ username=benjamin password=********
 urlpatterns = [
     # path('request-token/', obtain_auth_token, name='api_token_auth'),  
-    path('token/obtain/', views.TokenPairWithUsername.as_view(), name='token_create'),  # override sjwt stock token
-    path('token/refresh/', jwt_views.TokenRefreshView.as_view(), name='token_refresh'),
+    path(r'token/obtain/', views.TokenPairWithUsername.as_view(), name='token_create'),  # override sjwt stock token
+    path(r'token/obtain', RedirectView.as_view(url = '/token/obtain/', permanent=True), name='token_create'),
+    path(r'token/refresh/', jwt_views.TokenRefreshView.as_view(), name='token_refresh'),
     # url(r'^', include(router.urls)),
     path('', include(router.urls)),
     path(r'image_list/', views.filteredImagesView.as_view(), name='image_list'),
     path(r'paginate_obj_ids/<int:id>/<slug:field>', views.PersonParamView.as_view(), name='face_pages'),
     path(r'person_list/', views.PersonListView.as_view(), name='person_list'),
     path(r'folder_list/', views.FolderListView.as_view(), name='folder_list'),
-    path(r'keyed_image/<slug:type>/', views.KeyedImageView.as_view(), name='keyed_image')
+    path(r'keyed_image/<slug:type>/', views.KeyedImageView.as_view(), name='keyed_image'),
+    path(r'mobile/confident_unlabeled/', views.ConfidentUnlabeledView.as_view(), name='unlabeled'),
+    path(r'mobile/unlabeled_instance/<int:id>/', views.UnlabeledMobileInfo.as_view(), name='unlabeled_instances'),
 ]

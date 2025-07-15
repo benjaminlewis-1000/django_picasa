@@ -3,6 +3,7 @@
 import torch.utils.data as data
 import numpy as np
 import torch
+torch.backends.nnpack.enabled = False
 
 class FaceLabelSet(data.Dataset):
     def __init__(self, which_features):

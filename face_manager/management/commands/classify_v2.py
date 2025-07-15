@@ -34,8 +34,10 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
 
         classer = face_classify.faceAssigner()
-        classer.clear_unassigned_images()
-        classer.execute(True)
+        # print("Clearing unassigned images...")
+        # classer.clear_unassigned_images()
+        print("Classifying...")
+        classer.execute(False)
 
 # class siameseModel(nn.Module):
 #     def __init__(self, n_layers, activation, layers_sizes, dropouts, in_size, loss_type):

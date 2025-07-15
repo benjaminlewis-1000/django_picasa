@@ -2,6 +2,7 @@
 
 import torch.nn as nn 
 import torch
+torch.backends.nnpack.enabled = False
 
 class ContrastiveCenterLoss(nn.Module):
     def __init__(self, dim_hidden, num_classes, lambda_c=1.0, use_cuda=True):

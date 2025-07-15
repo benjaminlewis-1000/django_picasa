@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional
 import torchvision
+torch.backends.nnpack.enabled = False
 
 class faceAssigner():
 
@@ -58,9 +59,6 @@ class faceAssigner():
 
         # Sets self.person_ids
         self.get_filtered_list_of_faces(min_num_faces = self.MIN_NUM)
-        # Shouldn't do anything, but double checks that 
-        # a field is set in the database
-        self.doubleCheckFacesTimes()
         # Get earliest date for each person. 
         self.known_persons_to_dates()
 
@@ -75,6 +73,11 @@ class faceAssigner():
             p.save()
 
     def execute(self, redo_all=False):
+
+        if redo_all:
+            # Shouldn't do anything, but double checks that 
+            # a field is set in the database
+            self.doubleCheckFacesTimes()
         
         # Now we want to get each unassigned image
         unassigned_crit = Q(declared_name__person_name=settings.BLANK_FACE_NAME)
@@ -226,16 +229,18 @@ class faceAssigner():
         faces = Face.objects.filter(dateTakenUTC=0)
 
         count = faces.count()
-        # print(f"Faces found: {count}")
 
         for idx, face in enumerate(faces.iterator()):
             if idx % 100 == 0:
-                print(f'{idx / count * 100:.2f}%')
+                print(f'Checking face times: {idx / count * 100:.2f}%')
             date_utc = face.source_image_file.dateTakenUTC
-            face.dateTakenUTC = date_utc
-            super(Face, face).save()
+            face_utc = face.dateTakenUTC
+            if date_utc != face_utc:
+                face.dateTakenUTC = date_utc
+                super(Face, face).save()
 
     def classify_unassigned(self, u_img):
+        s = time.time()
 
         date = u_img.source_image_file.dateTaken.timestamp()
         # print(date)
@@ -307,39 +312,66 @@ class faceAssigner():
 
                 # print(l2_dist)
                 comparison_mat[row_num, :len(l2_dist)] = l2_dist
-                # print('here')
+
                 if len(l2_dist) < N_COMPARISONS:
                     comparison_mat[row_num, len(l2_dist):] = l2_dist[-1]
-                # print('here')
 
-                # dist_per_category.append(float(torch.min(l2_dist).detach()))
-
-        # print(comparison_mat)
+        # print(comparison_mat.shape)
         top_votes = np.argmin(comparison_mat, 0)
         vote_counts = np.bincount(top_votes)
+
+        have_votes = np.where(vote_counts > 0)
+        vote_nonzero_counts = vote_counts[have_votes]
+        # print(top_votes, vote_counts)
         # print(top_votes)
         # print(vote_counts)
-        most_votes_ranked = np.argsort(vote_counts)[::-1]
+        most_votes_ranked = np.argsort(vote_nonzero_counts)[::-1]
+        most_votes_ranked = have_votes[0][most_votes_ranked]
         average_dists = np.mean(comparison_mat, 1)
+        # print(most_votes_ranked, average_dists, top_votes, vote_counts, have_votes)
+        # print(average_dists)
 
-        best_id = self.person_ids[most_votes_ranked[0]]
-        first_wt = average_dists[most_votes_ranked[0]]
-        person = Person.objects.get(id=best_id)
-        if self.DEBUG:
-            print(time.time() - s, person, first_wt, len(average_dists), len(self.person_ids), average_dists)
+        top_weight = average_dists[most_votes_ranked[0]]
+        assignments = []
+        
+        thresh = 55
+        offset = 1
+        if top_weight > thresh and self.ignore_person.id not in rejected_ids:
+            insert_value = {'idx': 1,
+                            'id': self.ignore_person.id, 
+                            # 'person': self.ignore_person,
+                            'weight': 5} # float(top_weight)}
+            # Set as an unknown person
+            assignments.append(insert_value)
+            offset = 2
+
+        for ii in range(len(most_votes_ranked)):
+            person_id = self.person_ids[most_votes_ranked[ii]]
+            person = Person.objects.get(id=person_id)
+            person_id = person.id
+            weight = average_dists[most_votes_ranked[ii]]
+
+            insert_value = {'idx': ii + offset,
+                            'id': person_id, 
+                            # 'person': person,
+                            'weight': float(np.max((0, thresh - weight)))}
+
+            assignments.append(insert_value)
+
+            if self.DEBUG:
+                print(time.time() - s, person, weight, len(average_dists), len(self.person_ids), average_dists)
 
         # Set a threshold for a not-person
-        thresh = 55
-        if first_wt > thresh and self.ignore_person.id not in rejected_ids:
-            # Set as an unknown person
-            person_id = self.ignore_person
-            weight_val = first_wt
-        else:
-            person_id = person
-            weight_val = np.max((0, thresh - first_wt))
-
+        number_assignments = np.min((5, len(assignments)))
         u_img.set_possibles_zero()
-        u_img.set_possible_person( person_id.id, 1, weight_val)
+
+        for assign_idx in range(number_assignments):
+            person_id = assignments[assign_idx]['id']
+            index = assignments[assign_idx]['idx']
+            weight = assignments[assign_idx]['weight']
+            u_img.set_possible_person( person_id, index, weight)
+
+        settings.LOGGER.debug(f"Assigning one image took {time.time() - s:.2f} seconds")
 
 
 class siameseModel(nn.Module):

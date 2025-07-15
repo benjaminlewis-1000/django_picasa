@@ -3,6 +3,7 @@
 import pickle
 import albumentations as A
 import torch
+torch.backends.nnpack.enabled = False
 import torchvision
 from facenet_pytorch import MTCNN, InceptionResnetV1
 import numpy as np

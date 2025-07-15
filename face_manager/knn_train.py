@@ -21,6 +21,7 @@ import pickle
 import face_classifier
 from sklearn.neighbors import KNeighborsClassifier as knn_class
 from collections import Counter, OrderedDict
+torch.backends.nnpack.enabled = False
 
 def classify_unlabeled_faces():
 
