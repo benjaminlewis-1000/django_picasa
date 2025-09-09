@@ -243,6 +243,15 @@ class Face(models.Model):
 
         self.save()
 
+    def clear_person(self):
+        self.set_possibles_zero()
+    
+        if self.declared_name != None:
+            self.declared_name.decrement_assigned()
+            self.declared_name = None
+    
+        self.save() 
+
     def verify_person_in_image(self):
         self.declared_name.decrement_unverified()
 

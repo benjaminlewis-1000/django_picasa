@@ -936,12 +936,11 @@ class ConfidentUnlabeledView(APIView):
         first = unlabeled[0].weight_1
         last = unlabeled.last().weight_1
         assert first >= last
-#        print(first, unlabeled[0].id, last, 'filas')
-#        print('Unlabeled number', unlabeled.count())
         unlabeled_ids = unlabeled.values_list('id', flat=True)
 #        print(unlabeled_ids[:5])
         
         js = {'unlabeled_ids': list(unlabeled_ids)}
+        print(HttpResponse(json.dumps(js), content_type='application/json'))
         return HttpResponse(json.dumps(js), content_type='application/json') 
 
 class UnlabeledMobileInfo(APIView):
@@ -991,7 +990,8 @@ class UnlabeledMobileInfo(APIView):
                 person_info = {
                     'name': name,
                     'confirm_patch_url': f"{host_url}/faces/{selected_id}/assign_face_to_person/",
-                    'patch_data': {'declared_name_key': pid},
+                    'confirm_patch_data': {'declared_name_key': pid},
+                    'disassociate_patch_url': f"{host_url}/faces/{selected_id}/unassign_face/",
                     'person_id': pid,
                     'weight': weight,
                 }
@@ -1006,3 +1006,28 @@ class UnlabeledMobileInfo(APIView):
 
         return HttpResponse(json.dumps(js), content_type='application/json') 
 
+class ResetFace(APIView):
+
+    # Given a Face ID, reset it - make sure that there are no assigned names for that
+    # face. It will trigger a re-classification. 
+    permission_classes = (IsAuthenticated,)
+
+    @action(detail=True, methods=['patch', 'put'])
+    def patch(self, request, *args, **kwargs):
+        
+        selected_id = kwargs['id']
+
+        face_object = Face.objects.get(id = selected_id)
+        face_object.clear_person()
+
+class MobileNameList(APIView):
+    # Get a list of all defined person names.
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, *args, **kwargs):
+        print("here")
+
+        js = {'name_list': ['a', 'b', 'c', 'd']}
+        print(js)
+        print(HttpResponse(json.dumps(js), content_type='application/json'))
+        return HttpResponse(json.dumps(js), content_type='application/json') 

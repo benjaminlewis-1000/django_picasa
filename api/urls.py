@@ -39,4 +39,6 @@ urlpatterns = [
     path(r'keyed_image/<slug:type>/', views.KeyedImageView.as_view(), name='keyed_image'),
     path(r'mobile/confident_unlabeled/', views.ConfidentUnlabeledView.as_view(), name='unlabeled'),
     path(r'mobile/unlabeled_instance/<int:id>/', views.UnlabeledMobileInfo.as_view(), name='unlabeled_instances'),
+    path(r'mobile/reset/<int:id>/', views.ResetFace.as_view(), name='reset'),
+    path(r'mobile/name_list/', views.MobileNameList.as_view(), name='name_list'),
 ]
