@@ -17,6 +17,7 @@ import PIL
 import shutil
 import time
 import face_recognition
+import common
 
 class Command(BaseCommand):
 
@@ -62,7 +63,7 @@ class Command(BaseCommand):
         chip = cv2.cvtColor(chip, cv2.COLOR_BGR2RGB)
 
         image = face.source_image_file.filename
-        image = self.open_img_oriented(image)
+        image = common.open_img_oriented(image)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         cv2.imwrite('/code/tmp_data/chip.png', chip)
@@ -97,36 +98,6 @@ class Command(BaseCommand):
             self.ignore_images = Face.objects.filter(criterion_rejected)[:10] 
         else:
             self.ignore_images = Face.objects.filter(criterion_rejected).order_by('?')
-        
-
-    def open_img_oriented(self, filename):
-
-        try:
-            image = PIL.Image.open(filename)
-        except Exception as e:
-            print("EX", e)
-            return None
-
-        for orientation in ExifTags.TAGS.keys():
-            if ExifTags.TAGS[orientation]=='Orientation':
-                break
-
-        try:
-            exif=dict(image._getexif().items())
-        except Exception as e:
-            exif = {}
-
-        if orientation in exif.keys():
-            if exif[orientation] == 3:
-                image=image.rotate(180, expand=True)
-            elif exif[orientation] == 6:
-                image=image.rotate(270, expand=True)
-            elif exif[orientation] == 8:
-                image=image.rotate(90, expand=True)
-
-        # print(image.shape)
-        image = np.array(image)
-        return image
         
 
     def extract_chip(self, face):

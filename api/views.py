@@ -32,40 +32,12 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q
 from time import sleep
 
+import common
 import json
 from io import BytesIO
 from filters.mixins import (
     FiltersMixin,
 )
-
-
-def open_img_oriented(filename):
-
-    try:
-        image = PIL.Image.open(filename)
-    except Exception as e:
-        return None
-
-    # if image_type in ['slideshow', 'face_source']: 
-    #     # Resize the image dynamically
-    for orientation in ExifTags.TAGS.keys():
-        if ExifTags.TAGS[orientation]=='Orientation':
-            break
-
-    try:
-        exif=dict(image._getexif().items())
-    except Exception as e:
-        exif = {}
-
-    if orientation in exif.keys():
-        if exif[orientation] == 3:
-            image=image.rotate(180, expand=True)
-        elif exif[orientation] == 6:
-            image=image.rotate(270, expand=True)
-        elif exif[orientation] == 8:
-            image=image.rotate(90, expand=True)
-
-    return image
 
 # Create your views here.
 
@@ -396,7 +368,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         # Extract the source file, oriented. 
         source_file = face.source_image_file.filename
         pixel_hash = face.source_image_file.pixel_hash
-        image = open_img_oriented(source_file)
+        image = common.open_img_oriented(source_file)
         # Crop out the image, resize, encode in ByteIO, etc.
         img_thmb = image.crop((r_left, r_top, r_right, r_bot))
         img_thmb = np.array(img_thmb)
@@ -795,7 +767,7 @@ class KeyedImageView(APIView):
             return err_404(f'Bad id for object of type {image_type}')
 
 
-        image = open_img_oriented(image)
+        image = common.open_img_oriented(image)
 
         # Resize image. Allow for upsampling now. 
         w, h = image.size[:2]

@@ -12,10 +12,6 @@ services:
       dockerfile: Dockerfile_picasa
       args:
         buildno: 1
-    deploy:
-      resources:
-        limits:
-          cpus: '1.5'
     image:
       picasa_img
     container_name: picasa_api
@@ -42,6 +38,7 @@ services:
       - ${MEDIA_FILES_LOCATION}:/media
       - ${LOG_LOCATION}:/var/log/picasa
       - ${MODEL_LOCATION}:/models
+      - ${MODEL_LOCATION}:/root/.insightface/models
     depends_on:
       - db_django
     networks:

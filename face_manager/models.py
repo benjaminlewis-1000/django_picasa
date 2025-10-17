@@ -151,6 +151,8 @@ class Face(models.Model):
                             size=512, blank=True, null=True
                         )
 
+    detected_age = models.IntegerField(default=-1)
+    
     # This field will contain the top 5 possible identities as categorized
     # by the FC network.
     # Like the declared name, these also have the on_delete method set. 

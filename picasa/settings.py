@@ -154,6 +154,7 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt.token_blacklist', ## Added
     'corsheaders',
     'filepopulator',
+    'common', 
     'train_classify',
     'face_manager',
     'api',
@@ -381,10 +382,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'filepopulator.check_mod_dates',
         'schedule': crontab(hour = '23'),
     },
-   'reencode_images': {
-        'task': 'face_manager.reencode', 
-        'schedule': crontab( minute = '*/10', hour='*/1'),
-    },
+#   'reencode_images': {
+#        'task': 'face_manager.reencode', 
+#        'schedule': crontab( minute = '*/10', hour='*/1'),
+#    },
    'set_face_counts': {
        'task': 'face_manager.set_face_counts',
        'schedule': crontab( minute = '0', hour='*/4'),
