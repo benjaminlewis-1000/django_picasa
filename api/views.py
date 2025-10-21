@@ -368,7 +368,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         # Extract the source file, oriented. 
         source_file = face.source_image_file.filename
         pixel_hash = face.source_image_file.pixel_hash
-        image = common.open_img_oriented(source_file)
+        image = common.open_img_oriented(source_file, as_numpy = False)
         # Crop out the image, resize, encode in ByteIO, etc.
         img_thmb = image.crop((r_left, r_top, r_right, r_bot))
         img_thmb = np.array(img_thmb)
@@ -767,7 +767,7 @@ class KeyedImageView(APIView):
             return err_404(f'Bad id for object of type {image_type}')
 
 
-        image = common.open_img_oriented(image)
+        image = common.open_img_oriented(image, as_numpy = False)
 
         # Resize image. Allow for upsampling now. 
         w, h = image.size[:2]

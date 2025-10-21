@@ -17,7 +17,7 @@ def extract_faces(filename: str) -> dict:
     if not os.path.exists(filename):
         raise FileNotFoundError(f"File {filename} not found")
 
-    img_numpy = common.open_img_oriented(filename)
+    img_numpy = common.open_img_oriented(filename, as_numpy=True)
 
     app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])  # Use 'CUDAExecutionProvider' for GPU
     app.prepare(ctx_id=-1)  # ctx_id=-1 for CPU, 0 for GPU

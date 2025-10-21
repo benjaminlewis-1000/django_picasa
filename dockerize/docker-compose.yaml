@@ -19,7 +19,8 @@ services:
       bash /startup.sh
     env_file:
       - .env
-    # environment:
+    environment:
+      - TZ=America/New_York
       # Add the following line to your /etc/profile:
       # HOST_IP=`ip route | grep default | awk '{print $9}'`
       # - DOCKER_HOST_IP=${HOST_IP} 

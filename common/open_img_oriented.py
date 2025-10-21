@@ -7,7 +7,7 @@ import PIL
 from PIL import Image, ExifTags
 import numpy as np
 
-def open_img_oriented(filename: str):
+def open_img_oriented(filename: str, as_numpy: bool):
     # Open an image, get its metadata from the EXIF tag,
     # orient it, and then return as a numpy array
 
@@ -38,6 +38,7 @@ def open_img_oriented(filename: str):
             image=image.rotate(90, expand=True)
 
     # print(image.shape)
-    image = np.array(image)
+    if as_numpy:
+        image = np.array(image)
     return image
 

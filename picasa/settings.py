@@ -370,7 +370,7 @@ CELERY_BEAT_SCHEDULE = {
     },
    'face_add': {
        'task': 'face_manager.face_extraction', 
-       'schedule': crontab( hour = '*', minute='*/1'),
+       'schedule': crontab( hour = '*', minute='5,15,25,35,45,55'),
         # OK to schedule every 2 minutes, because it will
         # either get locked by the lock file, or it will
         # die and get restarted pretty quickly.
@@ -380,7 +380,7 @@ CELERY_BEAT_SCHEDULE = {
    },
    'check_mods': {
         'task': 'filepopulator.check_mod_dates',
-        'schedule': crontab(hour = '23'),
+        'schedule': crontab(minute='0', hour = '23'),
     },
 #   'reencode_images': {
 #        'task': 'face_manager.reencode', 

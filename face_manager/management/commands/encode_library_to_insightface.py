@@ -37,7 +37,7 @@ class Command(BaseCommand):
         source = pp.source_image_file.filename
         # Get the faces that are in the image already
 
-        img_numpy = common.open_img_oriented(source)
+        img_numpy = common.open_img_oriented(source, as_numpy = True)
 
         # Get existing faces, if any, attached to the image.
         # Put the bounding boxes of these faces into a 2D tensor.

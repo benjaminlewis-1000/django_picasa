@@ -25,9 +25,7 @@ def delete_old_thumbnails(instance):
     os.remove(instance.thumbnail_small.path)
 
 def instance_clean_and_save(instance):
-    #            print(cur_file)
 
-    print("Saving an instance")
     file_path = instance.filename
     try:
         instance.full_clean()
@@ -44,7 +42,6 @@ def instance_clean_and_save(instance):
             print(instance.__dict__)
             
             raise ve
-        settings.LOGGER.debug(f"Saved file {file_path} to database")
         settings.LOGGER.debug(f"Saved file {file_path} to database")
 
         assert os.path.isfile(instance.thumbnail_big.path), \
@@ -99,11 +96,14 @@ def create_image_file(file_path):
     duplicate_exists = DuplicateFile.objects.filter(filename=file_path)
 
     if len(duplicate_exists) > 0:
-        # print("We already have a duplicate.")
+        # Then we just want to get rid of everything and start over... 
+        for existing_file in exist_photo:
+            existing_file.delete()
+        for dupe in duplicate_exists:
+            dupe.delete()
         return
     
     new_photo = ImageFile(filename=file_path)
-
 
     # Case 1: photo exists at this location.
     if len(exist_photo):
@@ -117,7 +117,7 @@ def create_image_file(file_path):
         exist_timestamp = exist_photo.dateModified.timestamp()
         new_photo._get_mod_time()
         adding_timestamp = new_photo.dateModified.timestamp()
-        settings.LOGGER.info("Check: ", datetime.fromtimestamp(os.path.getctime(file_path)).timestamp(), adding_timestamp)
+        settings.LOGGER.info(f"Check: {datetime.fromtimestamp(os.path.getctime(file_path)).timestamp()}, {adding_timestamp}")
 
         # Check the timestamp between the database and the file 
         # under consideration. If they are exactly the same, 
@@ -127,7 +127,7 @@ def create_image_file(file_path):
         # values) and some not (most pictures). Timestamp simply
         # turns it into a float of UTC seconds. 
         if exist_timestamp == adding_timestamp:
-            settings.LOGGER.info(exist_timestamp, adding_timestamp)
+            settings.LOGGER.info(f"Existing timestamp: {exist_timestamp}, Adding timestamp: {adding_timestamp}")
             return
         # Only if the files are *not* the same do we compute the
         # md5 hash of the file. This is because reading in the 
@@ -331,7 +331,7 @@ def check_file_mods():
 
             # else:
                 # Don't worry about it -- it's in new_files
-        print(f"Mod file length is {len(modded_files)}")
+        settings.LOGGER.debug(f"Mod file length is {len(modded_files)}")
                     
         # Now process the new and modded files. 
 
@@ -352,46 +352,6 @@ def check_file_mods():
         settings.LOGGER.error(stack_trace) 
     finally:
         print("Finished checking file mod times!")
-#        try:
-#            os.remove(lockfile)
-#        except FileNotFoundError:
-#            pass
-
-
-
-
-
-
-        # try:
-        #     for root, dirs, files in os.walk(root_dir):
-        #         for f in files:
-        #         # Try/catch block only on individual file; lets the rest of the files be added regardless
-        #         # of a failure on one. 
-        #             count += 1
-        #             if count > 0 and count % 10000 == 0:
-        #                 print(f"Processed {count:,} images in add from root directory")
-        #             try:
-        #                 cur_file = os.path.join(root, f)
-        #                 cur_parts = cur_file.split(os.sep)[:-1]
-        #                 filename = cur_file.split(os.sep)[-1]
-        #                 if re.match(r'\.', filename):
-        #                     # Don't try to add files starting with a period - they're often
-        #                     # just system files. 
-        #                     continue
-        #                 # Check if a folder starts with '.'.
-        #                 if not True in set(map(lambda x: x.startswith('.'), cur_parts) ):
-        #                     create_image_file(cur_file)
-        #             except Exception as e:
-        #                 stack_trace = traceback.format_exc()
-        #                 settings.LOGGER.error(type(e).__name__)
-        #                 settings.LOGGER.error(e)
-        #                 settings.LOGGER.error(cur_file)
-        #                 settings.LOGGER.error(stack_trace) 
-        # finally:
-        #     try:
-        #         os.remove(lockfile)
-        #     except FileNotFoundError:
-        #         pass
 
 def delete_removed_photos():
     all_photos = ImageFile.objects.all()

@@ -44,6 +44,7 @@ RUN cp /usr/bin/python3 /usr/bin/python
 
 # RUN apt install -y postgresql
 RUN DEBIAN_FRONTEND=noninteractive apt install -y postgresql # postgresql-contrib
+RUN apt install -y iputils-ping
 RUN rm -r /var/lib/apt/lists
 
 ADD startup.sh /startup.sh

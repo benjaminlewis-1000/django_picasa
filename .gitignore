@@ -1,4 +1,5 @@
 thumbnails/*
+*.swp
 *.ptw
 server-notifications-django/
 MISC_DATA/

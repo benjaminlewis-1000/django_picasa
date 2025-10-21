@@ -63,7 +63,7 @@ class Command(BaseCommand):
         chip = cv2.cvtColor(chip, cv2.COLOR_BGR2RGB)
 
         image = face.source_image_file.filename
-        image = common.open_img_oriented(image)
+        image = common.open_img_oriented(image, as_numpy = True)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         cv2.imwrite('/code/tmp_data/chip.png', chip)
@@ -117,7 +117,7 @@ class Command(BaseCommand):
 
         # Load image to np array
         image = face.source_image_file.filename
-        image = self.open_img_oriented(image) # face_recognition.load_image_file(image)
+        image = common.open_img_oriented(image, as_numpy = True) # face_recognition.load_image_file(image)
         imh, imw = image.shape[:2]
 
         if l < 0:
