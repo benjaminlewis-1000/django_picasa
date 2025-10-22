@@ -38,7 +38,7 @@ celery -A picasa beat -l INFO --pidfile="/locks/celerybeat.pid"  &
 #     celery -A picasa worker -l INFO -c 4 --max-tasks-per-child 3 -n worker${i}  --uid=1001 --gid=1001 &
 #     celery -A picasa worker -l INFO -c 4 --max-tasks-per-child 3 -n worker${i}  --uid=root --gid=root &
 # done
-celery -A picasa worker -l INFO --max-tasks-per-child 3 -n worker  & # --uid=nobody --gid=nogroup &
+celery -A picasa worker -l INFO -c 20 --max-tasks-per-child 3 -n worker  & # --uid=nobody --gid=nogroup &
 
 gunicorn -b 0.0.0.0:8000 picasa.wsgi & 
 

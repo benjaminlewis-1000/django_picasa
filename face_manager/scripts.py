@@ -16,28 +16,6 @@ import torch
 import traceback
 torch.backends.nnpack.enabled = False
 
-def establish_server_connection():
-    server_conn = image_face_extractor.ip_finder.server_finder(logger=settings.LOGGER)
-
-    return server_conn
-
-def establish_multi_server_connection():
-    # server_conn = image_face_extractor.ip_finder.server_finder(logger=settings.LOGGER)
-    server_conn = image_face_extractor.ip_finder_multi.server_finder(logger=settings.LOGGER)
-
-    return server_conn
-
-
-def get_inception_embedding(highlight):
-
-    image = (highlight - 127.5) / 128
-    image = torch.Tensor(image)
-    resnet = InceptionResnetV1(pretrained='vggface2').eval()
-    encoding = resnet(image.unsqueeze(0))
-    encoding = encoding.detach().numpy().astype(np.float32)
-    encoding = list(encoding[0])
-
-    return encoding
 
 def placeInDatabase(foreign_key, face_data):
 
@@ -161,73 +139,3 @@ def placeInDatabase(foreign_key, face_data):
         
     return True
 
-
-def populateFromImage(img_object, server_conn = None):
-
-    if server_conn is None:
-        server_conn = establish_server_connection()
-    else:
-        if server_conn.check_ip() is False:
-            server_conn.find_external_server()
-
-    filename = img_object.filename
-    foreign_key = img_object
-
-    changed_fk = False
-
-    if foreign_key.isProcessed:
-        return None, server_conn, changed_fk
-
-    changed_fk = True
-
-    # def face_from_facerect(self, filename):
-    face_data = image_face_extractor.image_client.face_extract_client(filename, server_conn, logger=settings.LOGGER)
-    
-    placeInDatabase(foreign_key, face_data)
-    print(f"Faces from image {filename} have been placed in database.")
-
-    return face_data, server_conn, changed_fk 
-
-
-# def populateFromImageMultiGPU(img_object, server_conn = None, server_ip = None, ip_checked=False):
-
-#     filename = img_object.filename
-#     foreign_key = img_object
-    
-#     if server_ip is None:
-#         server_ip = 0
-    
-#     if server_conn is None:
-#         server_conn = establish_multi_server_connection()
-#         server_ip = 0
-#     else:
-#         if server_conn.check_ip(server_ip) is False:
-#             server_conn.find_external_server()
-#             server_ip = 0
-
-
-#     changed_fk = False
-
-#     if foreign_key.isProcessed:
-#         return None, server_conn, changed_fk
-
-#     changed_fk = True
-
-#     if not os.path.isfile(filename): #could have moved
-#         raise OSError(f"File {filename} not found.")
-
-#     face_data = image_face_extractor.image_client_multi.face_extract_client(filename, server_conn, ip_address=server_ip, logger=settings.LOGGER, ip_checked = ip_checked)
-#     print(f"Worked! IP was {server_ip}, length is {len(face_data)}, file is {filename}")
-#     settings.LOGGER.debug(f"Worked! IP was {server_ip}, length is {len(face_data)}, file is {filename}")
-#     placeInDatabase(foreign_key, face_data)
-#     print(f"Faces from {filename} have been placed in database.")
-#     settings.LOGGER.debug(f"Faces from {filename} have been placed in database.")
-
-#     return face_data, server_conn, changed_fk 
-
-
-def assignSourceImage(face_model, person_model):
-    savePath = person_model.highlight_img.path
-
-    shutil.copyfile(face_model.face_thumbnail.path, person_model.highlight_img.path)    
-    

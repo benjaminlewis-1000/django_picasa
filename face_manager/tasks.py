@@ -34,51 +34,6 @@ if not settings.configured:
 # app.config_from_object('django.conf:settings', namespace='CELERY')
 # app.autodiscover_tasks() 
 
-# @shared_task(ignore_result=False, name='face_manager.reencode')
-# def reencode_face():
-#     print("Reencoding!")
-#     settings.LOGGER.warning("Reencoding!")
-# 
-#     start_time = time.time()
-# 
-#     criterion_ign = ~Q(declared_name__person_name__in=['.ignore', '.realignore', '.jessicatodo', '.cutler_tbd'] )
-#     criterion_2 = Q(reencoded=False)
-# 
-#     all_faces = Face.objects.filter(criterion_ign&criterion_2).order_by('?')
-# 
-#     num_faces = all_faces.count()
-#     print(f"There are {num_faces} faces to reencode.")
-# 
-#     client_ip = ip_finder.server_finder()
-#     print("Found client IP")
-# 
-#     iter_num = 1
-#     try:
-#         for face in all_faces.iterator():
-#             print(f'{iter_num}/{num_faces}, {iter_num / num_faces * 100:.4f}%')
-#             settings.LOGGER.debug(f'Reencode: {iter_num}/{num_faces}, {iter_num / num_faces * 100:.4f}%')
-#             iter_num += 1
-#             if face.reencoded:
-#                 continue
-# 
-#             face_location = [(face.box_top, face.box_right, face.box_bottom, face.box_left)]
-#             source_image_file = face.source_image_file.filename
-# 
-#             encoding = reencoder.face_encoding_client(source_image_file, face_location, client_ip)
-#             # print(source_image_file, face_location, encoding)
-# 
-#             face.face_encoding = encoding
-#             face.reencoded = True
-#             face.save()
-# 
-#             # Kill after 5 minutes
-#             if time.time() - start_time > 54 * 60:
-#                 settings.LOGGER.debug(f"Ending reencode, running for {time.time() - start_time:.2f} seconds")
-#                 return
-#                 
-#     except Exception as e:
-#         settings.LOGGER.warning(f"reencode_face has failed: {e}")
-
 @shared_task(ignore_result=True, name='face_manager.face_extraction')
 def process_faces():
     starttime = time.time()
