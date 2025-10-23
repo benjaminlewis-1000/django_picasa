@@ -1,6 +1,7 @@
 #! /usr/bin/env python
 
 from insightface.app import FaceAnalysis
+import insightface 
 import numpy as np
 import torch
 import torchvision.ops.boxes as bops
@@ -119,6 +120,9 @@ class PyramidalDetector():
         bboxes = [det['bbox'] for det in overlapping_detections]
         bboxes = torch.tensor(np.array(bboxes))
 
+        if len(overlapping_detections) == 0:
+            return overlapping_detections
+
         iou = self.iou_function(bboxes, bboxes)
         binary_iou = torch.gt(iou, self.iou_thresh).to(torch.float)
         # Binary IOU matrix should be symmetric, so assert that it is
@@ -160,7 +164,7 @@ class PyramidalDetector():
             group_idcs = torch.where(face_group_row)[0]
             face_group = [overlapping_detections[f] for f in group_idcs]
             if len(face_group) == 1:
-                deduplicated_faces.append(face_group)
+                deduplicated_faces.append(face_group[0])
             else:
                 det_levels = np.array([f['detect_pyr_level'] for f in face_group])
                 on_screen = np.array([not f['off_screen'] for f in face_group])
@@ -211,5 +215,7 @@ class PyramidalDetector():
                 deduplicated_faces.append(chosen_detection)
 
         assert len(deduplicated_faces) == rank
+        assert type(deduplicated_faces) == list
+        assert type(deduplicated_faces[0]) == insightface.app.common.Face
 
         return deduplicated_faces

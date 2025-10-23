@@ -2,6 +2,7 @@ from django.db import models
 from django.conf import settings
 from django.forms import ModelForm
 from django.core.validators import MinValueValidator, MaxValueValidator, RegexValidator
+from django.core.exceptions import ValidationError
 from django.core.validators import *
 from datetime import datetime
 from django.utils import timezone
@@ -207,6 +208,29 @@ class Face(models.Model):
         os.remove(self.face_thumbnail.path)
         super(Face, self).delete()
 
+    def save(self, *args, **kwargs):
+        # Basic validation for the bounding box
+        if self.box_top >= self.box_bottom:
+            raise ValidationError(f'Box bottom ({self.box_bottom}) must be larger value than box top ({self.box_top}) ')
+        if self.box_right <= self.box_left:
+            raise ValidationError(f'Box right ({self.box_right}) must be larger value than box left ({self.box_left})')
+        # Get the image height and width
+        img_h = self.source_image_file.height
+        img_w = self.source_image_file.width
+
+        if self.box_top < 0:
+            raise ValidationError(f"Box top {self.box_top} is < 0")
+        if self.box_left < 0:
+            raise ValidationError(f"Box left {self.box_left} is < 0")
+        if self.box_bottom < 0:
+            raise ValidationError(f"Box bottom {self.box_bottom} is off the edge of the photo {img_h}")
+        if self.box_right < 0:
+            raise ValidationError(f"Box right {self.box_right} is off the edge of the photo {img_w}")
+
+        if not os.path.exists(self.face_thumbnail.file.name):
+            raise ValidationError(f"Face thumbnail image does not exist on the OS")
+            
+        return super().save(*args, **kwargs)
 
     def remove_poss_ident(self, poss_idx):
         if self.__dict__[f'poss_ident{poss_idx}_id'] != None:
