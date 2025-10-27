@@ -6,6 +6,7 @@ from django.conf import settings
 
 from django.db.models import Q
 from celery import shared_task
+from face_extract_encode import FaceExtractor
 from picasa import celery_app
 import time
 import os
@@ -57,6 +58,10 @@ def process_faces():
             settings.LOGGER.debug("Face file is locked, exiting.")
             settings.LOGGER.warning("Face adding locked!")
             return
+
+        extractor = FaceExtractor()
+        extractor.find_and_encode_faces()
+        exit()
             
         # all_images = ImageFile.objects.all()
         unprocessed_imgs = ImageFile.objects.filter(isProcessed=False).all()

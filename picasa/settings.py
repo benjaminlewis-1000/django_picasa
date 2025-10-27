@@ -370,7 +370,8 @@ CELERY_BEAT_SCHEDULE = {
     },
    'face_add': {
        'task': 'face_manager.face_extraction', 
-       'schedule': crontab( hour = '*', minute='5,15,25,35,45,55'),
+        # 'schedule': crontab( hour = '*', minute='5,15,25,35,45,55'),
+       'schedule': crontab( hour = '*', minute='*'),
         # OK to schedule every 2 minutes, because it will
         # either get locked by the lock file, or it will
         # die and get restarted pretty quickly.

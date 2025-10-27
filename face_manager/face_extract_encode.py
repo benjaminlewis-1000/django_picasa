@@ -4,6 +4,7 @@ from django.conf import settings
 from face_manager.models import Person, Face
 from filepopulator.models import ImageFile
 from insightface.app import FaceAnalysis
+import django
 from django.core.files.base import ContentFile
 from insightface.data import get_image as ins_get_image
 from io import BytesIO
@@ -83,21 +84,29 @@ class FaceExtractor(object):
         with detected faces. 
         """
 
+        # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Completed/Pictures_finished/Nicholas\' Pictures/Christmas time and Goblin Valley/PC094087.JPG') # SOLVED 
+        # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/2023/Nathaniel Preschool/Bloomz_e4d23164-bcab-4615-ad57-a20dc169de1b.jpeg') # SOLVED 
+        # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Completed/Pictures_finished/Family Pictures/2016/February 2016/Meagan Leaves/_DSC0247.JPG') # SOLVED 
+        # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/2024/Life/20240313_192916.jpg') # SOLVED 
+        ### unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/Emily_amazon_uploads/2017-01-05_07-37-57_903.jpeg') # SOLVED except for getting encoding
+        ### unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/2024/Family Texts/Resized_20221219_143329_20221220_015042.jpg')
+        ### unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Completed/Pictures_finished/Lewis Family Scans/Scan batch 2/1997_better/1997_00176A.jpg')
+        # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/2024/Florida/20240415_125811.jpg') # Eigenvalues match is wrong ### Solved by reducing IOU threshold, it seems. 
+        # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Completed/Pictures_finished/2016/Yellowstone/DSC_9447.JPG') # SOLVED 
+        # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/2021/Life/DSC_9825.JPG') # SOLVED - by setting the IOU threshold the same here and in pyramidal detector (0.3)
+        # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Pictures_In_Progress/preprocess/jessica_dropbox/2021-03-19 19.40.19.jpg') # No detected faces, some existing faces # SOLVED
         # Get unprocessed files.
-        unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/2024/Family Texts/Resized_20221219_143329_20221220_015042.jpg')
-        unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Completed/Pictures_finished/Nicholas\' Pictures/Christmas time and Goblin Valley/PC094087.JPG')
-        unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/2023/Nathaniel Preschool/Bloomz_e4d23164-bcab-4615-ad57-a20dc169de1b.jpeg')
-        unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Completed/Pictures_finished/Family Pictures/2016/February 2016/Meagan Leaves/_DSC0247.JPG')
-        unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/Emily_amazon_uploads/2017-01-05_07-37-57_903.jpeg')
-        unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Completed/Pictures_finished/Lewis Family Scans/Scan batch 2/1997_better/1997_00176A.jpg')
+        # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Pictures_In_Progress/Family History/Funk and Cutler Scans by Ariel Benson/1965-03-19 Clarence Funk and Joan Henderson Wedding/1965-03-19 (16) Clarence Funk and Joan Henderson Wedding.jpg')
+        # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Pictures_In_Progress/2019/Ben Work Trips/London and Brighton/2019-05-17 19.45.53-1.jpg') # SOLVED: del moved inside for loop
         unprocessed_imgs = ImageFile.objects.filter(isProcessed=False).order_by('?') 
-        # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/2024/Life/20240313_192916.jpg')
 
         for img_obj in unprocessed_imgs:
 
             source_file = img_obj.filename
             print(source_file)
             img_numpy = common.open_img_oriented(source_file, as_numpy = True)
+            assert len(img_numpy.shape) == 3
+            # print(img_numpy.shape)
 
             # Get existing faces, if any, attached to the image.
             # Put the bounding boxes of these faces into a 2D tensor
@@ -114,6 +123,7 @@ class FaceExtractor(object):
             # Use the self.app InsightFace module to detect and classify 
             # faces in the image. Populate those bounding boxes into a 
             # tensor to eventually compute IOU. 
+            # print(img_numpy.shape, type(img_numpy))
             detected_faces = self.app.get(img_numpy)
             n_detect = len(detected_faces)
             detect_boxes = torch.zeros(n_detect, 4)
@@ -128,6 +138,8 @@ class FaceExtractor(object):
 
                 dt_box = torch.tensor(det_face_obj['bbox']).unsqueeze(0)
                 detect_boxes[det_face_idx, :] = dt_box
+
+            # print(existing_boxes, "\n", detect_boxes)
 
             if n_existing == 0 and n_detect == 0:
                 # There is nothing to do here.
@@ -152,67 +164,146 @@ class FaceExtractor(object):
 
             # Suppress low IOUs
             iou[iou < self.IOU_thresh] = 0
-            max_ious = np.max(iou, axis=1) # Max IOU for each existing detection
+            # print(iou, len(iou), iou==[], type(iou), iou.shape)
+            if iou.shape[1] == 0:
+                assert n_detect == 0
+                print(iou, existing_boxes, detect_boxes)
+                print(type(existing_faces), existing_faces)
+                for jj in existing_faces:
+                    print(type(jj))
+                self.update_list_of_no_matching_detects(existing_faces)
+                img_obj.isProcessed = True
+                img_obj.save()
 
-            # Case 1 & 2
-            if np.min(max_ious) >= self.IOU_thresh:
-                # Candidate rows/columns are places where the IOU is greater
-                # than a threshold. 
-                candidate_rows, candidate_cols = np.where(iou >= self.IOU_thresh)
-                set_candidate_rows = list(set(candidate_rows.tolist()))
-                set_candidate_rows.sort()
+            else:
+                max_ious = np.max(iou, axis=1) # Max IOU for each existing detection
 
-                # Case 1: All match one-to-one for IOUs. 
-                if set_candidate_rows == np.arange(len(set_candidate_rows)).tolist():
-                    # print(f"One-to-one matches acquired")
-
-                    # Make sure to find indices where InsightFace found new faces.
-                    column_maxs = np.max(iou, axis=0)
-                    # print(iou, column_maxs)
-
-                    # This is the set of indices where a new face was detected by
-                    # InsightFace and needs to be added. 
-                    new_face_idcs = np.where(column_maxs == 0)[0]
-
-                    # Match existing faces to new data. This gives us an array
-                    # where the position in the array corresponds to the existing
-                    # face's index (position in existing_faces) and the value of that
-                    # position in the array is the newly detected face's index 
-                    # (position in detected_faces). Then we can go through and update. 
-                    matching_face_idcs = np.argmax(iou, axis=1)
-                    for ex_idx, new_idx in enumerate(matching_face_idcs):
-                        # print(ex_idx, new_idx)
-                        existing_data = existing_faces[ex_idx]
-                        new_data = detected_faces[new_idx]
-
+                # Case 1 & 2
+                if np.min(max_ious) >= self.IOU_thresh:
+                    # Candidate rows/columns are places where the IOU is greater
+                    # than a threshold. 
+                    candidate_rows, candidate_cols = np.where(iou >= self.IOU_thresh)
+                    set_candidate_rows = list(set(candidate_rows.tolist()))
+                    set_candidate_rows.sort()
+    
+                    # Case 1: All match one-to-one for IOUs. 
+                    if set_candidate_rows == np.arange(len(set_candidate_rows)).tolist():
+                        # print(f"One-to-one matches acquired")
+    
+                        # Make sure to find indices where InsightFace found new faces.
+                        column_maxs = np.max(iou, axis=0)
+                        # print(iou, column_maxs)
+    
+                        # This is the set of indices where a new face was detected by
+                        # InsightFace and needs to be added. 
+                        new_face_idcs = np.where(column_maxs == 0)[0]
+                        # print(new_face_idcs)
+    
+                        # Match existing faces to new data. This gives us an array
+                        # where the position in the array corresponds to the existing
+                        # face's index (position in existing_faces) and the value of that
+                        # position in the array is the newly detected face's index 
+                        # (position in detected_faces). Then we can go through and update. 
+                        matching_face_idcs = np.argmax(iou, axis=1)
+                        for ex_idx, new_idx in enumerate(matching_face_idcs):
+                            # print(ex_idx, new_idx)
+                            assert np.count_nonzero(iou[ex_idx]) == 1, f'An IOU match between detected and existing faces should only have one answer. This row was {iou[ex_idx]}'
+                            existing_data = existing_faces[ex_idx]
+                            new_data = detected_faces[new_idx]
+    
+                            self.update_existing_face_to_insightface(existing_data, new_data)
+    
+                        for new_face_idx in new_face_idcs:
+                            new_data = detected_faces[new_face_idx]
+                            self.add_new_face(new_data, img_obj, img_numpy)
+    
+                        # print(matching_face_idcs)
+                        
+                        img_obj.isProcessed = True
+                        img_obj.save()
+    
+                    else:
+                        raise NotImplementedError("Not one-to-one match")
+    
+                elif np.min(max_ious) < self.IOU_thresh:
+                    row_sums = np.sum(iou > self.IOU_thresh, axis=1)
+                    nonzero_rows = np.where(row_sums)[0]
+                    # print("NZ rows", nonzero_rows)
+    
+                    # Handle matching rows
+                    for rn in nonzero_rows:
+                        # print("RN = ", rn)
+                        row = iou[rn]
+                        assert np.count_nonzero(row) == 1
+                        existing_idx = int(rn)
+                        detected_idx = np.argmax(row)
+                        existing_data = existing_faces[existing_idx]
+                        new_data = detected_faces[detected_idx]
                         self.update_existing_face_to_insightface(existing_data, new_data)
+                        del existing_idx, row, detected_idx
 
+                    # Handle any new detections from InsightFace that were not previously there.
+                    column_maxs = np.max(iou, axis=0)
+                    new_face_idcs = np.where(column_maxs == 0)[0]
+    
                     for new_face_idx in new_face_idcs:
                         new_data = detected_faces[new_face_idx]
                         self.add_new_face(new_data, img_obj, img_numpy)
+            
+                    zero_row_sums = np.sum(iou, axis=1)
+                    zero_rows = np.where(zero_row_sums == 0)[0]
+                    # print("Zero rows", zero_rows, zero_row_sums)
+                    img_h, img_w, _ = img_numpy.shape 
 
-                    # print(matching_face_idcs)
-                    
+                    no_match_list = [existing_faces[int(idx)] for idx in zero_rows]
+                    no_match_bbox = existing_boxes[zero_rows]
+                    print(no_match_bbox, existing_boxes)
+                    check_iou = self.iou_function(no_match_bbox, detect_boxes)
+                    assert torch.all(check_iou < self.IOU_thresh)
+                    self.update_list_of_no_matching_detects(no_match_list)
+    
+                    # print("TODO: Handle zero-cols and zero-rows")
+                    # print("max_IOUs", max_ious)
+                    # print("Existing faces: ", existing_boxes)
+                    # print("Detected faces: ", detect_boxes)
+                    # pr    int("IOU: ", iou)
                     img_obj.isProcessed = True
                     img_obj.save()
-
-                else:
-                    raise NotImplementedError("Not one-to-one match")
-
-            elif np.min(max_ious) < self.IOU_thresh:
-                print("Existing faces: ", existing_boxes)
-                print("Detected faces: ", detect_boxes)
-                print("IOU: ", iou)
-                raise NotImplementedError("Not implemented")
-
+                    # raise NotImplementedError("Not implemented")
+    
             # Assert that the image isProcessed flag is set
             assert img_obj.isProcessed == True, 'Image isProcessed flag was not set'
             # Get the number of faces associated with this object
             img_faces = Face.objects.filter(source_image_file = img_obj)
+            # print(len(img_faces), len(detected_faces))
             assert len(img_faces) >= len(detected_faces)
             for face in img_faces:
                 assert face.face_encoding_512 is not None
+                assert len(face.face_encoding_512) == 512
                 assert face.reencoded == True
+
+
+
+    def update_list_of_no_matching_detects(self, unmatched_existing_faces: list):
+        if type(unmatched_existing_faces) not in [django.db.models.query.QuerySet, list]:
+            raise TypeError("Input must be a list or QuerySet")
+        if len(unmatched_existing_faces) <= 0:
+            raise ValueError("Input must be a non-zero list")
+    
+        img_h = unmatched_existing_faces[0].source_image_file.height
+        img_w = unmatched_existing_faces[0].source_image_file.width
+    
+        for face_obj in unmatched_existing_faces:
+            if type(face_obj) is not Face:
+                raise TypeError("List must be objects of type Face, from face_manager.model")
+                 
+            face_obj.face_encoding_512 = [-999] * 512 
+            face_obj.box_left = np.max((0, int(face_obj.box_left)))
+            face_obj.box_top = np.max((0, int(face_obj.box_top)))
+            face_obj.box_right = np.min((int(face_obj.box_right), img_w))
+            face_obj.box_bottom = np.min((int(face_obj.box_bottom), img_h))
+            face_obj.reencoded = True
+            face_obj.save()
 
     def update_existing_face_to_insightface(self, existing_face, new_data):
         
@@ -282,14 +373,19 @@ class FaceExtractor(object):
         new_face.declared_name = self.blank_face_person
         new_face.written_to_photo_metadata = False
         new_face.reencoded = True
-        # new_face.box_top = bb_l
-        # new_face.box_bottom = bb_t
-        # new_face.box_left = bb_r
-        # new_face.box_right = bb_b
+
+        img_h, img_w, _ = img_numpy.shape 
+        
+        bb_l = np.max((0, int(bb_l)))
+        bb_t = np.max((0, int(bb_t)))
+        bb_r = np.min((int(bb_r), img_w))
+        bb_b = np.min((int(bb_b), img_h))           
+
         new_face.box_top = bb_t
         new_face.box_bottom = bb_b
         new_face.box_left = bb_l
         new_face.box_right = bb_r
+
         new_face.source_image_file = img_obj
         new_face.dateTakenUTC = img_obj.dateTakenUTC
         new_face.detected_age = detected_age

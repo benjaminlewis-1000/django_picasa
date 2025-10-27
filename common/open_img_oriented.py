@@ -6,19 +6,26 @@ import os
 import PIL
 from PIL import Image, ExifTags
 import numpy as np
+import django
 
 def open_img_oriented(filename: str, as_numpy: bool):
     # Open an image, get its metadata from the EXIF tag,
     # orient it, and then return as a numpy array
+    
+    if type(filename) == django.db.models.fields.files.ImageFieldFile:
+#        data = filename.read()    
+        image = PIL.Image.open(filename.file)
+    elif type(filename) == str:
+        if not os.path.exists(filename):
+            raise FileNotFoundError(f"File {filename} not found.")
 
-    if not os.path.exists(filename):
-        raise FileNotFoundError(f"File {filename} not found.")
-
-    try:
-        image = PIL.Image.open(filename)
-    except Exception as e:
-        print("EX", e)
-        return None
+        try:
+            image = PIL.Image.open(filename)
+        except Exception as e:
+            print("EX", e)
+            return None
+    else:
+        raise NotImplementedError(f"Type of filename is {type(filename)}")
 
     for orientation in ExifTags.TAGS.keys():
         if ExifTags.TAGS[orientation]=='Orientation':
@@ -37,8 +44,8 @@ def open_img_oriented(filename: str, as_numpy: bool):
         elif exif[orientation] == 8:
             image=image.rotate(90, expand=True)
 
-    # print(image.shape)
     if as_numpy:
         image = np.array(image)
+        assert len(image.shape) == 3
     return image
 

@@ -122,7 +122,6 @@ class PersonViewSet(viewsets.ModelViewSet):
 
     def get_serializer_context(self):
         context = super(PersonViewSet, self).get_serializer_context()
-        print("Context: ", context)
         context.update({"request": self.request})
         return context
 
@@ -444,7 +443,7 @@ class FaceViewSet(viewsets.ModelViewSet):
             js['poss_ident5'] = None
             js['poss_ident5_id'] = None
 
-        print(js)
+        # print(js)
 
 
         # js = {'num_results': len(id_list), 'type': field, 'id_list': id_list,}
@@ -566,7 +565,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         # No body parameters
         # Given the face, sets the associated person's thumbnail to be
         # that face. 
-        print("Thumb")
+        # print("Thumb")
         face = self.get_object()
         person = face.declared_name
 
@@ -647,7 +646,7 @@ class FaceViewSet(viewsets.ModelViewSet):
         # Given the face, remove association to the given
         # person and add the person_id to the rejected_fields. 
         
-        print(request.data, request.data.keys())
+        # print(request.data, request.data.keys())
         def err_404(message=""):
             msg_start = f'Invalid reject association request. \n\n'
             msg_start += message
@@ -767,6 +766,8 @@ class KeyedImageView(APIView):
             return err_404(f'Bad id for object of type {image_type}')
 
 
+        # print("Type of image is ", type(image), image_type, dir(image))
+        # if type(image) == 
         image = common.open_img_oriented(image, as_numpy = False)
 
         # Resize image. Allow for upsampling now. 

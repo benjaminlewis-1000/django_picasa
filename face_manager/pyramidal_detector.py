@@ -27,7 +27,7 @@ class PyramidalDetector():
         # Percent of the image to overlap in each direction. 
         self.pct_overlap = 0.06
         self.iou_function = bops.distance_box_iou
-        self.iou_thresh = 0.5
+        self.iou_thresh = 0.3
 
         # Set of pyramidal levels. E.g. 1 in the list is a 1x1 grid, 2 is a 2x2 grid, 3 is a 3x3 grid, etc.
         # We will run detections of all grids listed in this list, then
