@@ -27,6 +27,10 @@ def open_img_oriented(filename: str, as_numpy: bool):
     else:
         raise NotImplementedError(f"Type of filename is {type(filename)}")
 
+    if image.mode == 'L':
+        # If a grayscale image, convert to 3-channel "RGB"
+        image = image.convert('RGB')
+
     for orientation in ExifTags.TAGS.keys():
         if ExifTags.TAGS[orientation]=='Orientation':
             break

@@ -25,6 +25,7 @@ imageio>=2.37.0
 importlib-metadata>=8.7.0
 matplotlib>=3.10.7
 numpy>=2.3.3
+pandas>=2.3.3
 pgi>=0.0.11.2
 piexif>=1.1.3
 Pillow>=11.3.0

@@ -333,6 +333,7 @@ LANGUAGE_CODE = 'en-us'
 
 TIME_ZONE = 'America/New_York'
 LOGGER.debug(f"Time zone is {TIME_ZONE}")
+NON_DETECTED_FACE_ENCODING = [-999] * 512 
 
 USE_I18N = True
 
@@ -371,7 +372,7 @@ CELERY_BEAT_SCHEDULE = {
    'face_add': {
        'task': 'face_manager.face_extraction', 
         # 'schedule': crontab( hour = '*', minute='5,15,25,35,45,55'),
-       'schedule': crontab( hour = '*', minute='*'),
+       'schedule': crontab( hour = '*/3', minute='30'),
         # OK to schedule every 2 minutes, because it will
         # either get locked by the lock file, or it will
         # die and get restarted pretty quickly.

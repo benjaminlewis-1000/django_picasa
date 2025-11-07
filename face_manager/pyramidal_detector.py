@@ -4,7 +4,9 @@ from insightface.app import FaceAnalysis
 import insightface 
 import numpy as np
 import torch
+from collections import Counter
 import torchvision.ops.boxes as bops
+import matplotlib.pyplot as plt
 
 class PyramidalDetector():
     """
@@ -13,7 +15,7 @@ class PyramidalDetector():
     It then de-duplicates detections across levels and rectangles to find an 
     'optimal' detection for each face. 
     """
-    def __init__(self, detector=None):
+    def __init__(self, detector: FaceAnalysis = None, debug: bool = False):
         super(PyramidalDetector, self).__init__()
 
         if detector is None:
@@ -27,12 +29,78 @@ class PyramidalDetector():
         # Percent of the image to overlap in each direction. 
         self.pct_overlap = 0.06
         self.iou_function = bops.distance_box_iou
-        self.iou_thresh = 0.3
+        self.iou_thresh = 0.1
+        self.wholly_contained_pct_thresh = 0.9
+        self.debug = debug
 
         # Set of pyramidal levels. E.g. 1 in the list is a 1x1 grid, 2 is a 2x2 grid, 3 is a 3x3 grid, etc.
         # We will run detections of all grids listed in this list, then
         # combine the results together with linear algebra. 
         self.cut_list = [1, 3]
+
+    def box_intersection_pct(self, input_bboxes: torch.tensor, remove_diag: bool = False) -> torch.tensor:
+        assert type(input_bboxes) == torch.Tensor
+        assert len(input_bboxes.shape) == 2
+        assert input_bboxes.shape[1] == 4
+
+        n_bbox = len(input_bboxes)
+
+        pct_intersect = torch.zeros((n_bbox, n_bbox))
+        for row in range(n_bbox):
+            for col in range(n_bbox):
+                row_l, row_t, row_r, row_b = input_bboxes[row]
+                col_l, col_t, col_r, col_b = input_bboxes[col]
+                row_area = torch.abs(row_r - row_l) * torch.abs(row_t - row_b)
+                # col_area = torch.abs(col_r - col_l) * torch.abs(col_t - col_b)
+                intersect_l = torch.max(row_l, col_l)
+                intersect_r = torch.min(row_r, col_r)
+                intersect_t = torch.max(row_t, col_t)
+                intersect_b = torch.min(row_b, col_b)
+                if intersect_l > intersect_r or intersect_t > intersect_b:
+                    intersect_pct = 0
+                else:
+                    intersect_area = torch.abs(intersect_l - intersect_r) * torch.abs(intersect_b - intersect_t)
+                    intersect_pct = intersect_area / row_area
+                assert intersect_pct <= 1
+                # Row/column is the % of box in row that overlaps with box in col
+                pct_intersect[row, col] = intersect_pct
+
+        assert torch.all(torch.diag(pct_intersect) == 1)
+        if remove_diag:
+            pct_intersect = pct_intersect - torch.diag(torch.diag(pct_intersect))
+        return pct_intersect
+
+    def pct_overlap_winnow(self, intersect_pct_tensor: torch.Tensor) -> torch.Tensor:
+        assert type(intersect_pct_tensor) == torch.Tensor
+        assert len(intersect_pct_tensor.shape) == 2
+        assert intersect_pct_tensor.shape[0] == intersect_pct_tensor.shape[1]
+
+        rows, cols = torch.where(intersect_pct_tensor > self.wholly_contained_pct_thresh)
+        # print(rows, cols)
+        bump_idcs = []
+        affected_bbox = []
+        for idx in range(len(rows)):
+            crow = int(rows[idx])
+            ccol = int(cols[idx])
+            affected_bbox.append(crow)
+            affected_bbox.append(ccol)
+            row_in_col = intersect_pct_tensor[crow, ccol]
+            col_in_row = intersect_pct_tensor[ccol, crow]
+            if row_in_col > col_in_row:
+                bump_idcs.append(crow)
+            else:
+                bump_idcs.append(ccol)
+
+        bump_idcs = list(set(bump_idcs))
+        affected_bbox = list(set(affected_bbox))
+        bump_idcs.sort()
+        # print(intersect_pct_tensor)
+        # print(affected_bbox)
+        # print(len(rows))
+        # print(bump_idcs)
+        if len(affected_bbox) > 0:
+            assert len(bump_idcs) < len(affected_bbox)
+        return bump_idcs
 
     def get(self, np_image: np.ndarray) -> list:
         if type(np_image) != np.ndarray:
@@ -47,6 +115,7 @@ class PyramidalDetector():
         height, width, _ = np_image.shape
 
         overlapping_detections = []
+        box_edges = []
 
         for cut_dims in self.cut_list:
             # Figure out the start and end row and columns for this. 
@@ -64,7 +133,7 @@ class PyramidalDetector():
                     # Even though it may technically go off-screen, this chip
                     # is always considered "on-screen" since there was no additional
                     # information to be had. 
-                    faces_at_level[idx]['off_screen'] = True
+                    faces_at_level[idx]['off_screen'] = False
                     
                 overlapping_detections.extend(faces_at_level)
 
@@ -99,6 +168,8 @@ class PyramidalDetector():
                         chip_part = np_image[top_edge:bottom_edge, left_edge:right_edge]
                         chip_h, chip_w, _ = chip_part.shape
 
+                        box_edges.append((left_edge, top_edge, right_edge, bottom_edge))
+
                         # Detect on sub-image. Indicate whether the detection went off
                         # the edge of the chip, and adjust the bounding box to its
                         # proper location in the larger image. 
@@ -123,8 +194,31 @@ class PyramidalDetector():
         if len(overlapping_detections) == 0:
             return overlapping_detections
 
+        # Compute how much of each bounding box lies within
+        # each other bounding box. Output is that a given
+        # row, col value is how much the bounding box in the
+        # row's index (in bboxes) lies in the bounding box of
+        # the col's index (in bboxes).
+        box_overlap_pcts = self.box_intersection_pct(bboxes, remove_diag = True)
+        superfluous_idcs = self.pct_overlap_winnow(box_overlap_pcts)
+
+        superfluous_idcs.sort()
+        last_idx = len(bboxes)
+        for pop_idx in superfluous_idcs[::-1]: # Reverse order
+            assert last_idx > pop_idx # Sanity check
+            overlapping_detections.pop(pop_idx)
+
+        # Get bounding boxes again without superfluous overlaps
+        bboxes = [det['bbox'] for det in overlapping_detections]
+        bboxes = torch.tensor(np.array(bboxes))
+
         iou = self.iou_function(bboxes, bboxes)
         binary_iou = torch.gt(iou, self.iou_thresh).to(torch.float)
+
+        # print("BINARY", iou, binary_iou, box_overlap_pcts, superfluous_idcs)
+        det_levels = np.array([f['detect_pyr_level'] for f in overlapping_detections])
+        off_screen = np.array([f['off_screen'] for f in overlapping_detections])
+        # print(det_levels, off_screen)
         # Binary IOU matrix should be symmetric, so assert that it is
         torch.all(binary_iou - binary_iou.T == 0)
         # Compute the eigenvalues of the binary matrix. The number of non-
@@ -142,6 +236,16 @@ class PyramidalDetector():
         # (or columns, but rows are easier to work with in some respects)
         # which then are going to be groups of correlated detections.
         unique_rows = torch.unique(binary_iou, dim=0)
+        # print(binary_iou)
+        # print(bboxes)
+        # print(len(overlapping_detections))
+        # print(unique_rows)
+        # print(torch.sum(unique_rows))
+        # print(iou)
+        # print(superfluous_idcs)
+        # # assert torch.sum(unique_rows) == len(overlapping_detections)
+        # plt.imshow(unique_rows)
+        # plt.show()
 
         assert len(unique_rows) == rank, 'Rank and number of unique rows has a discrepancy.'
         sums = torch.sum(unique_rows, dim=1).to(int)
@@ -155,7 +259,16 @@ class PyramidalDetector():
         large_eigens = eigenvalues[torch.where(eigenvalues > 0.01)]
         large_eigens = torch.round(large_eigens)
         large_eigens = [int(ev) for ev in large_eigens]
-        assert set(large_eigens) - set(sums.tolist()) == set(), 'Assumption that eigenvalues and rows sums match is inaccurate.'
+        # print(iou)
+        # print(binary_iou)
+        # print(rank)
+        # print(bboxes)
+        # print("TODO: put back assertion")
+        eigen_count = Counter(large_eigens)
+        sum_count = Counter(sums.tolist())
+        
+        assert eigen_count - sum_count == Counter(), f'Assumption that eigenvalues and rows sums match is inaccurate. {large_eigens} and {eigenvalues} VS {sums}'
+        assert sum_count - eigen_count == Counter(), f'Assumption that eigenvalues and rows sums match is inaccurate. {large_eigens} and {eigenvalues} VS {sums}'
 
         # Now we have sets of unique rows. On a face-by-face basis, let's decide on the "best"
         # face and encoding, then return those.
@@ -179,6 +292,7 @@ class PyramidalDetector():
                 # IOU parameters
                 bbox_tensor = torch.tensor(np.array(bboxes))
                 iou_check = self.iou_function(bbox_tensor, bbox_tensor)
+
                 assert torch.all(iou_check > self.iou_thresh)
 
                 if len(self.cut_list) > 2:
@@ -218,4 +332,7 @@ class PyramidalDetector():
         assert type(deduplicated_faces) == list
         assert type(deduplicated_faces[0]) == insightface.app.common.Face
 
-        return deduplicated_faces
+        if self.debug:
+            return deduplicated_faces, overlapping_detections, box_edges
+        else:
+            return deduplicated_faces

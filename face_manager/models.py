@@ -318,26 +318,55 @@ class Face(models.Model):
 
         disown_person = Person.objects.get(id=person_unassociate_id)
 
-        if self.poss_ident1 == disown_person:
-            self.poss_ident1.decrement_possible_num()
-            self.poss_ident1 = None
-            self.weight_1 = 0.0
-        elif self.poss_ident2 == disown_person:
-            self.poss_ident2.decrement_possible_num()
-            self.poss_ident2 = None
-            self.weight_2 = 0.0
-        elif self.poss_ident3 == disown_person:
-            self.poss_ident3.decrement_possible_num()
-            self.poss_ident3 = None
-            self.weight_3 = 0.0
-        elif self.poss_ident4 == disown_person:
-            self.poss_ident4.decrement_possible_num()
-            self.poss_ident4 = None
-            self.weight_4 = 0.0
-        elif self.poss_ident5 == disown_person:
-            self.poss_ident5.decrement_possible_num()
-            self.poss_ident5 = None
-            self.weight_5 = 0.0
+        possible_ids = []
+        for ID_num in range(1, 6):
+            try:
+                get_id = eval(f"self.poss_ident{ID_num}.id")
+            except AttributeError:
+                get_id = None
+            possible_ids.append(get_id)
+
+        # Use eval statements to effect a change in the possible ID list.
+        # Find if the removal ID is in the possible IDs, then bump everything
+        # up higher in the possible IDs list, accounting for any "None" values. 
+        if person_unassociate_id in possible_ids: 
+            remove_idx = possible_ids.index(person_unassociate_id)
+            print(f"self.poss_ident{remove_idx + 1}.decrement_possible_num()")
+            source_idcs = [x for x in range(5) if x != remove_idx and possible_ids[x] is not None]
+            dest_idcs = list(range(len(source_idcs)))
+
+            for offset in range(len(source_idcs)):
+                source_offset = source_idcs[offset]
+                dest_offset = dest_idcs[offset]
+                if source_offset == dest_offset:
+                    continue
+                exec(f"self.poss_ident{dest_offset + 1} = self.poss_ident{source_offset + 1}")
+                exec(f"self.weight_{dest_offset + 1} = self.weight_{source_offset + 1}")
+
+            for offset in range(max(dest_idcs) + 2, 6):
+                exec(f"self.poss_ident{offset} = None")
+                exec(f"self.weight_{offset} = 0.0")
+
+        # if self.poss_ident1 == disown_person:
+        #     self.poss_ident1.decrement_possible_num()
+        #     self.poss_ident1 = None
+        #     self.weight_1 = 0.0
+        # elif self.poss_ident2 == disown_person:
+        #     self.poss_ident2.decrement_possible_num()
+        #     self.poss_ident2 = None
+        #     self.weight_2 = 0.0
+        # elif self.poss_ident3 == disown_person:
+        #     self.poss_ident3.decrement_possible_num()
+        #     self.poss_ident3 = None
+        #     self.weight_3 = 0.0
+        # elif self.poss_ident4 == disown_person:
+        #     self.poss_ident4.decrement_possible_num()
+        #     self.poss_ident4 = None
+        #     self.weight_4 = 0.0
+        # elif self.poss_ident5 == disown_person:
+        #     self.poss_ident5.decrement_possible_num()
+        #     self.poss_ident5 = None
+        #     self.weight_5 = 0.0
 
         reject_list = self.rejected_fields
         if reject_list is None:

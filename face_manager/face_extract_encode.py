@@ -98,6 +98,9 @@ class FaceExtractor(object):
         # Get unprocessed files.
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Pictures_In_Progress/Family History/Funk and Cutler Scans by Ariel Benson/1965-03-19 Clarence Funk and Joan Henderson Wedding/1965-03-19 (16) Clarence Funk and Joan Henderson Wedding.jpg')
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Pictures_In_Progress/2019/Ben Work Trips/London and Brighton/2019-05-17 19.45.53-1.jpg') # SOLVED: del moved inside for loop
+        # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Family Pictures/2011/2011 (12) December/Christmas 2011 (93).JPG') # SOLVED: del moved inside for loop
+        # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Pictures_In_Progress/2019/Ben Work Trips/London and Brighton/2019-05-13 18.58.02.jpg') # SOLVED: del moved inside for loop
+        # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Family Pictures/2012/7-2012/July Trip/Washington DC (93).JPG') # SOLVED: del moved inside for loop
         unprocessed_imgs = ImageFile.objects.filter(isProcessed=False).order_by('?') 
 
         for img_obj in unprocessed_imgs:
@@ -167,10 +170,10 @@ class FaceExtractor(object):
             # print(iou, len(iou), iou==[], type(iou), iou.shape)
             if iou.shape[1] == 0:
                 assert n_detect == 0
-                print(iou, existing_boxes, detect_boxes)
-                print(type(existing_faces), existing_faces)
-                for jj in existing_faces:
-                    print(type(jj))
+                # print(iou, existing_boxes, detect_boxes)
+                # print(type(existing_faces), existing_faces)
+                # for jj in existing_faces:
+                #     print(type(jj))
                 self.update_list_of_no_matching_detects(existing_faces)
                 img_obj.isProcessed = True
                 img_obj.save()
@@ -257,7 +260,7 @@ class FaceExtractor(object):
 
                     no_match_list = [existing_faces[int(idx)] for idx in zero_rows]
                     no_match_bbox = existing_boxes[zero_rows]
-                    print(no_match_bbox, existing_boxes)
+                    # print(no_match_bbox, existing_boxes)
                     check_iou = self.iou_function(no_match_bbox, detect_boxes)
                     assert torch.all(check_iou < self.IOU_thresh)
                     self.update_list_of_no_matching_detects(no_match_list)
@@ -297,7 +300,7 @@ class FaceExtractor(object):
             if type(face_obj) is not Face:
                 raise TypeError("List must be objects of type Face, from face_manager.model")
                  
-            face_obj.face_encoding_512 = [-999] * 512 
+            face_obj.face_encoding_512 = settings.NON_DETECTED_FACE_ENCODING
             face_obj.box_left = np.max((0, int(face_obj.box_left)))
             face_obj.box_top = np.max((0, int(face_obj.box_top)))
             face_obj.box_right = np.min((int(face_obj.box_right), img_w))

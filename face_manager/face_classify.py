@@ -262,7 +262,7 @@ class faceAssigner():
             print("Already assigned")
             return
 
-        distances_matrix = None
+        # distances_matrix = None
         # dist_per_category = []
 
         N_COMPARISONS=25
