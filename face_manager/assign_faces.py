@@ -36,22 +36,25 @@ class faceAssigner():
         super(faceAssigner, self).__init__()
 
         self.DEBUG=debug
-        self.DEBUG_PKL_FILE='/tmp/pandas_data.pkl'
+        self.ENCODINGS_PKL_FILE='/models/face_assign_preload.pkl'
         self.USE_MIN_VALUE=True
         if self.USE_MIN_VALUE:
             self.IGN_VALUE = 999
         else:
             self.IGN_VALUE = 0
 
-        self.MIN_NUM_FACES = 50
+        self.MIN_NUM_FACES = 10
         self.NUM_DAYS = 180
         self.NUM_CLOSEST = 50
         self.NUM_TO_AVERAGE = 1
         self.N_COMPARISONS = 25
 
-        self.bogus_date = datetime(1990, 1, 1) # Very few images before that
-        self.bogus_date_utc = time.mktime(self.bogus_date.timetuple())
+        self.ASSIGN_THRESH=0.8
+
+        # self.bogus_date = datetime(1990, 1, 1) # Very few images before that
+        # self.bogus_date_utc = time.mktime(self.bogus_date.timetuple())
         self.ignore_person = Person.objects.filter(person_name=settings.SOFT_IGNORE_NAME)[0]
+        self.ignore_person_id = self.ignore_person.id
 
         ########################################################
         # Get a list of likely matches for the faces we have - people with
@@ -61,10 +64,12 @@ class faceAssigner():
         criterion_ign = ~Q(person_name__in=settings.IGNORED_NAMES)
         criterion_unlikely = Q(further_images_unlikely=False)
 
-        assigned_people = Person.objects.annotate(c=Count('face_declared', filter=criterion_ign & criterion_unlikely)).filter(c__gt=self.MIN_NUM_FACES)
+        # assigned_people = Person.objects.annotate(c=Count('face_declared', filter=criterion_ign & criterion_unlikely)).filter(c__gt=self.MIN_NUM_FACES)
+        assigned_people = Person.objects.annotate(c=Count('face_declared', filter=criterion_ign )).filter(c__gt=self.MIN_NUM_FACES)
 
         self.likely_people_ids = [p.id for p in assigned_people]
-        print(len(self.likely_people_ids))
+        self.num_likely_people = len(self.likely_people_ids)
+        print(self.num_likely_people)
 
         ########################################################
         # Map people to the likely earliest date they showed up in images,
@@ -72,6 +77,26 @@ class faceAssigner():
         ########################################################
         # self.known_persons_to_dates()
 
+    # def reset_task(self):
+    #     people = Person.objects.all()
+    #     for p in people:
+    #         p.num_faces = p.face_declared.count()
+    #         p.num_possibilities = p.face_poss1.count() # + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
+    #         p.num_unverified_faces = p.face_declared.filter(validated=False).count()
+    #         p.save()
+
+    def reset_possible_assignments(self):
+        Person.objects.all().update(num_possibilities = 0)
+        Face.objects.filter(~Q(poss_ident1=None)).update(poss_ident1 = None)
+        Face.objects.filter(~Q(poss_ident2=None)).update(poss_ident2 = None)
+        Face.objects.filter(~Q(poss_ident3=None)).update(poss_ident3 = None)
+        Face.objects.filter(~Q(poss_ident4=None)).update(poss_ident4 = None)
+        Face.objects.filter(~Q(poss_ident5=None)).update(poss_ident5 = None)
+        Face.objects.filter(~Q(weight_1=0.0)).update(weight_1 = 0.0)
+        Face.objects.filter(~Q(weight_2=0.0)).update(weight_2 = 0.0)
+        Face.objects.filter(~Q(weight_3=0.0)).update(weight_3 = 0.0)
+        Face.objects.filter(~Q(weight_4=0.0)).update(weight_4 = 0.0)
+        Face.objects.filter(~Q(weight_5=0.0)).update(weight_5 = 0.0)
 
     def execute(self, redo_all: bool = False) -> None:
         """
@@ -80,7 +105,6 @@ class faceAssigner():
 
         if type(redo_all) != bool:
             raise TypeError(f"Type of redo_all must be boolean, is {type(redo_all)}.")
-
 
         unassigned_crit = Q(declared_name__person_name=settings.BLANK_FACE_NAME)
         has_long = ~Q(face_encoding_512=None)
@@ -97,8 +121,9 @@ class faceAssigner():
             unassigned = Face.objects.filter(unassigned_crit & has_long & long_encoded).filter(no_suggestions).order_by('?')
 
         if self.DEBUG:
-            unassigned = unassigned[:101]
+            unassigned = unassigned[:1001]
         num_unassigned = int(unassigned.count())
+        print(f"There are {num_unassigned} faces to classify")
 
         if num_unassigned > 100:
 
@@ -108,46 +133,57 @@ class faceAssigner():
             self.candidate_dict = {}
             self.embedding_dict = {}
             self.norm_dict = {}
-            if self.DEBUG and os.path.exists(self.DEBUG_PKL_FILE):
-                with open(self.DEBUG_PKL_FILE, 'rb') as ph:
+            if os.path.exists(self.ENCODINGS_PKL_FILE):
+                with open(self.ENCODINGS_PKL_FILE, 'rb') as ph:
                     combo_dict = pickle.load(ph)
 
                     self.candidate_dict = combo_dict['candidate_dict']
                     self.embedding_dict = combo_dict['embedding_dict']
                     self.norm_dict = combo_dict['norm_dict']
                 print("Dataframe loaded from file")
-            else:
-                for face_id in tqdm(self.likely_people_ids):
+            # else:
+            changed = False
 
-                    faces_person = Q(declared_name__id=face_id)
-                    has_long = ~Q(face_encoding_512=None)
-                    long_encoded = ~Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
-                    
-                    person_data = Face.objects \
-                        .filter(faces_person & long_encoded & has_long)
-                    data = person_data.values_list('id', 'face_encoding_512', 'dateTakenUTC')
+            for face_id in tqdm(self.likely_people_ids):
 
-                    df = pd.DataFrame(data, columns=['id', 'face_encoding_512', 'dateTakenUTC'])
-                    
-                    self.candidate_dict[face_id] = df
+                if face_id in self.candidate_dict.keys() and \
+                   face_id in self.embedding_dict.keys() and \
+                   face_id in self.norm_dict.keys():
+                    print(f'No need to process this face {face_id}')
+                    continue
+                print(f"Processing face {face_id}")
+                changed = True
 
-                    cmp_embedding = np.array(self.candidate_dict[face_id]['face_encoding_512'].tolist())
-                    norm_list = np.linalg.norm(cmp_embedding, axis=1)
-                    self.embedding_dict[face_id] = cmp_embedding.T
-                    assert self.embedding_dict[face_id].shape[0] == 512
-                    assert self.embedding_dict[face_id].shape[1] == len(norm_list)
-                    assert len(norm_list) == len(self.candidate_dict[face_id])
-                    self.norm_dict[face_id] = norm_list
-                    
-                if self.DEBUG:
-                    all_dict = {'candidate_dict': self.candidate_dict,
-                                'embedding_dict': self.embedding_dict,
-                                'norm_dict': self.norm_dict}
-                    try:
-                        with open(self.DEBUG_PKL_FILE, 'wb') as ph:
-                            pickle.dump(all_dict, ph)
-                    except:
-                        os.remove(self.DEBUG_PKL_FILE)
+                faces_person = Q(declared_name__id=face_id)
+                has_long = ~Q(face_encoding_512=None)
+                long_encoded = ~Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
+                
+                person_data = Face.objects \
+                    .filter(faces_person & long_encoded & has_long)
+                data = person_data.values_list('id', 'face_encoding_512', 'dateTakenUTC')
+
+                df = pd.DataFrame(data, columns=['id', 'face_encoding_512', 'dateTakenUTC'])
+                
+                self.candidate_dict[face_id] = df
+
+                cmp_embedding = np.array(self.candidate_dict[face_id]['face_encoding_512'].tolist())
+                norm_list = np.linalg.norm(cmp_embedding, axis=1)
+                self.embedding_dict[face_id] = cmp_embedding.T
+                assert self.embedding_dict[face_id].shape[0] == 512
+                assert self.embedding_dict[face_id].shape[1] == len(norm_list)
+                assert len(norm_list) == len(self.candidate_dict[face_id])
+                self.norm_dict[face_id] = norm_list
+                
+            all_dict = {'candidate_dict': self.candidate_dict,
+                        'embedding_dict': self.embedding_dict,
+                        'norm_dict': self.norm_dict}
+
+            if changed:
+                try:
+                    with open(self.ENCODINGS_PKL_FILE, 'wb') as ph:
+                        pickle.dump(all_dict, ph)
+                except:
+                    os.remove(self.ENCODINGS_PKL_FILE)
 
             print(f"Dataframe preloading: {time.time() - ss:.2f} seconds")
         else:
@@ -155,16 +191,24 @@ class faceAssigner():
         
         u_idx = 0
         s = time.time()
-        for u_img in unassigned.iterator():
-            try:
-                elps = time.time() - s
-                s = time.time()
-                if self.DEBUG:
-                    print(f"Assigning: {u_idx+1}/{num_unassigned} | {elps:.2f}")
-                    u_idx += 1
-                self.classify_unassigned(u_img)
-            except Exception as e:
-                print(f"Exception! {e}")
+        for u_img in tqdm(unassigned.iterator()):
+            # try:
+            elps = time.time() - s
+            s = time.time()
+            if self.DEBUG:
+                print(f"Assigning: {u_idx+1}/{num_unassigned} | {elps:.2f}")
+                u_idx += 1
+            self.classify_unassigned(u_img)
+            # except Exception as e:
+            #     print(f"Exception! {e}")
+
+        # Finish up by "trueing up" the num_assigned for each person:
+        print("Verifying face counts...")
+        for p in tqdm(Person.objects.all()):
+            p.num_faces = p.face_declared.count()
+            p.num_possibilities = p.face_poss1.count() # + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
+            p.num_unverified_faces = p.face_declared.filter(validated=False).count()
+            p.save()
 
 
 
@@ -203,9 +247,12 @@ class faceAssigner():
             rejected_ids = []
 
         candidate_ids = list(set(self.likely_people_ids) - set(rejected_ids))
+        candidate_id_arr = np.array(candidate_ids)
 
+        # Pre-populate a metrics array
+        metrics_array = np.zeros((self.num_likely_people, 3))
 
-        for db_id in candidate_ids:
+        for row_num, db_id in enumerate(candidate_ids):
             cmp_face_encodings = self.embedding_dict[db_id]
             cmp_encoding_norms = self.norm_dict[db_id]
             dot_product = np.dot(query_encoding, cmp_face_encodings)
@@ -215,11 +262,42 @@ class faceAssigner():
 
             sim_max = np.max(similarity)
             sim_99th = np.percentile(similarity, 99)
-            if sim_max > 0.5:
-                print(sim_max, sim_99th, db_id, unassigned_face.id)
+            # if sim_max > 0.5:
+            #     print(sim_max, sim_99th, db_id, unassigned_face.id)
+
+            metrics_array[row_num, :] = [sim_max, sim_99th, db_id]
             # print(np.max(similarity))
             # similarity_ordered = np.sort(similarity)[::-1]
             # print(similarity_ordered)
+
+        possible_idcs = np.where(metrics_array[:, 0] > self.ASSIGN_THRESH)[0]
+        if len(possible_idcs) == 0:
+            # print("TODO: Assign to ignore person")
+            metric_max = np.max(metrics_array[:, 0])
+            weight = 1 - metric_max # High scores are presented on the
+                # screen first, so something that has a low similarity
+                # should have 1-value for a high score. 
+
+            if self.ignore_person_id in rejected_ids:
+                # print("Need to reject the person")
+                max_idx = np.argmax(metrics_array[:, 0])
+                max_id = candidate_id_arr[max_idx]
+                unassigned_face.set_possible_person(max_id, 1, metric_max)
+            else:
+                unassigned_face.set_possible_person(self.ignore_person_id, 1, weight)
+        else:
+            scores = metrics_array[possible_idcs, 0]
+            weights = metrics_array[possible_idcs, 1]
+            assign_ids = metrics_array[possible_idcs, 2].astype(np.int64)
+
+            order = np.argsort(scores)[::-1]
+            order = order[:5]
+            for precedence_idx, order_idx in enumerate(order):
+                # print(assign_ids[order_idx], precedence_idx, weights[order_idx])
+                unassigned_face.set_possible_person(int(assign_ids[order_idx]), precedence_idx + 1, float(weights[order_idx]))
+
+        # print(metrics_array)
+        # exit()
 
         # exit()
 

@@ -3,12 +3,12 @@
 sleep 5 
 
 
-python /code/manage.py makemigrations
-python /code/manage.py makemigrations filepopulator
-python /code/manage.py makemigrations face_manager
-python /code/manage.py migrate
-python /code/manage.py shell < /code/dockerize/make_superuser_once.py
-cat <(echo "yes") - | python /code/manage.py collectstatic
+# python /code/manage.py makemigrations
+# python /code/manage.py makemigrations filepopulator
+# python /code/manage.py makemigrations face_manager
+# python /code/manage.py migrate
+# python /code/manage.py shell < /code/dockerize/make_superuser_once.py
+# cat <(echo "yes") - | python /code/manage.py collectstatic
 
 mkdir /locks
 

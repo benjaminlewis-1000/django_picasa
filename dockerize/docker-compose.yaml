@@ -108,6 +108,8 @@ services:
     labels:
       - "user=postgres"
     container_name: db_picasa  
+    ports:
+      - '5433:5432'
     networks:
       - traefik_proxy
 

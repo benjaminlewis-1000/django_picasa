@@ -10,8 +10,12 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
 
-        classifier = assign_faces.faceAssigner(debug=True)
+        DEBUG=False
+        classifier = assign_faces.faceAssigner(debug=DEBUG)
+        # if DEBUG:
+        #     classifier.reset_possible_assignments()
         # print("Clearing unassigned images...")
         # classifier.clear_unassigned_images()
+        # # # classifier.reset_possible_assignments() ## OCCASIONAL
         print("Classifying...")
         classifier.execute(redo_all = False)

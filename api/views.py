@@ -1,45 +1,117 @@
-from django.shortcuts import render
-from django.contrib.auth.models import User, Group
-from filepopulator.models import ImageFile, Directory
-from face_manager.models import Person, Face
-from django.conf import settings
-from django.db.models import Count
-from rest_framework import viewsets, filters
-#from api.serializers import UserSerializer, GroupSerializer, ImageFileSerializer, DirectorySerializer, ParameterSerializer
-import api.serializers as api_ser
+#! /usr/bin/env python 
+
 # Authentication: https://simpleisbetterthancomplex.com/tutorial/2018/11/22/how-to-implement-token-authentication-using-django-rest-framework.html
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, AllowAny
-from rest_framework.views import APIView
-from rest_framework_simplejwt.views import TokenObtainPairView
-import base64
-import cv2
-from rest_framework.decorators import action
-import datetime
-import time
-import os
-import numpy as np
-import threading
-from queue import Queue
-import PIL
-from PIL import Image, ExifTags
+#from api.serializers import UserSerializer, GroupSerializer, ImageFileSerializer, DirectorySerializer, ParameterSerializer
+from django.conf import settings
+from django.contrib.auth.models import User, Group
+from django.core.files.base import ContentFile
+from django.core.paginator import Paginator
+from django.db.models import Count
+from django.db.models import Q
 from django.http import HttpResponse, Http404
 from django.shortcuts import render
-from django.core.paginator import Paginator
-from django.core.files.base import ContentFile
-from rest_framework.reverse import reverse, reverse_lazy
+from django.shortcuts import render
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Q
-from time import sleep
-
-import common
-import json
+from face_manager.models import Person, Face
+from filepopulator.models import ImageFile, Directory
 from io import BytesIO
+from PIL import Image, ExifTags
+from queue import Queue
+from rest_framework import viewsets, filters
+from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.response import Response
+from rest_framework.reverse import reverse, reverse_lazy
+from rest_framework.views import APIView
+from rest_framework_simplejwt.views import TokenObtainPairView
+from face_manager.tasks import api_bulk_operation
+from time import sleep
+import api.serializers as api_ser
+from queue import Queue
+import base64
+import common
+import cv2
+from datetime import datetime, timedelta
+import json
+import numpy as np
+import os
+import PIL
+import threading
+import threading
+import time
 from filters.mixins import (
     FiltersMixin,
 )
 
-# Create your views here.
+
+background_queue = Queue()
+
+soft_ignore_person = Person.objects.filter(person_name='.ignore')[0]
+hard_ignore_person = Person.objects.filter(person_name='.realignore')[0]
+
+def bulk_thread(dataframe: dict):
+    # print("Got a data load of ", dataframe)
+
+    assert 'face_id_list' in dataframe.keys()
+    assert 'operation' in dataframe.keys()
+    assert 'current_person_id' in dataframe.keys()
+
+    face_id_list = dataframe['face_id_list']
+    operation = dataframe['operation']
+    current_person_id = dataframe['current_person_id']
+
+    assert type(face_id_list) is list
+    assert type(current_person_id) is int
+    assert operation in ['close_unassigned', 'close_ignored', 'close_assigned', 'confirm_proposed', 'verify_face']
+
+    for face_id in face_id_list:
+        assert type(face_id) is int
+        try:
+            face = Face.objects.get(id=face_id)
+        except:
+            print(f"Face not found for ID {face_id}")
+
+        if operation == 'close_unassigned':
+            # Previously /api/face_id/ignore_face with {ignore_type: 'soft'}
+            # Set it to the soft ignore person, '.ignore'
+            face.associate_person(soft_ignore_person.id)
+        elif operation == 'close_ignored':
+            # Previously /api/face_id/ignore_face with {ignore_type: 'hard'}
+            # Set to the hard ignore person, '.realignore', but only
+            # if they have previously been set to '.ignore'
+            if face.declared_name == soft_ignore_person \
+                or face.declared_name == hard_ignore_person \
+                or face.poss_ident1 == soft_ignore_person:
+                face.associate_person(hard_ignore_person.id)
+            else:
+                print("Person currently assigned is not .ignore or .realignore.")
+        elif operation == 'close_assigned':
+            # Previously /api/face_id/reject_association with {unassociate_id: current_person_id}
+            face.reject_association(current_person_id)
+        elif operation == 'confirm_proposed':
+            # Update the face object fields accordingly
+            face.associate_person(current_person_id)
+        elif operation == 'verify_face':
+            face.verify_person_in_image()
+
+def background_bulk_processor():
+    print("Background processor initiating")
+    while True:
+        if background_queue.empty():
+            time.sleep(1)
+        else:
+            try:
+                data = background_queue.get()
+                assert type(data) is dict
+                # print("Got an item", data)
+                bulk_thread(data)
+            except Exception as e:
+                print(f"Error: {e} in background_bulk_processor, which is called by /api/faces/bulk_operation")
+
+
+    
+work_thread = threading.Thread(target=background_bulk_processor)
+work_thread.start()
 
 def render_404(request, message):
     
@@ -238,7 +310,7 @@ class FolderListView(APIView):
                 f_dict['first_datesec'] = fold.first_datesec
                 f_dict['mean_datesec'] = fold.mean_datesec
                 f_dict['num_images'] = fold.num_images
-                f_dict['year'] = datetime.datetime.fromtimestamp(fold.first_datesec).year
+                f_dict['year'] = datetime.fromtimestamp(fold.first_datesec).year
                 result_list.append(f_dict)
                 f_queue.task_done()
 
@@ -330,6 +402,10 @@ class FaceViewSet(viewsets.ModelViewSet):
 
     queryset = Face.objects.all()
     serializer_class = api_ser.FaceSerializer
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
 
     def get_serializer_context(self):
         context = super(FaceViewSet, self).get_serializer_context()
@@ -622,25 +698,49 @@ class FaceViewSet(viewsets.ModelViewSet):
         js = {'success': True}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
-    @action(detail=True, methods=['patch', 'put'])
-    def unassign_face(self, request, pk=None):
-        # Accessible as <root>/api/faces/<face_id>/unassign_face/
-        # Accept: HTML PATCH
-        # Body parameter : None
-        # Given the face, remove any assigned face
 
-        face = self.get_object()
-        unassigned_person = Person.objects.filter(person_name=settings.BLANK_FACE_NAME)[0]
+
+    @action(detail=False, methods=['patch', 'put'])
+    def bulk_operation(self, request, pk=None):
+        # Accessible as <root>/api/faces/bulk_operation/
+
+        payload = request.data
+
+        if 'face_id_list' not in payload.keys():
+            message = 'The key "face_id_list" was not in the keys of the dictionary passed in this request.'
+            return render_404(request, message)
+        if 'operation' not in payload.keys():
+            message = 'The key "operation" was not in the keys of the dictionary passed in this request.'
+            return render_404(request, message)
+        if 'current_person_id' not in payload.keys():
+            message = 'The key "current_person_id" was not in the keys of the dictionary passed in this request.'
+            return render_404(request, message)
+        if type(payload['face_id_list']) is not list:
+            message = 'The type of face_id_list was not a list.'
+            return render_404(request, message)
+        if type(payload['current_person_id']) is not int:
+            message = 'The type of current_person_id was not an int.'
+            return render_404(request, message)
+        if payload['operation'] not in ['close_unassigned', 'close_ignored', 'close_assigned', 'confirm_proposed', 'verify_face']:
+            message = f"Value in 'operation' key was not one of ['close_unassigned', 'close_ignored', 'close_assigned'], and is not implemented."
+            return render_404(request, message)
+
+        current_person_id = payload['current_person_id']
         
-        face.associate_person(unassigned_person.id)
+        if not Person.objects.filter(id=current_person_id).exists():
+            message = f"The 'current_person_id' value does not currently correspond to the ID of a person in the database."
+            response = render(request, '404.html', context = {'error': message})
+            response.status_code = 400
+            return response
+        
+        background_queue.put(payload)
 
-        js = {'success': True}
+        js = {'job_submitted': True}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
-
     @action(detail=True, methods=['patch', 'put'])
-    def reject_association(self, request, pk=None):
-        # Accessible as <root>/api/faces/<face_id>/reject_association/
+    def reject_association_app_api(self, request, pk=None):
+        # Accessible as <root>/api/faces/<face_id>/reject_association_app_api/
         # Accept: HTML PATCH
         # Body parameter : unassociate_id (person_id)
         # Given the face, remove association to the given
@@ -664,6 +764,7 @@ class FaceViewSet(viewsets.ModelViewSet):
             return err_404("unassociate_id passed was not an integer.")
 
         face = self.get_object()
+        
         face.reject_association(unassociate_id)
 
         js = {'success': True}
@@ -964,7 +1065,7 @@ class UnlabeledMobileInfo(APIView):
                     'name': name,
                     'confirm_patch_url': f"{host_url}/faces/{selected_id}/assign_face_to_person/",
                     'confirm_patch_data': {'declared_name_key': pid},
-                    'disassociate_patch_url': f"{host_url}/faces/{selected_id}/unassign_face/",
+                    'disassociate_patch_url': f"{host_url}/faces/{selected_id}/reject_association_app_api/",
                     'person_id': pid,
                     'weight': weight,
                 }

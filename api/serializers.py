@@ -209,15 +209,15 @@ class PersonSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer)
         # face_declared is the related field of the ForeignKey.
         return obj.face_declared.count()
 
-    def get_num_possibilities(self, obj):
-        # face_declared is the related field of the ForeignKey.
-        f1 = obj.face_poss1.count()
-        f2 = obj.face_poss2.count()
-        f3 = obj.face_poss3.count()
-        f4 = obj.face_poss4.count()
-        f5 = obj.face_poss5.count()
+    # def get_num_possibilities(self, obj):
+    #     # face_declared is the related field of the ForeignKey.
+    #     f1 = obj.face_poss1.count()
+    #     f2 = obj.face_poss2.count()
+    #     f3 = obj.face_poss3.count()
+    #     f4 = obj.face_poss4.count()
+    #     f5 = obj.face_poss5.count()
 
-        return  f1 + f2 + f3 + f4 + f5
+    #     return  f1 + f2 + f3 + f4 + f5
 
     
     # def update(self, instance, validated_data):

@@ -70,10 +70,12 @@ class PyramidalDetector():
             pct_intersect = pct_intersect - torch.diag(torch.diag(pct_intersect))
         return pct_intersect
 
-    def pct_overlap_winnow(self, intersect_pct_tensor: torch.Tensor) -> torch.Tensor:
+    def pct_overlap_winnow(self, intersect_pct_tensor: torch.Tensor, iter_nums: np.ndarray) -> torch.Tensor:
         assert type(intersect_pct_tensor) == torch.Tensor
         assert len(intersect_pct_tensor.shape) == 2
+        assert type(iter_nums) == np.ndarray
         assert intersect_pct_tensor.shape[0] == intersect_pct_tensor.shape[1]
+        assert intersect_pct_tensor.shape[0] == len(iter_nums)
 
         rows, cols = torch.where(intersect_pct_tensor > self.wholly_contained_pct_thresh)
         # print(rows, cols)
@@ -102,7 +104,7 @@ class PyramidalDetector():
             assert len(bump_idcs) < len(affected_bbox)
         return bump_idcs
 
-    def get(self, np_image: np.ndarray) -> list:
+    def find_raw_faces(self, np_image: np.ndarray) -> list:
         if type(np_image) != np.ndarray:
             raise TypeError('Import image must be a numpy array.')
         if not bool(np.all(np.array(self.cut_list) >= 1)):
@@ -117,6 +119,7 @@ class PyramidalDetector():
         overlapping_detections = []
         box_edges = []
 
+        iter_num = 0
         for cut_dims in self.cut_list:
             # Figure out the start and end row and columns for this. 
 
@@ -126,6 +129,7 @@ class PyramidalDetector():
                 chip_h, chip_w, _ = np_image.shape
                 for idx in range(len(faces_at_level)):
                     faces_at_level[idx]['detect_pyr_level'] = cut_dims
+                    faces_at_level[idx]['iter_num'] = iter_num
                     faces_at_level[idx]['bbox'][0] = int(faces_at_level[idx]['bbox'][0]) # Left
                     faces_at_level[idx]['bbox'][2] = int(faces_at_level[idx]['bbox'][2]) # Right
                     faces_at_level[idx]['bbox'][1] = int(faces_at_level[idx]['bbox'][1]) # Top
@@ -136,6 +140,7 @@ class PyramidalDetector():
                     faces_at_level[idx]['off_screen'] = False
                     
                 overlapping_detections.extend(faces_at_level)
+                iter_num += 1
 
             else:
                 subbox_width = width / cut_dims
@@ -176,6 +181,7 @@ class PyramidalDetector():
                         faces_at_level = self.app.get(chip_part)
                         for idx in range(len(faces_at_level)):
                             faces_at_level[idx]['detect_pyr_level'] = cut_dims
+                            faces_at_level[idx]['iter_num'] = iter_num
                             bbox_l, bbox_t, bbox_r, bbox_b = faces_at_level[idx]['bbox']
                             if bbox_l < 0 or bbox_t < 0 or bbox_r > chip_w or bbox_b > chip_h:
                                 faces_at_level[idx]['off_screen'] = True
@@ -187,9 +193,25 @@ class PyramidalDetector():
                             faces_at_level[idx]['bbox'][3] = int(bbox_b + top_edge) # Bottom
 
                         overlapping_detections.extend(faces_at_level)
+                        iter_num += 1
+
+        return overlapping_detections, box_edges
+
+    def get(self, np_image: np.ndarray) -> list:
+        if type(np_image) != np.ndarray:
+            raise TypeError('Import image must be a numpy array.')
+        if not bool(np.all(np.array(self.cut_list) >= 1)):
+            raise ValueError("All values in the self.cut_list parameter must be >= 1.")
+        if not np.array(self.cut_list).dtype == int:
+            raise ValueError("All values in the self.cut_list parameter must be integers.")
+        if 1 not in self.cut_list:
+            raise ValueError("Need to have the value of 1 in self.cut_list")
+
+        overlapping_detections, box_edges = self.find_raw_faces(np_image)
 
         bboxes = [det['bbox'] for det in overlapping_detections]
         bboxes = torch.tensor(np.array(bboxes))
+        iter_nums = np.array([det['iter_num'] for det in overlapping_detections])
 
         if len(overlapping_detections) == 0:
             return overlapping_detections
@@ -200,7 +222,7 @@ class PyramidalDetector():
         # row's index (in bboxes) lies in the bounding box of
         # the col's index (in bboxes).
         box_overlap_pcts = self.box_intersection_pct(bboxes, remove_diag = True)
-        superfluous_idcs = self.pct_overlap_winnow(box_overlap_pcts)
+        superfluous_idcs = self.pct_overlap_winnow(box_overlap_pcts, iter_nums)
 
         superfluous_idcs.sort()
         last_idx = len(bboxes)
@@ -215,12 +237,15 @@ class PyramidalDetector():
         iou = self.iou_function(bboxes, bboxes)
         binary_iou = torch.gt(iou, self.iou_thresh).to(torch.float)
 
+        # Remove the diagonal
+        binary_iou_diag = binary_iou - torch.eye(binary_iou.shape[0])
+
         # print("BINARY", iou, binary_iou, box_overlap_pcts, superfluous_idcs)
         det_levels = np.array([f['detect_pyr_level'] for f in overlapping_detections])
         off_screen = np.array([f['off_screen'] for f in overlapping_detections])
         # print(det_levels, off_screen)
         # Binary IOU matrix should be symmetric, so assert that it is
-        torch.all(binary_iou - binary_iou.T == 0)
+        assert torch.all(binary_iou - binary_iou.T == 0)
         # Compute the eigenvalues of the binary matrix. The number of non-
         # zero (or non-numerical noise) eigenvalues is equal to the rank 
         # of the matrix, and since there are identical rows/columns in a

@@ -8,7 +8,7 @@ from datetime import datetime
 from django.utils import timezone
 from django.contrib.postgres.fields import ArrayField
 import cv2
-
+import numpy as np
 import os
 import sys
 
@@ -236,7 +236,8 @@ class Face(models.Model):
         if self.__dict__[f'poss_ident{poss_idx}_id'] != None:
             ident_id_person = self.__dict__[f'poss_ident{poss_idx}_id']
             person = Person.objects.get(id=ident_id_person)
-            person.decrement_possible_num()
+            if poss_idx == 1:
+                person.decrement_possible_num()
             self.__dict__[f'poss_ident{poss_idx}_id'] = None
             self.__dict__[f'weight_{poss_idx}'] = 0.0
 
@@ -246,6 +247,9 @@ class Face(models.Model):
         # any, and decrements the counts of assigned faces. 
         # Also removes values for possible identities. Increments
         # counts for the new person appropriately.
+
+        assert type(person_id) is int, f"person_id must be an int corresponding to a database ID for a Person object."
+        assert Person.objects.filter(id=person_id).exists(), f"Person with ID {person_id} does not exist in the database"
 
         # Change the numbers for assigned to the old and new person objects
         if self.declared_name.id != person_id:
@@ -259,7 +263,6 @@ class Face(models.Model):
         new_id.increment_unverified()
         self.validated = False
         self.written_to_photo_metadata = False
-
 
         self.remove_poss_ident(1)
         self.remove_poss_ident(2)
@@ -286,21 +289,19 @@ class Face(models.Model):
 
     def set_possible_person(self, person_id, poss_idx, weight):
 
+        assert poss_idx > 0, 'The index correlateed to poss_ident must be a value between 1 and 5.'
+        assert poss_idx <= 5, 'The index correlateed to poss_ident must be a value between 1 and 5.'
+        assert type(person_id) in [int, np.int32, np.int64], f"Person ID should be an int but is {type(person_id)}"
+        assert type(weight) in [int, float, np.float64], f"Weight should be an int or float; is {type(weight)}"
+        assert weight >= 0
+        assert weight <= 1.000001, f"weight was {weight}"
         new_poss_id = Person.objects.get(id=person_id)
         if poss_idx == 1:
             new_poss_id.increment_possible_num()
-        self.__dict__[f'weight_{poss_idx}'] = weight
+        # self.__dict__[f'weight_{poss_idx}'] = weight
 
-        if poss_idx == 1:
-            self.poss_ident1 = new_poss_id
-        elif poss_idx == 2:
-            self.poss_ident2 = new_poss_id
-        elif poss_idx == 3:
-            self.poss_ident3 = new_poss_id
-        elif poss_idx == 4:
-            self.poss_ident4 = new_poss_id
-        elif poss_idx == 5:
-            self.poss_ident5 = new_poss_id
+        exec(f"self.poss_ident{poss_idx} = new_poss_id")
+        exec(f"self.weight_{poss_idx} = weight")
 
         self.save()
 
@@ -316,6 +317,7 @@ class Face(models.Model):
 
     def reject_association(self, person_unassociate_id):
 
+        assert type(person_unassociate_id) == int
         disown_person = Person.objects.get(id=person_unassociate_id)
 
         possible_ids = []
@@ -326,14 +328,17 @@ class Face(models.Model):
                 get_id = None
             possible_ids.append(get_id)
 
+        assert person_unassociate_id in possible_ids
+
         # Use eval statements to effect a change in the possible ID list.
         # Find if the removal ID is in the possible IDs, then bump everything
         # up higher in the possible IDs list, accounting for any "None" values. 
         if person_unassociate_id in possible_ids: 
             remove_idx = possible_ids.index(person_unassociate_id)
-            print(f"self.poss_ident{remove_idx + 1}.decrement_possible_num()")
+            exec(f"self.poss_ident{remove_idx + 1}.decrement_possible_num()")
             source_idcs = [x for x in range(5) if x != remove_idx and possible_ids[x] is not None]
             dest_idcs = list(range(len(source_idcs)))
+
 
             for offset in range(len(source_idcs)):
                 source_offset = source_idcs[offset]
@@ -342,31 +347,23 @@ class Face(models.Model):
                     continue
                 exec(f"self.poss_ident{dest_offset + 1} = self.poss_ident{source_offset + 1}")
                 exec(f"self.weight_{dest_offset + 1} = self.weight_{source_offset + 1}")
+                if dest_offset == 0:
+                    # print("Dest offset", self.poss_ident1.person_name, self.poss_ident1.id)
+                    self.poss_ident1.increment_possible_num()
 
-            for offset in range(max(dest_idcs) + 2, 6):
+            if len(dest_idcs) > 0:
+                offset_start = max(dest_idcs) + 2
+            else:
+                offset_start = 1
+                
+            for offset in range(offset_start, 6):
                 exec(f"self.poss_ident{offset} = None")
                 exec(f"self.weight_{offset} = 0.0")
 
-        # if self.poss_ident1 == disown_person:
-        #     self.poss_ident1.decrement_possible_num()
-        #     self.poss_ident1 = None
-        #     self.weight_1 = 0.0
-        # elif self.poss_ident2 == disown_person:
-        #     self.poss_ident2.decrement_possible_num()
-        #     self.poss_ident2 = None
-        #     self.weight_2 = 0.0
-        # elif self.poss_ident3 == disown_person:
-        #     self.poss_ident3.decrement_possible_num()
-        #     self.poss_ident3 = None
-        #     self.weight_3 = 0.0
-        # elif self.poss_ident4 == disown_person:
-        #     self.poss_ident4.decrement_possible_num()
-        #     self.poss_ident4 = None
-        #     self.weight_4 = 0.0
-        # elif self.poss_ident5 == disown_person:
-        #     self.poss_ident5.decrement_possible_num()
-        #     self.poss_ident5 = None
-        #     self.weight_5 = 0.0
+            # print("Removing", remove_idx)
+            # if remove_idx == 0:
+            #     assert source_idcs[0] == 1
+            #     assert dest_idcs[0] == 0
 
         reject_list = self.rejected_fields
         if reject_list is None:
@@ -379,13 +376,3 @@ class Face(models.Model):
         self.rejected_fields = reject_list
         self.save()
 
-'''
-from face_manager.models import Person
-people = Person.objects.all()
-for p in people:
-    print(p)
-    p.num_faces = p.face_declared.count()
-    p.num_possibilities = p.face_poss1.count() + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
-    p.num_unverified_faces = p.face_declared.filter(validated=False).count()
-    p.save()
-'''
