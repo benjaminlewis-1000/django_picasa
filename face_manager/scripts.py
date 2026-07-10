@@ -3,7 +3,7 @@
 from .models import Person, Face
 from django.conf import settings
 from django.core.files.base import ContentFile
-from facenet_pytorch import MTCNN, InceptionResnetV1
+# from facenet_pytorch import MTCNN, InceptionResnetV1
 from filepopulator.models import ImageFile
 from io import BytesIO
 import cv2

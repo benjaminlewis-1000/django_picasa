@@ -20,13 +20,23 @@ from django.contrib.staticfiles.urls import staticfiles_urlpatterns
 from django.conf import settings
 from django.conf.urls.static import static
 from picasa import views
+from django.shortcuts import redirect
+
+# Custom function to hijack the admin login screen
+def admin_login_redirect(request):
+    if not request.user.is_authenticated:
+        # Bounces unauthenticated admin visitors straight to the Authelia path
+        return redirect('/accounts/oidc/authelia/login/?next=/admin/')
+    return redirect('/admin/')
 
 urlpatterns = [
+    path('admin/login/', admin_login_redirect),
     path('admin/', admin.site.urls),
     # path('periodic/', include('periodic.urls')),
     # path('filepopulator/', include('filepopulator.urls')),
     # path('face_manager/', include('face_manager.urls')),
     path(r'api/', include('api.urls')),
+    path(r'accounts/', include('allauth.urls')),
     path(r'', views.index),
     path(r'index.html', views.index),
 ]

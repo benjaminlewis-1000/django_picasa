@@ -51,3 +51,4 @@ xmltodict>=1.0.2
 onnxruntime>=1.23.1
 insightface>=0.7.3
 tqdm>=4.67.1
+django-allauth[openidconnect]>=65.18.0

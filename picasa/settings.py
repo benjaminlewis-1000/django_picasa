@@ -145,8 +145,10 @@ INSTALLED_APPS = [
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
+    'django.contrib.sites',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'django.contrib.postgres',
     # 'periodic.apps.PeriodicConfig',
     'rest_framework',
     'rest_framework.authtoken',
@@ -161,7 +163,15 @@ INSTALLED_APPS = [
     'filters',
     # 'webpack_loader',
     # 'upload_img',
+    'allauth',
+    'allauth.account',
+    'allauth.socialaccount',
+    'allauth.socialaccount.providers.openid_connect', # <-- The OIDC bridge
 ]
+
+# You also must specify a SITE_ID if using django.contrib.sites
+SITE_ID = 1
+ACCOUNT_DEFAULT_HTTP_PROTOCOL = 'https'
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
@@ -172,41 +182,83 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    "allauth.account.middleware.AccountMiddleware",
 ]
 
-#######################
-# Webpack Configuration 
-#######################
-# STATICFILES_DIRS = (
-#     os.path.join(BASE_DIR, 'frontend', 'static'),
-# )
 
-# WEBPACK_LOADER = {
-#     'DEFAULT' : {
-#     ##TOCHANGE
-#         # 'dist' is the location of webpack generated files.
-#         'BUNDLE_DIR_NAME': 'dist/',
-#         'STATS_FILE': os.path.join(BASE_DIR, 'frontend',  'webpack-stats.json')
-#     }
-# }
-#######################
-# /Webpack Configuration 
-#######################
+# To get the Authelia secret:
+# 1) Generate the client secret plaintext, put it in your .env file
+# 2) Generate the hash for this in Authelia, with
+# docker exec -it authelia authelia crypto hash generate pbkdf2 --variant sha512 --password "your_chosen_cleartext_secret"
+# 3) Add the client to Authelia's configuration.yaml file:
+'''
+identity_providers:
 
-# CORS_ORIGIN_WHITELIST = [
-#     "https://192.168.1.15:8080",
-#     "https://192.168.1.145:8080",
-#     "https://facewire.exploretheworld.tech",
-#     "jsfiddle.net",
-# ]
+  ##
+  ## OpenID Connect (Identity Provider)
+  ##
+  ## It's recommended you read the documentation before configuration of this section.
+  ## See: https://www.authelia.com/c/oidc/provider
+  oidc:
+    clients:
+      - client_id: 'django_picasa'            # <-- This is your client_id
+        client_name: 'Django Face Tagging'
+        client_secret: 'HASHED_SECRET' # <-- The HASHED secret from Step 2
+        public: false
+        authorization_policy: 'one_factor'       # or 'two_factor' depending on your preference
+        scopes:
+          - 'openid'
+          - 'profile'
+          - 'email'
+        redirect_uris:
+        # Whatever your URL is
+          - 'https://facewire.exploretheworld.tech/accounts/oidc/authelia/login/callback/'
+'''
+# 4) Match it over to the below block.
+SOCIALACCOUNT_PROVIDERS = {
+    "openid_connect": {
+        "APPS": [
+            {
+                "provider_id": "authelia",
+                "name": "Authelia SSO",
+                "client_id": "django_picasa",
+                "secret": os.environ['AUTHELIA_SECRET'],
+                "settings": {
+                    "server_url": "https://auth.exploretheworld.tech/.well-known/openid-configuration"
+                }
+            }
+        ]
+    }
+}
 
-# CORS_ORIGIN_WHITELIST = (
-#     "http://192.168.1.15:8080"
-# )
+####################
+# AUTHELIA
+####################
 
-# CORS_ORIGIN_REGEX_WHITELIST = [
-#     r"*jsfiddle\.net*",
-# ]
+# Trust the email from Authelia and log into the matching local account
+SOCIALACCOUNT_EMAIL_AUTHENTICATION = True
+
+# Automatically link the Authelia social profile to the local account
+SOCIALACCOUNT_EMAIL_AUTHENTICATION_AUTO_CONNECT = True
+
+# Bypass the "You are about to sign in" intermediate warning page
+SOCIALACCOUNT_LOGIN_ON_GET = True
+
+# Where to send users after a successful login
+LOGIN_REDIRECT_URL = 'https://picasa.exploretheworld.tech/'
+
+# Where to send users if they log out
+# LOGOUT_REDIRECT_URL = 'https://picasa.exploretheworld.tech/'
+
+# Force Django's login shortcuts to point directly to your Authelia flow
+LOGIN_URL = '/accounts/oidc/authelia/login/'
+
+# Bouncing a Django logout request straight out to Authelia's logout portal
+LOGOUT_REDIRECT_URL = 'https://auth.exploretheworld.tech/logout'
+# Force Django to destroy its session cookie when the browser tab closes
+SESSION_COOKIE_AGE = 1800  # Expires after 30 minutes of inactivity
+SESSION_EXPIRE_AT_BROWSER_CLOSE = True
+SESSION_COOKIE_DOMAIN = '.exploretheworld.tech'
 
 LOGGING = {
     'version': 1,
@@ -228,7 +280,26 @@ LOGGING = {
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 CORS_ORIGIN_ALLOW_ALL=True
+# Crucial: This tells Django to accept incoming cookies from cross-origin requests
 CORS_ALLOW_CREDENTIALS = True
+
+CORS_ALLOWED_ORIGINS = [
+    "https://facewire.exploretheworld.tech",
+]
+
+ACCOUNT_ALLOW_OAuth2_REDIRECTS = True
+ALLOWED_REDIRECT_HOSTS = ["facewire.exploretheworld.tech"]
+
+ACCOUNT_ADAPTER = 'picasa.adapters.SubdomainRedirectAdapter'
+
+# Trust your frontend domain to submit POST/PATCH/DELETE requests
+CSRF_TRUSTED_ORIGINS = [
+    'https://facewire.exploretheworld.tech',
+    "http://picasa.exploretheworld.tech"
+]
+
+# Ensure the CSRF cookie is accessible across your subdomains
+CSRF_COOKIE_DOMAIN = '.exploretheworld.tech'
 
 CORS_ALLOW_HEADERS = [
     'accept',
@@ -241,6 +312,7 @@ CORS_ALLOW_HEADERS = [
     'x-csrftoken',
     'x-requested-with',
 ]
+
 
 LOGGER.debug("CORS allowing from all...")
 
@@ -298,6 +370,7 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 # Token authentication: https://simpleisbetterthancomplex.com/tutorial/2018/11/22/how-to-implement-token-authentication-using-django-rest-framework.html
+# Ensure SessionAuthentication is your top priority authentication class
 REST_FRAMEWORK = {
      'DEFAULT_AUTHENTICATION_CLASSES': [
         # 'rest_framework.authentication.BasicAuthentication',
@@ -308,7 +381,12 @@ REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': 100, 
     'DEFAULT_FILTER_BACKENDS': ['django_filters.rest_framework.DjangoFilterBackend'],
+    'EXCEPTION_HANDLER': 'picasa.exceptions.api_redirect_to_login_handler',
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
 }
+
 
 # JSON Web Tokens config
 SIMPLE_JWT = {
@@ -454,6 +532,5 @@ DEFAULT_RESOLUTION_HEIGHT = 2160 # For 4k screens
 DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
 APPEND_SLASH=True # Allow URLs to append a trailing slash
 
-CSRF_TRUSTED_ORIGINS = ["http://picasa.exploretheworld.tech", "https://picasa.exploretheworld.tech"]
 
 # print("STATIC is : ", STATIC_URL)

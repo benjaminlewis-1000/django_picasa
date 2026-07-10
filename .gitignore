@@ -20,3 +20,4 @@ static/*
 media/*
 gdrive_credentials.json
 *.npy
+*.pem

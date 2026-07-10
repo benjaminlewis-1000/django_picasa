@@ -58,14 +58,26 @@ services:
 
       # Need to start postgresql service
 
-#  flower:
-#    image: mher/flower
+  flower:
+    image: mher/flower
 #    command: ["flower", "--broker=redis://task_redis:6379/0", "--port=8888"]  
-#    container_name: flower
-#    networks:
-#      - traefik_proxy
-#    environment:
-#      - ub:50
+    command: celery flower --port=5555 --namespace=picasa
+    container_name: flower
+#    working_dir: /app 
+    networks:
+      - traefik_proxy
+    environment:
+      - ub:50
+      - CELERY_BROKER_URL=redis://task_redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://task_redis:6379/0  # Add this line!
+
+      # Force Flower to use your custom Django namespace channels
+      - CELERY_CONTROL_EXCHANGE=picasa.control
+      - CELERY_EVENT_EXCHANGE=picasa.ev
+#    volumes:
+#      - ${DJANGO_FILES_ROOT}:/app
+    depends_on:
+      - task_redis
 
 #    labels:
 #
@@ -114,7 +126,7 @@ services:
       - traefik_proxy
 
   task_redis:
-    image: redis:5.0-alpine
+    image: redis:8.6-alpine
     # env_file:
     #   - .env_picasa
     restart: always
