@@ -27,12 +27,12 @@ class FaceExtractor(object):
         face_analysis = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])  # Use 'CUDAExecutionProvider' for GPU
         # self.app = FaceAnalysis(name='antelopev2', providers=['CPUExecutionProvider'])  # Use 'CUDAExecutionProvider' for GPU
         face_analysis.prepare(ctx_id=-1)  # ctx_id=-1 for CPU, 0 for GPU
-
-        self.app = PyramidalDetector(detector = face_analysis)
         
         self.IOU_thresh = 0.3
         self.iou_function = bops.distance_box_iou 
         self.blank_face_person = Person.objects.get(person_name = settings.BLANK_FACE_NAME)
+
+        self.app = PyramidalDetector(detector = face_analysis, iou_thresh = self.IOU_thresh)
 
         # Based on code at: 
         # https://github.com/deepinsight/insightface/blob/2a78baec428354883e0cda39c54b555a5ed8358a/cpp-package/inspireface/cpp/inspireface/include/inspireface/data_type.h#L285
@@ -101,33 +101,44 @@ class FaceExtractor(object):
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Family Pictures/2011/2011 (12) December/Christmas 2011 (93).JPG') # SOLVED: del moved inside for loop
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Pictures_In_Progress/2019/Ben Work Trips/London and Brighton/2019-05-13 18.58.02.jpg') # SOLVED: del moved inside for loop
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Family Pictures/2012/7-2012/July Trip/Washington DC (93).JPG') # SOLVED: del moved inside for loop
+        # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/aggregated/IMG_20260630_173524.jpg') # 
+        # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Phone Camera Uploads/20190324_201733.jpg') # 
         unprocessed_imgs = ImageFile.objects.filter(isProcessed=False).order_by('?') 
 
         for img_obj in unprocessed_imgs:
 
             source_file = img_obj.filename
             print(source_file)
-            img_numpy = common.open_img_oriented(source_file, as_numpy = True)
-            assert len(img_numpy.shape) == 3
-            # print(img_numpy.shape)
+            try:
+                img_numpy = common.open_img_oriented(source_file, as_numpy = True)
+                assert len(img_numpy.shape) == 3
+                # print(img_numpy.shape)
 
-            # Get existing faces, if any, attached to the image.
-            # Put the bounding boxes of these faces into a 2D tensor
-            # which will be used to calculate IOU.
-            existing_faces = Face.objects.filter(source_image_file=img_obj)
-            n_existing = len(existing_faces)
-            existing_boxes = torch.zeros(n_existing, 4)
-            
-            for face_idx, face_obj in enumerate(existing_faces): 
+                # Get existing faces, if any, attached to the image.
+                # Put the bounding boxes of these faces into a 2D tensor
+                # which will be used to calculate IOU.
+                existing_faces = Face.objects.filter(source_image_file=img_obj)
+                n_existing = len(existing_faces)
+                existing_boxes = torch.zeros(n_existing, 4)
                 
-                ex_box = torch.tensor([[face_obj.box_left, face_obj.box_top, face_obj.box_right, face_obj.box_bottom]], dtype=torch.float)
-                existing_boxes[face_idx, :] = ex_box
-            
-            # Use the self.app InsightFace module to detect and classify 
-            # faces in the image. Populate those bounding boxes into a 
-            # tensor to eventually compute IOU. 
-            # print(img_numpy.shape, type(img_numpy))
-            detected_faces = self.app.get(img_numpy)
+                for face_idx, face_obj in enumerate(existing_faces): 
+                    
+                    ex_box = torch.tensor([[face_obj.box_left, face_obj.box_top, face_obj.box_right, face_obj.box_bottom]], dtype=torch.float)
+                    existing_boxes[face_idx, :] = ex_box
+                
+                # Use the self.app InsightFace module to detect and classify 
+                # faces in the image. Populate those bounding boxes into a 
+                # tensor to eventually compute IOU. 
+                # print(img_numpy.shape, type(img_numpy))
+                detected_faces = self.app.get(img_numpy)
+            except Exception as e:
+                print("Error in processing!")
+                settings.LOGGER.debug(f"Error processing image {source_file}: {str(e)}")
+                print(f"Error processing image {source_file}: {str(e)}")
+                continue
+
+            print(f"Found {len(detected_faces)} faces in image {source_file}")
+            # print("Finished getting faces")
             n_detect = len(detected_faces)
             detect_boxes = torch.zeros(n_detect, 4)
 
@@ -284,6 +295,8 @@ class FaceExtractor(object):
                 assert face.face_encoding_512 is not None
                 assert len(face.face_encoding_512) == 512
                 assert face.reencoded == True
+
+        print("DONE")
 
 
 

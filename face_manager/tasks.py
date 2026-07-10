@@ -59,11 +59,6 @@ def process_faces():
             settings.LOGGER.warning("Face adding locked!")
             return
 
-        extractor = FaceExtractor()
-        extractor.find_and_encode_faces()
-        exit()
-            
-        # all_images = ImageFile.objects.all()
         unprocessed_imgs = ImageFile.objects.filter(isProcessed=False).all()
         unprocessed_count = ImageFile.objects.filter(isProcessed=False).count()
 
@@ -71,140 +66,8 @@ def process_faces():
             settings.LOGGER.debug("No images to extract! Exiting." )
             return
 
-        img_q = queue.Queue()
-
-        for img in unprocessed_imgs:
-            if not img.isProcessed:
-                if os.path.isfile(img.filename):
-                    img_q.put(img)
-
-
-
-        settings.LOGGER.debug("Going to start workers...")
-            
-        # Develop a threaded function. 
-
-        # class process_thread(threading.Thread):
-
-        #     def __init__(self, ip_addr, *args, **kwargs):
-        #         super(process_thread, self).__init__(*args, **kwargs)
-        #         self._stopper = threading.Event()
-
-        #         self.ip_addr = ip_addr
-
-        #     def stop(self):
-        #         self._stopper.set()
-                
-        #     def stopped(self): 
-        #         return self._stopper.isSet() 
-
-        #     def run(self):
-        #         settings.LOGGER.debug(f"Hi, I'm worker # {self.ip_addr}")
-        #         while True:
-        #             if self.stopped():
-        #                 return 
-                        
-        #             settings.LOGGER.debug(f"Queue size is {img_q.qsize()}, worker is {self.ip_addr}")
-        #             if img_q.qsize() == 0:
-        #                 settings.LOGGER.debug("all done!")
-        #                 break
-        #             else:
-        #                 img = img_q.get()
-
-        #             is_ok = None
-        #             rndDelay = random.randrange(5, 10) * 0.03
-        #             time.sleep(rndDelay)
-        #             qs = img_q.qsize()
-        #             for _ in range(3):
-        #                 try:
-        #                     is_ok = server_conn.check_ip(self.ip_addr)
-        #                     break
-        #                 except OSError:
-        #                     timeDelay = random.randrange(0, 2)
-        #                     settings.LOGGER.debug(f"IS_OK failed in worker {self.ip_addr}")
-        #                     time.sleep(timeDelay)
-
-        #             if not is_ok: 
-        #                 break
-                            
-        #             if not img.isProcessed:
-        #                 try:
-        #                     populateFromImageMultiGPU(img, server_conn = server_conn, server_ip = self.ip_addr, ip_checked=True)
-        #                 except OSError as ose:
-        #                     settings.LOGGER.debug(f"IP {self.ip_addr} issue with populateFromImage, filename {img.filename}, img id {img.id}. Error: {ose}")
-        #                     break
-
-        # # Put everything in a while loop that polls for new workers
-        # # or dead workers every n (30 now) seconds
-
-        # running_threads = {}
-
-        # # Kill the process once every 6 hours if it hasn't stopped already.
-
-        # start_time = time.time()
-                
-        # settings.LOGGER.debug("Starting to try...")
-
-        # def end_threads(running_threads):
-        #     settings.LOGGER.debug("End the threads")
-        #     keys = list(running_threads.keys())
-        #     for key in keys:
-        #         # print(running_threads[key])
-        #         running_threads[key].stop()
-        #         # running_threads[key].join()
-        #         running_threads.pop(key)
-
-
-        # while True: 
-        #     settings.LOGGER.debug("True loop")
-        #     cur_time = time.time()
-            
-        #     if cur_time - start_time > (45 * 60): # 45 minutes
-        #         settings.LOGGER.debug("KILLING Current time")
-        #         end_threads(running_threads)
-        #         break
-
-        #     if img_q.qsize() == 0:
-        #         end_threads(running_threads)            
-        #         break
-
-        #     try:
-        #         server_conn = establish_multi_server_connection()
-        #         # print(f"Servers are {server_conn.server_ips}")
-
-        #         num_servers = len(server_conn.server_ips)
-        #         # print(f"Number of servers is {num_servers}")
-        #         if num_servers == 0:
-        #             settings.LOGGER.critical('No GPU servers found')
-        #             return
-
-        #         for i, ip in enumerate(running_threads.keys()):
-        #             if not running_threads[ip].is_alive():
-        #                 settings.LOGGER.debug(f"Killing thread {ip}")
-        #                 running_threads[ip].stop()
-        #                 running_threads[ip].join()
-
-        #         for i, serv in enumerate(server_conn.server_ips):
-        #             if serv not in running_threads.keys() or not running_threads[serv].is_alive():
-        #                 t = process_thread(ip_addr = serv) # threading.Thread(target=worker, args=(serv,))
-        #                 # t.start()
-        #                 settings.LOGGER.debug(f"{i}, {serv}")
-        #                 running_threads[serv] = t
-        #                 running_threads[serv].start()
-
-        #         time.sleep(30)
-        #         settings.LOGGER.debug(running_threads.keys())
-        #         # print("Time slept")
-
-        #     except Exception as e:
-        #         settings.LOGGER.debug(f"Exception in face extraction found : {e}")
-        #         settings.LOGGER.debug(traceback.format_exc())
-        #         try:
-        #             end_threads(running_threads)
-        #         except FileNotFoundError:
-        #             pass
-        #         break
-            
+        extractor = FaceExtractor()
+        extractor.find_and_encode_faces()
 
     except:
 
@@ -241,11 +104,11 @@ def thistask(redo_all=False):
 def api_bulk_operation(input_dict: dict):
     print("Executing a bulk operation task", input_dict)
 
-# @shared_task(ignore_result=True, name='face_manager.set_face_counts')
-# def reset_task():
-#     people = Person.objects.all()
-#     for p in people:
-#         p.num_faces = p.face_declared.count()
-#         p.num_possibilities = p.face_poss1.count() + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
-#         p.num_unverified_faces = p.face_declared.filter(validated=False).count()
-#         p.save()
+@shared_task(ignore_result=True, name='face_manager.set_face_counts')
+def reset_task():
+    people = Person.objects.all()
+    for p in people:
+        p.num_faces = p.face_declared.count()
+        p.num_possibilities = p.face_poss1.count() + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
+        p.num_unverified_faces = p.face_declared.filter(validated=False).count()
+        p.save()

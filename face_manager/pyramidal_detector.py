@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from collections import Counter
 import torchvision.ops.boxes as bops
+from torchvision.ops import nms as nms
 import matplotlib.pyplot as plt
 
 class PyramidalDetector():
@@ -15,7 +16,7 @@ class PyramidalDetector():
     It then de-duplicates detections across levels and rectangles to find an 
     'optimal' detection for each face. 
     """
-    def __init__(self, detector: FaceAnalysis = None, debug: bool = False):
+    def __init__(self, detector: FaceAnalysis = None, debug: bool = False, iou_thresh = None):
         super(PyramidalDetector, self).__init__()
 
         if detector is None:
@@ -29,7 +30,10 @@ class PyramidalDetector():
         # Percent of the image to overlap in each direction. 
         self.pct_overlap = 0.06
         self.iou_function = bops.distance_box_iou
-        self.iou_thresh = 0.1
+        if iou_thresh is None:
+            self.iou_thresh = 0.1
+        else:
+            self.iou_thresh = iou_thresh
         self.wholly_contained_pct_thresh = 0.9
         self.debug = debug
 
@@ -211,10 +215,32 @@ class PyramidalDetector():
 
         bboxes = [det['bbox'] for det in overlapping_detections]
         bboxes = torch.tensor(np.array(bboxes))
+        scores = [det['det_score'] for det in overlapping_detections]
+        scores = torch.tensor(np.array(scores))
         iter_nums = np.array([det['iter_num'] for det in overlapping_detections])
 
         if len(overlapping_detections) == 0:
             return overlapping_detections
+
+        # print(overlapping_detections[0].keys())
+        # print(bboxes, scores)
+
+        nms_out = nms(bboxes, scores, iou_threshold = self.iou_thresh).tolist()
+        # print(nms_out)
+
+        deduplicated_faces = [overlapping_detections[i] for i in nms_out]
+
+        assert len(deduplicated_faces) == len(nms_out)
+        assert type(deduplicated_faces) == list
+        assert type(deduplicated_faces[0]) == insightface.app.common.Face
+        return deduplicated_faces
+
+        # if self.debug:
+        #     return deduplicated_faces, overlapping_detections, box_edges
+        # else:
+        #     return deduplicated_faces
+        # exit()
+        """
 
         # Compute how much of each bounding box lies within
         # each other bounding box. Output is that a given
@@ -361,3 +387,4 @@ class PyramidalDetector():
             return deduplicated_faces, overlapping_detections, box_edges
         else:
             return deduplicated_faces
+        """
