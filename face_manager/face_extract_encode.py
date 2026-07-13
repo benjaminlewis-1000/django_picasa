@@ -76,6 +76,53 @@ class FaceExtractor(object):
                 pf.reencoded = False
                 pf.save()
 
+    def tiebreak_overlapping_bboxes(self, existing_bbox, det_bboxes, overlap_scores, considered_indices):
+
+        if len(existing_bbox.shape) == 1:
+            single_box = existing_bbox
+            multiple_boxes = det_bboxes
+        else:
+            single_box = det_bboxes
+            multiple_boxes = existing_bbox
+
+        while multiple_boxes.shape[0] == 1:
+            multiple_boxes = multiple_boxes.squeeze(0)
+
+        assert len(single_box) == 4
+        assert multiple_boxes.shape[1] == 4
+        assert multiple_boxes.shape[0] > 1
+        assert len(overlap_scores) == multiple_boxes.shape[0]
+            
+        assert type(single_box) == torch.Tensor
+        assert type(multiple_boxes) == torch.Tensor
+        assert type(overlap_scores) == np.ndarray
+        assert len(considered_indices) == len(overlap_scores)
+        assert type(considered_indices) == np.ndarray
+
+        sl, st, sr, sb = single_box
+        center_lr_single = np.abs(sr - sl) // 2 + sl
+        center_tb_single = np.abs(sb - st) // 2 + st
+
+        min_dist = 99999999999
+        min_idx = -1
+        for local_idx, mult_bbox in enumerate(multiple_boxes):
+            # print(local_idx, mult_bbox)
+            ml, mt, mr, mb = mult_bbox 
+            center_lr_mult = np.abs(mr - ml) // 2 + ml
+            center_tb_mult = np.abs(mb - mt) // 2 + mt
+
+            distance = np.sqrt( (center_lr_single - center_lr_mult) ** 2 + (center_tb_single - center_tb_mult) ** 2 )
+            if distance < min_dist:
+                min_dist = distance
+                min_idx = local_idx 
+            # print(distance, min_dist, min_idx)
+        # for rn in j
+
+        closest_bbox_idx = considered_indices[min_idx]
+        # print(closest_bbox_idx)
+        return closest_bbox_idx
+
+
     def find_and_encode_faces(self):
         """
         Workhorse function that finds faces for all unprocessed
@@ -103,7 +150,10 @@ class FaceExtractor(object):
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Family Pictures/2012/7-2012/July Trip/Washington DC (93).JPG') # SOLVED: del moved inside for loop
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/aggregated/IMG_20260630_173524.jpg') # 
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Phone Camera Uploads/20190324_201733.jpg') # 
+        # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Family Pictures/2013/Feb 2013/DSC_0405.JPG')
         unprocessed_imgs = ImageFile.objects.filter(isProcessed=False).order_by('?') 
+        # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Family Pictures/2008/2008 July/100_4251.JPG')
+        # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Misc Picture/Old Phone/20150123_201221.jpg')
 
         for img_obj in unprocessed_imgs:
 
@@ -172,6 +222,7 @@ class FaceExtractor(object):
 
             
             iou = self.iou_function(existing_boxes, detect_boxes)
+            # print(iou, "|", existing_boxes, "|", detect_boxes)
 
             # Now we do some cases... 
             iou = iou.numpy()
@@ -191,6 +242,7 @@ class FaceExtractor(object):
 
             else:
                 max_ious = np.max(iou, axis=1) # Max IOU for each existing detection
+                # print("max ious: ", max_ious)
 
                 # Case 1 & 2
                 if np.min(max_ious) >= self.IOU_thresh:
@@ -221,9 +273,31 @@ class FaceExtractor(object):
                         matching_face_idcs = np.argmax(iou, axis=1)
                         for ex_idx, new_idx in enumerate(matching_face_idcs):
                             # print(ex_idx, new_idx)
-                            assert np.count_nonzero(iou[ex_idx]) == 1, f'An IOU match between detected and existing faces should only have one answer. This row was {iou[ex_idx]}'
-                            existing_data = existing_faces[ex_idx]
-                            new_data = detected_faces[new_idx]
+                            # print(iou)
+                            correlation_row = iou[ex_idx]
+                            n_correlate = np.count_nonzero(correlation_row)
+                            if n_correlate == 1:
+                                existing_data = existing_faces[ex_idx]
+                                new_data = detected_faces[new_idx]
+                            elif n_correlate > 1:
+                                new_idcs = np.where(correlation_row > 0)[0]
+                                
+                                selected_existing_bboxes = existing_boxes[ex_idx]
+                                selected_new_bboxes = detect_boxes[new_idcs]
+                                overlap_scores = correlation_row[new_idcs]
+                                # print(selected_existing_bboxes, selected_new_bboxes)
+                                # print(correlation_row)
+                                closest_idx = self.tiebreak_overlapping_bboxes(selected_existing_bboxes, selected_new_bboxes, overlap_scores, new_idcs)
+                                # print(closest_idx)
+                                # print("New idcs: ", new_idcs)
+                                
+                                existing_data = existing_faces[ex_idx]
+                                new_data = detected_faces[closest_idx]
+                            else:
+                                raise NotImplementedError("Should have at least one correlation")
+                            # assert np.count_nonzero(iou[ex_idx]) == 1, \
+                            #     f'An IOU match between detected and existing faces should only ' +\
+                            #     'have one answer. This row was {iou[ex_idx]}'
     
                             self.update_existing_face_to_insightface(existing_data, new_data)
     
@@ -246,19 +320,40 @@ class FaceExtractor(object):
     
                     # Handle matching rows
                     for rn in nonzero_rows:
-                        # print("RN = ", rn)
                         row = iou[rn]
-                        assert np.count_nonzero(row) == 1
+                        # print("RN = ", rn, row)
+                        # assert np.count_nonzero(row) == 1
                         existing_idx = int(rn)
-                        detected_idx = np.argmax(row)
+                        if np.count_nonzero(row) > 1:
+                            # print("TODO")
+                            existing_bbox = existing_boxes[existing_idx, :]
+                            # print(existing_bbox)
+                            nz_cols = np.where(row > 0)[0]
+                            # print(nz_cols)
+                            detect_bboxes = detect_boxes[nz_cols, :]
+                            # print(detect_bboxes)
+                            nz_scores = row[nz_cols]
+                            # print(nz_scores)
+                            detected_idx = self.tiebreak_overlapping_bboxes(existing_bbox, detect_bboxes, nz_scores, nz_cols)
+                            # print(detected_idx)
+                            assert row[detected_idx] > 0
+                        elif np.count_nonzero(row) == 1:
+                            detected_idx = np.argmax(row)
+                        else:
+                            assert np.count_nonzero(row) == 0
+                            raise ValueError('No overlapping detected and existing boxes - you shouldn\'t get here')
+
                         existing_data = existing_faces[existing_idx]
                         new_data = detected_faces[detected_idx]
                         self.update_existing_face_to_insightface(existing_data, new_data)
                         del existing_idx, row, detected_idx
 
                     # Handle any new detections from InsightFace that were not previously there.
+                    # print(iou)
                     column_maxs = np.max(iou, axis=0)
+                    # print(column_maxs)
                     new_face_idcs = np.where(column_maxs == 0)[0]
+                    # print(new_face_idcs)
     
                     for new_face_idx in new_face_idcs:
                         new_data = detected_faces[new_face_idx]
@@ -290,7 +385,7 @@ class FaceExtractor(object):
             # Get the number of faces associated with this object
             img_faces = Face.objects.filter(source_image_file = img_obj)
             # print(len(img_faces), len(detected_faces))
-            assert len(img_faces) >= len(detected_faces)
+            assert len(img_faces) >= len(detected_faces), f"{len(img_faces)} is not >= {len(detected_faces)}"
             for face in img_faces:
                 assert face.face_encoding_512 is not None
                 assert len(face.face_encoding_512) == 512
