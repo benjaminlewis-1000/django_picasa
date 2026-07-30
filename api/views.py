@@ -36,6 +36,7 @@ import json
 import numpy as np
 import os
 import PIL
+from .permissions import HasSlideshowKeyOrAuthenticated
 import threading
 import threading
 import time
@@ -219,7 +220,7 @@ class PersonViewSet(viewsets.ModelViewSet):
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 class PersonListView(APIView):
-    permission_classes = (IsAuthenticated,) 
+    permission_classes = (HasSlideshowKeyOrAuthenticated,) 
     def get(self, request, *args, **kwargs):
         params = self.request.query_params
 

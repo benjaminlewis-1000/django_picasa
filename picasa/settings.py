@@ -472,21 +472,21 @@ CELERY_BEAT_SCHEDULE = {
    },
   'classify_unlabeled': {
       'task': 'face_manager.assign_faces',
-      'schedule': crontab( minute = '5', hour='*'),
+      'schedule': crontab( minute = '0', hour='*'),
       'args': (False, ), # Don't reassign all of them.
   },
-   'classify_unlabeled_all_weekly': {
-       'task': 'face_manager.assign_faces',
-       # This schedule should be sufficient to
-       # break race conditions with the more frequent
-       # task, which executes every 5 minutes. That
-       # should have very little to do on a run-to-run basis,
-       # so it should finish quickly and be done by the 
-       # time that minute 4 comes along and asks to 
-       # reclassify all of the faces. 
-       'schedule': crontab( minute = '4', hour='1', day_of_week=1),
-       'args': (True, ), # Reassign all faces. 
-   },
+   # 'classify_unlabeled_all_weekly': {
+   #     'task': 'face_manager.assign_faces',
+   #     # This schedule should be sufficient to
+   #     # break race conditions with the more frequent
+   #     # task, which executes every 5 minutes. That
+   #     # should have very little to do on a run-to-run basis,
+   #     # so it should finish quickly and be done by the 
+   #     # time that minute 4 comes along and asks to 
+   #     # reclassify all of the faces. 
+   #     'schedule': crontab( minute = '4', hour='1', day_of_week=1),
+   #     'args': (True, ), # Reassign all faces. 
+   # },
 
 
 }
@@ -512,6 +512,7 @@ FILEPOPULATOR_SERVER_IMG_DIR = PHOTO_ROOT # root location of images you want to 
 FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code. 
 FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory that will have validation images when testing the app.
 FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL = 150 # Maximum size of the short edge for thumbnails.
+SLIDESHOW_API_KEY = os.environ['PICASA_API_KEY']
 
 FACE_THUMBNAIL_SIZE=(200, 200)
 

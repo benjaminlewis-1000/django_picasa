@@ -207,6 +207,7 @@ class FaceExtractor(object):
 
             if n_existing == 0 and n_detect == 0:
                 # There is nothing to do here.
+
                 img_obj.isProcessed = True
                 img_obj.save()
                 continue
@@ -215,7 +216,7 @@ class FaceExtractor(object):
                 # TODO: Add new faces
                 for det_face_obj in detected_faces:
                     self.add_new_face(det_face_obj, img_obj, img_numpy)
-
+                
                 img_obj.isProcessed = True
                 img_obj.save()
                 continue
@@ -237,7 +238,6 @@ class FaceExtractor(object):
                 # for jj in existing_faces:
                 #     print(type(jj))
                 self.update_list_of_no_matching_detects(existing_faces)
-                img_obj.isProcessed = True
                 img_obj.save()
 
             else:
@@ -307,7 +307,6 @@ class FaceExtractor(object):
     
                         # print(matching_face_idcs)
                         
-                        img_obj.isProcessed = True
                         img_obj.save()
     
                     else:
@@ -376,22 +375,25 @@ class FaceExtractor(object):
                     # print("Existing faces: ", existing_boxes)
                     # print("Detected faces: ", detect_boxes)
                     # pr    int("IOU: ", iou)
-                    img_obj.isProcessed = True
                     img_obj.save()
                     # raise NotImplementedError("Not implemented")
     
-            # Assert that the image isProcessed flag is set
-            assert img_obj.isProcessed == True, 'Image isProcessed flag was not set'
             # Get the number of faces associated with this object
             img_faces = Face.objects.filter(source_image_file = img_obj)
             # print(len(img_faces), len(detected_faces))
             assert len(img_faces) >= len(detected_faces), f"{len(img_faces)} is not >= {len(detected_faces)}"
+
+            img_obj.isProcessed = True
+            img_obj.save()
+            # Assert that the image isProcessed flag is set
+            assert img_obj.isProcessed == True, 'Image isProcessed flag was not set'
+
             for face in img_faces:
                 assert face.face_encoding_512 is not None
                 assert len(face.face_encoding_512) == 512
                 assert face.reencoded == True
 
-        print("DONE")
+        # print("DONE")
 
 
 

@@ -49,7 +49,7 @@ class faceAssigner():
         self.NUM_TO_AVERAGE = 1
         self.N_COMPARISONS = 25
 
-        self.ASSIGN_THRESH=0.8
+        self.ASSIGN_THRESH=0.6
 
         # self.bogus_date = datetime(1990, 1, 1) # Very few images before that
         # self.bogus_date_utc = time.mktime(self.bogus_date.timetuple())
@@ -69,7 +69,6 @@ class faceAssigner():
 
         self.likely_people_ids = [p.id for p in assigned_people]
         self.num_likely_people = len(self.likely_people_ids)
-        print(self.num_likely_people)
 
         ########################################################
         # Map people to the likely earliest date they showed up in images,
@@ -97,6 +96,66 @@ class faceAssigner():
         Face.objects.filter(~Q(weight_3=0.0)).update(weight_3 = 0.0)
         Face.objects.filter(~Q(weight_4=0.0)).update(weight_4 = 0.0)
         Face.objects.filter(~Q(weight_5=0.0)).update(weight_5 = 0.0)
+        Face.objects.filter(Q(declared_name__person_name=settings.BLANK_FACE_NAME)).update(rejected_fields = None)
+
+    def load_encodings(self, reload_pkl_file: bool = False):
+
+        ss = time.time()
+
+        self.candidate_dict = {}
+        self.embedding_dict = {}
+        self.norm_dict = {}
+        if os.path.exists(self.ENCODINGS_PKL_FILE) and not reload_pkl_file:
+            with open(self.ENCODINGS_PKL_FILE, 'rb') as ph:
+                combo_dict = pickle.load(ph)
+
+                self.candidate_dict = combo_dict['candidate_dict']
+                self.embedding_dict = combo_dict['embedding_dict']
+                self.norm_dict = combo_dict['norm_dict']
+        changed = False
+
+        for face_id in tqdm(self.likely_people_ids):
+
+            if face_id in self.candidate_dict.keys() and \
+               face_id in self.embedding_dict.keys() and \
+               face_id in self.norm_dict.keys():
+                # print(f'No need to process this face {face_id}')
+                continue
+            # print(f"Processing face {face_id}")
+            changed = True
+
+            faces_person = Q(declared_name__id=face_id)
+            has_long = ~Q(face_encoding_512=None)
+            long_encoded = ~Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
+            
+            person_data = Face.objects \
+                .filter(faces_person & long_encoded & has_long)
+            data = person_data.values_list('id', 'face_encoding_512', 'dateTakenUTC')
+
+            df = pd.DataFrame(data, columns=['id', 'face_encoding_512', 'dateTakenUTC'])
+            
+            self.candidate_dict[face_id] = df
+
+            cmp_embedding = np.array(self.candidate_dict[face_id]['face_encoding_512'].tolist())
+            norm_list = np.linalg.norm(cmp_embedding, axis=1)
+            self.embedding_dict[face_id] = cmp_embedding.T
+            assert self.embedding_dict[face_id].shape[0] == 512
+            assert self.embedding_dict[face_id].shape[1] == len(norm_list)
+            assert len(norm_list) == len(self.candidate_dict[face_id])
+            self.norm_dict[face_id] = norm_list
+            
+        all_dict = {'candidate_dict': self.candidate_dict,
+                    'embedding_dict': self.embedding_dict,
+                    'norm_dict': self.norm_dict}
+
+        if changed:
+            try:
+                with open(self.ENCODINGS_PKL_FILE, 'wb') as ph:
+                    pickle.dump(all_dict, ph)
+            except:
+                os.remove(self.ENCODINGS_PKL_FILE)
+
+        print(f"Dataframe preloading: {time.time() - ss:.2f} seconds")
 
     def execute(self, redo_all: bool = False) -> None:
         """
@@ -126,66 +185,9 @@ class faceAssigner():
         print(f"There are {num_unassigned} faces to classify")
 
         if num_unassigned > 100:
-
-            print(f"There are {num_unassigned} faces to classify. We are pre-loading the database's encodings, which may take several minutes.")
-            ss = time.time()
-
-            self.candidate_dict = {}
-            self.embedding_dict = {}
-            self.norm_dict = {}
-            if os.path.exists(self.ENCODINGS_PKL_FILE):
-                with open(self.ENCODINGS_PKL_FILE, 'rb') as ph:
-                    combo_dict = pickle.load(ph)
-
-                    self.candidate_dict = combo_dict['candidate_dict']
-                    self.embedding_dict = combo_dict['embedding_dict']
-                    self.norm_dict = combo_dict['norm_dict']
-                print("Dataframe loaded from file")
-            # else:
-            changed = False
-
-            for face_id in tqdm(self.likely_people_ids):
-
-                if face_id in self.candidate_dict.keys() and \
-                   face_id in self.embedding_dict.keys() and \
-                   face_id in self.norm_dict.keys():
-                    print(f'No need to process this face {face_id}')
-                    continue
-                print(f"Processing face {face_id}")
-                changed = True
-
-                faces_person = Q(declared_name__id=face_id)
-                has_long = ~Q(face_encoding_512=None)
-                long_encoded = ~Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
-                
-                person_data = Face.objects \
-                    .filter(faces_person & long_encoded & has_long)
-                data = person_data.values_list('id', 'face_encoding_512', 'dateTakenUTC')
-
-                df = pd.DataFrame(data, columns=['id', 'face_encoding_512', 'dateTakenUTC'])
-                
-                self.candidate_dict[face_id] = df
-
-                cmp_embedding = np.array(self.candidate_dict[face_id]['face_encoding_512'].tolist())
-                norm_list = np.linalg.norm(cmp_embedding, axis=1)
-                self.embedding_dict[face_id] = cmp_embedding.T
-                assert self.embedding_dict[face_id].shape[0] == 512
-                assert self.embedding_dict[face_id].shape[1] == len(norm_list)
-                assert len(norm_list) == len(self.candidate_dict[face_id])
-                self.norm_dict[face_id] = norm_list
-                
-            all_dict = {'candidate_dict': self.candidate_dict,
-                        'embedding_dict': self.embedding_dict,
-                        'norm_dict': self.norm_dict}
-
-            if changed:
-                try:
-                    with open(self.ENCODINGS_PKL_FILE, 'wb') as ph:
-                        pickle.dump(all_dict, ph)
-                except:
-                    os.remove(self.ENCODINGS_PKL_FILE)
-
-            print(f"Dataframe preloading: {time.time() - ss:.2f} seconds")
+            print(f"There are {num_unassigned} faces to classify.' +\
+                f' We are pre-loading the database's encodings, which may take several minutes.")
+            self.load_encodings()
         else:
             self.encoding_dataframe = None
         
@@ -213,11 +215,14 @@ class faceAssigner():
 
 
 
-    def classify_unassigned(self, unassigned_face: Face) -> None:
+    def classify_unassigned(self, unassigned_face: Face, debug_face_id = None) -> None:
         """
         DOCSTRING
         """
-
+        if self.DEBUG:
+            print("=" * 80)
+            print("classify ", unassigned_face.id)
+            
         if type(unassigned_face) != Face:
             raise TypeError(f"Type of object passed to self.classify_unassigned was {type(unassigned_face)}, should be {Face}")
 
@@ -266,11 +271,16 @@ class faceAssigner():
             #     print(sim_max, sim_99th, db_id, unassigned_face.id)
 
             metrics_array[row_num, :] = [sim_max, sim_99th, db_id]
+            if self.DEBUG and db_id == debug_face_id and debug_face_id is not None:
+                print("Row values: ", metrics_array[row_num, :])
             # print(np.max(similarity))
             # similarity_ordered = np.sort(similarity)[::-1]
             # print(similarity_ordered)
 
         possible_idcs = np.where(metrics_array[:, 0] > self.ASSIGN_THRESH)[0]
+        if self.DEBUG:
+            print(possible_idcs, "poss len is", len(possible_idcs))
+            print(metrics_array[possible_idcs, :])
         if len(possible_idcs) == 0:
             # print("TODO: Assign to ignore person")
             metric_max = np.max(metrics_array[:, 0])
@@ -278,7 +288,13 @@ class faceAssigner():
                 # screen first, so something that has a low similarity
                 # should have 1-value for a high score. 
 
+            if self.DEBUG:
+                row = np.argmax(metrics_array[:, 0])
+                print("Metric max: ", metric_max, metrics_array[row])
+
             if self.ignore_person_id in rejected_ids:
+                if self.DEBUG:
+                    print("Ignore person is rejected")
                 # print("Need to reject the person")
                 max_idx = np.argmax(metrics_array[:, 0])
                 max_id = candidate_id_arr[max_idx]
@@ -296,118 +312,3 @@ class faceAssigner():
                 # print(assign_ids[order_idx], precedence_idx, weights[order_idx])
                 unassigned_face.set_possible_person(int(assign_ids[order_idx]), precedence_idx + 1, float(weights[order_idx]))
 
-        # print(metrics_array)
-        # exit()
-
-        # exit()
-
-
-        # for row_num, db_id in enumerate(candidate_ids):
-        #     person = Person.objects.get(id=db_id)
-        #     first_date_person = self.person_to_dates[db_id]['first_timestamp']
-        #     if date_taken < first_date_person and date_taken > self.bogus_date_utc: 
-        #         # This person is unlikely to be in this photo
-        #         # dist_per_category.append(9999)
-        #         # print(f'Person {person} is unlikely to be in this image on {date_string}')
-        #         # continue
-        #         pass
-        #     else:
-        #         faces_person = Q(declared_name__id=db_id)
-        #         has_long = ~Q(face_encoding_512=None)
-        #         long_encoded = ~Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
-                
-        #         s1 = time.time()
-        #         closest_faces = Face.objects \
-        #             .filter(faces_person & long_encoded & has_long) \
-        #             .annotate(result=Abs(F('dateTakenUTC') - date_taken)) \
-        #             .order_by('result')
-        #         # Get the N_COMPARISONS closest faces
-        #         closest_faces = closest_faces[:self.N_COMPARISONS]
-        #         print(f"Close face query takes {time.time() - s1:.2f} sec")
-
-        #         if self.encoding_dataframe is None:
-        #             cmp_encodings = np.array(closest_faces.values_list('face_encoding_512', flat=True))
-        #         else:
-        #             ss = time.time()
-        #             cmp_ids = list(closest_faces.values_list('id', flat=True))
-        #             cmp_ids.sort()
-        #             print(f"Getting ids takes {time.time() - ss: .2f} sec, ids are {cmp_ids}")
-        #             cmp_encodings = self.encoding_dataframe.loc[cmp_ids]
-        #             cmp_encodings = np.array(cmp_encodings['face_encoding_512'].tolist())
-        #             # print(cmp_ids)
-        #             assert len(cmp_encodings) == len(cmp_ids)
-        #             assert cmp_encodings.shape == (len(cmp_ids), 512)
-        #         # print(cmp_encodings.shape, encoding.shape)
-
-
-
-
-        # exit()
-
-
-    # def known_persons_to_dates(self):
-    #     # Get the dates for all pictures with a given person tagged in
-    #     # them. Also calculate the first (non-bogus) timestamp of the person
-    #     # appearing. 
-    #     self.person_to_dates = {}
-    #     for known_id in self.likely_people_ids:
-    #         faces_person = Q(declared_name__id=known_id)
-    #         p = Person.objects.get(id=known_id)
-    #         faces = Face.objects.filter(faces_person).order_by('id')
-    #         face_ids = list(faces.values_list('id', flat=True))
-    #         # face_timestamps = [f.source_image_file.dateTakenUTC for f in faces]
-    #         face_timestamps = list(faces.values_list('dateTakenUTC', flat=True))
-    #         timestamps_sorted = np.sort(face_timestamps).reshape(-1, 1)
-    #         earliest_date_idx = np.where(timestamps_sorted > self.bogus_date_utc)
-    #         timestamps_sorted_nonbogus = timestamps_sorted[earliest_date_idx]
-    #         # Modified Z score
-
-    #         median = np.median(timestamps_sorted_nonbogus, axis=0)
-    #         diff = (timestamps_sorted_nonbogus - median)**2
-    #         diff = np.sqrt(diff)
-    #         med_abs_deviation = np.median(diff)
-
-    #         modified_z_score = 0.6745 * diff / med_abs_deviation
-
-    #         min_idx = np.argmin(modified_z_score)
-    #         modified_z_score = modified_z_score[:min_idx]
-
-    #         # Compute z score as a heuristic to get earliest date
-    #         # z_score = stats.zscore(timestamps_sorted_nonbogus).reshape(-1, 1)
-    #         # Then inter-quartile range
-    #         q1 = np.percentile(modified_z_score, 25)#! /
-    #         q3 = np.percentile(modified_z_score, 75)
-    #         iqr = q3 - q1
-    #         lower_z = q1 - iqr 
-    #         upper_z = q3 + iqr 
-
-    #         # Get the threshold 
-    #         # The modified z score is a parabola, so only get the
-    #         # first half
-    #         thresh_idx = np.where(modified_z_score[:min_idx] > upper_z)[0]
-    #         if len(thresh_idx) > 0:
-    #             thresh_idx = np.max(thresh_idx) + 1
-    #         else:
-    #             thresh_idx = 0
-    #         # Throw in a couple more indices for fun
-    #         idx_add = int(np.ceil(len(face_ids) // 1000))
-    #         # print(known_id)
-    #         # print(upper_z)
-    #         # print(modified_z_score[:10])
-    #         thresh_idx += idx_add
-
-    #         # best_early = np.min(timestamps_sorted_nonbogus[np.where(z_score > -1)])
-    #         earliest_date = timestamps_sorted_nonbogus[thresh_idx]
-
-    #         person_data = {}
-    #         person_data['timestamps'] = face_timestamps
-    #         person_data['face_ids'] = face_ids
-    #         # Unlikely to get images before the first timestamp - or we can
-    #         # declare no images more than x days before the earliest timestamp. 
-    #         person_data['first_timestamp'] = earliest_date
-
-    #         date_string = time.strftime('%Y-%m-%d', time.localtime(earliest_date))
-    #         # print(p, '|', date_string, earliest_date)
-
-
-    #         self.person_to_dates[known_id] = person_data

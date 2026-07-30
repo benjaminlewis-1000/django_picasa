@@ -1,23 +1,21 @@
 from __future__ import absolute_import, unicode_literals
 
-from django.contrib.auth.models import User
-from django.utils.crypto import get_random_string
-from django.conf import settings
-
-from django.db.models import Q
-from celery import shared_task
-from face_extract_encode import FaceExtractor
-from picasa import celery_app
-import time
-import os
-import random
-
-import queue
-import threading
-
 # from .scripts import populateFromImageMultiGPU, establish_server_connection, establish_multi_server_connection
 from .models import Person, Face
+from assign_faces import faceAssigner
+from celery import shared_task
+from django.conf import settings
+from django.contrib.auth.models import User
+from django.db.models import Q
+from django.utils.crypto import get_random_string
+from face_extract_encode import FaceExtractor
 from filepopulator.models import ImageFile
+from picasa import celery_app
+import os
+import queue
+import random
+import threading
+import time
 import traceback
 
 
@@ -73,7 +71,6 @@ def process_faces():
 
         settings.LOGGER.debug("Ending face adding task")
         
-from face_classify import faceAssigner
 @shared_task(ignore_result=True, name='face_manager.assign_faces')
 def thistask(redo_all=False):
 
@@ -99,6 +96,11 @@ def thistask(redo_all=False):
         classer.execute(redo_all)
     except:
         print("Image classification failed!")
+        
+@shared_task(ignore_result=True, name='face_manager.reload_classifier_pkl')
+def classifier_pkl_file_reload():
+    classer = faceAssigner()
+    classer.load_encodings(reload_pkl_file = True)
 
 @shared_task(ignore_result=True, name='face_manager.api_bulk_operation')
 def api_bulk_operation(input_dict: dict):
@@ -109,6 +111,6 @@ def reset_task():
     people = Person.objects.all()
     for p in people:
         p.num_faces = p.face_declared.count()
-        p.num_possibilities = p.face_poss1.count() + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
+        p.num_possibilities = p.face_poss1.count() # + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
         p.num_unverified_faces = p.face_declared.filter(validated=False).count()
         p.save()
