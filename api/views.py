@@ -18,6 +18,7 @@ from io import BytesIO
 from PIL import Image, ExifTags
 from queue import Queue
 from rest_framework import viewsets, filters
+from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
@@ -220,7 +221,7 @@ class PersonViewSet(viewsets.ModelViewSet):
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 class PersonListView(APIView):
-    permission_classes = (HasSlideshowKeyOrAuthenticated,) 
+    permission_classes = (IsAuthenticated,) 
     def get(self, request, *args, **kwargs):
         params = self.request.query_params
 
@@ -903,8 +904,10 @@ class KeyedImageView(APIView):
         return HttpResponse('asdf')
 
 class filteredImagesView(APIView):
-
-    permission_classes = (IsAuthenticated,)
+    
+    authentication_classes = [] # Optional: keeps session auth available
+    permission_classes = [HasSlideshowKeyOrAuthenticated]
+    # permission_classes = (HasSlideshowKeyOrAuthenticated,)
 
     def get(self, request, *args, **kwargs):
         # print(self.request.query_params)
@@ -980,7 +983,8 @@ class ParameterViewSet(viewsets.ViewSet):
 ###############################################
     serializer_class = api_ser.ParameterSerializer
 
-    permission_classes = (IsAuthenticated,)
+    # permission_classes = (IsAuthenticated,)
+    permission_classes = (HasSlideshowKeyOrAuthenticated,)
 
     def list(self, request):
         serializer = api_ser.ParameterSerializer(instance=api_ser.ParameterSerializer.Parameters(), many=False)

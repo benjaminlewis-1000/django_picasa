@@ -15,4 +15,14 @@ class HasSlideshowKeyOrAuthenticated(permissions.BasePermission):
         if not provided_key:
             provided_key = request.query_params.get('key')
 
-        return provided_key == getattr(settings, 'SLIDESHOW_API_KEY', None)
+        expected_key = getattr(settings, 'SLIDESHOW_API_KEY', None)
+
+        # DIAGNOSTIC PRINTS - Check your docker logs!
+        print(f"--- DEBUG SLIDESHOW AUTH ---")
+        print(f"Header Key received: {provided_key}")
+        print(f"Expected Key in Settings: {expected_key}")
+        
+        if expected_key and provided_key == expected_key:
+            return True
+
+        return False #  provided_key == getattr(settings, 'SLIDESHOW_API_KEY', None)
