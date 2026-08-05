@@ -10,12 +10,14 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/2.2/ref/settings/
 """
 
-import os
 from celery.schedules import crontab
-import logging
 from datetime import timedelta, datetime
+import logging
+import os
 import random
+import re
 import string
+# from .custom_cors import LocalNetworkCorsMiddleware
 
 today = datetime.today()
 random_seed = today.year * 10000 + today.month * 100 + today.day
@@ -57,9 +59,14 @@ if in_docker:
     PHOTO_ROOT = '/photos'
     PHOTO_ROOT_RW = '/photos_rw'
     TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
-#    ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['WEBAPP_DOMAIN']]
-    ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['DOMAINNAME'], os.environ['WEBAPP_DOMAIN'], 'flower.' + os.environ['DOMAINNAME']]
-#    ALLOWED_HOSTS = ['localhost', '127.0.0.1', os.environ['DOMAINNAME'], os.environ['WEBAPP_DOMAIN'] ]
+    ALLOWED_HOSTS = ['localhost',
+        '127.0.0.1', 
+        os.environ['DOMAINNAME'], 
+        os.environ['API_DOMAIN'], 
+        'flower.' + os.environ['DOMAINNAME'],
+        os.environ['TAILSCALE_HOST_IP'],
+        os.environ['DOCKER_HOST_IP'],
+    ]
 #    STATIC_URL = 'http://localhost/static/'
 #    MEDIA_URL  = 'http://localhost:8080/'
     STATIC_URL = 'https://' + os.environ['MEDIA_DOMAIN'] + '/static/'
@@ -68,7 +75,7 @@ if in_docker:
     STATIC_ROOT = os.environ['PICASA_STATIC_LOCATION']
     MEDIA_URL_USER = os.environ['APACHE_USER']
     MEDIA_URL_PW = os.environ['APACHE_PWD']
-    HOST_DOMAIN = 'https://' + os.environ['WEBAPP_DOMAIN']
+    HOST_DOMAIN = 'https://' + os.environ['API_DOMAIN']
 else:
     DB_NAME = 'picasa'
     DB_USER = 'benjamin'
@@ -174,8 +181,10 @@ SITE_ID = 1
 ACCOUNT_DEFAULT_HTTP_PROTOCOL = 'https'
 
 MIDDLEWARE = [
+    # 'LocalNetworkCorsMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
+    # 'picasa.custom_cors.LocalNetworkCorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -245,10 +254,9 @@ SOCIALACCOUNT_EMAIL_AUTHENTICATION_AUTO_CONNECT = True
 SOCIALACCOUNT_LOGIN_ON_GET = True
 
 # Where to send users after a successful login
-LOGIN_REDIRECT_URL = 'https://picasa.exploretheworld.tech/'
+LOGIN_REDIRECT_URL = f'https://{os.environ['API_DOMAIN']}/'
 
 # Where to send users if they log out
-# LOGOUT_REDIRECT_URL = 'https://picasa.exploretheworld.tech/'
 
 # Force Django's login shortcuts to point directly to your Authelia flow
 LOGIN_URL = '/accounts/oidc/authelia/login/'
@@ -279,23 +287,40 @@ LOGGING = {
 # Get the Django Rest Framework to use https in pagination links
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
-CORS_ORIGIN_ALLOW_ALL=True
+CORS_ALLOW_ALL_ORIGINS=False
 # Crucial: This tells Django to accept incoming cookies from cross-origin requests
 CORS_ALLOW_CREDENTIALS = True
 
-CORS_ALLOWED_ORIGINS = [
-    "https://facewire.exploretheworld.tech",
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    # Matches http:// or https:// for any exploretheworld.tech subdomain
+    r"^https?://([a-zA-Z0-9-]+\.)*exploretheworld\.tech(:\d+)?$",
 ]
 
+# Dynamically add IP regexes if they exist in .env
+for ip in [os.environ['TAILSCALE_HOST_IP'], os.environ['DOCKER_HOST_IP']]:
+    if ip:
+        escaped_ip = re.escape(ip)  # Turns "100.69.34.1" into "100\.69\.34\.1"
+        CORS_ALLOWED_ORIGIN_REGEXES.append(fr"^https?://{escaped_ip}(:\d+)?$")
+
 ACCOUNT_ALLOW_OAuth2_REDIRECTS = True
-ALLOWED_REDIRECT_HOSTS = ["facewire.exploretheworld.tech"]
+ALLOWED_REDIRECT_HOSTS = [os.environ['FRONTEND_DOMAIN']]
 
 ACCOUNT_ADAPTER = 'picasa.adapters.SubdomainRedirectAdapter'
 
 # Trust your frontend domain to submit POST/PATCH/DELETE requests
 CSRF_TRUSTED_ORIGINS = [
-    'https://facewire.exploretheworld.tech',
-    "http://picasa.exploretheworld.tech"
+    f'https://{os.environ['FRONTEND_DOMAIN']}',
+    f"https://{os.environ['API_DOMAIN']}",
+    f'https://{os.environ['SLIDESHOW_DOMAIN']}', # Add this line
+    # Tailscale IP access
+    f'http://{os.environ['TAILSCALE_HOST_IP']}',
+    f'https://{os.environ['TAILSCALE_HOST_IP']}',
+    # If your frontend runs on a specific port (e.g. 3000 or 8080), include it:
+    # 'http://100.69.34.1:3000',
+
+    # Local LAN IP access
+    f"http://{os.environ['DOCKER_HOST_IP']}",
+    f"https://{os.environ['DOCKER_HOST_IP']}",
 ]
 
 # Ensure the CSRF cookie is accessible across your subdomains

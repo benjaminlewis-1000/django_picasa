@@ -773,6 +773,9 @@ class FaceViewSet(viewsets.ModelViewSet):
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 class KeyedImageView(APIView):
+
+    permission_classes = [AllowAny]
+
     def get(self, request, *args, **kwargs):
         '''
         Call to get an image defined by a given key.
@@ -901,7 +904,6 @@ class KeyedImageView(APIView):
         temp_thumb.seek(0)
         
         return HttpResponse(temp_thumb.read(), content_type="image/jpeg")
-        return HttpResponse('asdf')
 
 class filteredImagesView(APIView):
     
