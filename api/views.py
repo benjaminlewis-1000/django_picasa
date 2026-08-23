@@ -3,6 +3,7 @@
 # Authentication: https://simpleisbetterthancomplex.com/tutorial/2018/11/22/how-to-implement-token-authentication-using-django-rest-framework.html
 #from api.serializers import UserSerializer, GroupSerializer, ImageFileSerializer, DirectorySerializer, ParameterSerializer
 from django.conf import settings
+from django.contrib.auth import logout as django_logout
 from django.contrib.auth.models import User, Group
 from django.core.files.base import ContentFile
 from django.core.paginator import Paginator
@@ -37,6 +38,7 @@ import json
 import numpy as np
 import os
 import PIL
+import requests
 from .permissions import HasSlideshowKeyOrAuthenticated
 import threading
 import threading
@@ -47,6 +49,11 @@ from filters.mixins import (
 
 
 background_queue = Queue()
+
+# How much extra room to leave around a face's own bounding box when
+# generating a person's highlight image (FaceViewSet.highlight_from_face).
+# 1.0 = crop tight to the face, 1.5 = 50% more space on each side.
+HIGHLIGHT_PADDING_FACTOR = 1.6
 
 soft_ignore_person = Person.objects.filter(person_name='.ignore')[0]
 hard_ignore_person = Person.objects.filter(person_name='.realignore')[0]
@@ -220,6 +227,31 @@ class PersonViewSet(viewsets.ModelViewSet):
         js = {'success': True, }
         return HttpResponse(json.dumps(js), content_type='application/json')
 
+    @action(detail=True, methods=['put'])
+    def rename(self, request, pk=None):
+        # Accessible as <root>/api/people/<person_id>/rename/
+        # Accept: HTML PUT, body: {"person_name": "New Name"}
+        person = self.get_object()
+
+        if person.person_name in ('_NO_FACE_ASSIGNED_', 'Unassigned', '.ignore'):
+            js = {'success': False, 'error': 'This person cannot be renamed.'}
+            return HttpResponse(json.dumps(js), content_type='application/json', status=400)
+
+        new_name = (request.data.get('person_name') or '').strip()
+        if not new_name:
+            js = {'success': False, 'error': 'Name cannot be empty.'}
+            return HttpResponse(json.dumps(js), content_type='application/json', status=400)
+
+        if Person.objects.filter(person_name=new_name).exclude(pk=person.pk).exists():
+            js = {'success': False, 'error': 'A person with that name already exists.'}
+            return HttpResponse(json.dumps(js), content_type='application/json', status=400)
+
+        person.person_name = new_name
+        person.save()
+
+        js = {'success': True, 'person_name': person.person_name}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
 class PersonListView(APIView):
     permission_classes = (IsAuthenticated,) 
     def get(self, request, *args, **kwargs):
@@ -227,7 +259,7 @@ class PersonListView(APIView):
 
         all_people = Person.objects.all()
         num_people = all_people.count()
-        domain_name = 'https://' + os.environ['WEBAPP_DOMAIN'] + '/api/people'
+        domain_name = 'https://' + os.environ['API_DOMAIN'] + '/api/people'
 
         # ###############
         # s = time.time()
@@ -300,7 +332,7 @@ class FolderListView(APIView):
             f_queue.put(f)
 
         result_list = []
-        domain_name = 'https://' + os.environ['WEBAPP_DOMAIN'] + '/api/directories'
+        domain_name = 'https://' + os.environ['API_DOMAIN'] + '/api/directories'
 
         def worker():
             while not f_queue.empty():
@@ -437,15 +469,30 @@ class FaceViewSet(viewsets.ModelViewSet):
         tb_cent = r_top + top_to_bot // 2
 
         extent = min(top_to_bot, left_to_right) // 2
+
+        # Pad the crop out beyond the tight face box so the highlight
+        # image shows some surrounding context instead of being zoomed
+        # in on just the face.
+        extent = int(extent * HIGHLIGHT_PADDING_FACTOR)
+
         r_left = lr_cent - extent
         r_right = lr_cent + extent
         r_top = tb_cent - extent
         r_bot = tb_cent + extent
 
-        # Extract the source file, oriented. 
+        # Extract the source file, oriented.
         source_file = face.source_image_file.filename
         pixel_hash = face.source_image_file.pixel_hash
         image = common.open_img_oriented(source_file, as_numpy = False)
+
+        # Clamp the padded box to the source image's bounds - a face
+        # near an edge would otherwise crop out of range.
+        img_width, img_height = image.size
+        r_left = max(0, r_left)
+        r_top = max(0, r_top)
+        r_right = min(img_width, r_right)
+        r_bot = min(img_height, r_bot)
+
         # Crop out the image, resize, encode in ByteIO, etc.
         img_thmb = image.crop((r_left, r_top, r_right, r_bot))
         img_thmb = np.array(img_thmb)
@@ -977,6 +1024,68 @@ class filteredImagesView(APIView):
 #     def get(self, request):
 #         content = {'message': 'Hello, World!'}
 #         return Response(content)
+
+class CleanLogoutView(APIView):
+    # AllowAny since a user hitting logout may already have a half-dead
+    # session; we still want to make a best effort at killing both the
+    # Authelia and Django sessions rather than 403 them first.
+    permission_classes = (AllowAny,)
+
+    def post(self, request, *args, **kwargs):
+        try:
+            # The API equivalent of clicking "Logout" in the Authelia
+            # portal - invalidates the Authelia session server-side.
+            # Forwarding the request's cookies (rather than redirecting
+            # the browser there) avoids both the CORS gap on Authelia's
+            # own endpoints and the double-hop-through-Authelia redirect
+            # chain the frontend used to need.
+            requests.post(
+                'https://auth.exploretheworld.tech/api/logout',
+                cookies=request.COOKIES,
+                timeout=5,
+            )
+        except requests.RequestException as e:
+            # Don't let Authelia being unreachable block killing the
+            # Django session below.
+            pass
+
+        django_logout(request)
+
+        return HttpResponse(json.dumps({'success': True}), content_type='application/json')
+
+
+class AutheliaStateView(APIView):
+    # AllowAny is deliberate here: this needs to answer even when the
+    # Django session is itself already invalid/absent, since the whole
+    # point is cross-checking Authelia's session independently of
+    # Django's. Called server-side (not from the browser) specifically
+    # to avoid CORS, since Authelia's own /api/state endpoint isn't
+    # CORS-enabled for cross-origin callers and /api/verify is meant to
+    # be called by a trusted backend/proxy, not browser JS.
+    permission_classes = (AllowAny,)
+
+    def get(self, request, *args, **kwargs):
+        try:
+            resp = requests.get(
+                'https://auth.exploretheworld.tech/api/verify',
+                cookies=request.COOKIES,
+                headers={
+                    'X-Forwarded-Host': 'facewire.exploretheworld.tech',
+                    'X-Forwarded-Uri': '/',
+                    'X-Forwarded-Proto': 'https',
+                },
+                timeout=5,
+            )
+            authenticated = resp.status_code == 200
+        except requests.RequestException as e:
+            return HttpResponse(
+                json.dumps({'authenticated': None, 'error': str(e)}),
+                content_type='application/json',
+                status=502,
+            )
+
+        return HttpResponse(json.dumps({'authenticated': authenticated}), content_type='application/json')
+
 
 ###############################################
 ### NOTE###  Don't Use ViewSet for MODELS!!!

@@ -181,7 +181,6 @@ SITE_ID = 1
 ACCOUNT_DEFAULT_HTTP_PROTOCOL = 'https'
 
 MIDDLEWARE = [
-    # 'LocalNetworkCorsMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     # 'picasa.custom_cors.LocalNetworkCorsMiddleware',
@@ -254,7 +253,7 @@ SOCIALACCOUNT_EMAIL_AUTHENTICATION_AUTO_CONNECT = True
 SOCIALACCOUNT_LOGIN_ON_GET = True
 
 # Where to send users after a successful login
-LOGIN_REDIRECT_URL = f'https://{os.environ['API_DOMAIN']}/'
+LOGIN_REDIRECT_URL = f"https://{os.environ['API_DOMAIN']}/"
 
 # Where to send users if they log out
 
@@ -293,7 +292,7 @@ CORS_ALLOW_CREDENTIALS = True
 
 CORS_ALLOWED_ORIGIN_REGEXES = [
     # Matches http:// or https:// for any exploretheworld.tech subdomain
-    r"^https?://([a-zA-Z0-9-]+\.)*exploretheworld\.tech(:\d+)?$",
+    r"^https?://([a-zA-Z0-9_-]+\.)*exploretheworld\.tech(:\d+)?$",
 ]
 
 # Dynamically add IP regexes if they exist in .env
@@ -303,13 +302,14 @@ for ip in [os.environ['TAILSCALE_HOST_IP'], os.environ['DOCKER_HOST_IP']]:
         CORS_ALLOWED_ORIGIN_REGEXES.append(fr"^https?://{escaped_ip}(:\d+)?$")
 
 ACCOUNT_ALLOW_OAuth2_REDIRECTS = True
-ALLOWED_REDIRECT_HOSTS = [os.environ['FRONTEND_DOMAIN']]
+ALLOWED_REDIRECT_HOSTS = [os.environ['FRONTEND_DOMAIN'], os.environ['FRONTEND_DEV_DOMAIN']]
 
 ACCOUNT_ADAPTER = 'picasa.adapters.SubdomainRedirectAdapter'
 
 # Trust your frontend domain to submit POST/PATCH/DELETE requests
 CSRF_TRUSTED_ORIGINS = [
     f'https://{os.environ['FRONTEND_DOMAIN']}',
+    f'https://{os.environ['FRONTEND_DEV_DOMAIN']}',
     f"https://{os.environ['API_DOMAIN']}",
     f'https://{os.environ['SLIDESHOW_DOMAIN']}', # Add this line
     # Tailscale IP access
