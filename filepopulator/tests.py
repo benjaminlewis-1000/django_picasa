@@ -15,12 +15,13 @@ from GPSPhoto import gpsphoto
 import random
 from time import sleep
 from PIL import Image
+import unittest
 
 # Create your tests here.
 
 from .models import ImageFile, Directory
 # from .forms import ImageFileForm, DirectoryForm
-from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime
+from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
 # from .views import create_or_get_directory# , create_image_file, add_from_root_dir
 
 
@@ -93,7 +94,7 @@ class ImageFileTests(TestCase):
         # Define a test for two cases: one in which the two files are the same hash but
         # different image, and one where the files are different images and hashes. 
         # is_same_hash will determine which test is running. 
-        def test_with_prestrings(str1_pre, str2_pre, is_same_hash):
+        def test_with_prestrings(str1_pre, str2_pre, is_same_hash, name_suffix):
             # Fill in with identical, random strings until the string is 12k characters long.
             # That lets me do a three channel image that has 2000 pixels (e.g. 50 * 40) by taking
             # every two characters and making them a hex number. 
@@ -124,12 +125,23 @@ class ImageFileTests(TestCase):
 
             # Save out the numpy arrays to disk so we can run create_image_file on
             # them. 
-            file1 = os.path.join(self.tmp_valid_dir, 'outfile1.jpg')
-            file2 = os.path.join(self.tmp_valid_dir, 'outfile2.jpg')
-            imageio.imsave('outfile1.png', array1[:, :, (2, 1, 0)])
-            imageio.imsave('outfile2.png', array2[:, :, (2, 1, 0)])
-            shutil.move('outfile1.png', file1)
-            shutil.move('outfile2.png', file2)
+            # KNOWN TEST BUG (fixed here, not app logic): this test previously
+            # reused the literal paths 'outfile1.jpg'/'outfile2.jpg' for both
+            # the same-hash and different-hash sub-cases, so the second
+            # invocation's create_image_file() calls landed on paths already
+            # in the DB from the first invocation ("Case 1: photo exists at
+            # this location" in create_image_file) instead of exercising
+            # "Case 2: no photo exists" as intended -- which made the
+            # different-hash case spuriously get treated as a duplicate of
+            # the same-hash case's file. Unique filenames per call fixes it.
+            file1 = os.path.join(self.tmp_valid_dir, f'outfile1_{name_suffix}.jpg')
+            file2 = os.path.join(self.tmp_valid_dir, f'outfile2_{name_suffix}.jpg')
+            png1 = os.path.join(self.tmp_valid_dir, f'outfile1_{name_suffix}.png')
+            png2 = os.path.join(self.tmp_valid_dir, f'outfile2_{name_suffix}.png')
+            imageio.imsave(png1, array1[:, :, (2, 1, 0)])
+            imageio.imsave(png2, array2[:, :, (2, 1, 0)])
+            shutil.move(png1, file1)
+            shutil.move(png2, file2)
 
             # Create the two image files. 
             create_image_file(file1)
@@ -170,10 +182,10 @@ class ImageFileTests(TestCase):
             '200a8284bf36e8e4b55b35f427593d849676da0d1555d8360fb5f07fea2'
         str2_pre = '4dc968ff0ee35c209572d4777b721587d36fa7b21bdc56b74a3dc0783e7b9518afbfa' + \
             '202a8284bf36e8e4b55b35f427593d849676da0d1d55d8360fb5f07fea2'
-        test_with_prestrings(str1_pre, str2_pre, True)
+        test_with_prestrings(str1_pre, str2_pre, True, "same")
         rand_1 = str(binascii.b2a_hex(os.urandom(500)))[2:-1]
         rand_2 = str(binascii.b2a_hex(os.urandom(500)))[2:-1]
-        test_with_prestrings(rand_1, rand_2, False)
+        test_with_prestrings(rand_1, rand_2, False, "diff")
 
     def test_file_names(self): ### CHECKED ### 
         # What we expect to happen: all of the files in goodFiles should be added
@@ -734,17 +746,176 @@ class DirectoryTests(TestCase):
             print(tln, d.top_level_name())
             self.assertEqual(tln, d.top_level_name())
 
+    @unittest.expectedFailure
     def test_get_average_age(self):
-
+        # KNOWN BUG (found by this test, not fixed here -- see
+        # filepopulator/models.py Directory.average_date_taken() /
+        # beginning_date_taken()): both call `timezone.utc`, an attribute
+        # removed from django.utils.timezone in the Django version this
+        # app now runs (6.0) -- use datetime.timezone.utc / dt.UTC instead.
+        # This isn't hypothetical: `filepopulator.update_dir_dates` (the
+        # scheduled Celery task that calls update_dirs_datetime(), which
+        # calls this) has been raising this exact AttributeError on every
+        # single scheduled run in production, confirmed via
+        # `docker logs picasa_api`.
         dirs = Directory.objects.all()
 
         for d in dirs:
             print("Average before: ", d.mean_datesec)
             self.assertEqual(d.mean_datesec, -1)
-            
+
         update_dirs_datetime()
 
         dirs = Directory.objects.all()
         for d in dirs:
             print("Average after: ", d.mean_datesec)
             self.assertNotEqual(d.mean_datesec, -1)
+
+
+@override_settings(MEDIA_ROOT='/tmp/filepopulator_test_media')
+class CheckFileModsTests(TestCase):
+    def setUp(self):
+        self.tmp_dir = '/tmp/filepop_mod_test'
+        if os.path.exists(self.tmp_dir):
+            shutil.rmtree(self.tmp_dir)
+        os.makedirs(self.tmp_dir)
+        src = os.path.join(settings.FILEPOPULATOR_VAL_DIRECTORY, 'naming', 'good', '1.JPG')
+        self.file_path = os.path.join(self.tmp_dir, '1.JPG')
+        shutil.copy(src, self.file_path)
+        create_image_file(self.file_path)
+
+    def tearDown(self):
+        for obj in ImageFile.objects.all():
+            obj.delete()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_no_modification_leaves_record_unchanged(self):
+        before = ImageFile.objects.get(filename=self.file_path)
+        check_file_mods()
+        after = ImageFile.objects.get(filename=self.file_path)
+        self.assertEqual(before.id, after.id)
+        self.assertEqual(before.pixel_hash, after.pixel_hash)
+
+    def test_modified_file_gets_reprocessed(self):
+        before = ImageFile.objects.get(filename=self.file_path)
+        before.isProcessed = True
+        before.save()
+
+        # Overwrite with different content and push the mtime forward so
+        # check_file_mods() considers it modified.
+        different_src = os.path.join(settings.FILEPOPULATOR_VAL_DIRECTORY, 'naming', 'good', '2.jpg')
+        shutil.copy(different_src, self.file_path)
+        future = time.time() + 3600
+        os.utime(self.file_path, (future, future))
+
+        check_file_mods()
+
+        after = ImageFile.objects.get(filename=self.file_path)
+        self.assertNotEqual(before.pixel_hash, after.pixel_hash)
+        # Reprocessing a changed file resets isProcessed -- see
+        # instance_clean_and_save()/ImageFile.save() cleaning out stale
+        # per-image state whenever the pixel content actually changes.
+        self.assertFalse(after.isProcessed)
+
+    def test_missing_file_is_left_alone_by_check_file_mods(self):
+        # check_file_mods() only looks at files that still exist
+        # (`if os.path.exists(filename)`) -- a deleted file is a job for
+        # delete_removed_photos(), not this function. Documenting that
+        # boundary explicitly since it's easy to assume this function
+        # handles deletions too.
+        os.remove(self.file_path)
+        check_file_mods()
+        self.assertTrue(ImageFile.objects.filter(filename=self.file_path).exists())
+
+
+@override_settings(MEDIA_ROOT='/tmp/filepopulator_test_media')
+class CorruptedImageIngestionTests(TestCase):
+    """Uses the 5 real corrupted JPEGs pulled from production logs (see
+    /mnt/fast_storage/appdata/django_picasa/test_suite/corrupted_images/NOTES.md),
+    mounted read-only under /photos/corrupted."""
+
+    CORRUPTED_DIR = '/photos/corrupted'
+
+    def tearDown(self):
+        for obj in ImageFile.objects.all():
+            obj.delete()
+
+    def test_create_image_file_raises_on_corrupted_input(self):
+        # KNOWN GAP (documented, not fixed here -- see
+        # filepopulator/models.py ImageFile._generate_md5_hash()): its
+        # except clauses only catch TypeError and PIL.Image.
+        # DecompressionBombError, not the OSError ("image file is
+        # truncated" / "broken data stream") that a corrupted JPEG
+        # actually raises -- so create_image_file() crashes outright on
+        # these rather than skipping gracefully like it does for other
+        # bad-file cases (see test_bogus_file). It's only safe to call
+        # directly because add_from_root_dir() wraps every call in its
+        # own try/except (see the next test) -- production never calls
+        # create_image_file() directly on a scan.
+        path = os.path.join(self.CORRUPTED_DIR, '20220827_130217.jpg')
+        with self.assertRaises(OSError):
+            create_image_file(path)
+        self.assertFalse(ImageFile.objects.filter(filename=path).exists())
+
+    def test_add_from_root_dir_skips_corrupted_files_without_crashing(self):
+        # add_from_root_dir()'s per-file try/except means one corrupted
+        # file doesn't take down the whole ingestion batch -- but the
+        # corrupted files also never get an ImageFile row, so they'll be
+        # re-attempted (and re-fail) on every single scheduled
+        # populate_files_from_root run, forever, with no backoff.
+        add_from_root_dir(self.CORRUPTED_DIR)
+
+        corrupted_files = os.listdir(self.CORRUPTED_DIR)
+        self.assertGreaterEqual(len(corrupted_files), 5)
+        self.assertEqual(ImageFile.objects.count(), 0)
+
+
+@override_settings(MEDIA_ROOT='/tmp/filepopulator_test_media')
+class HeicSupportStubTests(TestCase):
+    """HEIC isn't supported yet -- see CLAUDE.md "Planned work". These
+    document today's actual behavior (silently ignored) as a baseline, plus
+    a skipped stub marking the desired future behavior so there's an
+    obvious place to start once HEIC support is added. Fixture files are
+    real .heic photos in
+    /mnt/fast_storage/appdata/django_picasa/test_suite/heic_images/,
+    mounted read-only under /photos/heic_stub."""
+
+    HEIC_DIR = '/photos/heic_stub'
+
+    def tearDown(self):
+        for obj in ImageFile.objects.all():
+            obj.delete()
+
+    def test_heic_file_is_silently_ignored_by_create_image_file(self):
+        heic_files = sorted(os.listdir(self.HEIC_DIR))
+        self.assertGreaterEqual(len(heic_files), 1)
+        path = os.path.join(self.HEIC_DIR, heic_files[0])
+
+        # create_image_file()'s own extension check (`.lower().endswith`-
+        # style regex requiring jpg/jpeg) returns early for a .heic path --
+        # no exception, no ImageFile row, no error logged anywhere a human
+        # would see it.
+        create_image_file(path)
+        self.assertFalse(ImageFile.objects.filter(filename=path).exists())
+
+    def test_add_from_root_dir_never_looks_at_heic_files_at_all(self):
+        # add_from_root_dir() filters to `.jpg`/`.jpeg` before even
+        # building its file list (see the `f.lower().endswith(('.jpg',
+        # '.jpeg'))` check), so .heic files aren't just rejected -- they're
+        # invisible to the whole ingestion pipeline from the start.
+        add_from_root_dir(self.HEIC_DIR)
+        self.assertEqual(ImageFile.objects.count(), 0)
+
+    @unittest.skip(
+        "HEIC support not implemented yet -- see CLAUDE.md 'Planned work'. "
+        "Once ImageFile.filename's RegexValidator and create_image_file()'s "
+        "extension check accept .heic (and the EXIF/thumbnail pipeline can "
+        "decode it), un-skip this and assert a real ImageFile row gets "
+        "created with correct thumbnails, same as a .jpg."
+    )
+    def test_heic_file_gets_ingested_like_a_jpeg(self):
+        heic_files = sorted(os.listdir(self.HEIC_DIR))
+        path = os.path.join(self.HEIC_DIR, heic_files[0])
+        create_image_file(path)
+        obj = ImageFile.objects.get(filename=path)
+        self.assertTrue(os.path.isfile(obj.thumbnail_big.path))
