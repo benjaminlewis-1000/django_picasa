@@ -1,0 +1,109 @@
+name: Tests
+
+# Runs on GitHub's own hosted runner -- an ephemeral VM in GitHub's cloud,
+# not your server. It never has network access to picasa_api/db_picasa or
+# anything at exploretheworld.tech; postgres/redis below are throwaway
+# service containers that live only for this job.
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: benjamin
+          POSTGRES_PASSWORD: ci-throwaway-password
+          POSTGRES_DB: picasa
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U benjamin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      IN_DOCKER: "True"
+      DEV: "True"
+      PRODUCTION: "False"
+      DJANGO_SECRET_KEY: ci-throwaway-secret-key
+      DB_NAME: picasa
+      DB_USER: benjamin
+      DB_PWD: ci-throwaway-password
+      DOMAINNAME: test.local
+      API_DOMAIN: api.test.local
+      MEDIA_DOMAIN: media.test.local
+      FRONTEND_DOMAIN: frontend.test.local
+      FRONTEND_DEV_DOMAIN: frontenddev.test.local
+      SLIDESHOW_DOMAIN: slideshow.test.local
+      TAILSCALE_HOST_IP: 127.0.0.1
+      DOCKER_HOST_IP: 127.0.0.1
+      AUTHELIA_SECRET: ci-throwaway-authelia-secret
+      PICASA_API_KEY: ci-throwaway-slideshow-key
+      PICASA_STATIC_LOCATION: /tmp/ci_static
+      APACHE_USER: ci
+      APACHE_PWD: ci-throwaway-apache-password
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: dockerize/requirements.txt
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+
+      - name: Install Python dependencies
+        run: pip install -r dockerize/requirements.txt
+
+      - name: Point DB_HOST/REDIS_HOST hostnames at the service containers
+        # settings.py hardcodes 'db_picasa_dev'/'task_redis_dev' as the
+        # hostnames to use whenever DEV=True (matching our local dev
+        # container setup) -- aliasing them to localhost here means the
+        # GH-hosted postgres/redis services (reachable via their mapped
+        # ports on localhost) just work, with zero settings.py changes.
+        run: |
+          echo "127.0.0.1 db_picasa_dev" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 task_redis_dev" | sudo tee -a /etc/hosts
+
+      - name: Install synthetic test fixtures at their hardcoded paths
+        # settings.py hardcodes these as absolute paths (matching how the
+        # real Docker containers mount them), so CI just needs to create
+        # them -- no settings.py changes needed. See ci_fixtures/ for how
+        # these were generated; none of it is real personal photo content.
+        run: |
+          sudo mkdir -p /test_imgs_filepopulate /photos/corrupted /photos/heic_stub /locks
+          sudo cp -r ci_fixtures/test_imgs_filepopulate/. /test_imgs_filepopulate/
+          sudo cp -r ci_fixtures/corrupted/. /photos/corrupted/
+          sudo cp -r ci_fixtures/heic_stub/. /photos/heic_stub/
+          sudo chown -R "$(whoami)" /test_imgs_filepopulate /photos /locks
+
+      - name: Run fast test suite
+        # face_manager's real-insightface tests are tagged 'slow' and
+        # deliberately excluded here -- cold model download plus CPU
+        # inference is a bad fit for a per-push CI gate. Run those
+        # locally/manually with --tag=slow instead.
+        run: >-
+          python manage.py test --exclude-tag=slow
+          picasa.tests common api face_manager filepopulator
