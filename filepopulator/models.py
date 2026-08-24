@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 from fractions import Fraction
 from dateutil import parser
+import common
 
 # Image thumbnail processing
 
@@ -437,30 +438,14 @@ class ImageFile(models.Model):
         self.dateAdded = timezone.now()
 
 
-        # If no ExifTags, no rotating needed.
+        # Rotate depending on orientation. Shared with common/
+        # open_img_oriented.py's apply_exif_orientation() -- this used to
+        # be its own separate (and correct) implementation of the same
+        # 8-value transform; now both call the one shared function.
         try:
-            # Grab orientation value.
-            # Already done in _init_image()
-
-            # Rotate depending on orientation.
-            if self.orientation == 2:
-                self.image = self.image.transpose(PIL.Image.FLIP_LEFT_RIGHT)
-            if self.orientation == 3:
-                self.image = self.image.transpose(PIL.Image.ROTATE_180)
-            if self.orientation == 4:
-                self.image = self.image.transpose(PIL.Image.FLIP_TOP_BOTTOM)
-            if self.orientation == 5:
-                self.image = self.image.transpose(PIL.Image.FLIP_LEFT_RIGHT).transpose(
-                    PIL.Image.ROTATE_90)
-            if self.orientation == 6:
-                self.image = self.image.transpose(PIL.Image.ROTATE_270)
-            if self.orientation == 7:
-                self.image = self.image.transpose(PIL.Image.FLIP_TOP_BOTTOM).transpose(
-                    PIL.Image.ROTATE_90)
-            if self.orientation == 8:
-                self.image = self.image.transpose(PIL.Image.ROTATE_90)
+            self.image = common.apply_exif_orientation(self.image, self.orientation)
         except:
-            # Orientation 1 
+            # Orientation 1
             pass
 
         self.width, self.height = self.image.size

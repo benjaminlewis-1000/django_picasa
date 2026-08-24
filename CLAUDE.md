@@ -69,6 +69,10 @@ python manage.py test picasa.tests common  # project-level + shared-util tests
 **Where things stand (as of this session)**: all of the above test/CI/dependency work is committed to `backend_upgrade` (3 commits: migrations-tracking, the test suite itself, then CI+fixtures+dependency pins) and pushed to `origin/backend_upgrade` — deliberately kept off `master` for now at the user's request, not yet merged or PR'd. `master` separately got a small, unrelated CORS/CSRF fix + this file, pushed directly. **The CI workflow has not actually been exercised on GitHub yet** — it only triggers on `push`/`pull_request` targeting `master` (see `.github/workflows/tests.yml`), and `backend_upgrade` doesn't touch `master`, so pushing to `backend_upgrade` alone does not run it. Opening a PR from `backend_upgrade` into `master` would trigger it without merging anything, if a real end-to-end check is wanted before merging. The confirmed bugs listed below are deliberately **not fixed** — the user chose to build out test coverage and stabilize the environment first, bugs are next.
 
 **Fixed bugs:**
+- **EXIF orientation handling was duplicated across three implementations, one of them wrong.** `common/open_img_oriented.py` only handled EXIF orientations 3, 6, 8 (via `rotate()`), silently doing nothing for 2, 4, 5, 7; `filepopulator/models.py`'s `ImageFile._init_image()` had its own separate, *correct* 8-value implementation (via `transpose()`); `face_manager/problem_photos.py` had a third copy (deprecated/dead — hardcoded a path to a different machine, unreferenced anywhere — deleted rather than merged). Consolidated into one shared `apply_exif_orientation(image, orientation)` in `common/open_img_oriented.py` (exported from `common/__init__.py`), using the correct 8-value logic; both `open_img_oriented()` and `ImageFile._init_image()` now call it instead of maintaining their own copies. Also explicitly treats orientation `0` (not a standard EXIF value, but present on ~1,090 images in the live library) the same as `1` — no rotation — rather than leaving it to fall through unhandled.
+
+  **Real-world impact turned out to be tiny**, checked against the live DB before doing this work (204,685 total images): orientations 1/3/6/8 (already correct under the old code) cover 203,593 images; of the four previously-broken values, 2, 4, and 5 have **zero** occurrences in the whole library, and 7 has exactly **2** (`ImageFile` ids `315617` and `316082`, 1 and 2 `Face` rows respectively — detection did find faces on both, just at the wrong coordinates since the image was never rotated for them). Given that, no bulk backfill/reprocessing migration was built — once this lands on `master`, just reprocess those two specific images by hand (clear their `isProcessed`/existing `Face` rows and let `face_extraction` redo them; expect to re-tag the 3 faces on them, which is fast for 2 photos). See "Planned work" for the port-to-master TODO.
+
 - `filepopulator` ingestion-side corrupted-file handling — `ImageFile._generate_md5_hash()`/`common/open_img_oriented.py`/`create_image_file()`/`add_from_root_dir()`. This turned out to be three separate decode-failure points, not one:
   1. `ImageFile._generate_md5_hash()`'s except clauses caught `TypeError`/`PIL.Image.DecompressionBombError` but not the plain `OSError` a corrupted JPEG actually raises. Now also catches `OSError`, falling back to `cv2.imread()` like the other branches (which is more tolerant of truncation than PIL and sometimes succeeds outright); if that also fails, raises one clear `OSError` instead of a downstream `AttributeError`.
   2. `_generate_thumbnail()` (called from `ImageFile.save()`) re-decodes the image via PIL to resize it and can raise `OSError` independently, *even when* `_generate_md5_hash()` above already succeeded via its `cv2.imread()` fallback — a second, separate failure point inside `instance_clean_and_save()` that needed its own handling.
@@ -130,6 +134,13 @@ bugs the test suite above already found/documented:**
 
 ## Planned work
 
+- **TODO: port the EXIF orientation consolidation (2026-08-24, `common/open_img_oriented.py`'s
+  `apply_exif_orientation()` + `filepopulator/models.py`'s `_init_image()` now sharing it) from
+  `backend_upgrade` to `master` and deploy, then manually reprocess the 2 known-affected images**
+  (`ImageFile` ids `315617`, `316082` — orientation 7, the only affected orientation value with
+  any real occurrences; see "Fixed bugs" for the full production count). Clear their
+  `isProcessed` flag and existing `Face` rows so `face_extraction` redetects them correctly
+  oriented, then re-tag the (few) faces on them.
 - **TODO: port the `find_and_encode_faces()` corrupted-image fix (2026-08-24, adds
   `ImageFile.image_load_failed`/`image_load_error` + a migration) from `backend_upgrade` to
   `master` and deploy.** Fixes the retry-forever bug where corrupted images were reprocessed by
