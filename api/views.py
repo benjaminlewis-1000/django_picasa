@@ -57,6 +57,7 @@ HIGHLIGHT_PADDING_FACTOR = 1.6
 
 soft_ignore_person = Person.objects.filter(person_name='.ignore')[0]
 hard_ignore_person = Person.objects.filter(person_name='.realignore')[0]
+blank_person = Person.objects.filter(person_name=settings.BLANK_FACE_NAME)[0]
 
 def bulk_thread(dataframe: dict):
     # print("Got a data load of ", dataframe)
@@ -96,7 +97,32 @@ def bulk_thread(dataframe: dict):
                 print("Person currently assigned is not .ignore or .realignore.")
         elif operation == 'close_assigned':
             # Previously /api/face_id/reject_association with {unassociate_id: current_person_id}
-            face.reject_association(current_person_id)
+            #
+            # reject_association() only knows how to cross a candidate off
+            # the face's poss_identN "possible match" list - it asserts
+            # current_person_id is one of those candidates, which is only
+            # true when this is declining a proposed match. "Remove from
+            # person" (and undoing a confirm) fire this operation on faces
+            # that are already DECLARED to current_person_id instead -
+            # never in poss_identN - so that assert used to raise every
+            # time, get silently swallowed by background_bulk_processor's
+            # except below, and the face never actually moved. Route based
+            # on which of the two cases this actually is.
+            possible_ids = [pid for pid in (
+                face.poss_ident1_id, face.poss_ident2_id, face.poss_ident3_id,
+                face.poss_ident4_id, face.poss_ident5_id,
+            ) if pid is not None]
+            if current_person_id in possible_ids:
+                # Declining a proposed candidate match - original behavior.
+                face.reject_association(current_person_id)
+            elif face.declared_name_id == current_person_id:
+                # Actually declared to this person - peel off the declared
+                # name tag itself, same mechanism close_unassigned uses to
+                # reassign a face to '.ignore'.
+                face.associate_person(blank_person.id)
+            else:
+                print(f"close_assigned: face {face.id} is neither declared to nor "
+                      f"has a possible match for person {current_person_id} - no-op.")
         elif operation == 'confirm_proposed':
             # Update the face object fields accordingly
             face.associate_person(current_person_id)

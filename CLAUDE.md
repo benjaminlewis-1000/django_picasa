@@ -126,6 +126,11 @@ bugs the test suite above already found/documented:**
 
 ## Planned work
 
+- **TODO: port the `close_assigned` fix (2026-08-24) from `backend_upgrade` to `master` and
+  deploy to the live `picasa_api` container.** Fixed and tested here (see "Fixed this session"
+  above), but deliberately *not* ported/deployed yet, same as the rest of this branch's work —
+  the frontend (`dev_facewire`) still talks to production and still has the original bug until
+  this lands there. Don't consider this done until it's actually live.
 - **HEIC support**: currently unsupported — `ImageFile.filename`'s `RegexValidator` and `create_image_file()`'s own extension check both only accept `.jpg`/`.jpeg`. iPhones increasingly deliver `.heic` natively (1,855 found under the live `PHOTO_ROOT`'s `aggregated/` dir alone). Sample fixture files for this are already pulled into `/mnt/fast_storage/appdata/django_picasa/test_suite/heic_images/`.
 - **Dead JWT auth code after the Authelia migration**: auth now goes through Authelia/OIDC (see `picasa/adapters.py`, `ACCOUNT_ADAPTER`), but `rest_framework_simplejwt` is still wired up in full — `SIMPLE_JWT` settings, `TokenPairWithUsername`/`api/token/obtain/`/`api/token/refresh/`, `token_blacklist` in `INSTALLED_APPS`, `PyJWT` as a direct dependency. Worth an audit for what's actually still reachable (the slideshow client? a mobile app?) vs. leftover from before Authelia, since it's a second parallel auth system to reason about/keep secure if nothing uses it anymore.
 - **Face clustering quality**: how `face_manager/assign_faces.py`'s `faceAssigner` clusters/matches detected faces against existing `Person`s hasn't been reviewed this round — flagged as a bigger task of its own, separate from the pipeline plumbing bugs already found.

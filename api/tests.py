@@ -345,6 +345,50 @@ class FaceViewSetTests(ApiTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertTrue(json.loads(resp.content)["job_submitted"])
 
+    def test_bulk_close_assigned_on_declared_face_clears_name_tag(self):
+        # "Remove from person" / undo-of-confirm case: current_person_id is
+        # the face's actual declared_name, not a poss_identN candidate.
+        # bulk_operation only enqueues onto a background thread/queue (see
+        # test_bulk_operation_accepts_well_formed_payload above, which only
+        # checks the enqueue response) - call bulk_thread() directly here so
+        # this test doesn't depend on that background thread's timing or
+        # its own DB connection/transaction visibility.
+        from api.views import bulk_thread
+
+        current_person_id = self.face.declared_name_id
+        bulk_thread({
+            "face_id_list": [self.face.id],
+            "operation": "close_assigned",
+            "current_person_id": current_person_id,
+        })
+        self.face.refresh_from_db()
+        self.assertEqual(self.face.declared_name.person_name, settings.BLANK_FACE_NAME)
+
+    def test_bulk_close_assigned_on_possible_match_still_declines_it(self):
+        # Declining a proposed candidate - reject_association()'s original,
+        # still-correct behavior - must keep working once close_assigned
+        # also handles the declared-face case above.
+        from api.views import bulk_thread
+
+        possible = Person.objects.create(person_name="Possible Match")
+        possible.highlight_img.save("poss.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
+        self.face.poss_ident1 = possible
+        self.face.weight_1 = 0.5
+        self.face.save()
+        original_declared_id = self.face.declared_name_id
+
+        bulk_thread({
+            "face_id_list": [self.face.id],
+            "operation": "close_assigned",
+            "current_person_id": possible.id,
+        })
+        self.face.refresh_from_db()
+        self.assertIsNone(self.face.poss_ident1_id)
+        self.assertIn(possible.id, self.face.rejected_fields)
+        # Declared name is untouched - this declined a guess, not the
+        # actual name tag.
+        self.assertEqual(self.face.declared_name_id, original_declared_id)
+
 
 class KeyedImageViewTests(ApiTestCase):
     def setUp(self):
