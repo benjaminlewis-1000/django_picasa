@@ -746,18 +746,15 @@ class DirectoryTests(TestCase):
             print(tln, d.top_level_name())
             self.assertEqual(tln, d.top_level_name())
 
-    @unittest.expectedFailure
     def test_get_average_age(self):
-        # KNOWN BUG (found by this test, not fixed here -- see
-        # filepopulator/models.py Directory.average_date_taken() /
-        # beginning_date_taken()): both call `timezone.utc`, an attribute
-        # removed from django.utils.timezone in the Django version this
-        # app now runs (6.0) -- use datetime.timezone.utc / dt.UTC instead.
-        # This isn't hypothetical: `filepopulator.update_dir_dates` (the
-        # scheduled Celery task that calls update_dirs_datetime(), which
-        # calls this) has been raising this exact AttributeError on every
-        # single scheduled run in production, confirmed via
-        # `docker logs picasa_api`.
+        # Regression test for a fixed bug: average_date_taken()/
+        # beginning_date_taken() used to call `timezone.utc`, an attribute
+        # removed from django.utils.timezone in the Django version this app
+        # now runs (6.0), raising AttributeError on every scheduled
+        # filepopulator.update_dir_dates run in production. Now uses
+        # pytz.utc (datetime.timezone.utc doesn't work here either, since
+        # this module's `from datetime import datetime` shadows the
+        # `datetime` module name with the class).
         dirs = Directory.objects.all()
 
         for d in dirs:

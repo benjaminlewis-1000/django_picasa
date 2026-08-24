@@ -98,24 +98,24 @@ class Directory(models.Model):
     def average_date_taken(self):
         img_dates = self.__get_filtered_img_dates__()
         if img_dates is None:
-            # self.mean_datesec = datetime.fromtimestamp(timezone.now(), timezone.utc)
+            # self.mean_datesec = datetime.fromtimestamp(timezone.now(), pytz.utc)
             self.mean_datesec = time.mktime(datetime.now().timetuple()) # datetime.now().total_seconds()
-            self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, timezone.utc)
+            self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, pytz.utc)
         else:
             self.mean_datesec = float(np.mean(img_dates))
-            self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, timezone.utc)
+            self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, pytz.utc)
 
     def beginning_date_taken(self):
         img_dates = self.__get_filtered_img_dates__()
         if img_dates is None:
-            # self.first_datesec = datetime.fromtimestamp(timezone.now(), timezone.utc)
-            self.first_datesec = time.mktime(datetime.now().timetuple()) # datetime.fromtimestamp(timezone.now(), timezone.utc)
-            self.first_datetime = datetime.fromtimestamp(self.mean_datesec, timezone.utc)
+            # self.first_datesec = datetime.fromtimestamp(timezone.now(), pytz.utc)
+            self.first_datesec = time.mktime(datetime.now().timetuple()) # datetime.fromtimestamp(timezone.now(), pytz.utc)
+            self.first_datetime = datetime.fromtimestamp(self.mean_datesec, pytz.utc)
         else:
             img_dates.sort()
             first_date = img_dates[0]
             self.first_datesec = int(first_date)
-            self.first_datetime = datetime.fromtimestamp(self.first_datesec, timezone.utc)
+            self.first_datetime = datetime.fromtimestamp(self.first_datesec, pytz.utc)
     
 def thumbnail_big_path(instance, filename):
     first_dir = filename[:2]
