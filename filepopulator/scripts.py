@@ -1,6 +1,6 @@
 #! /usr/bin/env python
 
-from .models import ImageFile, Directory, DuplicateFile
+from .models import ImageFile, Directory, DuplicateFile, FailedImageFile
 from datetime import datetime
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -24,7 +24,15 @@ def delete_old_thumbnails(instance):
     os.remove(instance.thumbnail_medium.path)
     os.remove(instance.thumbnail_small.path)
 
-def instance_clean_and_save(instance):
+def instance_clean_and_save(instance, record_failure=True):
+    """Returns (success, error_message); error_message is None on success.
+
+    record_failure=False lets a caller that needs custom failure handling
+    (see create_image_file()'s hash-changed branch, which needs to decide
+    whether to keep or drop a *different* existing row) opt out of this
+    function's own generic OSError bookkeeping and handle the (False,
+    error_message) result itself.
+    """
 
     file_path = instance.filename
     try:
@@ -34,14 +42,42 @@ def instance_clean_and_save(instance):
             settings.LOGGER.critical("Did not add JPEG-type photo {}: {}".format(file_path, ve))
         else:
             settings.LOGGER.debug("Did not add photo {}: {}".format(file_path, ve) )
+        return False, str(ve)
     else:
         try:
             instance.save()
         except ValueError as ve:
             print(dir(instance))
             print(instance.__dict__)
-            
+
             raise ve
+        except OSError as e:
+            # A decode failure can surface here even when
+            # _generate_md5_hash() already succeeded (e.g. via its
+            # cv2.imread() fallback, which is more tolerant of truncated
+            # files than PIL): _generate_thumbnail() re-decodes the image
+            # via PIL to resize it and can raise independently.
+            settings.LOGGER.error(f"File {file_path} failed to decode during save: {e}")
+            if record_failure:
+                # Route the same way create_image_file()'s own OSError
+                # handling does -- update the existing row if this is one
+                # (instance.pk is set), otherwise track it in
+                # FailedImageFile since no row exists.
+                if instance.pk is not None:
+                    ImageFile.objects.filter(pk=instance.pk).update(
+                        image_load_failed=True,
+                        image_load_error=str(e),
+                        dateModified=instance.dateModified,
+                    )
+                else:
+                    FailedImageFile.objects.update_or_create(
+                        filename=file_path,
+                        defaults={
+                            "error_message": str(e),
+                            "file_mod_time": os.path.getctime(file_path),
+                        },
+                    )
+            return False, str(e)
         settings.LOGGER.debug(f"Saved file {file_path} to database")
 
         assert os.path.isfile(instance.thumbnail_big.path), \
@@ -53,6 +89,11 @@ def instance_clean_and_save(instance):
         assert os.path.isfile(instance.thumbnail_small.path), \
             'Thumbnail {} wasn''t generated for {}.'.\
             format(instance.thumbnail_small.name, file_path)
+
+        # A successful save means this file just decoded fine -- clear any
+        # stale FailedImageFile record from an earlier failed attempt.
+        FailedImageFile.objects.filter(filename=file_path).delete()
+        return True, None
 
 # def add_new_photo(file_path):
 #     # This is for images where this file is not in the database.
@@ -144,15 +185,39 @@ def create_image_file(file_path):
         else:
             print(f"Working with {file_path} - photo exists")
             settings.LOGGER.debug(f"Updating file {file_path} in database due to changed timestamp")
-            new_photo.process_new_no_md5()
-            new_photo._generate_md5_hash()
+            try:
+                new_photo.process_new_no_md5()
+                new_photo._generate_md5_hash()
+            except OSError as e:
+                # File was previously ingested fine but is now unreadable
+                # (corrupted on disk since, or a bad in-place edit). Record
+                # the failure on the *existing* row rather than crashing --
+                # ImageFile.objects.update() is used deliberately, not
+                # exist_photo.save(), since save() would re-run
+                # _generate_md5_hash() and hit this same error again.
+                # Bumping dateModified to the file's current mtime is what
+                # makes create_image_file()'s "timestamp unchanged, skip"
+                # check above stop retrying this file every run -- it'll
+                # only be retried again once the file's mtime changes
+                # (e.g. someone fixes or replaces it).
+                settings.LOGGER.error(f"File {file_path} failed to decode: {e}")
+                ImageFile.objects.filter(pk=exist_photo.pk).update(
+                    image_load_failed=True,
+                    image_load_error=str(e),
+                    dateModified=new_photo.dateModified,
+                )
+                return
 
         if exist_photo.pixel_hash == new_photo.pixel_hash:
             if exist_photo.orientation == new_photo.orientation:
             # The photo is already in place, and the pixel hash hasn't changed, and it hasn't rotated
             # Don't want to delete it -- they reference the same picture in distinct locations.
-            # However, our modification timestamps are off, so let's update that. 
+            # However, our modification timestamps are off, so let's update that.
                 exist_photo.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
+                # Clear a previous decode-failure flag, if any -- getting
+                # this far means _generate_md5_hash() just succeeded.
+                exist_photo.image_load_failed = False
+                exist_photo.image_load_error = None
                 instance_clean_and_save(exist_photo)
                 return
             else:
@@ -164,16 +229,54 @@ def create_image_file(file_path):
                 instance_clean_and_save(exist_photo)
                 return
         else:
-            exist_photo.delete()
-            instance_clean_and_save(new_photo)
+            # The pixel hash changed -- normally means the file was
+            # genuinely replaced with different (valid) content. But if
+            # the *new* content turns out to be corrupted, saving it can
+            # fail at the thumbnail stage even though _generate_md5_hash()
+            # above already succeeded (see instance_clean_and_save()'s own
+            # OSError handling). Save the replacement BEFORE deleting the
+            # old row -- record_failure=False so a failure here doesn't
+            # get treated as "brand new file, never had a row" (it did),
+            # and the old good row is kept (flagged) instead of being
+            # deleted with nothing to replace it.
+            saved, error = instance_clean_and_save(new_photo, record_failure=False)
+            if saved:
+                exist_photo.delete()
+            else:
+                settings.LOGGER.error(
+                    f"File {file_path} changed but its new content failed to "
+                    f"decode: {error}. Keeping the prior row."
+                )
+                ImageFile.objects.filter(pk=exist_photo.pk).update(
+                    image_load_failed=True,
+                    image_load_error=error,
+                    dateModified=new_photo.dateModified,
+                )
             return
 
     # Case 2: No photo exists at this location.
     else:
         settings.LOGGER.debug(f"Working with {file_path} - no photo exists")
         settings.LOGGER.debug(f"Adding new file {file_path} to database.")
-        new_photo.process_new_no_md5()
-        new_photo._generate_md5_hash()
+        try:
+            new_photo.process_new_no_md5()
+            new_photo._generate_md5_hash()
+        except OSError as e:
+            # Never successfully ingested -- no ImageFile row exists to
+            # update (one can't be created without a successful decode:
+            # ImageFile.save() needs width/height/thumbnails from it), so
+            # track it in FailedImageFile instead. file_mod_time lets
+            # add_from_root_dir() skip retrying this file every run while
+            # it stays broken, but retry it once its mtime changes.
+            settings.LOGGER.error(f"File {file_path} failed to decode: {e}")
+            FailedImageFile.objects.update_or_create(
+                filename=file_path,
+                defaults={
+                    "error_message": str(e),
+                    "file_mod_time": os.path.getctime(file_path),
+                },
+            )
+            return
         # print(new_photo.pixel_hash)
         exist_with_same_hash = ImageFile.objects.filter(pixel_hash = new_photo.pixel_hash)
         # print("Comparison, same hash: ", exist_with_same_hash, len(exist_with_same_hash), exist_with_same_hash[0])
@@ -277,8 +380,24 @@ def add_from_root_dir(root_dir):
             dup_file_list = list(duplicate_files.values_list('filename', flat=True))
             # dup_files = list(dup_file_list)
 
-            # New files: 
-            new_files = list(set(actual_file_list) - set(db_file_list) - set(dup_file_list))
+            # Files that have never successfully decoded, and whose mtime
+            # hasn't changed since that failure -- skip these so they
+            # aren't re-attempted (and re-fail) on every single run.
+            # A file whose mtime DOES differ from what's recorded (fixed or
+            # replaced) is left in new_files so it gets retried; a
+            # successful retry clears its FailedImageFile row (see
+            # instance_clean_and_save()).
+            unchanged_failed_file_list = [
+                f.filename for f in FailedImageFile.objects.all()
+                if f.filename in metadata_time
+                and os.path.getctime(f.filename) == f.file_mod_time
+            ]
+
+            # New files:
+            new_files = list(
+                set(actual_file_list) - set(db_file_list) - set(dup_file_list)
+                - set(unchanged_failed_file_list)
+            )
             print(f"New file length is {len(new_files)}")
 
             for filename in new_files:

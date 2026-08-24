@@ -21,19 +21,15 @@ class OpenImgOrientedTests(TestCase):
         img = open_img_oriented(path, as_numpy=False)
         self.assertEqual(img.mode, "RGB")
 
-    def test_corrupted_image_raises_rather_than_returning_none(self):
-        # KNOWN GAP (documented, not fixed here): open_img_oriented()'s
-        # try/except only wraps the initial PIL.Image.open() call, which
+    def test_corrupted_image_returns_none(self):
+        # Regression test for a fixed bug: open_img_oriented()'s try/except
+        # used to only wrap the initial PIL.Image.open() call, which
         # succeeds even for a truncated/broken JPEG (PIL parses the header
         # lazily and doesn't decode pixels yet). The actual decode error
-        # only surfaces later, at `np.array(image)` (as_numpy=True) or a
-        # caller's own pixel access -- outside this function's guard -- so
-        # despite this function *looking* like it handles bad images
-        # gracefully (returns None on failure), corrupted files actually
-        # propagate an unguarded OSError. This is the root of the
-        # `find_and_encode_faces()`/`_generate_md5_hash()` retry-forever
-        # bugs documented in face_manager/filepopulator tests -- this test
-        # pins down where in the call stack it actually originates.
+        # only surfaced later, at `np.array(image)` (as_numpy=True) --
+        # outside the old guard -- so despite *looking* like it handled bad
+        # images gracefully, corrupted files actually raised an unguarded
+        # OSError. Now that call is wrapped too, so this genuinely returns
+        # None on failure as documented.
         path = "/photos/corrupted/20220827_130217.jpg"
-        with self.assertRaises(OSError):
-            open_img_oriented(path, as_numpy=True)
+        self.assertIsNone(open_img_oriented(path, as_numpy=True))

@@ -135,7 +135,31 @@ def thumbnail_small_path(instance, filename):
 class DuplicateFile(models.Model):
     filename = models.CharField(max_length=1024)
 
-# Lots ripped from https://github.com/hooram/ownphotos/blob/dev/api/models.py 
+
+class FailedImageFile(models.Model):
+    # Tracks a file that has never successfully been ingested into
+    # ImageFile -- e.g. corrupted/truncated from the moment it appeared in
+    # the photo tree. A real ImageFile row can't be created for these:
+    # ImageFile.save() requires a successful decode to populate
+    # width/height/thumbnails. A previously-good ImageFile that later
+    # becomes corrupted is tracked differently -- via its own
+    # image_load_failed/image_load_error fields, since a full row already
+    # exists for it. A future frontend view is planned to list files from
+    # both sources for cleanup (see CLAUDE.md's Planned work).
+    filename = models.CharField(max_length=1024, unique=True)
+    error_message = models.TextField()
+    # os.path.getctime() at the time of the failed attempt -- lets
+    # add_from_root_dir() tell "still the same broken file, don't retry
+    # every run" apart from "file was replaced/fixed, retry it".
+    file_mod_time = models.FloatField()
+    first_failed_at = models.DateTimeField(auto_now_add=True)
+    last_attempted_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"FailedImageFile({self.filename})"
+
+
+# Lots ripped from https://github.com/hooram/ownphotos/blob/dev/api/models.py
 class ImageFile(models.Model):
 
     filename = models.CharField(max_length=1024, validators=[RegexValidator(regex=r"\.[j|J][p|P][e|E]?[g|G]$", message="Filename must be a JPG")], db_index = True)
@@ -453,6 +477,17 @@ class ImageFile(models.Model):
             self.pixels = cv2.imread(self.filename)
         except PIL.Image.DecompressionBombError as bomberror:
             self.pixels = cv2.imread(self.filename)
+        except OSError as oe:
+            # A corrupted/truncated JPEG -- np.array(self.image) is where
+            # PIL's lazy decode actually happens and raises. Fall back to
+            # cv2.imread() the same way the other except branches above do;
+            # it sometimes succeeds where PIL doesn't. If it can't either,
+            # raise a clear, callers-can-catch-this OSError instead of the
+            # cryptic AttributeError that self.pixels.reshape(-1) below
+            # would otherwise raise on a None result.
+            self.pixels = cv2.imread(self.filename)
+            if self.pixels is None:
+                raise OSError(f"Could not decode image pixels for {self.filename}: {oe}") from oe
 
         arr = self.pixels.reshape(-1)
         # arr = arr[::500]

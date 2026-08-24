@@ -27,29 +27,40 @@ def open_img_oriented(filename: str, as_numpy: bool):
     else:
         raise NotImplementedError(f"Type of filename is {type(filename)}")
 
-    if image.mode == 'L':
-        # If a grayscale image, convert to 3-channel "RGB"
-        image = image.convert('RGB')
-
-    for orientation in ExifTags.TAGS.keys():
-        if ExifTags.TAGS[orientation]=='Orientation':
-            break
-
+    # PIL.Image.open() parses the header lazily and succeeds even on a
+    # truncated/broken file -- the real decode (and OSError) happens on
+    # first actual pixel access, which any of convert()/rotate()/
+    # np.array() below can trigger depending on exactly where the file is
+    # damaged. Catch it around all of them, not just open() above, so this
+    # function actually honors its documented "returns None on failure"
+    # contract instead of raising partway through.
     try:
-        exif=dict(image._getexif().items())
-    except Exception as e:
-        exif = {}
+        if image.mode == 'L':
+            # If a grayscale image, convert to 3-channel "RGB"
+            image = image.convert('RGB')
 
-    if orientation in exif.keys():
-        if exif[orientation] == 3:
-            image=image.rotate(180, expand=True)
-        elif exif[orientation] == 6:
-            image=image.rotate(270, expand=True)
-        elif exif[orientation] == 8:
-            image=image.rotate(90, expand=True)
+        for orientation in ExifTags.TAGS.keys():
+            if ExifTags.TAGS[orientation]=='Orientation':
+                break
 
-    if as_numpy:
-        image = np.array(image)
-        assert len(image.shape) == 3
+        try:
+            exif=dict(image._getexif().items())
+        except Exception as e:
+            exif = {}
+
+        if orientation in exif.keys():
+            if exif[orientation] == 3:
+                image=image.rotate(180, expand=True)
+            elif exif[orientation] == 6:
+                image=image.rotate(270, expand=True)
+            elif exif[orientation] == 8:
+                image=image.rotate(90, expand=True)
+
+        if as_numpy:
+            image = np.array(image)
+            assert len(image.shape) == 3
+    except OSError as e:
+        print("EX", e)
+        return None
     return image
 

@@ -19,7 +19,7 @@ import unittest
 
 # Create your tests here.
 
-from .models import ImageFile, Directory
+from .models import ImageFile, Directory, FailedImageFile
 # from .forms import ImageFileForm, DirectoryForm
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
 # from .views import create_or_get_directory# , create_image_file, add_from_root_dir
@@ -836,35 +836,101 @@ class CorruptedImageIngestionTests(TestCase):
     def tearDown(self):
         for obj in ImageFile.objects.all():
             obj.delete()
+        FailedImageFile.objects.all().delete()
 
-    def test_create_image_file_raises_on_corrupted_input(self):
-        # KNOWN GAP (documented, not fixed here -- see
-        # filepopulator/models.py ImageFile._generate_md5_hash()): its
-        # except clauses only catch TypeError and PIL.Image.
-        # DecompressionBombError, not the OSError ("image file is
-        # truncated" / "broken data stream") that a corrupted JPEG
-        # actually raises -- so create_image_file() crashes outright on
-        # these rather than skipping gracefully like it does for other
-        # bad-file cases (see test_bogus_file). It's only safe to call
-        # directly because add_from_root_dir() wraps every call in its
-        # own try/except (see the next test) -- production never calls
-        # create_image_file() directly on a scan.
+    def test_create_image_file_tracks_never_ingested_corrupted_file(self):
+        # Regression test for a fixed bug: ImageFile._generate_md5_hash()
+        # used to only catch TypeError/PIL.Image.DecompressionBombError,
+        # not the OSError ("image file is truncated" / "broken data
+        # stream") a corrupted JPEG actually raises -- so
+        # create_image_file() crashed outright instead of degrading
+        # gracefully. Now the OSError is caught and, since this file was
+        # never successfully ingested (no ImageFile row exists to record
+        # the failure on), it's tracked in FailedImageFile instead.
         path = os.path.join(self.CORRUPTED_DIR, '20220827_130217.jpg')
-        with self.assertRaises(OSError):
-            create_image_file(path)
-        self.assertFalse(ImageFile.objects.filter(filename=path).exists())
+        create_image_file(path)
 
-    def test_add_from_root_dir_skips_corrupted_files_without_crashing(self):
-        # add_from_root_dir()'s per-file try/except means one corrupted
-        # file doesn't take down the whole ingestion batch -- but the
-        # corrupted files also never get an ImageFile row, so they'll be
-        # re-attempted (and re-fail) on every single scheduled
-        # populate_files_from_root run, forever, with no backoff.
+        self.assertFalse(ImageFile.objects.filter(filename=path).exists())
+        failed = FailedImageFile.objects.get(filename=path)
+        self.assertTrue(failed.error_message)
+
+    def test_add_from_root_dir_tracks_and_stops_retrying_corrupted_files(self):
+        # add_from_root_dir()'s per-file try/except already meant one
+        # corrupted file didn't take down the whole batch. The bug was
+        # that these files also never got any record at all, so they were
+        # re-attempted (and re-failed) on every single scheduled
+        # populate_files_from_root run, forever. Now confirms both halves
+        # of the fix: every file ends up accounted for (either a real
+        # ImageFile or a FailedImageFile -- some of these "corrupted"
+        # fixtures are truncated shallowly enough that PIL/cv2's fallback
+        # decoding actually recovers them, which is fine, not every
+        # corrupted file is unrecoverable), and a second run doesn't
+        # re-attempt whichever ones did fail (last_attempted_at is
+        # untouched -- if it *had* retried, FailedImageFile.
+        # objects.update_or_create() would have bumped it via auto_now).
         add_from_root_dir(self.CORRUPTED_DIR)
 
         corrupted_files = os.listdir(self.CORRUPTED_DIR)
         self.assertGreaterEqual(len(corrupted_files), 5)
-        self.assertEqual(ImageFile.objects.count(), 0)
+        self.assertEqual(
+            ImageFile.objects.count() + FailedImageFile.objects.count(),
+            len(corrupted_files),
+        )
+        self.assertGreater(FailedImageFile.objects.count(), 0)
+        first_pass_timestamps = {
+            f.filename: f.last_attempted_at for f in FailedImageFile.objects.all()
+        }
+
+        add_from_root_dir(self.CORRUPTED_DIR)
+
+        second_pass_timestamps = {
+            f.filename: f.last_attempted_at for f in FailedImageFile.objects.all()
+        }
+        self.assertEqual(first_pass_timestamps, second_pass_timestamps)
+
+    def test_previously_good_photo_that_becomes_corrupted_is_flagged_not_crashed(self):
+        # The other half of the bug: a photo that was ingested fine and
+        # later becomes unreadable on disk (bit rot, a bad in-place edit)
+        # hits the same OSError, but through the "photo already exists"
+        # branch of create_image_file() -- there's already a real
+        # ImageFile row for it. That row is flagged via
+        # image_load_failed/image_load_error (added for the face_manager
+        # retry-forever fix) rather than losing its prior good data, and
+        # dateModified is bumped so it isn't re-attempted every run either.
+        tmp_dir = '/tmp/filepop_corrupt_existing_test'
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+        os.makedirs(tmp_dir)
+        try:
+            src = os.path.join(settings.FILEPOPULATOR_VAL_DIRECTORY, 'naming', 'good', '1.JPG')
+            file_path = os.path.join(tmp_dir, '1.JPG')
+            shutil.copy(src, file_path)
+            create_image_file(file_path)
+            before = ImageFile.objects.get(filename=file_path)
+            self.assertFalse(before.image_load_failed)
+
+            # Corrupt it in place (truncate) and push the mtime forward so
+            # create_image_file() treats it as changed, same technique
+            # ci_fixtures/generate_fixtures.py uses to build corrupted
+            # fixtures.
+            with open(file_path, 'rb') as f:
+                data = f.read()
+            with open(file_path, 'wb') as f:
+                f.write(data[: len(data) - 200])
+            future = time.time() + 3600
+            os.utime(file_path, (future, future))
+
+            create_image_file(file_path)
+
+            after = ImageFile.objects.get(filename=file_path)
+            self.assertEqual(before.id, after.id)
+            self.assertTrue(after.image_load_failed)
+            self.assertTrue(after.image_load_error)
+            # Prior good data (pixel_hash, thumbnails, etc.) is untouched.
+            self.assertEqual(before.pixel_hash, after.pixel_hash)
+            self.assertFalse(FailedImageFile.objects.filter(filename=file_path).exists())
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @override_settings(MEDIA_ROOT='/tmp/filepopulator_test_media')
