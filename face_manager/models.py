@@ -127,7 +127,12 @@ class Person(models.Model):
         self.save()
 
 class Face(models.Model):
-    
+
+    # Source of truth for how many poss_identN/weight_N field pairs exist
+    # below. face_manager/apps.py registers a system check that fails
+    # manage.py check/startup if this ever drifts from the actual fields.
+    NUM_POSSIBLE_IDENTITIES = 5
+
     # Primary key (id) comes for free.
     # For all the foreign keys to person, we set the on_delete method
     # to models.SET. This property takes a function that returns
@@ -233,13 +238,21 @@ class Face(models.Model):
         return super().save(*args, **kwargs)
 
     def remove_poss_ident(self, poss_idx):
-        if self.__dict__[f'poss_ident{poss_idx}_id'] != None:
-            ident_id_person = self.__dict__[f'poss_ident{poss_idx}_id']
-            person = Person.objects.get(id=ident_id_person)
+        field_name = f'poss_ident{poss_idx}'
+        if not hasattr(self, field_name):
+            raise AttributeError(
+                f"Face has no field '{field_name}' -- poss_idx must be between "
+                f"1 and {self.NUM_POSSIBLE_IDENTITIES} (NUM_POSSIBLE_IDENTITIES)."
+            )
+        if getattr(self, field_name) is not None:
+            person = getattr(self, field_name)
             if poss_idx == 1:
                 person.decrement_possible_num()
-            self.__dict__[f'poss_ident{poss_idx}_id'] = None
-            self.__dict__[f'weight_{poss_idx}'] = 0.0
+            # Real attribute assignment (not a raw __dict__/attname poke) so
+            # Model.save() doesn't reconcile the still-cached related object
+            # back over this on write.
+            setattr(self, field_name, None)
+            setattr(self, f'weight_{poss_idx}', 0.0)
 
     def associate_person(self, person_id):
         # A one-stop-shop function to assign a Face to a given
@@ -264,11 +277,8 @@ class Face(models.Model):
         self.validated = False
         self.written_to_photo_metadata = False
 
-        self.remove_poss_ident(1)
-        self.remove_poss_ident(2)
-        self.remove_poss_ident(3)
-        self.remove_poss_ident(4)
-        self.remove_poss_ident(5)
+        for poss_idx in range(1, self.NUM_POSSIBLE_IDENTITIES + 1):
+            self.remove_poss_ident(poss_idx)
 
         self.save()
 
@@ -306,11 +316,8 @@ class Face(models.Model):
         self.save()
 
     def set_possibles_zero(self):
-        self.remove_poss_ident(1)
-        self.remove_poss_ident(2)
-        self.remove_poss_ident(3)
-        self.remove_poss_ident(4)
-        self.remove_poss_ident(5)
+        for poss_idx in range(1, self.NUM_POSSIBLE_IDENTITIES + 1):
+            self.remove_poss_ident(poss_idx)
 
         self.save()
 

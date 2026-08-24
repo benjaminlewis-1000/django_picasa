@@ -68,14 +68,55 @@ python manage.py test picasa.tests common  # project-level + shared-util tests
 
 **Where things stand (as of this session)**: all of the above test/CI/dependency work is committed to `backend_upgrade` (3 commits: migrations-tracking, the test suite itself, then CI+fixtures+dependency pins) and pushed to `origin/backend_upgrade` — deliberately kept off `master` for now at the user's request, not yet merged or PR'd. `master` separately got a small, unrelated CORS/CSRF fix + this file, pushed directly. **The CI workflow has not actually been exercised on GitHub yet** — it only triggers on `push`/`pull_request` targeting `master` (see `.github/workflows/tests.yml`), and `backend_upgrade` doesn't touch `master`, so pushing to `backend_upgrade` alone does not run it. Opening a PR from `backend_upgrade` into `master` would trigger it without merging anything, if a real end-to-end check is wanted before merging. The confirmed bugs listed below are deliberately **not fixed** — the user chose to build out test coverage and stabilize the environment first, bugs are next.
 
+**Fixed bugs:**
+- `face_manager/models.py` `Face.remove_poss_ident()` (used by `associate_person`/`set_possibles_zero`/`clear_person`): used to clear a `poss_identN` FK by poking `self.__dict__['poss_identN_id'] = None` directly instead of `self.poss_identN = None`, so Django 6's `Model.save()` FK-cache reconciliation silently restored the old value — `poss_identN` was never actually cleared. Now uses real `setattr()`/`getattr()`, matching how `reject_association()` always did it correctly. Also added `Face.NUM_POSSIBLE_IDENTITIES = 5` as the single source of truth (the `associate_person`/`set_possibles_zero` call-chains now loop over it instead of hardcoding `remove_poss_ident(1)` through `(5)`), plus a Django system check (`face_manager/apps.py`, `face_manager.E001`) that fails `manage.py check`/startup loudly if the model's actual `poss_identN`/`weight_N` field pairs ever stop matching that constant. Note: `set_possible_person()` and `reject_association()` still hardcode `5`/`range(1, 6)` via `eval`/`exec` — not touched, out of scope for this fix, would need a separate pass if `NUM_POSSIBLE_IDENTITIES` is ever actually changed.
+
 **Known bugs the test suite found and documents (not fixed, per instruction) — each is `@unittest.expectedFailure` with a comment at the point it's caught:**
 - `api/views.py` `filteredImagesView.get()`: if query params are present but none are `people`/`year_start`/`year_end` (e.g. just `?key=...`), `p_query` stays `None` and `ImageFile.objects.filter(None)` raises `TypeError` instead of returning "all images" like the no-params case does.
-- `face_manager/models.py` `Face.remove_poss_ident()` (used by `associate_person`/`set_possibles_zero`/`clear_person`): clears a `poss_identN` FK by poking `self.__dict__['poss_identN_id'] = None` directly instead of `self.poss_identN = None`. Under Django 6, `Model.save()` reconciles each cached forward-FK object back onto its attname column before writing, so the manually-nulled attname gets silently overwritten by the *still-cached* related object's pk again — `poss_identN` is never actually cleared. `reject_association()` doesn't have this bug (it uses real `self.poss_identN = None` assignment).
 - `face_manager/face_extract_encode.py` `find_and_encode_faces()`: the `except Exception: ... continue` around image loading never sets `isProcessed = True`, so a file that fails to decode (corrupt JPEG) is retried by the scheduled face-extraction task forever, on every run, with no backoff or dead-lettering. Reproduced with 5 real corrupted files pulled from production logs (`face_manager/tests.py` `FaceExtractorCorruptedImageTests`).
 - `api/views.py` `bulk_thread()`: bare `except: print(...)` with no `continue` when a `face_id` doesn't resolve — falls through to use the unset `face` variable, raising `UnboundLocalError`, silently swallowed by the caller. A stale/bad ID in a bulk-operation request just silently no-ops.
 - `filepopulator/models.py` `Directory.average_date_taken()`/`beginning_date_taken()`: both use `timezone.utc`, removed from `django.utils.timezone` in the Django version this app now runs (6.0) — should be `datetime.timezone.utc`. Not hypothetical: the scheduled `filepopulator.update_dir_dates` Celery task has crashed with this exact `AttributeError` on every single run, confirmed via `docker logs picasa_api`, and never gets past the first `Directory` (no per-item try/except in `update_dirs_datetime()`), so directory date aggregation has been completely non-functional since the upgrade.
 - `filepopulator/models.py` `ImageFile._generate_md5_hash()`'s except clauses catch `TypeError` and `PIL.Image.DecompressionBombError` but not the plain `OSError` a corrupted JPEG actually raises — `create_image_file()` crashes outright on a corrupted file rather than skipping gracefully; only survivable in practice because `add_from_root_dir()` wraps each file in its own try/except (so ingestion of *new* corrupt files is skipped, silently, forever — same retry-forever shape as the face-extraction bug above, just one layer earlier).
 - `common/open_img_oriented.py`: its try/except only wraps the initial `PIL.Image.open()` call, which succeeds even for a truncated/broken JPEG (PIL parses the header lazily). The real decode error only surfaces later at `np.array(image)` (or a caller's own pixel access), unguarded — despite the function *looking* like it degrades gracefully (returns `None` on failure), a corrupted file actually raises an uncaught `OSError`. This is the actual origin point of the two retry-forever bugs above; pinned down at this layer in `common/tests.py`.
+
+**Fixed this session (2026-08-24), breaking the "not fixed yet" pattern above because the
+frontend (`dev_facewire`) hit it directly through its new undo/redo feature — not one of the
+bugs the test suite above already found/documented:**
+- `api/views.py` `bulk_thread()`'s `close_assigned` branch called `Face.reject_association()`
+  unconditionally. That method only knows how to cross a candidate off a face's `poss_identN`
+  "possible match" list, and asserts `current_person_id` is actually one of those candidates.
+  That's correct when declining a proposed match, but `close_assigned` is also fired from
+  "Remove from person" and (as of `dev_facewire`'s new undo/redo) undoing a `confirm_proposed` —
+  both cases where the face is already **declared** to `current_person_id`, never a
+  `poss_identN` entry, so the assert raised every time. That exception propagated out of
+  `bulk_thread()` into `background_bulk_processor()`'s blanket `except Exception: print(...)`,
+  silently swallowed — the queued job was just dropped, no error surfaced anywhere, and the
+  face never actually moved. Fixed by checking which case it actually is: if
+  `current_person_id` is a `poss_identN` candidate, still decline it via `reject_association`
+  (unchanged); if it's the face's actual `declared_name`, reassign to `blank_person`
+  (`_NO_FACE_ASSIGNED_`) via `associate_person()` instead — same mechanism `close_unassigned`
+  already uses to reassign a face to `.ignore`. Covered by two new tests in
+  `api/tests.py::FaceViewSetTests` (`test_bulk_close_assigned_on_declared_face_clears_name_tag`,
+  `test_bulk_close_assigned_on_possible_match_still_declines_it`) that call `bulk_thread()`
+  directly rather than going through the real `bulk_operation` HTTP endpoint + background
+  queue/thread, since that path's own timing/DB-connection isolation isn't something a test
+  should depend on. **This is only on `backend_upgrade`/`picasa_api_dev_test`, not `master`/the
+  live `picasa_api` container** — the production API `dev_facewire`'s UI actually talks to
+  (`picasa.exploretheworld.tech/api`) still has the original bug until this is ported to
+  `master` and deployed. See `dev_facewire/CLAUDE.md`'s "Currently in progress / open" for the
+  frontend-side note about this.
+- Testing gotcha found while verifying the above (not itself an app bug, just a trap for
+  future test runs): `api/views.py` starts a non-daemon background worker thread at *import*
+  time (`work_thread = threading.Thread(target=background_bulk_processor); work_thread.start()`)
+  running `while True: ...` forever. Once any test imports `api.views` (directly, or indirectly
+  via the first request through DRF's URL routing), that thread keeps the whole `manage.py
+  test` process alive even after every test has finished and results have printed — it just
+  sits there, alive, never exiting on its own. Looks exactly like a hung test run (a `ps`
+  snapshot shows low/flat CPU time, state `S`, blocked on a futex) when it's actually already
+  done. Confirmed by killing the process after `Ran N tests ... OK` was already sitting in the
+  (unflushed, pipe-buffered) output. Not chased further as an app fix - just know to check
+  whether results already printed before assuming a `manage.py test` run is stuck, and expect
+  to `kill` it rather than wait for a natural exit.
 
 **Not a bug, just dead code worth knowing about**: `picasa/custom_cors.py`'s `LocalNetworkCorsMiddleware` is fully commented out of `MIDDLEWARE` in `settings.py` — not currently active. No tests were written for it since testing inactive code would be misleading; if it's ever re-enabled, write tests for it then.
 

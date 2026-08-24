@@ -210,24 +210,12 @@ class FaceModelTests(TestCase):
         self.assertEqual(face.weight_1, 0.0)
         self.assertFalse(face.validated)
 
-    @unittest.expectedFailure
     def test_associate_person_clears_possible_identity(self):
-        # KNOWN BUG (found by this test, not fixed here -- see
-        # face_manager/models.py Face.remove_poss_ident): it clears the FK
-        # by poking `self.__dict__['poss_identN_id'] = None` directly
-        # instead of `self.poss_identN = None`. Under the Django version
-        # this app now runs (6.0), Model.save() reconciles each cached
-        # forward-FK object (Face._state.fields_cache['poss_identN'],
-        # populated earlier by set_possible_person's normal `self.poss_
-        # identN = person` assignment) back onto its attname column before
-        # writing -- so the manually-nulled attname gets silently
-        # overwritten with the *cached* related object's pk again, and
-        # poss_identN is never actually cleared in the database. Confirmed
-        # by direct reproduction: calling remove_poss_ident() standalone
-        # clears it; calling save() right after puts the old value back.
-        # reject_association() doesn't have this bug -- it clears via
-        # `exec(f"self.poss_ident{offset} = None")`, the real descriptor
-        # assignment, which invalidates the cache correctly.
+        # Regression test for a fixed bug: remove_poss_ident() used to clear
+        # the FK by poking `self.__dict__['poss_identN_id'] = None` directly
+        # instead of `self.poss_identN = None`, so Model.save()'s FK-cache
+        # reconciliation silently restored the old value. Now uses real
+        # setattr()/getattr(), matching how reject_association() always did.
         original = make_person("Original2")
         target = make_person("Target2")
         face = make_face(self.image, declared_name=original)
