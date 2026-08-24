@@ -292,14 +292,18 @@ class FaceExtractorCorruptedImageTests(TestCase):
         super().setUpClass()
         cls.extractor = FaceExtractor()
 
-    def test_corrupted_images_never_get_marked_processed(self):
-        # KNOWN BUG (found by this test, not fixed here -- see
-        # face_manager/face_extract_encode.py find_and_encode_faces):
-        # the `except Exception: ... continue` branch that catches the
-        # PIL "image file is truncated" / "broken data stream" errors
-        # never sets img_obj.isProcessed = True, so these files are
-        # retried by the scheduled face_extraction task on every run,
-        # forever. This test documents that behavior as it exists today.
+    def test_corrupted_images_get_marked_processed_and_flagged(self):
+        # Regression test for a fixed bug: the `except Exception: ...
+        # continue` branch that catches the PIL "image file is truncated" /
+        # "broken data stream" errors used to never set
+        # img_obj.isProcessed = True, so these files were retried by the
+        # scheduled face_extraction task on every run, forever. Now marks
+        # isProcessed (stop retrying) and image_load_failed/
+        # image_load_error (so the failure is recorded instead of just
+        # silently no-op'd -- see the planned frontend "failed to open"
+        # list in CLAUDE.md). Uses ImageFile.objects.filter(...).update()
+        # rather than img_obj.save(), since save() would itself re-decode
+        # the (still corrupted) image via _generate_md5_hash() and raise.
         corrupted_files = sorted(os.listdir(self.CORRUPTED_DIR))
         self.assertEqual(len(corrupted_files), 5)
 
@@ -312,11 +316,13 @@ class FaceExtractorCorruptedImageTests(TestCase):
 
         for img_obj in image_objs:
             img_obj.refresh_from_db()
-            self.assertFalse(
+            self.assertTrue(
                 img_obj.isProcessed,
-                f"{img_obj.filename} was marked processed -- corrupted-image "
-                "handling may have changed; update this test and NOTES.md.",
+                f"{img_obj.filename} was not marked processed -- would be "
+                "retried by face_extraction on every future run.",
             )
+            self.assertTrue(img_obj.image_load_failed)
+            self.assertTrue(img_obj.image_load_error)
             self.assertEqual(Face.objects.filter(source_image_file=img_obj).count(), 0)
 
     def test_good_image_gets_processed_and_gains_faces(self):

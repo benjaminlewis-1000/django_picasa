@@ -185,6 +185,21 @@ class FaceExtractor(object):
                 print("Error in processing!")
                 settings.LOGGER.debug(f"Error processing image {source_file}: {str(e)}")
                 print(f"Error processing image {source_file}: {str(e)}")
+                # Mark isProcessed so this file isn't retried on every future
+                # run (it never will decode differently), and record the
+                # failure so it can be found/cleaned up later instead of
+                # silently vanishing from the pipeline. Uses .update()
+                # rather than img_obj.save() deliberately: ImageFile.save()
+                # unconditionally re-decodes the image to recompute its
+                # pixel hash (see filepopulator/models.py
+                # _generate_md5_hash()), which would itself raise an
+                # uncaught OSError on the same corrupted file (bug #6,
+                # still open) right here in the handler for this failure.
+                ImageFile.objects.filter(pk=img_obj.pk).update(
+                    isProcessed=True,
+                    image_load_failed=True,
+                    image_load_error=str(e),
+                )
                 continue
 
             print(f"Found {len(detected_faces)} faces in image {source_file}")

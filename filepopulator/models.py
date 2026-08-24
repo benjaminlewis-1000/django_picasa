@@ -191,6 +191,14 @@ class ImageFile(models.Model):
     isProcessed = models.BooleanField(default=False)
     orientation = models.IntegerField(default=-8008)
 
+    # Set when the underlying file failed to open/decode -- e.g. a
+    # corrupted or truncated JPEG. Generic (not tied to face extraction
+    # specifically) since both face_manager's extraction pipeline and
+    # filepopulator's own ingestion can hit this on the same file; a
+    # future frontend view is planned to list these for cleanup.
+    image_load_failed = models.BooleanField(default=False)
+    image_load_error = models.TextField(null=True, blank=True)
+
     # For storing tags
     tags = ArrayField(
         models.CharField(max_length = 128, null=True, blank = True),
