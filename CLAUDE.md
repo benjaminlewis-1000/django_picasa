@@ -83,9 +83,9 @@ python manage.py test picasa.tests common  # project-level + shared-util tests
 - `filepopulator/models.py` `Directory.average_date_taken()`/`beginning_date_taken()`: used `timezone.utc`, an attribute removed from `django.utils.timezone` in the Django version this app now runs (6.0). Not hypothetical: the scheduled `filepopulator.update_dir_dates` Celery task crashed with this exact `AttributeError` on every single run, confirmed via `docker logs picasa_api`, never getting past the first `Directory` (no per-item try/except in `update_dirs_datetime()`), so directory date aggregation had been completely non-functional since the upgrade. Fixed with `pytz.utc` (already imported in this file) rather than `datetime.timezone.utc` — the module's own `from datetime import datetime` shadows the `datetime` module name with the class, so `datetime.timezone.utc` isn't reachable here.
 - `face_manager/models.py` `Face.remove_poss_ident()` (used by `associate_person`/`set_possibles_zero`/`clear_person`): used to clear a `poss_identN` FK by poking `self.__dict__['poss_identN_id'] = None` directly instead of `self.poss_identN = None`, so Django 6's `Model.save()` FK-cache reconciliation silently restored the old value — `poss_identN` was never actually cleared. Now uses real `setattr()`/`getattr()`, matching how `reject_association()` always did it correctly. Also added `Face.NUM_POSSIBLE_IDENTITIES = 5` as the single source of truth (the `associate_person`/`set_possibles_zero` call-chains now loop over it instead of hardcoding `remove_poss_ident(1)` through `(5)`), plus a Django system check (`face_manager/apps.py`, `face_manager.E001`) that fails `manage.py check`/startup loudly if the model's actual `poss_identN`/`weight_N` field pairs ever stop matching that constant. Note: `set_possible_person()` and `reject_association()` still hardcode `5`/`range(1, 6)` via `eval`/`exec` — not touched, out of scope for this fix, would need a separate pass if `NUM_POSSIBLE_IDENTITIES` is ever actually changed.
 
-**Known bugs the test suite found and documents (not fixed, per instruction) — each is `@unittest.expectedFailure` with a comment at the point it's caught:**
-- `api/views.py` `filteredImagesView.get()`: if query params are present but none are `people`/`year_start`/`year_end` (e.g. just `?key=...`), `p_query` stays `None` and `ImageFile.objects.filter(None)` raises `TypeError` instead of returning "all images" like the no-params case does.
-- `api/views.py` `bulk_thread()`: bare `except: print(...)` with no `continue` when a `face_id` doesn't resolve — falls through to use the unset `face` variable, raising `UnboundLocalError`, silently swallowed by the caller. A stale/bad ID in a bulk-operation request just silently no-ops.
+**All 6 bugs originally found by the initial test-writing pass are now fixed** (the last two, below, plus the 4 above). None have been ported to `master`/deployed yet — see the TODOs in "Planned work".
+- `api/views.py` `filteredImagesView.get()`: if query params were present but none were `people`/`year_start`/`year_end` (e.g. just `?key=...`), `p_query` stayed `None` and `ImageFile.objects.filter(None)` raised `TypeError` instead of returning "all images" like the no-params case does. Fixed by explicitly falling back to `ImageFile.objects.all()` when `p_query is None`, same as the no-params branch.
+- `api/views.py` `bulk_thread()`: the bare `except: print(...)` around `Face.objects.get(id=face_id)` had no `continue`, so a bad/stale `face_id` let execution fall through to the operation branches with `face` either unbound (`UnboundLocalError` on the first list entry) or still holding the *previous* iteration's `Face` (silently operating on the wrong face for later entries) — either way swallowed by `background_bulk_processor()`'s blanket except. Fixed by catching `Face.DoesNotExist` specifically and adding the missing `continue`.
 
 **Fixed this session (2026-08-24), breaking the "not fixed yet" pattern above because the
 frontend (`dev_facewire`) hit it directly through its new undo/redo feature — not one of the
@@ -134,6 +134,11 @@ bugs the test suite above already found/documented:**
 
 ## Planned work
 
+- **TODO: port the `filteredImagesView`/`bulk_thread()` bug fixes (2026-08-24) from
+  `backend_upgrade` to `master` and deploy.** `filteredImagesView.get()` no longer 500s on a
+  query-params-but-no-recognized-filter request (e.g. `?key=...` alone, which the slideshow
+  client can send); `bulk_thread()` no longer silently misbehaves when a bad `face_id` is mixed
+  into a bulk-operation request. No migration involved.
 - **TODO: port the EXIF orientation consolidation (2026-08-24, `common/open_img_oriented.py`'s
   `apply_exif_orientation()` + `filepopulator/models.py`'s `_init_image()` now sharing it) from
   `backend_upgrade` to `master` and deploy, then manually reprocess the 2 known-affected images**

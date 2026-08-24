@@ -78,8 +78,15 @@ def bulk_thread(dataframe: dict):
         assert type(face_id) is int
         try:
             face = Face.objects.get(id=face_id)
-        except:
+        except Face.DoesNotExist:
+            # Missing `continue` used to let execution fall through to the
+            # operation branches below with `face` either unbound (first
+            # iteration) or still holding the *previous* iteration's Face
+            # (later iterations) -- silently operating on the wrong face,
+            # or raising UnboundLocalError, either way swallowed by
+            # background_bulk_processor()'s blanket except.
             print(f"Face not found for ID {face_id}")
+            continue
 
         if operation == 'close_unassigned':
             # Previously /api/face_id/ignore_face with {ignore_type: 'soft'}
@@ -1031,7 +1038,15 @@ class filteredImagesView(APIView):
                     p_query = p_query | years_query
 
             print(p_query)
-            obj = ImageFile.objects.filter(p_query).exclude(face__declared_name__person_name='Charlotte Lewis').distinct().order_by('dateTaken').values_list('id', 'dateTaken')
+            if p_query is None:
+                # Query params were present but none were 'people'/
+                # 'year_start'/'year_end' (e.g. just '?key=...') -- p_query
+                # never got built. Fall back to "all images", same as the
+                # no-params case above, rather than calling
+                # ImageFile.objects.filter(None), which raises TypeError.
+                obj = ImageFile.objects.all().order_by('dateTaken').values_list('id', 'dateTaken')
+            else:
+                obj = ImageFile.objects.filter(p_query).exclude(face__declared_name__person_name='Charlotte Lewis').distinct().order_by('dateTaken').values_list('id', 'dateTaken')
 
         ids = list(([o[0] for o in obj]))
         dates = list(([o[1].isoformat() for o in obj]))

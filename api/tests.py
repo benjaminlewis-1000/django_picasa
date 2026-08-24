@@ -150,15 +150,14 @@ class SlideshowKeyPermissionTests(ApiTestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
-    @unittest.expectedFailure
     def test_correct_key_query_param_is_accepted(self):
-        # KNOWN BUG (found by this test, not fixed here -- see api/views.py
-        # filteredImagesView.get): when query params are present but none of
-        # them are 'people'/'year_start'/'year_end' (e.g. just '?key=...'),
-        # `p_query` is left as None and `ImageFile.objects.filter(p_query)`
-        # raises TypeError instead of falling back to "all images" the way
-        # the no-params case does. The header-based key auth path (tested
-        # above) doesn't hit this because it sends no query params at all.
+        # Regression test for a fixed bug: when query params were present
+        # but none of them were 'people'/'year_start'/'year_end' (e.g. just
+        # '?key=...'), `p_query` was left as None and
+        # `ImageFile.objects.filter(p_query)` raised TypeError instead of
+        # falling back to "all images" the way the no-params case does.
+        # The header-based key auth path (tested above) doesn't hit this
+        # because it sends no query params at all.
         resp = self.anon_client.get(f"/api/image_list/?key={settings.SLIDESHOW_API_KEY}")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
@@ -388,6 +387,28 @@ class FaceViewSetTests(ApiTestCase):
         # Declared name is untouched - this declined a guess, not the
         # actual name tag.
         self.assertEqual(self.face.declared_name_id, original_declared_id)
+
+    def test_bulk_thread_skips_unknown_face_id_without_crashing(self):
+        # Regression test for a fixed bug: bulk_thread()'s
+        # `except: print(...)` around the Face.objects.get() lookup had no
+        # `continue`, so execution fell through to the operation branches
+        # with `face` either unbound (raising UnboundLocalError on the
+        # first list entry) or still holding the *previous* iteration's
+        # Face (silently operating on the wrong face for later entries) --
+        # either way swallowed by background_bulk_processor()'s blanket
+        # except, so a stale/bad id in the list silently broke the whole
+        # batch. A bad id followed by a real one should skip the bad one
+        # and still process the real one correctly.
+        from api.views import bulk_thread
+
+        current_person_id = self.face.declared_name_id
+        bulk_thread({
+            "face_id_list": [999999, self.face.id],
+            "operation": "close_assigned",
+            "current_person_id": current_person_id,
+        })
+        self.face.refresh_from_db()
+        self.assertEqual(self.face.declared_name.person_name, settings.BLANK_FACE_NAME)
 
 
 class KeyedImageViewTests(ApiTestCase):
