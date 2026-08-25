@@ -270,6 +270,29 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   again unless/until the settings collapse + `close_ignored` fix from `backend_upgrade` (see
   above) is ported to `master` and deployed. Don't consider this fully resolved until that
   ships.
+- **Lesson from the above: bulk `Face.objects.filter(...).update(...)` bypasses `Person`'s
+  cached face-count columns.** `Person.num_faces`/`num_possibilities`/`num_unverified_faces` are
+  plain `IntegerField`s only kept in sync by `increment_assigned()`/`decrement_assigned()`/etc
+  (called from `Face` model methods like `associate_person()`), or recomputed wholesale by the
+  scheduled `face_manager.set_face_counts` task (`face_manager/tasks.py`'s `reset_task`) — never
+  by a live query. Right after the `.another_ignore` merge, the underlying `Face` rows were
+  correct but `.ignore`'s cached counters were stale (still `10,467`/`0` instead of the real
+  `103,317`/`115,335`), which is what `PersonListView` (`api/views.py`) actually serves to the
+  frontend for non-blank-sentinel people — it reads `p.num_faces`/`p.num_possibilities` directly,
+  not a live count. Fixed by queuing the real `set_face_counts` Celery task (`reset_task.delay()`)
+  rather than looping and saving every `Person` by hand. **Any future bulk `Face` reassignment
+  needs to trigger `set_face_counts` afterward**, or add it as a step in the operation itself.
+- **New bug found while investigating the above**: `PersonSerializer` (`api/serializers.py`)
+  declares `num_possibilities = serializers.SerializerMethodField()` but `get_num_possibilities`
+  is commented out — any code path that actually serializes a `Person` through this serializer
+  (confirmed via direct test: `PersonSerializer(p).data` raises
+  `AttributeError: 'PersonSerializer' object has no attribute 'get_num_possibilities'`) crashes.
+  `PersonViewSet` (the `/api/people/` DRF router endpoint) uses this serializer, so it's likely
+  broken for any request that hits it — the frontend must be relying on `PersonListView`
+  (`/api/person_list/`, a hand-rolled `APIView` with its own dict-building, no serializer)
+  instead, which is presumably why this hasn't been noticed. Not fixed yet — just found. Either
+  implement `get_num_possibilities` (mirroring `set_face_counts`'s `p.face_poss1.count()`) or
+  drop the field if `/api/people/` isn't actually used by anything live.
 - **Investigate actually fixing the non-daemon background thread in `api/views.py`**
   (`work_thread` / `background_bulk_processor`, see "Testing gotcha" above), rather than just
   working around it. It's currently just a trap for test runs (looks hung, isn't), but the same
