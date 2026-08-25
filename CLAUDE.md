@@ -157,12 +157,16 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   `disassociate_patch_url` in its response, since it pointed at this now-removed route.
   `Face.reject_association()` itself is untouched and still live — `bulk_thread()`'s
   `close_assigned` branch still calls it for the "decline a candidate" case.
-- [ ] `SOFT_IGNORE_NAME` mismatch — the scheduled `assign_faces` task (`face_manager/
-  assign_faces.py`) routes low-confidence faces to `Person` `.another_ignore` (via
-  `settings.SOFT_IGNORE_NAME`), but every UI-facing check (`bulk_thread`'s `close_ignored`,
-  etc.) only recognizes `.ignore`/`.realignore`. Confirmed `.another_ignore` exists in the live
-  DB, so this isn't a crash — it's silent misrouting: those ML-flagged faces can never be
-  promoted to hard-ignore through the normal UI action.
+- [x] `SOFT_IGNORE_NAME` mismatch — fixed by collapsing the two identities rather than teaching
+  `close_ignored` about a second one. `.another_ignore` (created by the scheduled `assign_faces`
+  task for low-confidence auto-suggestions) and `.ignore` (the sentinel a human assigns via
+  `close_unassigned`) were separate `Person` rows, so `bulk_thread`'s `close_ignored` — which
+  only recognized `.ignore`/`.realignore` — could never promote a classifier-suggested face to
+  hard-ignore. `SOFT_IGNORE_NAME` now equals `.ignore` directly. Code fix ships on
+  `backend_upgrade`; the data side (92,780 faces with `declared_name='.another_ignore'`, 115,410
+  with `poss_ident1` set to it, per a real production count) needs the
+  `merge_another_ignore_into_ignore` management command run against production — see "Planned
+  work" — before/alongside deploying this.
 - [x] Orphaned `Face` thumbnail files on every scheduled cleanup — fixed. `filepopulator/
   scripts.py`'s `delete_removed_photos()` deletes `ImageFile` rows whose file vanished from
   disk; `Face.source_image_file`'s `CASCADE` meant Django's bulk-SQL cascade delete skipped
