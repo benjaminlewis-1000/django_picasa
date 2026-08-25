@@ -26,6 +26,7 @@ from rest_framework.response import Response
 from rest_framework.reverse import reverse, reverse_lazy
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
+from django.utils.functional import SimpleLazyObject
 from face_manager.tasks import api_bulk_operation
 from time import sleep
 import api.serializers as api_ser
@@ -55,9 +56,20 @@ background_queue = Queue()
 # 1.0 = crop tight to the face, 1.5 = 50% more space on each side.
 HIGHLIGHT_PADDING_FACTOR = 1.6
 
-soft_ignore_person = Person.objects.filter(person_name='.ignore')[0]
-hard_ignore_person = Person.objects.filter(person_name='.realignore')[0]
-blank_person = Person.objects.filter(person_name=settings.BLANK_FACE_NAME)[0]
+# Lazy rather than a plain module-level query: this module gets imported at
+# Django startup (URL resolution, system checks) well before any request --
+# and before any test's setUp has had a chance to seed these sentinel Person
+# rows. An eager query here crashed the entire app on any DB that doesn't
+# already have '.ignore'/'.realignore'/BLANK_FACE_NAME rows -- which includes
+# every fresh install and every CI run (production only avoided this because
+# someone seeded them by hand once). SimpleLazyObject defers the query to
+# first actual attribute access, by which point the DB is guaranteed to be
+# ready. See CLAUDE.md's "Bootstrapping a fresh DB from scratch" note --
+# this stops the crash but doesn't auto-create the rows themselves, which is
+# a separate gap.
+soft_ignore_person = SimpleLazyObject(lambda: Person.objects.filter(person_name='.ignore')[0])
+hard_ignore_person = SimpleLazyObject(lambda: Person.objects.filter(person_name='.realignore')[0])
+blank_person = SimpleLazyObject(lambda: Person.objects.filter(person_name=settings.BLANK_FACE_NAME)[0])
 
 def bulk_thread(dataframe: dict):
     # print("Got a data load of ", dataframe)

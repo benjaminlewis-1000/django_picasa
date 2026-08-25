@@ -192,6 +192,25 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+- **Fixed (2026-08-25): `api/views.py`'s sentinel `Person` lookups crashed app startup on any
+  DB without `.ignore`/`.realignore`/`BLANK_FACE_NAME` rows already present.** Found while
+  getting CI (PR #43) to actually run — a genuinely fresh, empty CI database hits this on the
+  very first `manage.py test`/`manage.py check`, since `soft_ignore_person`/`hard_ignore_person`/
+  `blank_person` were plain module-level queries evaluated at import time (URL resolution),
+  before any test's sentinel-seeding has run. Production never noticed because those rows were
+  seeded by hand once, long ago. Fixed by wrapping all three in `SimpleLazyObject`, deferring the
+  query to first actual attribute access. Covered by `LazySentinelPersonTests` in `api/tests.py`.
+- **TODO: auto-create the sentinel `Person` rows (`.ignore`, `.realignore`, `BLANK_FACE_NAME`,
+  etc) instead of relying on someone having seeded them by hand.** The `SimpleLazyObject` fix
+  above only stops `api/views.py` from crashing at *import* time — it doesn't make these rows
+  exist. Nothing in the codebase creates them today (no migration, no fixture); the live DB only
+  has them because someone created them by hand at some point (see "Bootstrapping a fresh DB
+  from scratch is currently broken" in "Testing" above). CI survives this today only because
+  `api/tests.py`'s `ensure_sentinel_people()` runs per-`TestCase` before any test body executes —
+  a genuine fresh production install (or a fresh CI DB touched by non-test code, e.g. a
+  management command run directly) would still hit a `Person.DoesNotExist`/`IndexError` the
+  first time anything actually uses `soft_ignore_person`/etc. Real fix is a data migration that
+  creates these rows if missing, so a truly fresh `migrate` is enough to boot the app.
 - **TODO: port the `api/mobile_views.py` split + `ResetFace`/`ConfidentUnlabeledView` fixes +
   `reject_association_app_api()` removal (2026-08-24) from `backend_upgrade` to `master` and
   deploy.** No migration involved; `api/urls.py` now imports the 4 mobile views from

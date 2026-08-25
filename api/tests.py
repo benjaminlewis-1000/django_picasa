@@ -8,6 +8,7 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.files.base import ContentFile
 from django.test import TestCase, override_settings
+from django.utils.functional import SimpleLazyObject
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -97,6 +98,33 @@ class ApiTestCase(TestCase):
         )
         face.save()
         return face
+
+
+class LazySentinelPersonTests(ApiTestCase):
+    """Regression test for a fixed bug: api/views.py used to run
+    Person.objects.filter(person_name='.ignore')[0] etc as plain
+    module-level queries -- executed at import time (URL resolution,
+    Django's system checks), before any test's setUp/sentinel seeding has
+    run. That crashed the entire app on any DB without those rows
+    already present, which is every fresh install and every CI run (only
+    production avoided it, because someone seeded them by hand once).
+    Now they're SimpleLazyObject-wrapped so the query is deferred to
+    first actual use."""
+
+    def test_sentinel_people_are_lazy_not_eagerly_queried(self):
+        import api.views as api_views
+        self.assertIsInstance(api_views.soft_ignore_person, SimpleLazyObject)
+        self.assertIsInstance(api_views.hard_ignore_person, SimpleLazyObject)
+        self.assertIsInstance(api_views.blank_person, SimpleLazyObject)
+
+    def test_sentinel_people_resolve_correctly_on_first_access(self):
+        import api.views as api_views
+        ignore = Person.objects.get(person_name=".ignore")
+        realignore = Person.objects.get(person_name=".realignore")
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        self.assertEqual(api_views.soft_ignore_person.id, ignore.id)
+        self.assertEqual(api_views.hard_ignore_person.id, realignore.id)
+        self.assertEqual(api_views.blank_person.id, blank.id)
 
 
 class AuthenticationTests(ApiTestCase):
