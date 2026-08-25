@@ -26,6 +26,8 @@ from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.test import TestCase, override_settings, tag
 
+from django.core.management import call_command
+
 from face_manager.face_extract_encode import FaceExtractor
 from face_manager.models import Face, Person, get_default_blank_person
 from face_manager.pyramidal_detector import PyramidalDetector
@@ -346,3 +348,53 @@ class FaceExtractorCorruptedImageTests(TestCase):
         img_obj.refresh_from_db()
         self.assertTrue(img_obj.isProcessed)
         self.assertGreaterEqual(Face.objects.filter(source_image_file=img_obj).count(), 1)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class MergeAnotherIgnoreIntoIgnoreTests(TestCase):
+    """'.another_ignore' used to be a separate sentinel Person from '.ignore'
+    (see settings.SOFT_IGNORE_NAME) -- created by the assign_faces
+    classifier for low-confidence auto-suggestions, but never recognized by
+    api/views.py's close_ignored bulk action, which only checked for
+    '.ignore'/'.realignore'. This command folds any Face rows still
+    pointing at '.another_ignore' over to '.ignore' and removes it."""
+
+    def setUp(self):
+        # The --keepdb test DB can already have a permanent '.ignore'/
+        # '.another_ignore' Person row left over from before IGNORED_NAMES
+        # was trimmed (they aren't test-created, so TestCase's rollback
+        # doesn't remove them) -- reuse whatever's there instead of always
+        # creating a fresh one, or Person.objects.get() in the command
+        # finds two rows with the same name.
+        self.ignore_person = Person.objects.filter(person_name=".ignore").first() or make_person(".ignore")
+        self.another_ignore_person = Person.objects.filter(person_name=".another_ignore").first() or make_person(".another_ignore")
+        self.img = make_image()
+
+    def test_dry_run_reports_counts_and_writes_nothing(self):
+        declared_face = make_face(self.img, declared_name=self.another_ignore_person)
+        poss_face = make_face(self.img, declared_name=self.ignore_person, poss_ident1=self.another_ignore_person)
+
+        call_command("merge_another_ignore_into_ignore", "--dry-run")
+
+        declared_face.refresh_from_db()
+        poss_face.refresh_from_db()
+        self.assertEqual(declared_face.declared_name, self.another_ignore_person)
+        self.assertEqual(poss_face.poss_ident1, self.another_ignore_person)
+        self.assertTrue(Person.objects.filter(person_name=".another_ignore").exists())
+
+    def test_merge_reassigns_declared_name_and_poss_idents_then_deletes_sentinel(self):
+        declared_face = make_face(self.img, declared_name=self.another_ignore_person)
+        poss_face = make_face(self.img, declared_name=self.ignore_person, poss_ident1=self.another_ignore_person)
+
+        call_command("merge_another_ignore_into_ignore", "--yes")
+
+        declared_face.refresh_from_db()
+        poss_face.refresh_from_db()
+        self.assertEqual(declared_face.declared_name, self.ignore_person)
+        self.assertEqual(poss_face.poss_ident1, self.ignore_person)
+        self.assertFalse(Person.objects.filter(person_name=".another_ignore").exists())
+
+    def test_merge_with_no_another_ignore_person_is_a_safe_noop(self):
+        self.another_ignore_person.delete()
+        call_command("merge_another_ignore_into_ignore", "--yes")
+        self.assertTrue(Person.objects.filter(person_name=".ignore").exists())

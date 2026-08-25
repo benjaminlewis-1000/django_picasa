@@ -253,6 +253,25 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   prompted noticing the lock file itself has the same fragility. Worth replacing with something
   that can't wedge itself: a DB-backed lock with a timeout/heartbeat, or just relying on Celery's
   own task-overlap prevention if the scheduled task doesn't already have it. Not started.
+- **TODO: build and run the `.another_ignore` → `.ignore` merge (2026-08-25) once
+  `SOFT_IGNORE_NAME`'s settings collapse ships to `master`.** The `merge_another_ignore_into_ignore`
+  management command (`face_manager/management/commands/`) reassigns `Face.declared_name`/
+  `poss_identN` off `.another_ignore` onto `.ignore` via bulk `.update()`, then deletes the
+  now-empty `.another_ignore` Person. Confirmed real production scale: 92,780 faces have
+  `declared_name = .another_ignore`, 115,410 have `poss_ident1 = .another_ignore`. Run
+  `--dry-run` against production first and confirm the counts before running for real with
+  `--yes`.
+- **Investigate actually fixing the non-daemon background thread in `api/views.py`**
+  (`work_thread` / `background_bulk_processor`, see "Testing gotcha" above), rather than just
+  working around it. It's currently just a trap for test runs (looks hung, isn't), but the same
+  "never exits on its own" behavior applies to any real process that imports `api.views` — worth
+  understanding what it's actually for and whether it should be a daemon thread, a Celery task,
+  or something with a real shutdown path.
+- **Investigate `ImageFile.save()`'s unconditional MD5 rehash** (see "Data model notes" above) —
+  it fully decodes the image and recomputes `_generate_md5_hash()` on *every* `.save()` call, not
+  just creation. Worth checking whether anything calls `.save()` on existing rows somewhere hot
+  (bulk operations, periodic tasks) where this is pure wasted CPU, and whether the hash could be
+  computed once and skipped on later saves when the file's mtime/size haven't changed.
 - **HEIC support**: currently unsupported — `ImageFile.filename`'s `RegexValidator` and `create_image_file()`'s own extension check both only accept `.jpg`/`.jpeg`. iPhones increasingly deliver `.heic` natively (1,855 found under the live `PHOTO_ROOT`'s `aggregated/` dir alone). Sample fixture files for this are already pulled into `/mnt/fast_storage/appdata/django_picasa/test_suite/heic_images/`.
 - **Dead JWT auth code after the Authelia migration**: auth now goes through Authelia/OIDC (see `picasa/adapters.py`, `ACCOUNT_ADAPTER`), but `rest_framework_simplejwt` is still wired up in full — `SIMPLE_JWT` settings, `TokenPairWithUsername`/`api/token/obtain/`/`api/token/refresh/`, `token_blacklist` in `INSTALLED_APPS`, `PyJWT` as a direct dependency. Worth an audit for what's actually still reachable (the slideshow client? a mobile app?) vs. leftover from before Authelia, since it's a second parallel auth system to reason about/keep secure if nothing uses it anymore.
 - **Face clustering quality**: how `face_manager/assign_faces.py`'s `faceAssigner` clusters/matches detected faces against existing `Person`s hasn't been reviewed this round — flagged as a bigger task of its own, separate from the pipeline plumbing bugs already found.

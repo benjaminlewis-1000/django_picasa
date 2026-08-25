@@ -552,8 +552,17 @@ if DEV:
     FACE_NUM_THRESH = 1
 else:
     FACE_NUM_THRESH=50
-SOFT_IGNORE_NAME = '.another_ignore'
-IGNORED_NAMES=[BLANK_FACE_NAME, SOFT_IGNORE_NAME, '.ignore', '.realignore', '.jessicatodo', '.cutler_tbd']
+# SOFT_IGNORE_NAME used to be its own sentinel Person ('.another_ignore'),
+# separate from the '.ignore' a human assigns via the UI's close_unassigned
+# action -- that meant the assign_faces classifier's low-confidence
+# suggestions and the UI's own ignore state were never the same Person, so
+# api/views.py's close_ignored bulk action could never recognize a
+# classifier-suggested candidate. Collapsed into one identity so both paths
+# agree; see merge_another_ignore_into_ignore management command for the
+# one-time data migration that reassigns any existing '.another_ignore'
+# Face references over to '.ignore'.
+SOFT_IGNORE_NAME = '.ignore'
+IGNORED_NAMES=[BLANK_FACE_NAME, SOFT_IGNORE_NAME, '.realignore', '.jessicatodo', '.cutler_tbd']
 CLASSIFY_MODEL_PATH = '/code/face_manager/face_classifier/models'
 DEFAULT_RESOLUTION_HEIGHT = 2160 # For 4k screens
 DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
