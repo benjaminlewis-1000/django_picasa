@@ -607,6 +607,20 @@ class ImageFile(models.Model):
         super(ImageFile, self).save(*args, **kwargs)
 
     def delete(self):
+        # Face.source_image_file references this ImageFile with
+        # on_delete=CASCADE. Django's cascade-delete collector removes
+        # those Face rows with a bulk SQL DELETE, which does NOT call each
+        # Face's overridden delete() (the one that removes its
+        # face_thumbnail file from disk) -- so those thumbnail files were
+        # being silently orphaned on disk every time an ImageFile was
+        # deleted this way (e.g. delete_removed_photos(), run on every
+        # scheduled ingestion pass for photos that vanished from disk).
+        # Import here, not at module level, to avoid a circular import --
+        # face_manager/models.py already imports filepopulator.
+        from face_manager.models import Face
+        for face in Face.objects.filter(source_image_file=self):
+            face.delete()
+
         # file = ImageFile.objects.filter(id=self.id)
         # os.remove(file[0].thumbnail_small.path)
         try:

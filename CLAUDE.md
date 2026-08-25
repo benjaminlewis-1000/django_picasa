@@ -158,11 +158,18 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   etc.) only recognizes `.ignore`/`.realignore`. Confirmed `.another_ignore` exists in the live
   DB, so this isn't a crash — it's silent misrouting: those ML-flagged faces can never be
   promoted to hard-ignore through the normal UI action.
-- [ ] Orphaned `Face` thumbnail files on every scheduled cleanup — `filepopulator/scripts.py`'s
-  `delete_removed_photos()` deletes `ImageFile` rows whose file vanished from disk;
-  `Face.source_image_file`'s `CASCADE` means Django's bulk-SQL cascade delete skips
-  `Face.delete()`'s override (which removes the thumbnail file from disk). Slow, silent
-  disk-space leak, ongoing since ~200K images and years of face-detection history.
+- [x] Orphaned `Face` thumbnail files on every scheduled cleanup — fixed. `filepopulator/
+  scripts.py`'s `delete_removed_photos()` deletes `ImageFile` rows whose file vanished from
+  disk; `Face.source_image_file`'s `CASCADE` meant Django's bulk-SQL cascade delete skipped
+  `Face.delete()`'s override (which removes the thumbnail file from disk), silently orphaning
+  it. `ImageFile.delete()` now explicitly deletes each related `Face` first (invoking `Face`'s
+  own `delete()` override) before deleting itself, fixing every instance-level `ImageFile`
+  deletion call site at once (`delete_removed_photos()`, `create_image_file()`'s duplicate/
+  hash-mismatch branches), not just this one. Note: `filepopulator/management/commands/
+  cleanDB.py`'s `models.ImageFile.objects.all().delete()` is a separate, bigger version of the
+  same root cause (a bulk queryset `.delete()` skips instance `delete()` entirely, no override
+  can fix that) — not touched, since that command is a deliberate full-wipe dev tool where
+  leftover files likely don't matter as much.
 - [ ] `classify_unassigned()` array-sizing bug (`face_manager/assign_faces.py`) — a
   stale-sized zero-padded array can pollute a max-similarity calculation, and can raise
   `IndexError` in a specific combination (rejected candidates + `.another_ignore` in the
@@ -176,6 +183,10 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+- **TODO: port the `ImageFile.delete()` orphaned-thumbnail fix (2026-08-24) from
+  `backend_upgrade` to `master` and deploy.** No migration involved; once live, worth a one-off
+  disk sweep for already-orphaned `Face` thumbnail files from before this fix (not attempted
+  here — would need to cross-reference `face_thumbnail` paths on disk against live `Face` rows).
 - **TODO: port the `picasa/adapters.py` open-redirect fix (2026-08-24) from `backend_upgrade`
   to `master` and deploy.** No migration involved.
 - **TODO: port the `filteredImagesView`/`bulk_thread()` bug fixes (2026-08-24) from

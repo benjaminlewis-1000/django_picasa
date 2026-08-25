@@ -194,8 +194,18 @@ class FaceModelTests(TestCase):
     def test_deleting_image_cascades_to_faces(self):
         face = make_face(self.image)
         face_id = face.id
+        thumb_path = face.face_thumbnail.path
         self.image.delete()
         self.assertFalse(Face.objects.filter(id=face_id).exists())
+        # Regression test for a fixed bug: Face.source_image_file's
+        # on_delete=CASCADE means Django's cascade-delete collector used
+        # to remove cascaded Face rows via a bulk SQL DELETE, which does
+        # NOT call each instance's overridden delete() -- so the DB row
+        # above was always cleaned up correctly, but this thumbnail file
+        # was silently left orphaned on disk. ImageFile.delete() now
+        # explicitly deletes each related Face first (invoking Face's own
+        # delete() override) before deleting itself.
+        self.assertFalse(os.path.exists(thumb_path))
 
     def test_associate_person_updates_declared_name_and_weight(self):
         original = make_person("Original")
