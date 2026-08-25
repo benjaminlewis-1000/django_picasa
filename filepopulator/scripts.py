@@ -460,7 +460,7 @@ def check_file_mods():
             except Exception as e:
                 exc_type, exc_obj, exc_tb = sys.exc_info()
                 fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-                print(f'{filename} was not processed. {e}, {exc_type}, {exc_tb.tb_lineno}')
+                print(f'{modfile} was not processed. {e}, {exc_type}, {exc_tb.tb_lineno}')
                 print(traceback.format_exc())
 
     except Exception as e:
@@ -468,7 +468,7 @@ def check_file_mods():
         settings.LOGGER.error(type(e).__name__)
         settings.LOGGER.error(e)
 #        settings.LOGGER.error(filename)
-        settings.LOGGER.error(stack_trace) 
+        settings.LOGGER.error(stack_trace)
     finally:
         print("Finished checking file mod times!")
 

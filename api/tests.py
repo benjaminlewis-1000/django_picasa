@@ -552,3 +552,18 @@ class MobileViewTests(ApiTestCase):
         # sentinel Person) -- it's a nullable field, unlike associate_
         # person()'s reassignment-based clearing elsewhere in this file.
         self.assertIsNone(face.declared_name)
+
+    def test_name_list_returns_real_people_and_excludes_sentinel_names(self):
+        # Regression test for a fixed bug: this used to be an unfinished
+        # stub returning a hardcoded ['a', 'b', 'c', 'd'] regardless of
+        # what Person rows actually existed.
+        Person.objects.create(person_name="Alice")
+        Person.objects.create(person_name="Bob")
+
+        resp = self.client.get("/api/mobile/name_list/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        names = json.loads(resp.content)["name_list"]
+        self.assertIn("Alice", names)
+        self.assertIn("Bob", names)
+        for ignored in settings.IGNORED_NAMES:
+            self.assertNotIn(ignored, names)

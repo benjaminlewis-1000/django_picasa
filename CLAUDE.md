@@ -180,11 +180,12 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   `IndexError` in a specific combination (rejected candidates + `.another_ignore` in the
   rejected set). Compounded by `execute()`'s per-face error handling being commented out, so
   any exception here aborts the *entire* scheduled `assign_faces` run, not just one face.
-- [ ] Misleading log message in `check_file_mods()` (`filepopulator/scripts.py`) — logs
-  `filename` (leftover from an earlier, unrelated loop) instead of `modfile` on failure.
-  Cosmetic only, doesn't affect behavior, just makes debugging real failures misleading.
-- [ ] `MobileNameList` (`api/views.py`) is an unfinished stub — returns hardcoded placeholder
-  data (`['a','b','c','d']`) instead of real `Person` names. Not a regression, a feature gap.
+- [x] Misleading log message in `check_file_mods()` (`filepopulator/scripts.py`) — fixed. Was
+  logging `filename` (leftover from an earlier, unrelated loop) instead of `modfile` on
+  failure. Cosmetic only, didn't affect behavior, just made debugging real failures misleading.
+- [x] `MobileNameList` (`api/mobile_views.py`) was an unfinished stub returning hardcoded
+  placeholder data (`['a','b','c','d']`) — fixed. Now queries real `Person` names, excluding
+  the sentinel/ignore rows via `settings.IGNORED_NAMES`.
 
 ## Planned work
 
@@ -239,6 +240,19 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   above), but deliberately *not* ported/deployed yet, same as the rest of this branch's work —
   the frontend (`dev_facewire`) still talks to production and still has the original bug until
   this lands there. Don't consider this done until it's actually live.
+- **TODO: port the `check_file_mods()` log-message fix and `MobileNameList` real-name-list fix
+  (2026-08-25) from `backend_upgrade` to `master` and deploy.** Both cosmetic/feature-gap fixes,
+  no migration involved.
+- **Remove the file-lock (`settings.LOCKFILE`) mechanism in `add_from_root_dir()`
+  (`filepopulator/scripts.py`).** It's a plain `os.path.isfile()` check with no
+  wait/retry/timeout, and no cleanup on crash — if a run dies or gets killed (`kill -9`, OOM,
+  container restart) mid-ingestion, the lockfile is left behind and every subsequent scheduled
+  run silently no-ops (`"Locked!"` then returns) forever, with no alerting. Ran into stale
+  leftover hung `manage.py` processes in `picasa_api_dev_test` this session (unrelated root
+  cause — non-daemon background thread, already documented above — not this lock), which
+  prompted noticing the lock file itself has the same fragility. Worth replacing with something
+  that can't wedge itself: a DB-backed lock with a timeout/heartbeat, or just relying on Celery's
+  own task-overlap prevention if the scheduled task doesn't already have it. Not started.
 - **HEIC support**: currently unsupported — `ImageFile.filename`'s `RegexValidator` and `create_image_file()`'s own extension check both only accept `.jpg`/`.jpeg`. iPhones increasingly deliver `.heic` natively (1,855 found under the live `PHOTO_ROOT`'s `aggregated/` dir alone). Sample fixture files for this are already pulled into `/mnt/fast_storage/appdata/django_picasa/test_suite/heic_images/`.
 - **Dead JWT auth code after the Authelia migration**: auth now goes through Authelia/OIDC (see `picasa/adapters.py`, `ACCOUNT_ADAPTER`), but `rest_framework_simplejwt` is still wired up in full — `SIMPLE_JWT` settings, `TokenPairWithUsername`/`api/token/obtain/`/`api/token/refresh/`, `token_blacklist` in `INSTALLED_APPS`, `PyJWT` as a direct dependency. Worth an audit for what's actually still reachable (the slideshow client? a mobile app?) vs. leftover from before Authelia, since it's a second parallel auth system to reason about/keep secure if nothing uses it anymore.
 - **Face clustering quality**: how `face_manager/assign_faces.py`'s `faceAssigner` clusters/matches detected faces against existing `Person`s hasn't been reviewed this round — flagged as a bigger task of its own, separate from the pipeline plumbing bugs already found.

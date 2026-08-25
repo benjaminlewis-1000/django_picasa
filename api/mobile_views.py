@@ -11,7 +11,7 @@ from django.http import HttpResponse
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 
-from face_manager.models import Face
+from face_manager.models import Face, Person
 
 
 class ConfidentUnlabeledView(APIView):
@@ -120,13 +120,16 @@ class ResetFace(APIView):
 
 
 class MobileNameList(APIView):
-    # Get a list of all defined person names.
+    # Get a list of all defined person names, excluding the sentinel
+    # "person" rows (blank/ignore placeholders) that aren't real people.
     permission_classes = (IsAuthenticated,)
 
     def get(self, request, *args, **kwargs):
-        print("here")
+        names = list(
+            Person.objects.exclude(person_name__in=settings.IGNORED_NAMES)
+            .order_by('person_name')
+            .values_list('person_name', flat=True)
+        )
 
-        js = {'name_list': ['a', 'b', 'c', 'd']}
-        print(js)
-        print(HttpResponse(json.dumps(js), content_type='application/json'))
+        js = {'name_list': names}
         return HttpResponse(json.dumps(js), content_type='application/json')
