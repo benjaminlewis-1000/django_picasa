@@ -69,6 +69,7 @@ python manage.py test picasa.tests common  # project-level + shared-util tests
 **Where things stand (as of this session)**: all of the above test/CI/dependency work is committed to `backend_upgrade` (3 commits: migrations-tracking, the test suite itself, then CI+fixtures+dependency pins) and pushed to `origin/backend_upgrade` — deliberately kept off `master` for now at the user's request, not yet merged or PR'd. `master` separately got a small, unrelated CORS/CSRF fix + this file, pushed directly. **The CI workflow has not actually been exercised on GitHub yet** — it only triggers on `push`/`pull_request` targeting `master` (see `.github/workflows/tests.yml`), and `backend_upgrade` doesn't touch `master`, so pushing to `backend_upgrade` alone does not run it. Opening a PR from `backend_upgrade` into `master` would trigger it without merging anything, if a real end-to-end check is wanted before merging. The confirmed bugs listed below are deliberately **not fixed** — the user chose to build out test coverage and stabilize the environment first, bugs are next.
 
 **Fixed bugs:**
+- **Open redirect in `picasa/adapters.py`'s `SubdomainRedirectAdapter.get_login_redirect_url()`** (found by a follow-up bug-hunt pass, not the original test-writing session): the post-login `?next=` check was `'facewire.exploretheworld.tech' in next_param` — plain substring containment, not host validation — so `next=https://evil.example/?x=facewire.exploretheworld.tech` passed and would have redirected a freshly-authenticated user's browser to an attacker-controlled host. Now parses `next_param` and validates the actual hostname against `^([a-zA-Z0-9_-]+\.)*exploretheworld\.tech$` (same pattern `CORS_ALLOWED_ORIGIN_REGEXES` already uses), trusting any real `exploretheworld.tech` subdomain rather than only the one hardcoded `facewire` case; a relative path (no host to spoof) is allowed through as-is, same as Django's own `next`-handling convention.
 - **EXIF orientation handling was duplicated across three implementations, one of them wrong.** `common/open_img_oriented.py` only handled EXIF orientations 3, 6, 8 (via `rotate()`), silently doing nothing for 2, 4, 5, 7; `filepopulator/models.py`'s `ImageFile._init_image()` had its own separate, *correct* 8-value implementation (via `transpose()`); `face_manager/problem_photos.py` had a third copy (deprecated/dead — hardcoded a path to a different machine, unreferenced anywhere — deleted rather than merged). Consolidated into one shared `apply_exif_orientation(image, orientation)` in `common/open_img_oriented.py` (exported from `common/__init__.py`), using the correct 8-value logic; both `open_img_oriented()` and `ImageFile._init_image()` now call it instead of maintaining their own copies. Also explicitly treats orientation `0` (not a standard EXIF value, but present on ~1,090 images in the live library) the same as `1` — no rotation — rather than leaving it to fall through unhandled.
 
   **Real-world impact turned out to be tiny**, checked against the live DB before doing this work (204,685 total images): orientations 1/3/6/8 (already correct under the old code) cover 203,593 images; of the four previously-broken values, 2, 4, and 5 have **zero** occurrences in the whole library, and 7 has exactly **2** (`ImageFile` ids `315617` and `316082`, 1 and 2 `Face` rows respectively — detection did find faces on both, just at the wrong coordinates since the image was never rotated for them). Given that, no bulk backfill/reprocessing migration was built — once this lands on `master`, just reprocess those two specific images by hand (clear their `isProcessed`/existing `Face` rows and let `face_extraction` redo them; expect to re-tag the 3 faces on them, which is fast for 2 photos). See "Planned work" for the port-to-master TODO.
@@ -132,8 +133,51 @@ bugs the test suite above already found/documented:**
 
 `dockerize/requirements.txt` on `master` is still the original, every entry an unbounded `>=` — untouched there deliberately, per the user's request to keep this work dev-only for now. On `backend_upgrade`, it's been trimmed and pinned: 15 packages with zero references anywhere in the codebase removed (`coloredlogs`, `dj-database-url`, `django-celery-beat`, `django-celerybeat-status`, `django-rest-framework` [a dead/unrelated stub package — not `djangorestframework`, which stays], `django-timezone-field`, `ExifRead`, `importlib-metadata`, `pgi`, `piexif`, `psycopg2-pool`, `python-dotenv`, `python-xmp-toolkit`, `SCons`, `twilio`), and every remaining package pinned `==` to the exact version that passed all 93 fast tests. Deliberately pinned Django to `6.0.8`, not the newer `6.1` that `pip install --upgrade` offered — upgrading to 6.1 (with scipy bumped to 1.18.1 alongside it) made the test suite hang indefinitely partway through `filepopulator`'s duplicate-detection tests; root cause not confirmed (Django vs. scipy), not chased further, just avoided. If picking this back up: reproduce in a throwaway container (not `picasa_api_dev_test`), and getting a real stack trace will need `--cap-add=SYS_PTRACE` on the container so `py-spy dump` can attach (it couldn't, last time).
 
+## Follow-up bug audit (2026-08-24)
+
+After the original test-writing pass's 6 bugs were all fixed, a further audit pass covering
+previously-unreviewed areas (`face_manager/assign_faces.py`, untouched `api/views.py` mobile
+endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py`,
+`api/permissions.py`) found more. Working through these one at a time, at the user's request:
+
+- [x] **Open redirect in `picasa/adapters.py`** — fixed, see "Fixed bugs" above.
+- [ ] `ResetFace.patch()` (`api/views.py`) — missing `return` statement; DRF requires a
+  `Response` back, so this crashes on **every single call**. Live endpoint,
+  `/api/mobile/reset/<id>/`.
+- [ ] `ConfidentUnlabeledView.get()` (`api/views.py`) — `unlabeled[0]` with no bounds check;
+  crashes with `IndexError` the moment there are zero unlabeled faces (the *goal* state of
+  tagging, not an edge case). Live endpoint, `/api/mobile/confident_unlabeled/`.
+- [ ] `reject_association_app_api()` (`api/views.py`) — same root cause as the already-fixed
+  `close_assigned` bug, but this sibling mobile endpoint never got the fix: calls
+  `Face.reject_association()` unconditionally, which asserts the person is a `poss_identN`
+  candidate. Crashes with an unhandled 500 if the mobile client passes an actual
+  `declared_name` (the "remove from person" case rather than "decline a suggestion").
+- [ ] `SOFT_IGNORE_NAME` mismatch — the scheduled `assign_faces` task (`face_manager/
+  assign_faces.py`) routes low-confidence faces to `Person` `.another_ignore` (via
+  `settings.SOFT_IGNORE_NAME`), but every UI-facing check (`bulk_thread`'s `close_ignored`,
+  etc.) only recognizes `.ignore`/`.realignore`. Confirmed `.another_ignore` exists in the live
+  DB, so this isn't a crash — it's silent misrouting: those ML-flagged faces can never be
+  promoted to hard-ignore through the normal UI action.
+- [ ] Orphaned `Face` thumbnail files on every scheduled cleanup — `filepopulator/scripts.py`'s
+  `delete_removed_photos()` deletes `ImageFile` rows whose file vanished from disk;
+  `Face.source_image_file`'s `CASCADE` means Django's bulk-SQL cascade delete skips
+  `Face.delete()`'s override (which removes the thumbnail file from disk). Slow, silent
+  disk-space leak, ongoing since ~200K images and years of face-detection history.
+- [ ] `classify_unassigned()` array-sizing bug (`face_manager/assign_faces.py`) — a
+  stale-sized zero-padded array can pollute a max-similarity calculation, and can raise
+  `IndexError` in a specific combination (rejected candidates + `.another_ignore` in the
+  rejected set). Compounded by `execute()`'s per-face error handling being commented out, so
+  any exception here aborts the *entire* scheduled `assign_faces` run, not just one face.
+- [ ] Misleading log message in `check_file_mods()` (`filepopulator/scripts.py`) — logs
+  `filename` (leftover from an earlier, unrelated loop) instead of `modfile` on failure.
+  Cosmetic only, doesn't affect behavior, just makes debugging real failures misleading.
+- [ ] `MobileNameList` (`api/views.py`) is an unfinished stub — returns hardcoded placeholder
+  data (`['a','b','c','d']`) instead of real `Person` names. Not a regression, a feature gap.
+
 ## Planned work
 
+- **TODO: port the `picasa/adapters.py` open-redirect fix (2026-08-24) from `backend_upgrade`
+  to `master` and deploy.** No migration involved.
 - **TODO: port the `filteredImagesView`/`bulk_thread()` bug fixes (2026-08-24) from
   `backend_upgrade` to `master` and deploy.** `filteredImagesView.get()` no longer 500s on a
   query-params-but-no-recognized-filter request (e.g. `?key=...` alone, which the slideshow

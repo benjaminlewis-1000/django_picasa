@@ -89,6 +89,41 @@ class SubdomainRedirectAdapterTests(TestCase):
         result = self.adapter.get_login_redirect_url(request)
         self.assertNotEqual(result, "https://evil.example.com/phish")
 
+    def test_next_param_to_any_exploretheworld_subdomain_is_honored(self):
+        # Not just the one hardcoded 'facewire' subdomain -- any real
+        # exploretheworld.tech subdomain should be trusted.
+        request = self.factory.get(
+            "/accounts/oidc/authelia/login/callback/",
+            {"next": "https://slideshow.exploretheworld.tech/some/path"},
+        )
+        result = self.adapter.get_login_redirect_url(request)
+        self.assertEqual(result, "https://slideshow.exploretheworld.tech/some/path")
+
+    def test_next_param_with_domain_name_only_in_query_string_is_rejected(self):
+        # Regression test for a fixed open-redirect bug: the old check was
+        # `'facewire.exploretheworld.tech' in next_param`, plain substring
+        # containment -- so a malicious host with the trusted domain name
+        # merely present somewhere in the URL (e.g. a query string) passed
+        # the check and would have redirected a freshly-authenticated
+        # user's browser to an attacker-controlled host. Now the actual
+        # parsed hostname is validated, not the raw string.
+        request = self._authenticated_request(
+            "/accounts/oidc/authelia/login/callback/",
+            {"next": "https://evil.example/?x=facewire.exploretheworld.tech"},
+        )
+        result = self.adapter.get_login_redirect_url(request)
+        self.assertNotEqual(result, "https://evil.example/?x=facewire.exploretheworld.tech")
+
+    def test_next_param_relative_path_is_honored(self):
+        # A relative path has no host to spoof -- safe by construction,
+        # and allauth commonly passes these (e.g. '/accounts/profile/').
+        request = self.factory.get(
+            "/accounts/oidc/authelia/login/callback/",
+            {"next": "/some/relative/path"},
+        )
+        result = self.adapter.get_login_redirect_url(request)
+        self.assertEqual(result, "/some/relative/path")
+
     def test_missing_next_param_falls_back_to_default(self):
         request = self._authenticated_request("/accounts/oidc/authelia/login/callback/")
         # Should not raise, and should not be None -- falls through to
