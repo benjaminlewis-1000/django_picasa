@@ -489,3 +489,46 @@ class StatsAndParametersTests(ApiTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertGreaterEqual(resp.data["num_imgs"], 1)
         self.assertGreaterEqual(resp.data["num_faces"], 1)
+
+
+class MobileViewTests(ApiTestCase):
+    """Tests for api/mobile_views.py -- split out of api/views.py, which
+    had grown to mix these mobile-app-facing endpoints in with the
+    standard ModelViewSets and slideshow-facing ones."""
+
+    def test_confident_unlabeled_with_no_unlabeled_faces_returns_empty_list(self):
+        # Regression test for a fixed bug: this used to do
+        # `unlabeled[0].weight_1` unconditionally, raising IndexError the
+        # moment there were zero unlabeled faces -- the *goal* state of
+        # the tagging workflow (or a fresh/near-empty DB), not an edge
+        # case, so this crashed exactly when tagging was fully caught up.
+        resp = self.client.get("/api/mobile/confident_unlabeled/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(json.loads(resp.content)["unlabeled_ids"], [])
+
+    def test_confident_unlabeled_with_unlabeled_faces_returns_their_ids(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = self.make_image()
+        face = self.make_face(img, declared_name=blank)
+
+        resp = self.client.get("/api/mobile/confident_unlabeled/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(json.loads(resp.content)["unlabeled_ids"], [face.id])
+
+    def test_reset_face_clears_person_and_returns_a_response(self):
+        # Regression test for a fixed bug: this method had no return
+        # statement, so DRF's dispatch() got None back instead of a
+        # Response and raised AssertionError -- this crashed on every
+        # single call, not just an edge case.
+        img = self.make_image()
+        target = Person.objects.create(person_name="Resettable")
+        target.highlight_img.save("r.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
+        face = self.make_face(img, declared_name=target)
+
+        resp = self.client.patch(f"/api/mobile/reset/{face.id}/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        face.refresh_from_db()
+        # clear_person() sets declared_name to None (not the blank
+        # sentinel Person) -- it's a nullable field, unlike associate_
+        # person()'s reassignment-based clearing elsewhere in this file.
+        self.assertIsNone(face.declared_name)
