@@ -257,14 +257,19 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   prompted noticing the lock file itself has the same fragility. Worth replacing with something
   that can't wedge itself: a DB-backed lock with a timeout/heartbeat, or just relying on Celery's
   own task-overlap prevention if the scheduled task doesn't already have it. Not started.
-- **TODO: build and run the `.another_ignore` → `.ignore` merge (2026-08-25) once
-  `SOFT_IGNORE_NAME`'s settings collapse ships to `master`.** The `merge_another_ignore_into_ignore`
-  management command (`face_manager/management/commands/`) reassigns `Face.declared_name`/
-  `poss_identN` off `.another_ignore` onto `.ignore` via bulk `.update()`, then deletes the
-  now-empty `.another_ignore` Person. Confirmed real production scale: 92,780 faces have
-  `declared_name = .another_ignore`, 115,410 have `poss_ident1 = .another_ignore`. Run
-  `--dry-run` against production first and confirm the counts before running for real with
-  `--yes`.
+- **DONE (data side): the `.another_ignore` → `.ignore` production merge ran 2026-08-25.**
+  Applied directly via `docker exec picasa_api python manage.py shell` (not the
+  `merge_another_ignore_into_ignore` command file itself, since that only exists on
+  `backend_upgrade` and `master`'s checkout is the live bind-mounted container -- ran the same
+  bulk-`.update()` logic inline instead, after a fresh `pg_dump` backup and a `--dry-run`-style
+  count check). Reassigned 92,850 faces' `declared_name` and 115,335 faces' `poss_ident1` from
+  `.another_ignore` (id 2333, now deleted) to `.ignore` (id 1403, now at 103,317 declared_name /
+  115,335 poss_ident1). **Still outstanding: the code side.** Production's `master` checkout
+  still has the old `SOFT_IGNORE_NAME = '.another_ignore'` setting, so the next scheduled
+  `assign_faces` run will recreate a fresh `.another_ignore` Person and start populating it
+  again unless/until the settings collapse + `close_ignored` fix from `backend_upgrade` (see
+  above) is ported to `master` and deployed. Don't consider this fully resolved until that
+  ships.
 - **Investigate actually fixing the non-daemon background thread in `api/views.py`**
   (`work_thread` / `background_bulk_processor`, see "Testing gotcha" above), rather than just
   working around it. It's currently just a trap for test runs (looks hung, isn't), but the same
