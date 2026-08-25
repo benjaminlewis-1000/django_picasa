@@ -93,11 +93,11 @@ jobs:
         # them -- no settings.py changes needed. See ci_fixtures/ for how
         # these were generated; none of it is real personal photo content.
         run: |
-          sudo mkdir -p /test_imgs_filepopulate /photos/corrupted /photos/heic_stub /locks
+          sudo mkdir -p /test_imgs_filepopulate /photos/corrupted /photos/heic_stub /locks /var/log/picasa
           sudo cp -r ci_fixtures/test_imgs_filepopulate/. /test_imgs_filepopulate/
           sudo cp -r ci_fixtures/corrupted/. /photos/corrupted/
           sudo cp -r ci_fixtures/heic_stub/. /photos/heic_stub/
-          sudo chown -R "$(whoami)" /test_imgs_filepopulate /photos /locks
+          sudo chown -R "$(whoami)" /test_imgs_filepopulate /photos /locks /var/log/picasa
 
       - name: Run fast test suite
         # face_manager's real-insightface tests are tagged 'slow' and
