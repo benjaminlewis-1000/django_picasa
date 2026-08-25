@@ -7,6 +7,7 @@ from django.contrib.auth import logout as django_logout
 from django.contrib.auth.models import User, Group
 from django.core.files.base import ContentFile
 from django.core.paginator import Paginator
+from django.db import connections
 from django.db.models import Count
 from django.db.models import Q
 from django.http import HttpResponse, Http404
@@ -152,6 +153,16 @@ def background_bulk_processor():
     print("Background processor initiating")
     while True:
         if background_queue.empty():
+            # Close any DB connection this thread opened while handling the
+            # last item -- Django only auto-closes connections at the end
+            # of a normal request/response cycle, which this loop never
+            # participates in. Left open, it holds a connection to
+            # whatever database is active (including a test run's
+            # test_picasa) indefinitely, which made `manage.py test`'s own
+            # teardown fail with "database is being accessed by other
+            # users" even after the thread itself stopped blocking process
+            # exit (see the daemon=True note below).
+            connections.close_all()
             time.sleep(1)
         else:
             try:
@@ -164,7 +175,14 @@ def background_bulk_processor():
 
 
     
-work_thread = threading.Thread(target=background_bulk_processor)
+# daemon=True: this loop is meant to run forever in the background, never
+# to keep the interpreter alive on its own. A non-daemon thread here used
+# to block manage.py test/CI's process exit indefinitely after tests
+# finished -- Python won't exit while a non-daemon thread is alive, and
+# this thread's held-open DB connection also made the test runner's
+# post-run `DROP DATABASE test_picasa` fail with "being accessed by other
+# users". See CLAUDE.md's "Testing gotcha" note.
+work_thread = threading.Thread(target=background_bulk_processor, daemon=True)
 work_thread.start()
 
 def render_404(request, message):

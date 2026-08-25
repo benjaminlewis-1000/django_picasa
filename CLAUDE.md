@@ -62,7 +62,7 @@ python manage.py test picasa.tests common  # project-level + shared-util tests
 ```
 `face_manager/test_face_cache.py` caches real `PyramidalDetector` output keyed on `sha256(image bytes) + sha256(pyramidal_detector.py source)`, so repeat runs against an unchanged image with an unchanged detector skip the CPU cost entirely (~4s → ~0.01s per image). Change either the image or the detector's code and the cache key changes automatically.
 
-**Bootstrapping a fresh DB from scratch is currently broken**: `api/views.py` runs a module-level query (`Person.objects.filter(person_name='.ignore')[0]`) that assumes the `.ignore`/`.realignore`/`_NO_FACE_ASSIGNED_`/etc. `Person` rows already exist — nothing in the codebase creates them (no migration, no fixture). The live DB only has them because someone created them by hand at some point. Any new test DB (or a genuine fresh install) needs these seeded before the first request touches an `api/` URL — see `ensure_sentinel_people()` in `api/tests.py`.
+**Bootstrapping a fresh DB from scratch — fixed 2026-08-25** (see "Fixed bugs" for the full writeup): `api/views.py` used to run a module-level query (`Person.objects.filter(person_name='.ignore')[0]`) assuming the `.ignore`/`.realignore`/`_NO_FACE_ASSIGNED_`/etc. `Person` rows already existed, with nothing in the codebase creating them. Now fixed two ways together: the lookups are `SimpleLazyObject`-wrapped (defers the query past import time), and `face_manager/migrations/0003_seed_sentinel_people.py` creates the rows automatically as part of `manage.py migrate`. `ensure_sentinel_people()` in `api/tests.py` still exists as a defensive no-op for tests but is no longer the only thing creating these rows.
 
 **Dev/test infra lives outside this repo entirely**: a separate git worktree at `/home/benjamin/git_repos/django_picasa_dev` on branch `backend_upgrade` (isolated from whatever `picasa_api`/`db_picasa` are running live) with its own `db_picasa_dev`/`task_redis_dev`/`picasa_api_dev_test` Docker containers (plain `docker run` on a dedicated `picasa_test_net` network, not `dockerize_dev`'s compose file — that Dockerfile is stale/broken, missing its own `requirements.txt` and still installing dlib/`face-recognition` instead of insightface). `picasa_api_dev_test` runs from the same `picasa_img:latest` image as production (so dependencies match exactly) with `sleep infinity` as its command — exec into it (`docker exec picasa_api_dev_test bash -c "cd /code && python manage.py test ..."`) rather than expecting it to serve anything. If these containers have been torn down, they're cheap to recreate: fresh `postgres:16-alpine`/`redis:7-alpine` containers, migrate, then seed the sentinel `Person` rows (see `ensure_sentinel_people()` in `api/tests.py` for exactly which ones and why). Real (non-synthetic) fixture data — 500 sampled real photos, the 5 known-corrupted JPEGs pulled from production logs with `NOTES.md`, `.heic` samples, filepopulator's real `test_imgs_filepopulate` — lives under `/mnt/fast_storage/appdata/django_picasa/test_suite/` on the host (used for local/manual runs, especially the `slow`-tagged real-inference tests); separate, small, git-committed *synthetic* equivalents live in `ci_fixtures/` in the repo itself, used only by CI (see below).
 **Where things stand (as of 2026-08-25)**: all of the test/CI/dependency work below is committed to `backend_upgrade` and pushed to `origin/backend_upgrade`. PR #43 (`backend_upgrade` → `master`) is open to trigger the first real CI run — see "Planned work" for what's still outstanding before an actual merge/deploy. `master` separately got a small, unrelated CORS/CSRF fix + this file, plus (2026-08-25) the `.github/workflows/tests.yml` file itself, added directly so PR-triggered CI runs can fire at all (GitHub won't run a `pull_request`-triggered workflow the first time if the workflow file doesn't already exist on the base branch).
@@ -200,17 +200,8 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   before any test's sentinel-seeding has run. Production never noticed because those rows were
   seeded by hand once, long ago. Fixed by wrapping all three in `SimpleLazyObject`, deferring the
   query to first actual attribute access. Covered by `LazySentinelPersonTests` in `api/tests.py`.
-- **TODO: auto-create the sentinel `Person` rows (`.ignore`, `.realignore`, `BLANK_FACE_NAME`,
-  etc) instead of relying on someone having seeded them by hand.** The `SimpleLazyObject` fix
-  above only stops `api/views.py` from crashing at *import* time — it doesn't make these rows
-  exist. Nothing in the codebase creates them today (no migration, no fixture); the live DB only
-  has them because someone created them by hand at some point (see "Bootstrapping a fresh DB
-  from scratch is currently broken" in "Testing" above). CI survives this today only because
-  `api/tests.py`'s `ensure_sentinel_people()` runs per-`TestCase` before any test body executes —
-  a genuine fresh production install (or a fresh CI DB touched by non-test code, e.g. a
-  management command run directly) would still hit a `Person.DoesNotExist`/`IndexError` the
-  first time anything actually uses `soft_ignore_person`/etc. Real fix is a data migration that
-  creates these rows if missing, so a truly fresh `migrate` is enough to boot the app.
+  auto-creating them via a migration — see the "sentinel `Person` rows ... auto-create via a data
+  migration" entry further down for how that was actually resolved the same day.
 - **TODO: port the `api/mobile_views.py` split + `ResetFace`/`ConfidentUnlabeledView` fixes +
   `reject_association_app_api()` removal (2026-08-24) from `backend_upgrade` to `master` and
   deploy.** No migration involved; `api/urls.py` now imports the 4 mobile views from
@@ -316,12 +307,38 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   all), or keep the cached-column approach but make every mutation path — `associate_person()`,
   `remove_poss_ident()`, any future bulk operation — update it as a mandatory part of the same
   transaction, with `get_num_possibilities` implemented to match instead of missing. Not started.
-- **Investigate actually fixing the non-daemon background thread in `api/views.py`**
-  (`work_thread` / `background_bulk_processor`, see "Testing gotcha" above), rather than just
-  working around it. It's currently just a trap for test runs (looks hung, isn't), but the same
-  "never exits on its own" behavior applies to any real process that imports `api.views` — worth
-  understanding what it's actually for and whether it should be a daemon thread, a Celery task,
-  or something with a real shutdown path.
+- **Fixed (2026-08-25): the non-daemon background thread in `api/views.py`** (`work_thread` /
+  `background_bulk_processor`) — turned out not to be just a local testing annoyance ("looks
+  hung, isn't"). In CI, with no `--keepdb` and no one around to manually `kill` the leftover
+  process, this actually broke the run: the thread's held-open DB connection made the test
+  runner's post-run `DROP DATABASE test_picasa` fail (`OperationalError: database "test_picasa"
+  is being accessed by other users`), and the whole job then hung indefinitely since Python won't
+  exit while a non-daemon thread is alive — would have run until GitHub's runner timeout (up to
+  6 hours) rather than actually completing. Fixed with `daemon=True` on the thread constructor,
+  so it's killed automatically at interpreter exit instead of blocking it. That alone stopped the
+  hang but not the underlying `DROP DATABASE` failure/exit code 1 — the thread still held an open
+  DB connection (Django only auto-closes connections at the end of a normal request/response
+  cycle, which this loop never participates in), just no longer blocking process exit. Fully
+  fixed by calling `connections.close_all()` each time the loop goes idle (empty queue), so it
+  never holds a connection indefinitely. Verified against a genuinely fresh, non-`--keepdb`
+  database (matching CI exactly): 120 tests, `OK`, clean `exit 0`. A real Celery-task redesign
+  might still be worth it for other reasons, but this specific failure mode is fully resolved.
+- **Fixed (2026-08-25): sentinel `Person` rows (`.ignore`, `.realignore`, `BLANK_FACE_NAME`, etc)
+  now auto-create via a data migration** (`face_manager/migrations/0003_seed_sentinel_people.py`),
+  closing the "Bootstrapping a fresh DB from scratch is currently broken" gap for real, not just
+  the import-time crash the `SimpleLazyObject` fix addressed. Found this was necessary while
+  testing the lazy-object fix against a genuinely fresh (non-`--keepdb`) database: without it,
+  `face_manager.tests.PersonModelTests` failed with `Person.DoesNotExist` (that test class never
+  seeded its own sentinel rows — only `api/tests.py`'s `ApiTestCase` did), and a regression test
+  of my own failed with an ID mismatch, because each `TestCase` class's own `ensure_sentinel_people()`
+  call was creating its *own* throwaway copy inside a per-class transaction that rolls back
+  afterward — meanwhile the module-level `SimpleLazyObject` in `api/views.py` caches whichever
+  copy it resolved *first*, forever, so later test classes' freshly-created rows had different
+  IDs than what was cached. The migration runs once, automatically, as part of `manage.py
+  migrate` — before any test's transaction begins — so every test class (and a real fresh
+  install) now shares the same permanent rows, matching how production actually behaves.
+  `ensure_sentinel_people()` in `api/tests.py` is now effectively a no-op safety net (its
+  `exists()` check short-circuits immediately) rather than the sole source of these rows.
 - **Investigate `ImageFile.save()`'s unconditional MD5 rehash** (see "Data model notes" above) —
   it fully decodes the image and recomputes `_generate_md5_hash()` on *every* `.save()` call, not
   just creation. Worth checking whether anything calls `.save()` on existing rows somewhere hot
