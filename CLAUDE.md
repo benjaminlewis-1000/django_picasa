@@ -270,29 +270,34 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   again unless/until the settings collapse + `close_ignored` fix from `backend_upgrade` (see
   above) is ported to `master` and deployed. Don't consider this fully resolved until that
   ships.
-- **Lesson from the above: bulk `Face.objects.filter(...).update(...)` bypasses `Person`'s
-  cached face-count columns.** `Person.num_faces`/`num_possibilities`/`num_unverified_faces` are
-  plain `IntegerField`s only kept in sync by `increment_assigned()`/`decrement_assigned()`/etc
-  (called from `Face` model methods like `associate_person()`), or recomputed wholesale by the
-  scheduled `face_manager.set_face_counts` task (`face_manager/tasks.py`'s `reset_task`) — never
-  by a live query. Right after the `.another_ignore` merge, the underlying `Face` rows were
-  correct but `.ignore`'s cached counters were stale (still `10,467`/`0` instead of the real
+- **TODO: stop relying on manually-synced cached face-count columns on `Person`.**
+  `Person.num_faces`/`num_possibilities`/`num_unverified_faces` are plain `IntegerField`s only
+  kept in sync by `increment_assigned()`/`decrement_assigned()`/etc (called from `Face` model
+  methods like `associate_person()`), or recomputed wholesale by the scheduled
+  `face_manager.set_face_counts` task (`face_manager/tasks.py`'s `reset_task`) — never by a live
+  query, so any code path that mutates `Face.declared_name`/`poss_identN` without going through
+  those model methods (e.g. a bulk `.update()`) silently leaves the cached numbers wrong until
+  someone happens to notice or the scheduled task next runs. This bit us directly: right after
+  the `.another_ignore` → `.ignore` merge (2026-08-25), the underlying `Face` rows were correct
+  but `.ignore`'s cached counters were stale (`10,467`/`0` instead of the real
   `103,317`/`115,335`), which is what `PersonListView` (`api/views.py`) actually serves to the
-  frontend for non-blank-sentinel people — it reads `p.num_faces`/`p.num_possibilities` directly,
-  not a live count. Fixed by queuing the real `set_face_counts` Celery task (`reset_task.delay()`)
-  rather than looping and saving every `Person` by hand. **Any future bulk `Face` reassignment
-  needs to trigger `set_face_counts` afterward**, or add it as a step in the operation itself.
-- **New bug found while investigating the above**: `PersonSerializer` (`api/serializers.py`)
-  declares `num_possibilities = serializers.SerializerMethodField()` but `get_num_possibilities`
-  is commented out — any code path that actually serializes a `Person` through this serializer
-  (confirmed via direct test: `PersonSerializer(p).data` raises
-  `AttributeError: 'PersonSerializer' object has no attribute 'get_num_possibilities'`) crashes.
+  frontend for non-blank-sentinel people. Worked around in the moment by manually queuing
+  `set_face_counts` (`reset_task.delay()`) rather than looping and saving every `Person` by
+  hand — but that's a hack, not a fix; the real problem is that these numbers require a separate
+  sync step *at all*. Also folds in a second bug found while investigating this: `PersonSerializer`
+  (`api/serializers.py`) declares `num_possibilities = serializers.SerializerMethodField()` but
+  `get_num_possibilities` is commented out — any code path that actually serializes a `Person`
+  through this serializer (confirmed via direct test: `PersonSerializer(p).data` raises
+  `AttributeError: 'PersonSerializer' object has no attribute 'get_num_possibilities'`) crashes;
   `PersonViewSet` (the `/api/people/` DRF router endpoint) uses this serializer, so it's likely
-  broken for any request that hits it — the frontend must be relying on `PersonListView`
-  (`/api/person_list/`, a hand-rolled `APIView` with its own dict-building, no serializer)
-  instead, which is presumably why this hasn't been noticed. Not fixed yet — just found. Either
-  implement `get_num_possibilities` (mirroring `set_face_counts`'s `p.face_poss1.count()`) or
-  drop the field if `/api/people/` isn't actually used by anything live.
+  broken for any request that hits it, while `PersonListView` (`/api/person_list/`, hand-rolled,
+  no serializer) is presumably what the frontend actually relies on instead. Real fix needs to
+  address both symptoms of the same root cause together: either make `num_faces`/
+  `num_possibilities`/`num_unverified_faces` genuinely live (a `SerializerMethodField`/annotated
+  queryset computed on read, like `get_num_faces` already correctly does, no cached column at
+  all), or keep the cached-column approach but make every mutation path — `associate_person()`,
+  `remove_poss_ident()`, any future bulk operation — update it as a mandatory part of the same
+  transaction, with `get_num_possibilities` implemented to match instead of missing. Not started.
 - **Investigate actually fixing the non-daemon background thread in `api/views.py`**
   (`work_thread` / `background_bulk_processor`, see "Testing gotcha" above), rather than just
   working around it. It's currently just a trap for test runs (looks hung, isn't), but the same
