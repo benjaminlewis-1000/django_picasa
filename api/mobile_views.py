@@ -80,7 +80,10 @@ class UnlabeledMobileInfo(APIView):
                     'name': name,
                     'confirm_patch_url': f"{host_url}/faces/{selected_id}/assign_face_to_person/",
                     'confirm_patch_data': {'declared_name_key': pid},
-                    'disassociate_patch_url': f"{host_url}/faces/{selected_id}/reject_association_app_api/",
+                    # disassociate_patch_url used to point at
+                    # reject_association_app_api(), removed as dead code
+                    # (see api/views.py history) -- no frontend this
+                    # project has access to ever called it.
                     'person_id': pid,
                     'weight': weight,
                 }

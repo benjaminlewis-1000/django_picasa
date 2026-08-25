@@ -287,22 +287,22 @@ class FaceViewSetTests(ApiTestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_reject_association(self):
-        # reject_association() only accepts a person that's currently one of
-        # the face's *possible* identities (poss_identN), not its declared
-        # name -- see face_manager/models.py Face.reject_association.
+    def test_reject_association_model_method_still_works_directly(self):
+        # Face.reject_association() is still live -- bulk_thread()'s
+        # close_assigned branch calls it to decline a possible-match
+        # candidate. Only the api/views.py HTTP wrapper around it
+        # (reject_association_app_api) was removed as dead code; see
+        # test_reject_association_app_api_endpoint_was_removed below.
         possible = Person.objects.create(person_name="Possible Match")
         possible.highlight_img.save("poss.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
         self.face.poss_ident1 = possible
         self.face.weight_1 = 0.5
         self.face.save()
 
-        resp = self.client.patch(
-            f"/api/faces/{self.face.id}/reject_association_app_api/",
-            {"unassociate_id": possible.id},
-            format="json",
-        )
-        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.face.reject_association(possible.id)
+        self.face.refresh_from_db()
+        self.assertIsNone(self.face.poss_ident1_id)
+        self.assertIn(possible.id, self.face.rejected_fields)
 
     def test_face_to_new_person(self):
         resp = self.client.put(
@@ -409,6 +409,26 @@ class FaceViewSetTests(ApiTestCase):
         })
         self.face.refresh_from_db()
         self.assertEqual(self.face.declared_name.person_name, settings.BLANK_FACE_NAME)
+
+    def test_reject_association_app_api_endpoint_was_removed(self):
+        # reject_association_app_api() had the same unguarded-assert bug
+        # as bulk_thread()'s close_assigned (asserts unassociate_id is a
+        # poss_identN candidate, raising an unhandled AssertionError if
+        # it's actually the declared_name instead) -- but unlike
+        # close_assigned, nothing in either frontend repo this project
+        # has access to (dev_facewire, facewires_frontend) actually calls
+        # it or its disassociate_patch_url. Removed rather than fixed,
+        # per the user's call, as dead code. This just documents that the
+        # route is gone -- a future re-add attempt should route through
+        # Face.reject_association()/associate_person() the same way
+        # bulk_thread()'s close_assigned does, not call
+        # reject_association() unconditionally.
+        resp = self.client.patch(
+            f"/api/faces/{self.face.id}/reject_association_app_api/",
+            {"unassociate_id": self.face.declared_name_id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
 
 class KeyedImageViewTests(ApiTestCase):

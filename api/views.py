@@ -820,38 +820,6 @@ class FaceViewSet(viewsets.ModelViewSet):
         js = {'job_submitted': True}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
-    @action(detail=True, methods=['patch', 'put'])
-    def reject_association_app_api(self, request, pk=None):
-        # Accessible as <root>/api/faces/<face_id>/reject_association_app_api/
-        # Accept: HTML PATCH
-        # Body parameter : unassociate_id (person_id)
-        # Given the face, remove association to the given
-        # person and add the person_id to the rejected_fields. 
-        
-        # print(request.data, request.data.keys())
-        def err_404(message=""):
-            msg_start = f'Invalid reject association request. \n\n'
-            msg_start += message
-            err_404 = render_404(request, msg_start)
-            return err_404
-
-        if 'unassociate_id' not in request.data.keys():
-            return err_404("unassociate_id not set in body")
-        else:
-            unassociate_id = request.data['unassociate_id']
-
-        try:
-            unassociate_id = int(unassociate_id)
-        except:
-            return err_404("unassociate_id passed was not an integer.")
-
-        face = self.get_object()
-        
-        face.reject_association(unassociate_id)
-
-        js = {'success': True}
-        return HttpResponse(json.dumps(js), content_type='application/json')
-
 class KeyedImageView(APIView):
 
     permission_classes = [AllowAny]

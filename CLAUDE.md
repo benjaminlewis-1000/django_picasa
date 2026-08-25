@@ -145,11 +145,18 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 - [x] **`ResetFace.patch()` and `ConfidentUnlabeledView.get()`** — fixed, see "Fixed bugs"
   above. Also split all 4 mobile-app-facing views out of `api/views.py` into
   `api/mobile_views.py` while touching them (they were the entire `/api/mobile/...` URL group).
-- [ ] `reject_association_app_api()` (`api/views.py`) — same root cause as the already-fixed
-  `close_assigned` bug, but this sibling mobile endpoint never got the fix: calls
-  `Face.reject_association()` unconditionally, which asserts the person is a `poss_identN`
-  candidate. Crashes with an unhandled 500 if the mobile client passes an actual
-  `declared_name` (the "remove from person" case rather than "decline a suggestion").
+- [x] `reject_association_app_api()` (`api/views.py`) — removed rather than fixed, per the
+  user's call. Had the same unguarded-assert root cause as the already-fixed `close_assigned`
+  bug (calls `Face.reject_association()` unconditionally, which asserts the person is a
+  `poss_identN` candidate, crashing with an unhandled 500 if passed an actual `declared_name`
+  instead) — but checking both frontend repos this project has access to (`dev_facewire`,
+  `facewires_frontend`), neither one actually calls this endpoint or its
+  `disassociate_patch_url` (only `dev_facewire`'s `CLAUDE.md` mentions it in passing, while
+  explaining the *other*, already-fixed `close_assigned` bug). Confirmed dead code, so it was
+  deleted rather than fixed. `UnlabeledMobileInfo` (`api/mobile_views.py`) no longer includes
+  `disassociate_patch_url` in its response, since it pointed at this now-removed route.
+  `Face.reject_association()` itself is untouched and still live — `bulk_thread()`'s
+  `close_assigned` branch still calls it for the "decline a candidate" case.
 - [ ] `SOFT_IGNORE_NAME` mismatch — the scheduled `assign_faces` task (`face_manager/
   assign_faces.py`) routes low-confidence faces to `Person` `.another_ignore` (via
   `settings.SOFT_IGNORE_NAME`), but every UI-facing check (`bulk_thread`'s `close_ignored`,
@@ -181,9 +188,11 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
-- **TODO: port the `api/mobile_views.py` split + `ResetFace`/`ConfidentUnlabeledView` fixes
-  (2026-08-24) from `backend_upgrade` to `master` and deploy.** No migration involved; `api/
-  urls.py` now imports the 4 mobile views from `api.mobile_views` instead of `api.views`.
+- **TODO: port the `api/mobile_views.py` split + `ResetFace`/`ConfidentUnlabeledView` fixes +
+  `reject_association_app_api()` removal (2026-08-24) from `backend_upgrade` to `master` and
+  deploy.** No migration involved; `api/urls.py` now imports the 4 mobile views from
+  `api.mobile_views` instead of `api.views`, and no longer registers a route for
+  `reject_association_app_api` (removed as confirmed dead code — see "Follow-up bug audit").
 - **TODO: port the `ImageFile.delete()` orphaned-thumbnail fix (2026-08-24) from
   `backend_upgrade` to `master` and deploy.** No migration involved; once live, worth a one-off
   disk sweep for already-orphaned `Face` thumbnail files from before this fix (not attempted
