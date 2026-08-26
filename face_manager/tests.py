@@ -350,6 +350,112 @@ class FaceExtractorCorruptedImageTests(TestCase):
         self.assertGreaterEqual(Face.objects.filter(source_image_file=img_obj).count(), 1)
 
 
+class UpdateListOfNoMatchingDetectsTests(TestCase):
+    """Regression test for a fixed bug: update_list_of_no_matching_detects()
+    only clamped each box coordinate on one side (box_left/box_top floored
+    at 0, box_right/box_bottom capped at the image's current width/height),
+    so a face whose stored box came from a different coordinate space than
+    the image's current dimensions -- e.g. a stale detection from before
+    this session's EXIF-orientation-consolidation fix, when
+    face_extract_encode's decode path could disagree with filepopulator's
+    about a rotated image's true width/height -- could still end up with
+    box_right <= box_left (or box_bottom <= box_top) after "clamping",
+    which Face.save() correctly rejects via ValidationError. That
+    propagated all the way up through find_and_encode_faces() into
+    face_manager.tasks.process_faces()'s bare except:, silently aborting
+    the *entire* scheduled run, not just this one face -- confirmed
+    against a real production case (FastFoto_0248.jpg) before fixing."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.extractor = FaceExtractor()
+
+    def test_geometrically_invalid_face_is_deleted_not_crashed(self):
+        img = make_image()
+        stale_face = make_face(
+            img,
+            box_left=img.width + 500,
+            box_top=1,
+            box_right=img.width + 700,
+            box_bottom=40,
+        )
+
+        self.extractor.update_list_of_no_matching_detects([stale_face])
+
+        self.assertFalse(Face.objects.filter(pk=stale_face.pk).exists())
+
+    def test_recoverable_out_of_bounds_face_is_clamped_and_kept(self):
+        img = make_image()
+        face = make_face(
+            img,
+            box_left=1,
+            box_top=1,
+            box_right=img.width + 50,  # slightly over -- should just clamp
+            box_bottom=40,
+        )
+
+        self.extractor.update_list_of_no_matching_detects([face])
+
+        face.refresh_from_db()
+        self.assertEqual(face.box_right, img.width)
+        self.assertTrue(face.reencoded)
+
+    def test_box_that_only_fits_swapped_dimensions_is_deleted(self):
+        """A box that doesn't fit the image's current (w, h) at all, but
+        does fit the swapped (h, w) -- the signature of a face whose
+        coordinates were computed against the wrong (unrotated) dimensions
+        by the pre-fix decode-path disagreement -- must be deleted even
+        though clamping alone wouldn't necessarily make it degenerate."""
+        img = make_image()  # width=800, height=286
+        self.assertGreater(img.width, img.height)
+        face = make_face(
+            img,
+            box_left=1, box_top=1,
+            box_right=200,  # fits both width interpretations
+            box_bottom=500,  # > img.height (286), but < img.width (800): only fits swapped
+        )
+
+        self.extractor.update_list_of_no_matching_detects([face])
+
+        self.assertFalse(Face.objects.filter(pk=face.pk).exists())
+
+    def test_unreencoded_face_on_rotated_image_is_deleted_even_if_in_bounds(self):
+        """An orientation 6/8 face that has never been successfully
+        re-matched since creation (reencoded=False) has never had its box
+        verified under the corrected decode path -- delete it outright,
+        even if its box happens to still fit the image's current
+        dimensions by coincidence."""
+        img = make_image()
+        ImageFile.objects.filter(pk=img.pk).update(orientation=8)
+        img.refresh_from_db()
+        face = make_face(img, box_left=1, box_top=1, box_right=40, box_bottom=40)
+        self.assertFalse(face.reencoded)
+
+        self.extractor.update_list_of_no_matching_detects([face])
+
+        self.assertFalse(Face.objects.filter(pk=face.pk).exists())
+
+    def test_unreencoded_face_on_unrotated_image_is_kept(self):
+        """Regression guard: the orientation 6/8 + reencoded=False deletion
+        must not apply to orientations where no width/height swap is
+        possible -- an in-bounds, unreencoded face on an orientation-1
+        image is just legitimately not yet re-matched, not stale data, and
+        should be kept (clamped/marked reencoded like any other kept
+        face)."""
+        img = make_image()
+        ImageFile.objects.filter(pk=img.pk).update(orientation=1)
+        img.refresh_from_db()
+        face = make_face(img, box_left=1, box_top=1, box_right=40, box_bottom=40)
+        self.assertFalse(face.reencoded)
+
+        self.extractor.update_list_of_no_matching_detects([face])
+
+        face.refresh_from_db()
+        self.assertTrue(Face.objects.filter(pk=face.pk).exists())
+        self.assertTrue(face.reencoded)
+
+
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class MergeAnotherIgnoreIntoIgnoreTests(TestCase):
     """'.another_ignore' used to be a separate sentinel Person from '.ignore'

@@ -424,12 +424,76 @@ class FaceExtractor(object):
         for face_obj in unmatched_existing_faces:
             if type(face_obj) is not Face:
                 raise TypeError("List must be objects of type Face, from face_manager.model")
-                 
+
+            orig_left, orig_top = face_obj.box_left, face_obj.box_top
+            orig_right, orig_bottom = face_obj.box_right, face_obj.box_bottom
+            orientation = face_obj.source_image_file.orientation
+
+            # 90/270-degree rotations (orientation 6/8) swap width and
+            # height. A pre-existing decode-path disagreement (fixed by
+            # this session's EXIF-orientation consolidation --
+            # face_extract_encode's old common.open_img_oriented() call
+            # could disagree with filepopulator's _init_image() about a
+            # rotated image's true width/height) could compute a face's box
+            # against the *unrotated* (swapped) dimensions instead of the
+            # image's actual current ones. Bounds-checking alone can't
+            # catch every case of this -- a swapped-frame box can still
+            # happen to fit the current dimensions by coincidence -- so two
+            # signals are used together:
+            #  1. The box doesn't fit the current dims at all but does fit
+            #     the swapped dims -- an unambiguous sign it was computed
+            #     in the wrong coordinate frame.
+            #  2. On an orientation 6/8 image, this face has never been
+            #     successfully re-matched to a real detection since it was
+            #     created (reencoded=False) -- its box has never actually
+            #     been verified under the corrected decode path, even if it
+            #     happens to still fit the current dimensions.
+            # Signal 2 only applies to orientation 6/8, since no
+            # width/height swap is possible for orientation 1/3 -- a stale
+            # box there is instead caught by the degenerate-after-clamp
+            # check below.
+            fits_current = (0 <= orig_left < orig_right <= img_w) and (0 <= orig_top < orig_bottom <= img_h)
+            fits_swapped = (0 <= orig_left < orig_right <= img_h) and (0 <= orig_top < orig_bottom <= img_w)
+            untrusted_orientation = orientation in (6, 8) and not face_obj.reencoded
+
+            if (not fits_current and fits_swapped) or untrusted_orientation:
+                settings.LOGGER.error(
+                    f"Deleting Face {face_obj.id} on {face_obj.source_image_file.filename}: "
+                    f"its stored box ({orig_left}, {orig_top}, {orig_right}, {orig_bottom}) is "
+                    f"untrustworthy against this orientation-{orientation} image's current "
+                    f"dimensions ({img_w}x{img_h}) -- likely computed in a different coordinate "
+                    f"space by a decode path that has since been fixed."
+                )
+                print(f"Deleting geometrically-untrustworthy stale Face {face_obj.id}")
+                face_obj.delete()
+                continue
+
             face_obj.face_encoding_512 = settings.NON_DETECTED_FACE_ENCODING
-            face_obj.box_left = np.max((0, int(face_obj.box_left)))
-            face_obj.box_top = np.max((0, int(face_obj.box_top)))
-            face_obj.box_right = np.min((int(face_obj.box_right), img_w))
-            face_obj.box_bottom = np.min((int(face_obj.box_bottom), img_h))
+            face_obj.box_left = np.max((0, int(orig_left)))
+            face_obj.box_top = np.max((0, int(orig_top)))
+            face_obj.box_right = np.min((int(orig_right), img_w))
+            face_obj.box_bottom = np.min((int(orig_bottom), img_h))
+
+            # Regression fix: even after the checks above, clamping each
+            # coordinate independently (rather than rejecting the box
+            # outright) can still produce a degenerate box in edge cases
+            # not caught by either signal (e.g. orientation 1/3, where no
+            # width/height swap is possible but a box can still be stale
+            # for other reasons). Keep this as a final safety net so
+            # Face.save()'s ValidationError can never again crash and abort
+            # the entire scheduled run the way it used to via
+            # face_manager.tasks.process_faces()'s bare `except:`.
+            if face_obj.box_right <= face_obj.box_left or face_obj.box_bottom <= face_obj.box_top:
+                settings.LOGGER.error(
+                    f"Deleting Face {face_obj.id} on {face_obj.source_image_file.filename}: "
+                    f"its stored box ({face_obj.box_left}, {face_obj.box_top}, "
+                    f"{face_obj.box_right}, {face_obj.box_bottom}) doesn't fit the image's "
+                    f"current dimensions ({img_w}x{img_h}) even after clamping."
+                )
+                print(f"Deleting geometrically-invalid stale Face {face_obj.id}")
+                face_obj.delete()
+                continue
+
             face_obj.reencoded = True
             face_obj.save()
 
