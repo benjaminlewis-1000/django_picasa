@@ -401,6 +401,60 @@ class UpdateListOfNoMatchingDetectsTests(TestCase):
         self.assertEqual(face.box_right, img.width)
         self.assertTrue(face.reencoded)
 
+    def test_box_that_only_fits_swapped_dimensions_is_deleted(self):
+        """A box that doesn't fit the image's current (w, h) at all, but
+        does fit the swapped (h, w) -- the signature of a face whose
+        coordinates were computed against the wrong (unrotated) dimensions
+        by the pre-fix decode-path disagreement -- must be deleted even
+        though clamping alone wouldn't necessarily make it degenerate."""
+        img = make_image()  # width=800, height=286
+        self.assertGreater(img.width, img.height)
+        face = make_face(
+            img,
+            box_left=1, box_top=1,
+            box_right=200,  # fits both width interpretations
+            box_bottom=500,  # > img.height (286), but < img.width (800): only fits swapped
+        )
+
+        self.extractor.update_list_of_no_matching_detects([face])
+
+        self.assertFalse(Face.objects.filter(pk=face.pk).exists())
+
+    def test_unreencoded_face_on_rotated_image_is_deleted_even_if_in_bounds(self):
+        """An orientation 6/8 face that has never been successfully
+        re-matched since creation (reencoded=False) has never had its box
+        verified under the corrected decode path -- delete it outright,
+        even if its box happens to still fit the image's current
+        dimensions by coincidence."""
+        img = make_image()
+        ImageFile.objects.filter(pk=img.pk).update(orientation=8)
+        img.refresh_from_db()
+        face = make_face(img, box_left=1, box_top=1, box_right=40, box_bottom=40)
+        self.assertFalse(face.reencoded)
+
+        self.extractor.update_list_of_no_matching_detects([face])
+
+        self.assertFalse(Face.objects.filter(pk=face.pk).exists())
+
+    def test_unreencoded_face_on_unrotated_image_is_kept(self):
+        """Regression guard: the orientation 6/8 + reencoded=False deletion
+        must not apply to orientations where no width/height swap is
+        possible -- an in-bounds, unreencoded face on an orientation-1
+        image is just legitimately not yet re-matched, not stale data, and
+        should be kept (clamped/marked reencoded like any other kept
+        face)."""
+        img = make_image()
+        ImageFile.objects.filter(pk=img.pk).update(orientation=1)
+        img.refresh_from_db()
+        face = make_face(img, box_left=1, box_top=1, box_right=40, box_bottom=40)
+        self.assertFalse(face.reencoded)
+
+        self.extractor.update_list_of_no_matching_detects([face])
+
+        face.refresh_from_db()
+        self.assertTrue(Face.objects.filter(pk=face.pk).exists())
+        self.assertTrue(face.reencoded)
+
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class MergeAnotherIgnoreIntoIgnoreTests(TestCase):
