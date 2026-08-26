@@ -202,60 +202,31 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   query to first actual attribute access. Covered by `LazySentinelPersonTests` in `api/tests.py`.
   auto-creating them via a migration — see the "sentinel `Person` rows ... auto-create via a data
   migration" entry further down for how that was actually resolved the same day.
-- **TODO: port the `api/mobile_views.py` split + `ResetFace`/`ConfidentUnlabeledView` fixes +
-  `reject_association_app_api()` removal (2026-08-24) from `backend_upgrade` to `master` and
-  deploy.** No migration involved; `api/urls.py` now imports the 4 mobile views from
-  `api.mobile_views` instead of `api.views`, and no longer registers a route for
-  `reject_association_app_api` (removed as confirmed dead code — see "Follow-up bug audit").
-- **TODO: port the `ImageFile.delete()` orphaned-thumbnail fix (2026-08-24) from
-  `backend_upgrade` to `master` and deploy.** No migration involved; once live, worth a one-off
-  disk sweep for already-orphaned `Face` thumbnail files from before this fix (not attempted
-  here — would need to cross-reference `face_thumbnail` paths on disk against live `Face` rows).
-- **TODO: port the `picasa/adapters.py` open-redirect fix (2026-08-24) from `backend_upgrade`
-  to `master` and deploy.** No migration involved.
-- **TODO: port the `filteredImagesView`/`bulk_thread()` bug fixes (2026-08-24) from
-  `backend_upgrade` to `master` and deploy.** `filteredImagesView.get()` no longer 500s on a
-  query-params-but-no-recognized-filter request (e.g. `?key=...` alone, which the slideshow
-  client can send); `bulk_thread()` no longer silently misbehaves when a bad `face_id` is mixed
-  into a bulk-operation request. No migration involved.
-- **TODO: port the EXIF orientation consolidation (2026-08-24, `common/open_img_oriented.py`'s
-  `apply_exif_orientation()` + `filepopulator/models.py`'s `_init_image()` now sharing it) from
-  `backend_upgrade` to `master` and deploy, then manually reprocess the 2 known-affected images**
-  (`ImageFile` ids `315617`, `316082` — orientation 7, the only affected orientation value with
-  any real occurrences; see "Fixed bugs" for the full production count). Clear their
-  `isProcessed` flag and existing `Face` rows so `face_extraction` redetects them correctly
-  oriented, then re-tag the (few) faces on them.
-- **TODO: port the `find_and_encode_faces()` corrupted-image fix (2026-08-24, adds
-  `ImageFile.image_load_failed`/`image_load_error` + a migration) from `backend_upgrade` to
-  `master` and deploy.** Fixes the retry-forever bug where corrupted images were reprocessed by
-  the scheduled `face_extraction` task on every run, forever, with no record kept.
-- **TODO: port the filepopulator ingestion corrupted-file fix (2026-08-24, adds the
-  `FailedImageFile` model + a migration, plus `open_img_oriented()`/`_generate_md5_hash()`/
-  `create_image_file()`/`instance_clean_and_save()` changes) from `backend_upgrade` to `master`
-  and deploy.** Fixes the retry-forever bug in `add_from_root_dir()`'s per-file ingestion loop,
-  and a real data-loss bug where a good `ImageFile` row could be deleted and never replaced if
-  the file it pointed at was later overwritten with corrupted content.
-- **Frontend: "failed to open" image list.** Two sources to query once this is live: a
+- **DONE (2026-08-26): `backend_upgrade` merged into `master` (PR #43) and deployed to the live
+  `picasa_api` container.** This closes out every "port to master and deploy" TODO that had
+  accumulated in this file — the mobile-views split + `ResetFace`/`ConfidentUnlabeledView` fixes,
+  `reject_association_app_api()` removal, the `ImageFile.delete()` orphaned-thumbnail fix, the
+  `picasa/adapters.py` open-redirect fix, `filteredImagesView`/`bulk_thread()` fixes, the EXIF
+  orientation consolidation, the corrupted-image tracking fixes (both `face_extract_encode.py`
+  and filepopulator ingestion sides), the `average_date_taken`/`beginning_date_taken` `pytz.utc`
+  fix, the `close_assigned` fix, and the `check_file_mods()`/`MobileNameList` fixes — all are now
+  live in production, not just tested on `backend_upgrade`. New migrations applied cleanly
+  (`face_manager.0002_face_detected_age` needed a one-time `--fake` apply first — production
+  already had that column under a lost migration name from before git-tracking existed; purely a
+  one-off for this specific database, not something a fresh install or CI ever hits). No
+  dependency rebuild needed since `picasa_img`'s installed versions already matched every pin
+  exactly. The two known EXIF-orientation-7 images (`ImageFile` ids `315617`, `316082`) have been
+  manually reprocessed — `isProcessed` cleared, old (wrong-coordinate) `Face` rows deleted,
+  `face_extraction` re-ran and correctly redetected all 3 faces with proper bounding boxes; all 3
+  are currently unassigned and need re-tagging by hand (one was previously tagged "Gwendolyn
+  Lewis").
+- **Frontend: "failed to open" image list.** Two sources to query, now live in production: a
   previously-good photo that's since become unreadable is flagged via
   `ImageFile.objects.filter(image_load_failed=True)` (its old thumbnails/metadata are kept, just
   flagged); a file that's never been successfully ingested at all shows up in
   `FailedImageFile.objects.all()` instead (no `ImageFile` row exists for these — one can't be
   created without a successful decode). The frontend should surface both so the user can go fix
-  or remove the underlying files. Not started, and explicitly out of scope for the backend fix
-  itself — noted here so it isn't lost.
-- **TODO: port the `average_date_taken`/`beginning_date_taken` `pytz.utc` fix (2026-08-24) from
-  `backend_upgrade` to `master` and deploy.** The scheduled `filepopulator.update_dir_dates`
-  Celery task has been crashing with `AttributeError` on every single run in production since
-  the Django 6 upgrade (see "Fixed bugs" above) — directory date aggregation stays
-  non-functional live until this ships.
-- **TODO: port the `close_assigned` fix (2026-08-24) from `backend_upgrade` to `master` and
-  deploy to the live `picasa_api` container.** Fixed and tested here (see "Fixed this session"
-  above), but deliberately *not* ported/deployed yet, same as the rest of this branch's work —
-  the frontend (`dev_facewire`) still talks to production and still has the original bug until
-  this lands there. Don't consider this done until it's actually live.
-- **TODO: port the `check_file_mods()` log-message fix and `MobileNameList` real-name-list fix
-  (2026-08-25) from `backend_upgrade` to `master` and deploy.** Both cosmetic/feature-gap fixes,
-  no migration involved.
+  or remove the underlying files. Not started on the frontend side — noted here so it isn't lost.
 - **Remove the file-lock (`settings.LOCKFILE`) mechanism in `add_from_root_dir()`
   (`filepopulator/scripts.py`).** It's a plain `os.path.isfile()` check with no
   wait/retry/timeout, and no cleanup on crash — if a run dies or gets killed (`kill -9`, OOM,
@@ -266,19 +237,17 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   prompted noticing the lock file itself has the same fragility. Worth replacing with something
   that can't wedge itself: a DB-backed lock with a timeout/heartbeat, or just relying on Celery's
   own task-overlap prevention if the scheduled task doesn't already have it. Not started.
-- **DONE (data side): the `.another_ignore` → `.ignore` production merge ran 2026-08-25.**
-  Applied directly via `docker exec picasa_api python manage.py shell` (not the
-  `merge_another_ignore_into_ignore` command file itself, since that only exists on
-  `backend_upgrade` and `master`'s checkout is the live bind-mounted container -- ran the same
-  bulk-`.update()` logic inline instead, after a fresh `pg_dump` backup and a `--dry-run`-style
-  count check). Reassigned 92,850 faces' `declared_name` and 115,335 faces' `poss_ident1` from
-  `.another_ignore` (id 2333, now deleted) to `.ignore` (id 1403, now at 103,317 declared_name /
-  115,335 poss_ident1). **Still outstanding: the code side.** Production's `master` checkout
-  still has the old `SOFT_IGNORE_NAME = '.another_ignore'` setting, so the next scheduled
-  `assign_faces` run will recreate a fresh `.another_ignore` Person and start populating it
-  again unless/until the settings collapse + `close_ignored` fix from `backend_upgrade` (see
-  above) is ported to `master` and deployed. Don't consider this fully resolved until that
-  ships.
+- **DONE: the `.another_ignore` → `.ignore` production merge (data side ran 2026-08-25; code
+  side landed with the 2026-08-26 `backend_upgrade` merge/deploy).** Data: applied directly via
+  `docker exec picasa_api python manage.py shell` (not the `merge_another_ignore_into_ignore`
+  command file itself, since it only existed on `backend_upgrade` at the time and `master`'s
+  checkout was the live bind-mounted container -- ran the same bulk-`.update()` logic inline
+  instead, after a fresh `pg_dump` backup and a `--dry-run`-style count check). Reassigned 92,850
+  faces' `declared_name` and 115,335 faces' `poss_ident1` from `.another_ignore` (id 2333, now
+  deleted) to `.ignore` (id 1403, now at 103,317 declared_name / 115,335 poss_ident1). Code:
+  `SOFT_IGNORE_NAME` now equals `.ignore` in production's live `settings.py`, so `assign_faces`
+  no longer recreates `.another_ignore` on its next scheduled run, and `close_ignored` correctly
+  recognizes classifier-suggested candidates. Fully resolved.
 - **TODO: stop relying on manually-synced cached face-count columns on `Person`.**
   `Person.num_faces`/`num_possibilities`/`num_unverified_faces` are plain `IntegerField`s only
   kept in sync by `increment_assigned()`/`decrement_assigned()`/etc (called from `Face` model
