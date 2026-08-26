@@ -183,6 +183,31 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   `IndexError` in a specific combination (rejected candidates + `.another_ignore` in the
   rejected set). Compounded by `execute()`'s per-face error handling being commented out, so
   any exception here aborts the *entire* scheduled `assign_faces` run, not just one face.
+- [ ] **Same anti-pattern, different task: `find_and_encode_faces()`'s IOU-matching branch
+  (`face_manager/face_extract_encode.py` lines ~240-394) can silently abort the entire
+  `face_extraction` run.** Found 2026-08-26 while investigating why the live "num images" vs.
+  "num processed" stats were off by 3 after a manual `face_extraction` run. Root cause: when an
+  `ImageFile` already has existing `Face` rows and this run's detector finds a different count
+  (e.g. `FastFoto_0025.jpg` had 9 existing faces but only 5 were redetected), the mismatch is
+  handled by IOU (bounding-box overlap) matching logic that has several genuinely unhandled edge
+  cases left as hard failures by the original author — `raise NotImplementedError("Not
+  one-to-one match")`, `raise ValueError("No overlapping detected and existing boxes...")`, plus
+  a couple of bare `assert`s. None of this section is wrapped in the function's own try/except
+  (which only covers image loading + detection, not the matching logic afterward), so any of
+  these raises propagates all the way up. It's then caught by a **bare `except:` in
+  `face_manager/tasks.py`'s `process_faces()`** (the actual Celery task for
+  `face_manager.face_extraction`), which silently logs a DEBUG-level message and lets the task
+  report "succeeded" — so there's no visible error anywhere. Whatever image was mid-processing
+  never gets `isProcessed=True`, and critically, **every other unprocessed image still queued in
+  that same run's random-ordered batch never gets attempted either**, since the whole loop
+  aborts right there — that's the source of the "off by 3" discrepancy (one image crashed the
+  matching logic, two more simply never got their turn). These are valid images that should
+  successfully process — this needs the IOU-matching logic itself examined (why did the
+  existing/detected face counts diverge, and what should actually happen in each unhandled
+  case), not just a try/except slapped around it. Not fixed yet — documented per the user's
+  request to investigate the actual IOU logic before deciding a fix. The 3 affected images from
+  this run (`ImageFile` ids `99862`, `103837`, `108072`) remain unprocessed
+  (`isProcessed=False`, `image_load_failed=False`) until this is resolved.
 - [x] Misleading log message in `check_file_mods()` (`filepopulator/scripts.py`) — fixed. Was
   logging `filename` (leftover from an earlier, unrelated loop) instead of `modfile` on
   failure. Cosmetic only, didn't affect behavior, just made debugging real failures misleading.
