@@ -494,6 +494,26 @@ class KeyedImageViewTests(ApiTestCase):
         resp = self.client.get("/api/keyed_image/face_array/")
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_face_array_serves_thumbnail_bytes_directly(self):
+        # face_array used to decode/resize/re-encode the thumbnail via PIL
+        # on every request even though no resize was ever actually applied
+        # (no height/width is set for this branch) - it now serves the
+        # pre-generated file's bytes as-is. A byte-exact match here would
+        # catch a regression back to the PIL round-trip, since re-encoding
+        # a JPEG (even at identical dimensions) reliably changes its bytes.
+        resp = self.client.get(f"/api/keyed_image/face_array/?id={self.face.id}")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.face.face_thumbnail.open("rb")
+        expected = self.face.face_thumbnail.read()
+        self.face.face_thumbnail.close()
+        self.assertEqual(resp.content, expected)
+
+    def test_keyed_image_response_is_cacheable(self):
+        resp = self.client.get(f"/api/keyed_image/face_array/?id={self.face.id}")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn("max-age", resp["Cache-Control"])
+        self.assertIn("immutable", resp["Cache-Control"])
+
 
 class MobileEndpointTests(ApiTestCase):
     def setUp(self):
