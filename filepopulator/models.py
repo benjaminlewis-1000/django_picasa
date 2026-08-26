@@ -640,6 +640,16 @@ class ImageFile(models.Model):
                         settings.FILEPOPULATOR_THUMBNAIL_SIZE_MEDIUM, \
                         settings.FILEPOPULATOR_THUMBNAIL_SIZE_SMALL]
 
+        # JPEG (FTYPE below) can't encode an alpha channel or a palette --
+        # found via a real production HEIC file that decoded to RGBA mode
+        # (some HEIC images carry an alpha plane even for plain photos,
+        # unlike the all-RGB samples this was originally tested against),
+        # which raised "cannot write mode RGBA as JPEG" here. Converting
+        # drops any alpha channel; for a real photo, that channel is
+        # essentially always fully opaque anyway.
+        if self.image.mode not in ('RGB', 'L'):
+            self.image = self.image.convert('RGB')
+
         for field, size in zip(thumb_fields, thumb_sizes):
 
 

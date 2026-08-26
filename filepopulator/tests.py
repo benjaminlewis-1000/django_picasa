@@ -1,6 +1,7 @@
 from django.test import TestCase
 from django.test import override_settings
 from django.core.exceptions import ValidationError
+from django.core.files.base import ContentFile
 from django import forms
 from django.conf import settings
 import os
@@ -24,6 +25,15 @@ import pillow_heif
 from .models import ImageFile, Directory, FailedImageFile
 # from .forms import ImageFileForm, DirectoryForm
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
+from face_manager.models import Face
+
+
+def _tiny_jpeg_bytes(size=(30, 30)):
+    import cv2
+    img = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+    ok, buf = cv2.imencode(".jpg", img)
+    from io import BytesIO
+    return BytesIO(buf).read()
 # from .views import create_or_get_directory# , create_image_file, add_from_root_dir
 
 
@@ -828,6 +838,55 @@ class CheckFileModsTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT='/tmp/filepopulator_test_media')
+class OrientationChangeReprocessTests(TestCase):
+    """Regression test for a fixed bug: when create_image_file() detects
+    the same pixel hash but a different orientation than what's stored, it
+    reset isProcessed=False to trigger redetection but never cleared the
+    image's existing Face rows. Those faces' box coordinates were computed
+    against the *old* orientation/rotation and don't correspond to the
+    newly (correctly) rotated pixel data, so they'd sit alongside fresh
+    detections with incompatible coordinates -- exactly the shape of stale
+    data that made find_and_encode_faces() crash in production (see
+    face_manager.face_extract_encode's update_list_of_no_matching_detects()
+    for the matching defensive fix on that side)."""
+
+    def test_orientation_change_clears_stale_faces_and_marks_unprocessed(self):
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/naming/good/1.JPG"
+        create_image_file(path)
+        img = ImageFile.objects.get(filename=path)
+
+        face = Face(
+            source_image_file=img,
+            box_left=1, box_top=1, box_right=min(40, img.width - 1), box_bottom=min(40, img.height - 1),
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.save()
+
+        # Simulate "orientation as computed now differs from what's
+        # stored" without touching the file itself. Also back-date the
+        # stored dateModified (rather than the read-only fixture file's
+        # actual mtime) so create_image_file()'s "timestamp unchanged,
+        # skip" short-circuit doesn't apply and it actually recomputes.
+        from datetime import timedelta
+        ImageFile.objects.filter(pk=img.pk).update(
+            orientation=img.orientation + 1,
+            isProcessed=True,
+            dateModified=img.dateModified - timedelta(days=1),
+        )
+
+        create_image_file(path)
+
+        self.assertFalse(Face.objects.filter(pk=face.pk).exists())
+        # Regression check for a second, related fixed bug: this branch
+        # used to reassign exist_photo to an unsaved instance (no pk),
+        # so .save() inserted a *second* row for the same filename
+        # instead of updating the existing one.
+        self.assertEqual(ImageFile.objects.filter(filename=path).count(), 1)
+        img.refresh_from_db()
+        self.assertFalse(img.isProcessed)
+
+
+@override_settings(MEDIA_ROOT='/tmp/filepopulator_test_media')
 class CorruptedImageIngestionTests(TestCase):
     """Uses the 5 real corrupted JPEGs pulled from production logs (see
     /mnt/fast_storage/appdata/django_picasa/test_suite/corrupted_images/NOTES.md),
@@ -1055,3 +1114,32 @@ class HeicIngestionTests(TestCase):
         self.assertFalse(ImageFile.objects.filter(filename=path).exists())
         failed = FailedImageFile.objects.get(filename=path)
         self.assertIn("frames", failed.error_message.lower())
+
+    def test_rgba_heic_thumbnail_does_not_crash(self):
+        # Regression test for a fixed bug: some real-world HEIC files
+        # decode to RGBA mode (an alpha channel) even for a plain photo --
+        # found via a genuine production file after HEIC support shipped,
+        # unlike any of the all-RGB samples this was originally tested
+        # against. _generate_thumbnail() tried to save that straight to
+        # JPEG, which can't encode alpha, raising
+        # "cannot write mode RGBA as JPEG".
+        os.makedirs("/tmp/heic_rgba_test", exist_ok=True)
+        path = "/tmp/heic_rgba_test/rgba.heic"
+        arr = np.zeros((150, 200, 4), dtype=np.uint8)
+        arr[:, :, 0] = 90
+        arr[:, :, 1] = 160
+        arr[:, :, 2] = 210
+        arr[:, :, 3] = 255  # fully opaque, same as a real photo would be
+        img = Image.fromarray(arr, mode="RGBA")
+        heif_file = pillow_heif.from_pillow(img)
+        heif_file.save(path, quality=80)
+        self.addCleanup(shutil.rmtree, "/tmp/heic_rgba_test", ignore_errors=True)
+
+        # Confirm the fixture is actually RGBA before testing our handling.
+        self.assertEqual(Image.open(path).mode, "RGBA")
+
+        create_image_file(path)
+
+        self.assertFalse(FailedImageFile.objects.filter(filename=path).exists())
+        obj = ImageFile.objects.get(filename=path)
+        self.assertTrue(os.path.isfile(obj.thumbnail_big.path))

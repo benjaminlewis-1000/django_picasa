@@ -424,12 +424,46 @@ class FaceExtractor(object):
         for face_obj in unmatched_existing_faces:
             if type(face_obj) is not Face:
                 raise TypeError("List must be objects of type Face, from face_manager.model")
-                 
+
             face_obj.face_encoding_512 = settings.NON_DETECTED_FACE_ENCODING
             face_obj.box_left = np.max((0, int(face_obj.box_left)))
             face_obj.box_top = np.max((0, int(face_obj.box_top)))
             face_obj.box_right = np.min((int(face_obj.box_right), img_w))
             face_obj.box_bottom = np.min((int(face_obj.box_bottom), img_h))
+
+            # Regression fix: each coordinate above is only clamped on one
+            # side (box_left/box_top only floored at 0, box_right/
+            # box_bottom only capped at the image's current width/height).
+            # A face whose *stored* box already came from a different
+            # coordinate space than the image's current dimensions --
+            # found in practice on faces detected before this session's
+            # EXIF-orientation-consolidation fix, where face_extract_encode
+            # previously used a decode path (common.open_img_oriented())
+            # whose rotation handling could disagree with filepopulator's
+            # _init_image() about a rotated image's true width/height --
+            # can still end up with box_right <= box_left (or
+            # box_bottom <= box_top) after this clamp, which Face.save()
+            # correctly rejects via ValidationError. That used to propagate
+            # all the way up through find_and_encode_faces() into
+            # face_manager.tasks.process_faces()'s bare `except:`, silently
+            # aborting the *entire* scheduled run -- not just this one face.
+            # This face's stored geometry is fundamentally incompatible
+            # with the image's current dimensions, not just slightly out
+            # of bounds, so there's nothing meaningful left to save --
+            # delete it instead of crashing the batch. If a real face is
+            # actually there, a future detection pass will add a fresh one.
+            if face_obj.box_right <= face_obj.box_left or face_obj.box_bottom <= face_obj.box_top:
+                settings.LOGGER.error(
+                    f"Deleting Face {face_obj.id} on {face_obj.source_image_file.filename}: "
+                    f"its stored box ({face_obj.box_left}, {face_obj.box_top}, "
+                    f"{face_obj.box_right}, {face_obj.box_bottom}) doesn't fit the image's "
+                    f"current dimensions ({img_w}x{img_h}) even after clamping -- stale data "
+                    f"from a different coordinate space."
+                )
+                print(f"Deleting geometrically-invalid stale Face {face_obj.id}")
+                face_obj.delete()
+                continue
+
             face_obj.reencoded = True
             face_obj.save()
 

@@ -221,7 +221,44 @@ def create_image_file(file_path):
                 instance_clean_and_save(exist_photo)
                 return
             else:
+                # Orientation changed (pixel hash didn't) -- any existing
+                # Face rows on this image have box coordinates computed
+                # against the *old* orientation/rotation, which no longer
+                # correspond to the newly-decoded (correctly rotated)
+                # pixel data. isProcessed=False below gets them
+                # redetected, but the stale old Face rows were never
+                # cleared here, so they'd sit alongside fresh detections
+                # with incompatible coordinates -- exactly the shape of
+                # bug that made find_and_encode_faces() crash on stale
+                # pre-existing faces from before this session's EXIF-
+                # orientation-consolidation fix (see
+                # update_list_of_no_matching_detects() for the defensive
+                # fix on that side). Delete them properly (Face.delete(),
+                # not a bulk queryset .delete(), so its thumbnail file on
+                # disk gets cleaned up too) rather than leaving them to be
+                # discovered as stale later.
+                from face_manager.models import Face
+                for stale_face in Face.objects.filter(source_image_file=exist_photo):
+                    stale_face.delete()
+
+                # Regression fix: new_photo was constructed via
+                # ImageFile(filename=file_path) with no pk, so
+                # `exist_photo = new_photo` followed by .save() performed
+                # an INSERT, not an UPDATE -- silently creating a *second*
+                # ImageFile row for the same filename (the original stayed
+                # untouched, stale, and isProcessed unchanged) instead of
+                # updating the one that actually exists. Preserve the
+                # original pk so this updates in place.
+                old_pk = exist_photo.pk
                 exist_photo = new_photo
+                exist_photo.pk = old_pk
+                # Setting .pk alone isn't enough -- new_photo was
+                # constructed fresh (never fetched from the DB), so
+                # Django's _state.adding is still True, and full_clean()'s
+                # validate_unique() then treats reusing this pk as a
+                # collision ("Image file with this ID already exists")
+                # instead of recognizing it as the same row being updated.
+                exist_photo._state.adding = False
                 exist_photo.orientation = new_photo.orientation
                 exist_photo.dateAdded = timezone.now()
                 exist_photo.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
