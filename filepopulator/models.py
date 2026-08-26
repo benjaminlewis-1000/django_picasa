@@ -28,6 +28,39 @@ import numpy as np
 from fractions import Fraction
 from dateutil import parser
 import common
+from PIL import ExifTags
+
+# Accepted image file extensions -- shared by the filename validator here,
+# process_new_no_md5()'s own check, and scripts.py's create_image_file()/
+# add_from_root_dir() gates, so there's one place to extend when a new
+# format is supported.
+IMAGE_EXTENSION_REGEX = r"\.(?:[jJ][pP][eE]?[gG]|[hH][eE][iI][cC]|[hH][eE][iI][fF])$"
+
+HEIC_EXTENSIONS = ('.heic', '.heif')
+
+
+def _heic_style_exif(image):
+    """Build an EXIF dict shaped like the legacy `Image._getexif()` API
+    (decoded top-level tag names, GPSInfo as a raw numeric-keyed sub-dict)
+    from the modern `Image.getexif()`/`get_ifd()` API.
+
+    HEIC's pillow_heif-registered plugin doesn't implement `_getexif()` at
+    all (confirmed: raises AttributeError) -- but everything downstream of
+    building this dict (Make/Model/GPS/Orientation extraction, a few lines
+    below in _init_image()) is otherwise format-agnostic, so this adapter
+    lets HEIC reuse that same logic unchanged rather than duplicating it.
+    """
+    exif = image.getexif()
+    if not exif:
+        return None
+    info = {}
+    for tag_id, value in exif.items():
+        name = TAGS.get(tag_id, tag_id)
+        info[name] = value
+    gps_ifd = exif.get_ifd(ExifTags.IFD.GPSInfo)
+    if gps_ifd:
+        info['GPSInfo'] = dict(gps_ifd)
+    return info
 
 # Image thumbnail processing
 
@@ -163,7 +196,7 @@ class FailedImageFile(models.Model):
 # Lots ripped from https://github.com/hooram/ownphotos/blob/dev/api/models.py
 class ImageFile(models.Model):
 
-    filename = models.CharField(max_length=1024, validators=[RegexValidator(regex=r"\.[j|J][p|P][e|E]?[g|G]$", message="Filename must be a JPG")], db_index = True)
+    filename = models.CharField(max_length=1024, validators=[RegexValidator(regex=IMAGE_EXTENSION_REGEX, message="Filename must be a JPG, JPEG, HEIC, or HEIF")], db_index = True)
     # CASCADE is expected; if delete directory, delete images.
     directory = models.ForeignKey(Directory, on_delete=models.PROTECT, related_name='image_set')
     pixel_hash = models.CharField(max_length = 64, null = False, default = -1)
@@ -245,8 +278,8 @@ class ImageFile(models.Model):
 
     def process_new_no_md5(self):
 
-        if not re.match(r".*\.[j|J][p|P][e|E]?[g|G]$", self.filename):
-            settings.LOGGER.debug("File {} does not have a jpeg-type ending.".format(self.filename))
+        if not re.match(r".*" + IMAGE_EXTENSION_REGEX, self.filename):
+            settings.LOGGER.debug("File {} does not have a supported image-type ending.".format(self.filename))
             return False # Success value
 
         self._init_image()
@@ -328,9 +361,13 @@ class ImageFile(models.Model):
 
 
         self.exifDict = {}
+        is_heic = self.filename.lower().endswith(HEIC_EXTENSIONS)
         # print(self.filename)
         try:
-            info = self.image._getexif()
+            if is_heic:
+                info = _heic_style_exif(self.image)
+            else:
+                info = self.image._getexif()
         except AttributeError as ae:
             info = None
         if info is not None:
@@ -434,6 +471,43 @@ class ImageFile(models.Model):
                 self.orientation = self.exifDict['Orientation']
             else:
                 self.orientation = 1
+
+        if is_heic:
+            # Empirically, pillow_heif/libheif auto-applies any
+            # container-level rotation transform (irot/imir boxes) during
+            # decode and resets the EXIF Orientation tag to 1 to match --
+            # verified against 8 real-world iPhone HEIC samples (models 12
+            # through 17 Pro), all of which came back as orientation 1
+            # regardless of the photo's actual portrait/landscape framing.
+            # A different value means either an encoder that behaves
+            # differently than what's been tested, or something else
+            # unexpected -- rather than guess at a second rotation on top
+            # of whatever the decoder already did (risking a silently
+            # wrong image), fail loudly. Raising a plain OSError here
+            # routes through the same corrupted-image handling as
+            # everything else (FailedImageFile / image_load_failed,
+            # logged, not retried forever) via process_new_no_md5()'s
+            # callers in scripts.py.
+            if self.orientation != 1:
+                msg = (
+                    f"HEIC file {self.filename} has unexpected EXIF "
+                    f"orientation {self.orientation} (expected 1) -- needs "
+                    f"manual review before this can be trusted."
+                )
+                print(msg)
+                settings.LOGGER.error(msg)
+                raise OSError(msg)
+
+            n_frames = getattr(self.image, 'n_frames', 1)
+            if n_frames > 1:
+                msg = (
+                    f"HEIC file {self.filename} has {n_frames} frames "
+                    f"(Live Photo or burst?) -- only single-frame HEIC is "
+                    f"currently supported."
+                )
+                print(msg)
+                settings.LOGGER.error(msg)
+                raise OSError(msg)
 
         self.dateAdded = timezone.now()
 

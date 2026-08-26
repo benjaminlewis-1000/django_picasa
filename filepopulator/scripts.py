@@ -1,6 +1,6 @@
 #! /usr/bin/env python
 
-from .models import ImageFile, Directory, DuplicateFile, FailedImageFile
+from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, IMAGE_EXTENSION_REGEX, HEIC_EXTENSIONS
 from datetime import datetime
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -38,8 +38,8 @@ def instance_clean_and_save(instance, record_failure=True):
     try:
         instance.full_clean()
     except ValidationError as ve:
-        if file_path.lower().endswith(('.jpg', '.jpeg')):
-            settings.LOGGER.critical("Did not add JPEG-type photo {}: {}".format(file_path, ve))
+        if file_path.lower().endswith(('.jpg', '.jpeg') + HEIC_EXTENSIONS):
+            settings.LOGGER.critical("Did not add photo {}: {}".format(file_path, ve))
         else:
             settings.LOGGER.debug("Did not add photo {}: {}".format(file_path, ve) )
         return False, str(ve)
@@ -128,8 +128,8 @@ def create_image_file(file_path):
         settings.LOGGER.debug('File {} is not a file path. Will not insert.'.format(file_path))
         return
 
-    if not re.match(r".*\.[j|J][p|P][e|E]?[g|G]$", file_path):
-        settings.LOGGER.debug("File {} does not have a jpeg-type ending.".format(file_path))
+    if not re.match(r".*" + IMAGE_EXTENSION_REGEX, file_path):
+        settings.LOGGER.debug("File {} does not have a supported image-type ending.".format(file_path))
         return # Success value
 
     # Check if this photo already exists:
@@ -352,7 +352,7 @@ def add_from_root_dir(root_dir):
             metadata_time = {}
             for root, dirs, files in os.walk(root_dir):
                 for f in files:
-                    if f.lower().endswith(('.jpg', '.jpeg')):
+                    if f.lower().endswith(('.jpg', '.jpeg') + HEIC_EXTENSIONS):
                         cur_file = os.path.join(root, f)
 
                         # Don't try to add files starting with a period - they're often
