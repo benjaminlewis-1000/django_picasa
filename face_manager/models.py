@@ -210,7 +210,14 @@ class Face(models.Model):
         return "Face instance of {}".format(self.declared_name)
 
     def delete(self):
-        os.remove(self.face_thumbnail.path)
+        # Tolerate the thumbnail already being gone from disk -- e.g. a
+        # duplicate delete against a restored DB snapshot whose rows
+        # point at the same shared media path a live/earlier run already
+        # cleaned up. The row itself should still be removed either way.
+        try:
+            os.remove(self.face_thumbnail.path)
+        except FileNotFoundError:
+            pass
         super(Face, self).delete()
 
     def save(self, *args, **kwargs):

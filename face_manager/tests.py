@@ -196,6 +196,18 @@ class FaceModelTests(TestCase):
         face.delete()
         self.assertFalse(os.path.exists(thumb_path))
 
+    def test_face_delete_tolerates_already_missing_thumbnail_file(self):
+        # Regression test for a fixed bug: delete() unconditionally called
+        # os.remove() with no guard for the file already being gone (e.g.
+        # a duplicate delete against a restored DB snapshot whose rows
+        # point at the same shared media path an earlier/live run already
+        # cleaned up) -- used to raise FileNotFoundError instead of still
+        # removing the row.
+        face = make_face(self.image)
+        os.remove(face.face_thumbnail.path)
+        face.delete()
+        self.assertFalse(Face.objects.filter(pk=face.pk).exists())
+
     def test_deleting_image_cascades_to_faces(self):
         face = make_face(self.image)
         face_id = face.id
