@@ -98,7 +98,12 @@ def _get_nominatim_geocode():
     from geopy.geocoders import Nominatim
     from geopy.extra.rate_limiter import RateLimiter
 
-    geolocator = Nominatim(user_agent=settings.NOMINATIM_USER_AGENT)
+    # geopy's own default timeout is a mere 1 second, far too aggressive
+    # for a real round trip to a public geocoding server -- found via a
+    # real backfill run spuriously failing every lookup with
+    # ReadTimeoutError (never surfaced in tests, which mock the network
+    # call entirely).
+    geolocator = Nominatim(user_agent=settings.NOMINATIM_USER_AGENT, timeout=10)
     return RateLimiter(geolocator.reverse, min_delay_seconds=1.1, max_retries=2, error_wait_seconds=5.0)
 
 
