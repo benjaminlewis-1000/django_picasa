@@ -22,6 +22,8 @@ import pillow_heif
 
 # Create your tests here.
 
+from django.core.management import call_command
+
 from .models import ImageFile, Directory, FailedImageFile
 # from .forms import ImageFileForm, DirectoryForm
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
@@ -1143,3 +1145,152 @@ class HeicIngestionTests(TestCase):
         self.assertFalse(FailedImageFile.objects.filter(filename=path).exists())
         obj = ImageFile.objects.get(filename=path)
         self.assertTrue(os.path.isfile(obj.thumbnail_big.path))
+
+
+class NormalizeNullIslandGpsTests(TestCase):
+    """Regression test for the normalize_null_island_gps management
+    command, which cleans up ImageFile rows left with GPS (0, 0) by a
+    fixed bug in _init_image(): a NaN GPS decimal conversion used to fall
+    back to 0 instead of the -999 "no GPS" sentinel used everywhere else,
+    so those rows look like real (if geographically absurd) GPS data
+    rather than "no GPS" under a straight equality check."""
+
+    def _make_bare_image_file(self, filename, lat, lon):
+        directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(filename))
+        obj = ImageFile(
+            filename=filename,
+            directory=directory,
+            thumbnail_big="", thumbnail_medium="", thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=10, height=10,
+            gps_lat_decimal=lat, gps_lon_decimal=lon,
+        )
+        ImageFile.objects.bulk_create([obj])
+        return ImageFile.objects.get(filename=filename)
+
+    def test_normalizes_null_island_rows(self):
+        null_island = self._make_bare_image_file("/tmp/null_island_test/a.jpg", 0, 0)
+        real_gps = self._make_bare_image_file("/tmp/null_island_test/b.jpg", 47.62, -122.33)
+        no_gps = self._make_bare_image_file("/tmp/null_island_test/c.jpg", -999, -999)
+
+        call_command("normalize_null_island_gps", "--yes")
+
+        null_island.refresh_from_db()
+        real_gps.refresh_from_db()
+        no_gps.refresh_from_db()
+        self.assertEqual((null_island.gps_lat_decimal, null_island.gps_lon_decimal), (-999, -999))
+        self.assertEqual((real_gps.gps_lat_decimal, real_gps.gps_lon_decimal), (47.62, -122.33))
+        self.assertEqual((no_gps.gps_lat_decimal, no_gps.gps_lon_decimal), (-999, -999))
+
+    def test_dry_run_writes_nothing(self):
+        null_island = self._make_bare_image_file("/tmp/null_island_test/d.jpg", 0, 0)
+
+        call_command("normalize_null_island_gps", "--dry-run")
+
+        null_island.refresh_from_db()
+        self.assertEqual((null_island.gps_lat_decimal, null_island.gps_lon_decimal), (0, 0))
+
+
+class FindNearestMetroTests(unittest.TestCase):
+    """find_nearest_metro() is pure/offline (no DB, no network) -- a plain
+    unittest.TestCase rather than Django's TestCase is enough."""
+
+    def test_suburb_maps_to_nearby_major_city(self):
+        from filepopulator.geocode import find_nearest_metro
+        name, distance_km = find_nearest_metro(47.7623, -122.2054)  # Bothell, WA
+        self.assertIsNotNone(name)
+        self.assertIn(name, ("Seattle", "Bellevue"))
+        self.assertLess(distance_km, 25)
+
+    def test_remote_location_has_no_match(self):
+        from filepopulator.geocode import find_nearest_metro
+        # Rural central Montana (Fergus County / Lewistown area) -- the
+        # nearest sizeable city (Billings, Great Falls) is well over
+        # SEARCH_RADIUS_BANDS_KM's widest band away.
+        name, distance_km = find_nearest_metro(47.0623, -109.4280)
+        self.assertIsNone(name)
+        self.assertIsNone(distance_km)
+
+
+class BackfillGeocodingTests(TestCase):
+    """Exercises the backfill_geocoding management command against a
+    mocked Nominatim lookup (no real network calls in tests) -- covers
+    coordinate deduplication (multiple images at the same rounded spot
+    share one GeocodeCache row), --dry-run, and that a failure on one
+    coordinate is recorded (lookup_failed) rather than aborting the whole
+    backfill for every other coordinate queued behind it."""
+
+    def _make_bare_image_file(self, filename, lat, lon):
+        directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(filename))
+        obj = ImageFile(
+            filename=filename,
+            directory=directory,
+            thumbnail_big="", thumbnail_medium="", thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=10, height=10,
+            gps_lat_decimal=lat, gps_lon_decimal=lon,
+        )
+        ImageFile.objects.bulk_create([obj])
+        return ImageFile.objects.get(filename=filename)
+
+    def test_shared_coordinate_reuses_one_cache_entry(self):
+        from filepopulator.models import GeocodeCache
+        img_a = self._make_bare_image_file("/tmp/geocode_test/a.jpg", 47.6062, -122.3321)
+        img_b = self._make_bare_image_file("/tmp/geocode_test/b.jpg", 47.6062, -122.3321)
+
+        fake_result = {
+            'locality': 'Seattle', 'county': 'King', 'state': 'Washington',
+            'country': 'United States', 'display_name': 'Seattle, WA, USA',
+            'raw_response': {'address': {}},
+        }
+        with mock.patch(
+            'filepopulator.geocode.reverse_geocode_precise',
+            return_value=fake_result,
+        ):
+            call_command('backfill_geocoding')
+
+        self.assertEqual(GeocodeCache.objects.count(), 1)
+        img_a.refresh_from_db()
+        img_b.refresh_from_db()
+        self.assertIsNotNone(img_a.geocode)
+        self.assertEqual(img_a.geocode_id, img_b.geocode_id)
+        self.assertEqual(img_a.geocode.locality, 'Seattle')
+
+    def test_dry_run_writes_nothing(self):
+        from filepopulator.models import GeocodeCache
+        self._make_bare_image_file("/tmp/geocode_test/c.jpg", 47.6062, -122.3321)
+
+        call_command('backfill_geocoding', '--dry-run')
+
+        self.assertEqual(GeocodeCache.objects.count(), 0)
+
+    def test_failed_lookup_recorded_and_does_not_block_other_coordinates(self):
+        from filepopulator.models import GeocodeCache
+        img_fail = self._make_bare_image_file("/tmp/geocode_test/d.jpg", 47.6062, -122.3321)
+        img_ok = self._make_bare_image_file("/tmp/geocode_test/e.jpg", 45.5152, -122.6784)
+
+        fake_result = {
+            'locality': 'Portland', 'county': 'Multnomah', 'state': 'Oregon',
+            'country': 'United States', 'display_name': 'Portland, OR, USA',
+            'raw_response': {'address': {}},
+        }
+
+        def flaky_geocode(lat, lon):
+            if round(lat, 2) == 47.61:
+                raise RuntimeError("simulated Nominatim failure")
+            return fake_result
+
+        with mock.patch(
+            'filepopulator.geocode.reverse_geocode_precise',
+            side_effect=flaky_geocode,
+        ):
+            call_command('backfill_geocoding')
+
+        self.assertEqual(GeocodeCache.objects.count(), 2)
+        img_fail.refresh_from_db()
+        img_ok.refresh_from_db()
+        self.assertTrue(img_fail.geocode.lookup_failed)
+        self.assertFalse(img_ok.geocode.lookup_failed)
+        self.assertEqual(img_ok.geocode.locality, 'Portland')

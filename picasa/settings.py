@@ -134,6 +134,10 @@ LOCKFILE = '/locks/adding.lock' # path.join(PROJECT_ROOT, 'adding.lock')
 FACE_LOCKFILE = '/locks/face_add.lock'
 CLASSIFY_LOCKFILE = '/locks/classify.lock'
 DUPLICATES_FILE = '/code/duplicates.csv'
+
+# Nominatim's usage policy requires a real, identifying user agent -- it
+# rejects/blocks requests using geopy's generic default.
+NOMINATIM_USER_AGENT = 'django_picasa (self-hosted photo library, contact: ' + os.environ.get('NOMINATIM_CONTACT_EMAIL', 'unset@example.com') + ')'
 # if os.path.isfile(LOCKFILE):
 #     os.remove(LOCKFILE)
 
@@ -487,6 +491,10 @@ CELERY_BEAT_SCHEDULE = {
    'check_mods': {
         'task': 'filepopulator.check_mod_dates',
         'schedule': crontab(minute='0', hour = '23'),
+    },
+   'geocode_new_images': {
+        'task': 'filepopulator.geocode_new_images',
+        'schedule': crontab(minute='30', hour='*'),
     },
 #   'reencode_images': {
 #        'task': 'face_manager.reencode', 
