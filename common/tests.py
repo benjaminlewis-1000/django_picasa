@@ -33,7 +33,7 @@ class OpenImgOrientedTests(TestCase):
         # images gracefully, corrupted files actually raised an unguarded
         # OSError. Now that call is wrapped too, so this genuinely returns
         # None on failure as documented.
-        path = "/photos/corrupted/20220827_130217.jpg"
+        path = "/photos/corrupted/truncated_a.jpg"
         self.assertIsNone(open_img_oriented(path, as_numpy=True))
 
 

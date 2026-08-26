@@ -14,6 +14,15 @@ djangorestframework-simplejwt==5.5.1
 djangorestframework==3.18.0
 drf-url-filters==0.5.1
 editdistance==0.8.1
+# ExifRead and piexif aren't imported directly anywhere in this codebase --
+# they were removed as "zero references" in an earlier pass, which broke a
+# genuinely fresh `pip install` (only caught once CI actually ran on a clean
+# environment): gpsphoto's own setup.py doesn't declare install_requires at
+# all, but gpsphoto.py itself does `import exifread` and
+# `from piexif import load, dump` -- so they're required transitive
+# dependencies of a package we do use, not actually unused.
+ExifRead==3.5.1
+piexif==1.1.3
 flower==2.1.0
 gpsphoto==2.2.3
 gunicorn==26.1.0
