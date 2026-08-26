@@ -217,6 +217,30 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+**Where things stand (2026-08-26, end of session)**: `backend_upgrade` is pushed
+(`9475adf`) with three fixes made *after* HEIC/PR #44 was already merged to `master` and
+deployed — these are **not yet on `master`/deployed**:
+- RGBA-mode HEIC thumbnail crash (`filepopulator/models.py`)
+- `face_extraction` silently dying on every single scheduled hourly run (real, ongoing
+  production impact — see the "Fixed" entries below for the full diagnosis)
+- `create_image_file()`'s orientation-change branch: stale-face cleanup + a duplicate-`ImageFile`-row
+  bug (29 real duplicates confirmed in production, not yet cleaned up)
+
+**Next step when resuming**: open a PR for `9475adf` (backend_upgrade → master), same flow as
+PR #43/#44 — check CI, merge, redeploy `picasa_api`. Given `face_extraction` has apparently been
+failing on *every* run for a long time (confirmed via `picasa_debug.log`), this is a real,
+active production issue, not just cleanup — worth prioritizing the deploy once CI is green.
+
+**Outstanding/unresolved, not blocking a deploy:**
+- 29 duplicate `ImageFile` rows in production need manual cleanup (see the fix entry below for
+  the query and what needs deciding).
+- `classify_unassigned()` array-sizing bug (`face_manager/assign_faces.py`) — original
+  audit item, still open, unrelated to this session's later work.
+- Frontend "mark image for deletion" button — requested, not scoped (no visibility into the
+  slideshow frontend's code in this session).
+- Frontend "failed to open" image list — backend data ready (`image_load_failed`/
+  `FailedImageFile`), frontend work not started.
+
 - **Fixed (2026-08-25): `api/views.py`'s sentinel `Person` lookups crashed app startup on any
   DB without `.ignore`/`.realignore`/`BLANK_FACE_NAME` rows already present.** Found while
   getting CI (PR #43) to actually run — a genuinely fresh, empty CI database hits this on the
@@ -225,8 +249,6 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   before any test's sentinel-seeding has run. Production never noticed because those rows were
   seeded by hand once, long ago. Fixed by wrapping all three in `SimpleLazyObject`, deferring the
   query to first actual attribute access. Covered by `LazySentinelPersonTests` in `api/tests.py`.
-  auto-creating them via a migration — see the "sentinel `Person` rows ... auto-create via a data
-  migration" entry further down for how that was actually resolved the same day.
 - **DONE (2026-08-26): `backend_upgrade` merged into `master` (PR #43) and deployed to the live
   `picasa_api` container.** This closes out every "port to master and deploy" TODO that had
   accumulated in this file — the mobile-views split + `ResetFace`/`ConfidentUnlabeledView` fixes,
@@ -252,6 +274,59 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   `FailedImageFile.objects.all()` instead (no `ImageFile` row exists for these — one can't be
   created without a successful decode). The frontend should surface both so the user can go fix
   or remove the underlying files. Not started on the frontend side — noted here so it isn't lost.
+- **Fixed (2026-08-26): `face_manager.face_extraction` was silently dying on every single
+  scheduled run, not just occasionally.** Found by actually investigating a user-reported "only
+  processed 2 images" observation after the HEIC deploy. `face_manager/tasks.py`'s
+  `process_faces()` (the Celery task) wraps the entire run in a bare `except:` that only logs a
+  DEBUG-level "Ending face adding task" — checking `/var/log/picasa/picasa_debug.log` showed a
+  matching "Starting"/"Ending" pair for *every* hourly run going back through the whole log, with
+  no successful completions in between. Root cause, in
+  `face_manager/face_extract_encode.py`'s `update_list_of_no_matching_detects()`: each box
+  coordinate was only clamped on *one* side (`box_left`/`box_top` floored at 0 only,
+  `box_right`/`box_bottom` capped at the image's width/height only) — a face whose *stored* box
+  came from a different coordinate space than the image's current dimensions could clamp down to
+  `box_right <= box_left`, which `Face.save()` correctly rejects via `ValidationError`, killing
+  the whole run via the bare `except:` above. Confirmed against a real case
+  (`FastFoto_0248.jpg`, id 103837): traced via `reencoded`/`face_encoding` (128-d dlib vs 512-d
+  insightface) that the stale faces were insightface-era detections made *before* this session's
+  EXIF-orientation-consolidation fix, when `face_extract_encode.py`'s decode path
+  (`common.open_img_oriented()`) could disagree with `filepopulator`'s `_init_image()` about a
+  rotated image's true width/height. Fixed by detecting the still-degenerate case after clamping
+  and deleting that face outright (its geometry is fundamentally incompatible with the current
+  image, not just slightly out of bounds) instead of crashing the batch — a fresh detection pass
+  adds a correct one back if a real face is there. Scope checked: only 1 image / 2 faces
+  currently affected DB-wide, not a widespread problem. Covered by
+  `face_manager.tests.UpdateListOfNoMatchingDetectsTests`.
+- **Fixed (2026-08-26): `create_image_file()`'s orientation-change branch never cleared stale
+  `Face` rows, *and* silently created a duplicate `ImageFile` row instead of updating the
+  existing one.** Investigated per the user's specific question ("shouldn't reprocessing have
+  removed the faces?") while diagnosing the `face_extraction` crash above. Two separate bugs in
+  the "same pixel hash, different orientation" branch (`filepopulator/scripts.py`):
+  1. It reset `isProcessed=False` to trigger redetection but never deleted the image's existing
+     `Face` rows, which are stale under the *old* orientation/rotation — the same shape of bug
+     as the `face_extraction` crash above, just from the ingestion side. Fixed by deleting them
+     properly (`Face.delete()` per-instance, not a bulk queryset `.delete()`, so thumbnail files
+     on disk get cleaned up too) before marking for redetection.
+  2. `exist_photo = new_photo` reassigned to a freshly-constructed, *unsaved* instance (no pk) --
+     `instance_clean_and_save()`'s `.save()` therefore performed an INSERT, not an UPDATE,
+     silently leaving a second `ImageFile` row for the same filename (the original stayed
+     untouched and stale) instead of updating the one that actually exists. **Confirmed in
+     production: 29 filenames currently have exactly this kind of duplicate row.** Fixed by
+     preserving the original pk (`exist_photo.pk = old_pk`) and explicitly marking
+     `exist_photo._state.adding = False` (needed because `full_clean()`'s `validate_unique()`
+     otherwise treats reusing that pk as a collision with itself). This fix only stops *new*
+     duplicates from being created — the 29 existing ones are a separate data-cleanup question,
+     not yet addressed (need a decision on which of each duplicate pair to keep). Covered by
+     `filepopulator.tests.OrientationChangeReprocessTests`.
+- **TODO: clean up the 29 known duplicate `ImageFile` rows in production** (see the fix above —
+  this is the pre-existing data left over from before the fix, not something the fix itself
+  resolves). Query: `ImageFile.objects.values('filename').annotate(n=Count('id')).filter(n__gt=1)`.
+  Needs a decision on which row of each pair to keep (and what happens to `Face` rows/thumbnails
+  attached to the one being dropped) before doing anything destructive.
+- **TODO: frontend slideshow — add a "mark image for deletion" button.** Requested 2026-08-26;
+  not scoped yet (this project doesn't have visibility into the slideshow frontend's codebase in
+  this session — noted here so it isn't lost, needs its own design pass covering both the
+  frontend button/flow and whatever backend endpoint/state it needs).
 - **Remove the file-lock (`settings.LOCKFILE`) mechanism in `add_from_root_dir()`
   (`filepopulator/scripts.py`).** It's a plain `os.path.isfile()` check with no
   wait/retry/timeout, and no cleanup on crash — if a run dies or gets killed (`kill -9`, OOM,
