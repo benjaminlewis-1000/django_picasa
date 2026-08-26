@@ -352,6 +352,42 @@ class FaceExtractorCorruptedImageTests(TestCase):
         self.assertTrue(img_obj.isProcessed)
         self.assertGreaterEqual(Face.objects.filter(source_image_file=img_obj).count(), 1)
 
+    def test_failure_on_one_image_does_not_block_others(self):
+        """Regression test: the IOU-matching logic in
+        find_and_encode_faces() (everything after image load/detection --
+        computing IOU, matching existing faces to detections, and the
+        NotImplementedError/ValueError/bare-assert paths the original
+        author left for cases believed unreachable) used to have no
+        exception handling of its own. Any failure there -- one of those
+        specific cases, or any future unforeseen edge case -- propagated
+        out of the entire per-image loop and up into face_manager.tasks.
+        process_faces()'s outer bare except, silently aborting the
+        *entire* scheduled run: every other already-queued image would
+        never get attempted either. Now wrapped so a failure on one image
+        just skips it (left isProcessed=False to retry later) instead of
+        blocking every other image in the batch."""
+        path_a = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/has_face_tags.jpg"
+        path_b = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/has_same_faces.jpg"
+        create_image_file(path_a)
+        create_image_file(path_b)
+        img_a = ImageFile.objects.get(filename=path_a)
+        img_b = ImageFile.objects.get(filename=path_b)
+
+        original_add_new_face = FaceExtractor.add_new_face
+
+        def flaky_add_new_face(self, insight_detected_face, img_obj, img_numpy):
+            if img_obj.pk == img_a.pk:
+                raise RuntimeError("simulated IOU-matching crash")
+            return original_add_new_face(self, insight_detected_face, img_obj, img_numpy)
+
+        with patch.object(FaceExtractor, "add_new_face", flaky_add_new_face):
+            self.extractor.find_and_encode_faces()
+
+        img_a.refresh_from_db()
+        img_b.refresh_from_db()
+        self.assertFalse(img_a.isProcessed)
+        self.assertTrue(img_b.isProcessed)
+
 
 class UpdateListOfNoMatchingDetectsTests(TestCase):
     """Regression test for a fixed bug: update_list_of_no_matching_detects()
