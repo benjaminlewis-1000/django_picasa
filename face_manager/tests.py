@@ -28,6 +28,9 @@ from django.test import TestCase, override_settings, tag
 
 from django.core.management import call_command
 
+from unittest.mock import patch
+
+from face_manager.assign_faces import faceAssigner
 from face_manager.face_extract_encode import FaceExtractor
 from face_manager.models import Face, Person, get_default_blank_person
 from face_manager.pyramidal_detector import PyramidalDetector
@@ -504,3 +507,67 @@ class MergeAnotherIgnoreIntoIgnoreTests(TestCase):
         self.another_ignore_person.delete()
         call_command("merge_another_ignore_into_ignore", "--yes")
         self.assertTrue(Person.objects.filter(person_name=".ignore").exists())
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class ClassifyUnassignedArraySizingTests(TestCase):
+    """Regression test for a fixed bug: classify_unassigned()'s
+    metrics_array used to be sized to self.num_likely_people (the full
+    candidate roster) rather than len(candidate_ids) (this face's roster
+    minus whatever's already been rejected for it), leaving stale
+    np.zeros() padding in the tail rows whenever a rejection had shrunk the
+    candidate list. A real (negative) similarity could lose to that padded
+    0 in np.argmax(), which then indexed candidate_id_arr -- sized to the
+    *shrunk* list -- out of bounds, raising IndexError. Since execute()'s
+    per-face try/except was commented out, that IndexError aborted the
+    entire scheduled assign_faces run, not just this one face."""
+
+    def setUp(self):
+        self.assigner = faceAssigner()
+        self.person_a = make_person("Candidate A")
+        self.person_b = make_person("Candidate B")
+        self.assigner.likely_people_ids = [self.person_a.id, self.person_b.id]
+        self.assigner.num_likely_people = 2
+
+        self.query = np.zeros(512)
+        self.query[0] = 1.0
+
+        # Person A's only reference encoding points the opposite
+        # direction -- a real, negative cosine similarity, needed to make
+        # the stale zero padding (0.0) look like a better match than any
+        # real candidate under the old sizing bug.
+        ref_a = -self.query.copy()
+        self.assigner.embedding_dict = {self.person_a.id: ref_a.reshape(512, 1)}
+        self.assigner.norm_dict = {self.person_a.id: np.array([1.0])}
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+        self.face = make_face(img, declared_name=blank_person)
+        self.face.face_encoding_512 = self.query.tolist()
+        self.face.save()
+
+    def test_shrunk_candidate_list_does_not_raise_indexerror(self):
+        # Reject person_b and the ignore person -- only person_a is left
+        # as a real candidate, but the array used to still be sized for
+        # both likely people (self.num_likely_people == 2).
+        self.face.rejected_fields = [self.person_b.id, self.assigner.ignore_person_id]
+        self.face.save()
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            self.assigner.classify_unassigned(self.face)
+
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, self.person_a.id)
+
+    def test_all_candidates_rejected_assigns_to_ignore_without_crashing(self):
+        # Every likely person has been rejected for this face -- candidate_ids
+        # is empty. Must not attempt any similarity math (which would raise
+        # ValueError on a size-0 array reduction) and must not crash.
+        self.face.rejected_fields = [self.person_a.id, self.person_b.id]
+        self.face.save()
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            self.assigner.classify_unassigned(self.face)
+
+        mock_set.assert_called_once_with(self.assigner.ignore_person_id, 1, 1.0)
