@@ -16,6 +16,8 @@ import random
 from time import sleep
 from PIL import Image
 import unittest
+from unittest import mock
+import pillow_heif
 
 # Create your tests here.
 
@@ -950,51 +952,106 @@ class CorruptedImageIngestionTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT='/tmp/filepopulator_test_media')
-class HeicSupportStubTests(TestCase):
-    """HEIC isn't supported yet -- see CLAUDE.md "Planned work". These
-    document today's actual behavior (silently ignored) as a baseline, plus
-    a skipped stub marking the desired future behavior so there's an
-    obvious place to start once HEIC support is added. Fixture files are
-    real .heic photos in
+class HeicIngestionTests(TestCase):
+    """HEIC (Apple's default photo format since iOS 11) support.
+
+    HEIC_DIR mirrors real fixture data locally: 8 real iPhone photos
+    (models 12 through 17 Pro) at
     /mnt/fast_storage/appdata/django_picasa/test_suite/heic_images/,
-    mounted read-only under /photos/heic_stub."""
+    mounted read-only under /photos/heic_stub. CI only has the single
+    synthetic no-EXIF stub from ci_fixtures/heic_stub/ (see
+    generate_fixtures.py) -- tests here work with "whatever's present"
+    rather than assuming a specific count or specific metadata, so they
+    hold in both environments.
+
+    Verified empirically (see CLAUDE.md) against all 8 real samples:
+    pillow_heif/libheif always decodes to plain RGB, and always reports
+    EXIF orientation 1 regardless of the photo's actual portrait/
+    landscape framing -- meaning it auto-applies any container-level
+    rotation transform during decode and resets the tag to match. The
+    guards below assume that continues to hold for any real-world HEIC
+    this pipeline ever sees, and fail loudly (recorded via
+    FailedImageFile/image_load_failed, not silently) rather than risk a
+    silently wrong rotation if it ever doesn't.
+    """
 
     HEIC_DIR = '/photos/heic_stub'
 
     def tearDown(self):
         for obj in ImageFile.objects.all():
             obj.delete()
+        FailedImageFile.objects.all().delete()
 
-    def test_heic_file_is_silently_ignored_by_create_image_file(self):
-        heic_files = sorted(os.listdir(self.HEIC_DIR))
+    def _heic_files(self):
+        return [
+            f for f in sorted(os.listdir(self.HEIC_DIR))
+            if f.lower().endswith(('.heic', '.heif'))
+        ]
+
+    def test_ingests_every_heic_fixture_successfully(self):
+        heic_files = self._heic_files()
         self.assertGreaterEqual(len(heic_files), 1)
-        path = os.path.join(self.HEIC_DIR, heic_files[0])
+        for filename in heic_files:
+            path = os.path.join(self.HEIC_DIR, filename)
+            create_image_file(path)
+            img = ImageFile.objects.filter(filename=path).first()
+            self.assertIsNotNone(img, f"{filename} was not ingested")
+            self.assertEqual(img.orientation, 1)
+            self.assertGreater(img.width, 0)
+            self.assertGreater(img.height, 0)
+            self.assertTrue(os.path.isfile(img.thumbnail_big.path))
 
-        # create_image_file()'s own extension check (`.lower().endswith`-
-        # style regex requiring jpg/jpeg) returns early for a .heic path --
-        # no exception, no ImageFile row, no error logged anywhere a human
-        # would see it.
-        create_image_file(path)
-        self.assertFalse(ImageFile.objects.filter(filename=path).exists())
-
-    def test_add_from_root_dir_never_looks_at_heic_files_at_all(self):
-        # add_from_root_dir() filters to `.jpg`/`.jpeg` before even
-        # building its file list (see the `f.lower().endswith(('.jpg',
-        # '.jpeg'))` check), so .heic files aren't just rejected -- they're
-        # invisible to the whole ingestion pipeline from the start.
+    def test_add_from_root_dir_discovers_heic_files(self):
+        # Regression test for a fixed bug: add_from_root_dir() used to
+        # filter to `.jpg`/`.jpeg` before even building its file list, so
+        # .heic files were invisible to the whole ingestion pipeline from
+        # the start, not just rejected.
         add_from_root_dir(self.HEIC_DIR)
-        self.assertEqual(ImageFile.objects.count(), 0)
+        self.assertEqual(ImageFile.objects.count(), len(self._heic_files()))
 
-    @unittest.skip(
-        "HEIC support not implemented yet -- see CLAUDE.md 'Planned work'. "
-        "Once ImageFile.filename's RegexValidator and create_image_file()'s "
-        "extension check accept .heic (and the EXIF/thumbnail pipeline can "
-        "decode it), un-skip this and assert a real ImageFile row gets "
-        "created with correct thumbnails, same as a .jpg."
-    )
-    def test_heic_file_gets_ingested_like_a_jpeg(self):
-        heic_files = sorted(os.listdir(self.HEIC_DIR))
-        path = os.path.join(self.HEIC_DIR, heic_files[0])
-        create_image_file(path)
-        obj = ImageFile.objects.get(filename=path)
-        self.assertTrue(os.path.isfile(obj.thumbnail_big.path))
+    def test_gps_decimal_conversion_is_sane_when_present(self):
+        # Not every fixture (or CI's synthetic stub) has GPS data -- only
+        # assert against ones that actually do.
+        found_any = False
+        for filename in self._heic_files():
+            path = os.path.join(self.HEIC_DIR, filename)
+            create_image_file(path)
+            img = ImageFile.objects.get(filename=path)
+            if img.gps_lat_decimal == -999 and img.gps_lon_decimal == -999:
+                # -999 is ImageFile's own "no GPS data" sentinel default.
+                continue
+            found_any = True
+            self.assertGreaterEqual(img.gps_lat_decimal, -90)
+            self.assertLessEqual(img.gps_lat_decimal, 90)
+            self.assertGreaterEqual(img.gps_lon_decimal, -180)
+            self.assertLessEqual(img.gps_lon_decimal, 180)
+        if not found_any:
+            self.skipTest("no fixture in HEIC_DIR has GPS data (expected for CI's synthetic stub)")
+
+    def test_orientation_guard_fails_loudly_on_non_one_orientation(self):
+        path = os.path.join(self.HEIC_DIR, self._heic_files()[0])
+
+        class FakeExif(dict):
+            def get_ifd(self, tag):
+                return {}
+
+        fake_exif = FakeExif({274: 6})  # Orientation tag id = 274
+        with mock.patch("PIL.Image.Image.getexif", return_value=fake_exif):
+            create_image_file(path)
+
+        self.assertFalse(ImageFile.objects.filter(filename=path).exists())
+        failed = FailedImageFile.objects.get(filename=path)
+        self.assertIn("orientation", failed.error_message.lower())
+
+    def test_multi_frame_guard_fails_loudly(self):
+        path = os.path.join(self.HEIC_DIR, self._heic_files()[0])
+
+        with mock.patch.object(
+            pillow_heif.HeifImageFile, "n_frames",
+            new_callable=mock.PropertyMock, return_value=3,
+        ):
+            create_image_file(path)
+
+        self.assertFalse(ImageFile.objects.filter(filename=path).exists())
+        failed = FailedImageFile.objects.get(filename=path)
+        self.assertIn("frames", failed.error_message.lower())
