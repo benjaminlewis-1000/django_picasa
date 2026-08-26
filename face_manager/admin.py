@@ -25,7 +25,7 @@ class FaceAdmin(admin.ModelAdmin):
     # Set empty value
     empty_value_display = '-empty-'
 
-    readonly_fields=('source_image_file', 'face_encoding', 'poss_ident1', \
+    readonly_fields=('source_image_file', 'poss_ident1', \
         'poss_ident2', 'poss_ident3', 'poss_ident4', 'poss_ident5', 'box_top', \
         'box_left', 'box_right', 'box_bottom', 'written_to_photo_metadata', \
         'face_thumbnail')
@@ -42,7 +42,7 @@ class FaceAdmin(admin.ModelAdmin):
         # A few advanced options that we generally don't need to see.
         ('Advanced options', {
             'classes': ('collapse',),
-            'fields': ('box_top','box_bottom', 'box_left', 'box_right', 'face_encoding'),
+            'fields': ('box_top','box_bottom', 'box_left', 'box_right'),
         }),
     )
 

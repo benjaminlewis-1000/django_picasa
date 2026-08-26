@@ -575,8 +575,7 @@ class FaceExtractor(object):
         # print(detected_gender, detected_age)
         
         new_face = Face()
-        
-        new_face.face_encoding = None # Not using this right now.
+
         new_face.face_encoding_512 = insight_detected_face['embedding'].tolist()
         new_face.declared_name = self.blank_face_person
         new_face.written_to_photo_metadata = False

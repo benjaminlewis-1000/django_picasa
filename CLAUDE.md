@@ -217,6 +217,17 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+- **Removed `Face.face_encoding` (legacy 128-d dlib embedding), 2026-08-26.** Superseded by
+  `face_encoding_512` (insightface) for years — the live pipeline (`face_extract_encode.py`)
+  already hadn't written a real value to it, explicitly setting it to `None`. Freed ~371MB in
+  production (`face_manager_face` was ~2.5GB, almost entirely its two embedding array columns).
+  Updated the two live references (`face_extract_encode.py`, `face_manager/admin.py`). **Left
+  broken, not fixed**: `face_manager/scripts.py` (dead code path, only reachable via unscheduled
+  commands `test_broken_face_files.py`/`process_test.py`/`db_faces_to_xmp.py`),
+  `feature_vecs_for_snn.py`, `rescan_image_features.py`, and everything under
+  `management/commands/deprecated/` all still read/write `face_encoding` and will error if run —
+  none are part of the scheduled Celery pipeline, so this was a deliberate scope decision rather
+  than an oversight.
 - **TODO: `faceAssigner.execute()` (`face_manager/assign_faces.py`) never initializes
   `self.embedding_dict`/`self.norm_dict`/`self.candidate_dict` when there are <= 100 unassigned
   faces to classify** — `load_encodings()` (the only thing that sets them) is only called when

@@ -147,11 +147,7 @@ class Face(models.Model):
     dateTakenUTC = models.FloatField(default=0)
 
     reencoded = models.BooleanField(default=False)
-    face_encoding = ArrayField(
-                            models.FloatField(),
-                            size=128, blank=True, null=True
-                        )
-    
+
     face_encoding_512 = ArrayField(
                             models.FloatField(),
                             size=512, blank=True, null=True
