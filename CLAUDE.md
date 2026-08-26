@@ -217,6 +217,30 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+**Where things stand (2026-08-26, end of session)**: `backend_upgrade` is pushed
+(`9475adf`) with three fixes made *after* HEIC/PR #44 was already merged to `master` and
+deployed — these are **not yet on `master`/deployed**:
+- RGBA-mode HEIC thumbnail crash (`filepopulator/models.py`)
+- `face_extraction` silently dying on every single scheduled hourly run (real, ongoing
+  production impact — see the "Fixed" entries below for the full diagnosis)
+- `create_image_file()`'s orientation-change branch: stale-face cleanup + a duplicate-`ImageFile`-row
+  bug (29 real duplicates confirmed in production, not yet cleaned up)
+
+**Next step when resuming**: open a PR for `9475adf` (backend_upgrade → master), same flow as
+PR #43/#44 — check CI, merge, redeploy `picasa_api`. Given `face_extraction` has apparently been
+failing on *every* run for a long time (confirmed via `picasa_debug.log`), this is a real,
+active production issue, not just cleanup — worth prioritizing the deploy once CI is green.
+
+**Outstanding/unresolved, not blocking a deploy:**
+- 29 duplicate `ImageFile` rows in production need manual cleanup (see the fix entry below for
+  the query and what needs deciding).
+- `classify_unassigned()` array-sizing bug (`face_manager/assign_faces.py`) — original
+  audit item, still open, unrelated to this session's later work.
+- Frontend "mark image for deletion" button — requested, not scoped (no visibility into the
+  slideshow frontend's code in this session).
+- Frontend "failed to open" image list — backend data ready (`image_load_failed`/
+  `FailedImageFile`), frontend work not started.
+
 - **Fixed (2026-08-25): `api/views.py`'s sentinel `Person` lookups crashed app startup on any
   DB without `.ignore`/`.realignore`/`BLANK_FACE_NAME` rows already present.** Found while
   getting CI (PR #43) to actually run — a genuinely fresh, empty CI database hits this on the
