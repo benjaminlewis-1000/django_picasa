@@ -15,8 +15,8 @@ picasa/adding.lock
 picasa/static/*
 static/*
 *.jpg
+!ci_fixtures/**/*.jpg
 *.pyc
-*/migrations/*
 media/*
 gdrive_credentials.json
 *.npy

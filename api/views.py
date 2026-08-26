@@ -7,6 +7,7 @@ from django.contrib.auth import logout as django_logout
 from django.contrib.auth.models import User, Group
 from django.core.files.base import ContentFile
 from django.core.paginator import Paginator
+from django.db import connections
 from django.db.models import Count
 from django.db.models import Q
 from django.http import HttpResponse, Http404
@@ -26,6 +27,7 @@ from rest_framework.response import Response
 from rest_framework.reverse import reverse, reverse_lazy
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
+from django.utils.functional import SimpleLazyObject
 from face_manager.tasks import api_bulk_operation
 from time import sleep
 import api.serializers as api_ser
@@ -55,8 +57,20 @@ background_queue = Queue()
 # 1.0 = crop tight to the face, 1.5 = 50% more space on each side.
 HIGHLIGHT_PADDING_FACTOR = 1.6
 
-soft_ignore_person = Person.objects.filter(person_name='.ignore')[0]
-hard_ignore_person = Person.objects.filter(person_name='.realignore')[0]
+# Lazy rather than a plain module-level query: this module gets imported at
+# Django startup (URL resolution, system checks) well before any request --
+# and before any test's setUp has had a chance to seed these sentinel Person
+# rows. An eager query here crashed the entire app on any DB that doesn't
+# already have '.ignore'/'.realignore'/BLANK_FACE_NAME rows -- which includes
+# every fresh install and every CI run (production only avoided this because
+# someone seeded them by hand once). SimpleLazyObject defers the query to
+# first actual attribute access, by which point the DB is guaranteed to be
+# ready. See CLAUDE.md's "Bootstrapping a fresh DB from scratch" note --
+# this stops the crash but doesn't auto-create the rows themselves, which is
+# a separate gap.
+soft_ignore_person = SimpleLazyObject(lambda: Person.objects.filter(person_name='.ignore')[0])
+hard_ignore_person = SimpleLazyObject(lambda: Person.objects.filter(person_name='.realignore')[0])
+blank_person = SimpleLazyObject(lambda: Person.objects.filter(person_name=settings.BLANK_FACE_NAME)[0])
 
 def bulk_thread(dataframe: dict):
     # print("Got a data load of ", dataframe)
@@ -77,8 +91,15 @@ def bulk_thread(dataframe: dict):
         assert type(face_id) is int
         try:
             face = Face.objects.get(id=face_id)
-        except:
+        except Face.DoesNotExist:
+            # Missing `continue` used to let execution fall through to the
+            # operation branches below with `face` either unbound (first
+            # iteration) or still holding the *previous* iteration's Face
+            # (later iterations) -- silently operating on the wrong face,
+            # or raising UnboundLocalError, either way swallowed by
+            # background_bulk_processor()'s blanket except.
             print(f"Face not found for ID {face_id}")
+            continue
 
         if operation == 'close_unassigned':
             # Previously /api/face_id/ignore_face with {ignore_type: 'soft'}
@@ -96,7 +117,32 @@ def bulk_thread(dataframe: dict):
                 print("Person currently assigned is not .ignore or .realignore.")
         elif operation == 'close_assigned':
             # Previously /api/face_id/reject_association with {unassociate_id: current_person_id}
-            face.reject_association(current_person_id)
+            #
+            # reject_association() only knows how to cross a candidate off
+            # the face's poss_identN "possible match" list - it asserts
+            # current_person_id is one of those candidates, which is only
+            # true when this is declining a proposed match. "Remove from
+            # person" (and undoing a confirm) fire this operation on faces
+            # that are already DECLARED to current_person_id instead -
+            # never in poss_identN - so that assert used to raise every
+            # time, get silently swallowed by background_bulk_processor's
+            # except below, and the face never actually moved. Route based
+            # on which of the two cases this actually is.
+            possible_ids = [pid for pid in (
+                face.poss_ident1_id, face.poss_ident2_id, face.poss_ident3_id,
+                face.poss_ident4_id, face.poss_ident5_id,
+            ) if pid is not None]
+            if current_person_id in possible_ids:
+                # Declining a proposed candidate match - original behavior.
+                face.reject_association(current_person_id)
+            elif face.declared_name_id == current_person_id:
+                # Actually declared to this person - peel off the declared
+                # name tag itself, same mechanism close_unassigned uses to
+                # reassign a face to '.ignore'.
+                face.associate_person(blank_person.id)
+            else:
+                print(f"close_assigned: face {face.id} is neither declared to nor "
+                      f"has a possible match for person {current_person_id} - no-op.")
         elif operation == 'confirm_proposed':
             # Update the face object fields accordingly
             face.associate_person(current_person_id)
@@ -107,6 +153,16 @@ def background_bulk_processor():
     print("Background processor initiating")
     while True:
         if background_queue.empty():
+            # Close any DB connection this thread opened while handling the
+            # last item -- Django only auto-closes connections at the end
+            # of a normal request/response cycle, which this loop never
+            # participates in. Left open, it holds a connection to
+            # whatever database is active (including a test run's
+            # test_picasa) indefinitely, which made `manage.py test`'s own
+            # teardown fail with "database is being accessed by other
+            # users" even after the thread itself stopped blocking process
+            # exit (see the daemon=True note below).
+            connections.close_all()
             time.sleep(1)
         else:
             try:
@@ -119,7 +175,14 @@ def background_bulk_processor():
 
 
     
-work_thread = threading.Thread(target=background_bulk_processor)
+# daemon=True: this loop is meant to run forever in the background, never
+# to keep the interpreter alive on its own. A non-daemon thread here used
+# to block manage.py test/CI's process exit indefinitely after tests
+# finished -- Python won't exit while a non-daemon thread is alive, and
+# this thread's held-open DB connection also made the test runner's
+# post-run `DROP DATABASE test_picasa` fail with "being accessed by other
+# users". See CLAUDE.md's "Testing gotcha" note.
+work_thread = threading.Thread(target=background_bulk_processor, daemon=True)
 work_thread.start()
 
 def render_404(request, message):
@@ -787,38 +850,6 @@ class FaceViewSet(viewsets.ModelViewSet):
         js = {'job_submitted': True}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
-    @action(detail=True, methods=['patch', 'put'])
-    def reject_association_app_api(self, request, pk=None):
-        # Accessible as <root>/api/faces/<face_id>/reject_association_app_api/
-        # Accept: HTML PATCH
-        # Body parameter : unassociate_id (person_id)
-        # Given the face, remove association to the given
-        # person and add the person_id to the rejected_fields. 
-        
-        # print(request.data, request.data.keys())
-        def err_404(message=""):
-            msg_start = f'Invalid reject association request. \n\n'
-            msg_start += message
-            err_404 = render_404(request, msg_start)
-            return err_404
-
-        if 'unassociate_id' not in request.data.keys():
-            return err_404("unassociate_id not set in body")
-        else:
-            unassociate_id = request.data['unassociate_id']
-
-        try:
-            unassociate_id = int(unassociate_id)
-        except:
-            return err_404("unassociate_id passed was not an integer.")
-
-        face = self.get_object()
-        
-        face.reject_association(unassociate_id)
-
-        js = {'success': True}
-        return HttpResponse(json.dumps(js), content_type='application/json')
-
 class KeyedImageView(APIView):
 
     permission_classes = [AllowAny]
@@ -1005,7 +1036,15 @@ class filteredImagesView(APIView):
                     p_query = p_query | years_query
 
             print(p_query)
-            obj = ImageFile.objects.filter(p_query).exclude(face__declared_name__person_name='Charlotte Lewis').distinct().order_by('dateTaken').values_list('id', 'dateTaken')
+            if p_query is None:
+                # Query params were present but none were 'people'/
+                # 'year_start'/'year_end' (e.g. just '?key=...') -- p_query
+                # never got built. Fall back to "all images", same as the
+                # no-params case above, rather than calling
+                # ImageFile.objects.filter(None), which raises TypeError.
+                obj = ImageFile.objects.all().order_by('dateTaken').values_list('id', 'dateTaken')
+            else:
+                obj = ImageFile.objects.filter(p_query).exclude(face__declared_name__person_name='Charlotte Lewis').distinct().order_by('dateTaken').values_list('id', 'dateTaken')
 
         ids = list(([o[0] for o in obj]))
         dates = list(([o[1].isoformat() for o in obj]))
@@ -1113,111 +1152,5 @@ class StatsViewSet(viewsets.ViewSet):
         return Response(stat_serializer.data)
 
 
-
-class ConfidentUnlabeledView(APIView):
-
-    permission_classes = (IsAuthenticated,)
-
-    def get(self, request, *args, **kwargs):
-
-        # host_url = f'https://{request.get_host()}'
-        # print(host_url)
-        unlabeled = Face.objects.filter(declared_name__person_name=settings.BLANK_FACE_NAME).order_by('-weight_1')
-        first = unlabeled[0].weight_1
-        last = unlabeled.last().weight_1
-        assert first >= last
-        unlabeled_ids = unlabeled.values_list('id', flat=True)
-#        print(unlabeled_ids[:5])
-        
-        js = {'unlabeled_ids': list(unlabeled_ids)}
-        print(HttpResponse(json.dumps(js), content_type='application/json'))
-        return HttpResponse(json.dumps(js), content_type='application/json') 
-
-class UnlabeledMobileInfo(APIView):
-
-    # Take a single Face ID from the list returned by ConfidentUnlabeledView,
-    # and build all the data it would require to put that image on a page / 
-    # app screen with possible names and the URLs to assign the face that name.
-    permission_classes = (IsAuthenticated,)
-
-    def get(self, request, *args, **kwargs):
-        
-        selected_id = kwargs['id']
-
-        host_url = f'https://{request.get_host()}/api'
-        
-        # Get: URL for full size image
-        # URL for small image (face_array)
-        # URL for large image (face_source)
-        # URL to assign the face to no-one.
-        # Names for various assignments and the URL and payload
-        # to assign the person to that. 
-
-        face_img = f"{host_url}/keyed_image/face_array/?id={selected_id}&access_key={settings.RANDOM_ACCESS_KEY}"
-        whole_img = f"{host_url}/keyed_image/face_source/?id={selected_id}&access_key={settings.RANDOM_ACCESS_KEY}"
-        ignore_url = f"{host_url}/faces/{selected_id}/ignore_face/"
-        ignore_payload = {'ignore_type': 'soft'}
-
-        face_object = Face.objects.get(id = selected_id)
-
-        people_foreign_keys = [face_object.poss_ident1, \
-            face_object.poss_ident2, \
-            face_object.poss_ident3, \
-            face_object.poss_ident4, \
-            face_object.poss_ident5, ]
-
-        names = []
-        for idx in range(len(people_foreign_keys)):
-            weight = face_object.__dict__[f'weight_{idx + 1}']
-            # Can't get a foreign key from the __dict__, so 
-            # use the list above
-            
-            person = people_foreign_keys[idx]
-            if person is not None:
-                name = person.person_name
-                pid = person.id
-                # store.get('api_url') + '/faces/' + faceId + '/assign_face_to_person/
-                person_info = {
-                    'name': name,
-                    'confirm_patch_url': f"{host_url}/faces/{selected_id}/assign_face_to_person/",
-                    'confirm_patch_data': {'declared_name_key': pid},
-                    'disassociate_patch_url': f"{host_url}/faces/{selected_id}/reject_association_app_api/",
-                    'person_id': pid,
-                    'weight': weight,
-                }
-                names.append(person_info)
-
-        js = {'face_img_url': face_img,
-              'source_img_url': whole_img,
-              'names': names,
-              'ignore_url': ignore_url,
-              'ignore_payload': ignore_payload,
-              } 
-
-        return HttpResponse(json.dumps(js), content_type='application/json') 
-
-class ResetFace(APIView):
-
-    # Given a Face ID, reset it - make sure that there are no assigned names for that
-    # face. It will trigger a re-classification. 
-    permission_classes = (IsAuthenticated,)
-
-    @action(detail=True, methods=['patch', 'put'])
-    def patch(self, request, *args, **kwargs):
-        
-        selected_id = kwargs['id']
-
-        face_object = Face.objects.get(id = selected_id)
-        face_object.clear_person()
-
-class MobileNameList(APIView):
-    # Get a list of all defined person names.
-    permission_classes = (IsAuthenticated,)
-
-    def get(self, request, *args, **kwargs):
-        print("here")
-
-        js = {'name_list': ['a', 'b', 'c', 'd']}
-        print(js)
-        print(HttpResponse(json.dumps(js), content_type='application/json'))
-        return HttpResponse(json.dumps(js), content_type='application/json') 
+# Mobile-app-facing views (ConfidentUnlabeledView, UnlabeledMobileInfo,
+# ResetFace, MobileNameList) live in api/mobile_views.py, not here.

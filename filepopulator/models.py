@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 from fractions import Fraction
 from dateutil import parser
+import common
 
 # Image thumbnail processing
 
@@ -98,24 +99,24 @@ class Directory(models.Model):
     def average_date_taken(self):
         img_dates = self.__get_filtered_img_dates__()
         if img_dates is None:
-            # self.mean_datesec = datetime.fromtimestamp(timezone.now(), timezone.utc)
+            # self.mean_datesec = datetime.fromtimestamp(timezone.now(), pytz.utc)
             self.mean_datesec = time.mktime(datetime.now().timetuple()) # datetime.now().total_seconds()
-            self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, timezone.utc)
+            self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, pytz.utc)
         else:
             self.mean_datesec = float(np.mean(img_dates))
-            self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, timezone.utc)
+            self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, pytz.utc)
 
     def beginning_date_taken(self):
         img_dates = self.__get_filtered_img_dates__()
         if img_dates is None:
-            # self.first_datesec = datetime.fromtimestamp(timezone.now(), timezone.utc)
-            self.first_datesec = time.mktime(datetime.now().timetuple()) # datetime.fromtimestamp(timezone.now(), timezone.utc)
-            self.first_datetime = datetime.fromtimestamp(self.mean_datesec, timezone.utc)
+            # self.first_datesec = datetime.fromtimestamp(timezone.now(), pytz.utc)
+            self.first_datesec = time.mktime(datetime.now().timetuple()) # datetime.fromtimestamp(timezone.now(), pytz.utc)
+            self.first_datetime = datetime.fromtimestamp(self.mean_datesec, pytz.utc)
         else:
             img_dates.sort()
             first_date = img_dates[0]
             self.first_datesec = int(first_date)
-            self.first_datetime = datetime.fromtimestamp(self.first_datesec, timezone.utc)
+            self.first_datetime = datetime.fromtimestamp(self.first_datesec, pytz.utc)
     
 def thumbnail_big_path(instance, filename):
     first_dir = filename[:2]
@@ -135,7 +136,31 @@ def thumbnail_small_path(instance, filename):
 class DuplicateFile(models.Model):
     filename = models.CharField(max_length=1024)
 
-# Lots ripped from https://github.com/hooram/ownphotos/blob/dev/api/models.py 
+
+class FailedImageFile(models.Model):
+    # Tracks a file that has never successfully been ingested into
+    # ImageFile -- e.g. corrupted/truncated from the moment it appeared in
+    # the photo tree. A real ImageFile row can't be created for these:
+    # ImageFile.save() requires a successful decode to populate
+    # width/height/thumbnails. A previously-good ImageFile that later
+    # becomes corrupted is tracked differently -- via its own
+    # image_load_failed/image_load_error fields, since a full row already
+    # exists for it. A future frontend view is planned to list files from
+    # both sources for cleanup (see CLAUDE.md's Planned work).
+    filename = models.CharField(max_length=1024, unique=True)
+    error_message = models.TextField()
+    # os.path.getctime() at the time of the failed attempt -- lets
+    # add_from_root_dir() tell "still the same broken file, don't retry
+    # every run" apart from "file was replaced/fixed, retry it".
+    file_mod_time = models.FloatField()
+    first_failed_at = models.DateTimeField(auto_now_add=True)
+    last_attempted_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"FailedImageFile({self.filename})"
+
+
+# Lots ripped from https://github.com/hooram/ownphotos/blob/dev/api/models.py
 class ImageFile(models.Model):
 
     filename = models.CharField(max_length=1024, validators=[RegexValidator(regex=r"\.[j|J][p|P][e|E]?[g|G]$", message="Filename must be a JPG")], db_index = True)
@@ -190,6 +215,14 @@ class ImageFile(models.Model):
     # isProcessed -- whether the photo has had faces detected.
     isProcessed = models.BooleanField(default=False)
     orientation = models.IntegerField(default=-8008)
+
+    # Set when the underlying file failed to open/decode -- e.g. a
+    # corrupted or truncated JPEG. Generic (not tied to face extraction
+    # specifically) since both face_manager's extraction pipeline and
+    # filepopulator's own ingestion can hit this on the same file; a
+    # future frontend view is planned to list these for cleanup.
+    image_load_failed = models.BooleanField(default=False)
+    image_load_error = models.TextField(null=True, blank=True)
 
     # For storing tags
     tags = ArrayField(
@@ -405,30 +438,14 @@ class ImageFile(models.Model):
         self.dateAdded = timezone.now()
 
 
-        # If no ExifTags, no rotating needed.
+        # Rotate depending on orientation. Shared with common/
+        # open_img_oriented.py's apply_exif_orientation() -- this used to
+        # be its own separate (and correct) implementation of the same
+        # 8-value transform; now both call the one shared function.
         try:
-            # Grab orientation value.
-            # Already done in _init_image()
-
-            # Rotate depending on orientation.
-            if self.orientation == 2:
-                self.image = self.image.transpose(PIL.Image.FLIP_LEFT_RIGHT)
-            if self.orientation == 3:
-                self.image = self.image.transpose(PIL.Image.ROTATE_180)
-            if self.orientation == 4:
-                self.image = self.image.transpose(PIL.Image.FLIP_TOP_BOTTOM)
-            if self.orientation == 5:
-                self.image = self.image.transpose(PIL.Image.FLIP_LEFT_RIGHT).transpose(
-                    PIL.Image.ROTATE_90)
-            if self.orientation == 6:
-                self.image = self.image.transpose(PIL.Image.ROTATE_270)
-            if self.orientation == 7:
-                self.image = self.image.transpose(PIL.Image.FLIP_TOP_BOTTOM).transpose(
-                    PIL.Image.ROTATE_90)
-            if self.orientation == 8:
-                self.image = self.image.transpose(PIL.Image.ROTATE_90)
+            self.image = common.apply_exif_orientation(self.image, self.orientation)
         except:
-            # Orientation 1 
+            # Orientation 1
             pass
 
         self.width, self.height = self.image.size
@@ -445,6 +462,17 @@ class ImageFile(models.Model):
             self.pixels = cv2.imread(self.filename)
         except PIL.Image.DecompressionBombError as bomberror:
             self.pixels = cv2.imread(self.filename)
+        except OSError as oe:
+            # A corrupted/truncated JPEG -- np.array(self.image) is where
+            # PIL's lazy decode actually happens and raises. Fall back to
+            # cv2.imread() the same way the other except branches above do;
+            # it sometimes succeeds where PIL doesn't. If it can't either,
+            # raise a clear, callers-can-catch-this OSError instead of the
+            # cryptic AttributeError that self.pixels.reshape(-1) below
+            # would otherwise raise on a None result.
+            self.pixels = cv2.imread(self.filename)
+            if self.pixels is None:
+                raise OSError(f"Could not decode image pixels for {self.filename}: {oe}") from oe
 
         arr = self.pixels.reshape(-1)
         # arr = arr[::500]
@@ -579,6 +607,20 @@ class ImageFile(models.Model):
         super(ImageFile, self).save(*args, **kwargs)
 
     def delete(self):
+        # Face.source_image_file references this ImageFile with
+        # on_delete=CASCADE. Django's cascade-delete collector removes
+        # those Face rows with a bulk SQL DELETE, which does NOT call each
+        # Face's overridden delete() (the one that removes its
+        # face_thumbnail file from disk) -- so those thumbnail files were
+        # being silently orphaned on disk every time an ImageFile was
+        # deleted this way (e.g. delete_removed_photos(), run on every
+        # scheduled ingestion pass for photos that vanished from disk).
+        # Import here, not at module level, to avoid a circular import --
+        # face_manager/models.py already imports filepopulator.
+        from face_manager.models import Face
+        for face in Face.objects.filter(source_image_file=self):
+            face.delete()
+
         # file = ImageFile.objects.filter(id=self.id)
         # os.remove(file[0].thumbnail_small.path)
         try:

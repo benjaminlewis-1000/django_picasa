@@ -2,6 +2,7 @@
 from django.conf.urls import include
 from rest_framework import routers
 from api import views
+from api import mobile_views
 from django.urls import path
 from rest_framework.authtoken.views import obtain_auth_token  # <-- Here
 from rest_framework_simplejwt import views as jwt_views
@@ -39,8 +40,8 @@ urlpatterns = [
     path(r'keyed_image/<slug:type>/', views.KeyedImageView.as_view(), name='keyed_image'),
     path(r'authelia_state/', views.AutheliaStateView.as_view(), name='authelia_state'),
     path(r'clean_logout/', views.CleanLogoutView.as_view(), name='clean_logout'),
-    path(r'mobile/confident_unlabeled/', views.ConfidentUnlabeledView.as_view(), name='unlabeled'),
-    path(r'mobile/unlabeled_instance/<int:id>/', views.UnlabeledMobileInfo.as_view(), name='unlabeled_instances'),
-    path(r'mobile/reset/<int:id>/', views.ResetFace.as_view(), name='reset'),
-    path(r'mobile/name_list/', views.MobileNameList.as_view(), name='name_list'),
+    path(r'mobile/confident_unlabeled/', mobile_views.ConfidentUnlabeledView.as_view(), name='unlabeled'),
+    path(r'mobile/unlabeled_instance/<int:id>/', mobile_views.UnlabeledMobileInfo.as_view(), name='unlabeled_instances'),
+    path(r'mobile/reset/<int:id>/', mobile_views.ResetFace.as_view(), name='reset'),
+    path(r'mobile/name_list/', mobile_views.MobileNameList.as_view(), name='name_list'),
 ]

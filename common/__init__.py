@@ -1,1 +1,1 @@
-from .open_img_oriented import open_img_oriented
+from .open_img_oriented import open_img_oriented, apply_exif_orientation
