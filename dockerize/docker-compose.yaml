@@ -16,7 +16,7 @@ services:
       picasa_img
     container_name: picasa_api
     command:
-      bash /startup.sh
+      bash /code/dockerize/startup.sh
     env_file:
       - .env
     environment:

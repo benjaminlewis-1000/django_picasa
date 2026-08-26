@@ -39,8 +39,11 @@ RUN cp /usr/bin/python3 /usr/bin/python
 RUN DEBIAN_FRONTEND=noninteractive apt install -y postgresql # postgresql-contrib
 RUN rm -r /var/lib/apt/lists
 
-ADD startup.sh /startup.sh
+# startup.sh is no longer baked into the image here -- it's part of the
+# /code bind mount (see docker-compose.yaml's command, which now points at
+# dockerize/startup.sh directly), so editing it takes effect on a plain
+# container restart instead of requiring an image rebuild.
 
-RUN groupadd --gid 1001 usergrp && useradd --uid 1001 --gid usergrp -m user 
+RUN groupadd --gid 1001 usergrp && useradd --uid 1001 --gid usergrp -m user
 
 WORKDIR /code
