@@ -40,7 +40,14 @@ celery -A picasa beat -l INFO --pidfile="/locks/celerybeat.pid"  &
 # done
 celery -A picasa worker -l INFO -c 20 --max-tasks-per-child 3 -n worker  & # --uid=nobody --gid=nogroup &
 
-gunicorn -b 0.0.0.0:8000 picasa.wsgi & 
+# Previously ran with gunicorn's defaults (1 sync worker, 1 thread), which
+# serializes *every* request - including every single face-thumbnail image
+# request a gallery page fires - through one process, regardless of how many
+# CPU threads the host actually has. 4 workers x 4 threads (gthread) = 16
+# concurrent request slots, a middle ground that fixes that serialization
+# without competing too hard against celery's own -c 20 concurrency above
+# for the same host's cores.
+gunicorn -b 0.0.0.0:8000 --workers 4 --threads 4 --worker-class gthread picasa.wsgi &
 
 
 

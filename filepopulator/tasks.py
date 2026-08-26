@@ -67,3 +67,25 @@ def check_mod_dates():
 def update_dir_dates():
     print("Updates")
     update_dirs_datetime()
+
+@shared_task(ignore_result=True, name='filepopulator.geocode_new_images')
+def geocode_new_images():
+    # Small recurring batch, not a one-time backfill: newly-ingested
+    # images with GPS accumulate between runs, but nowhere near fast
+    # enough to need more than a modest cap per run given Nominatim's
+    # ~1 req/sec rate limit (see filepopulator/geocode.py).
+    i = celery_app.control.inspect()
+    active_tasks = i.active()
+    num_this_task_running = 0
+    for k in active_tasks.keys():
+        tasks = active_tasks[k]
+        for tt in tasks:
+            if tt['name'] == 'filepopulator.geocode_new_images':
+                num_this_task_running += 1
+
+    if num_this_task_running > 1:
+        settings.LOGGER.debug("Already running a geocoding task, exiting.")
+        return
+
+    from .geocode import run_geocoding_backfill
+    run_geocoding_backfill(limit=200, log=settings.LOGGER.debug)

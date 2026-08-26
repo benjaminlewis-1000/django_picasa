@@ -193,6 +193,45 @@ class FailedImageFile(models.Model):
         return f"FailedImageFile({self.filename})"
 
 
+class GeocodeCache(models.Model):
+    # Keyed by coordinate (rounded to ~11m -- see ROUND_DECIMALS below),
+    # not by ImageFile: a photo library has massive location reuse (home,
+    # relatives' houses, the same vacation spot across many shots), so
+    # caching per-coordinate rather than per-image is what keeps a
+    # Nominatim reverse-geocoding backfill within its rate limit.
+    ROUND_DECIMALS = 4
+
+    lat = models.FloatField()
+    lon = models.FloatField()
+
+    # Precise reverse-geocode result (e.g. from Nominatim) -- the actual
+    # place this coordinate is in, however small/unrecognizable.
+    locality = models.CharField(max_length=256, null=True, blank=True)
+    county = models.CharField(max_length=256, null=True, blank=True)
+    state = models.CharField(max_length=256, null=True, blank=True)
+    country = models.CharField(max_length=256, null=True, blank=True)
+    display_name = models.CharField(max_length=512, null=True, blank=True)
+    raw_response = models.JSONField(null=True, blank=True)
+    geocoded_at = models.DateTimeField(null=True, blank=True)
+    lookup_failed = models.BooleanField(default=False)
+    lookup_error = models.TextField(null=True, blank=True)
+
+    # Nearest sufficiently-large place, independent of the precise lookup
+    # above -- computed offline from a static dataset, no rate limit.
+    # Lets downstream callers show either the precise locality or this
+    # more-recognizable fallback (e.g. "Bothell" vs. "Seattle").
+    nearest_metro_name = models.CharField(max_length=256, null=True, blank=True)
+    nearest_metro_distance_km = models.FloatField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['lat', 'lon'], name='unique_geocode_cache_coordinate')
+        ]
+
+    def __str__(self):
+        return f"GeocodeCache({self.lat}, {self.lon}) -> {self.display_name}"
+
+
 # Lots ripped from https://github.com/hooram/ownphotos/blob/dev/api/models.py
 class ImageFile(models.Model):
 
@@ -233,6 +272,18 @@ class ImageFile(models.Model):
     light_source = models.IntegerField(validators=[MinValueValidator(-1)], default= -1)
     gps_lat_decimal = models.FloatField(default=-999,validators=[validate_lat])
     gps_lon_decimal = models.FloatField(default=-999,validators=[validate_lon])
+
+    # Where gps_lat_decimal/gps_lon_decimal actually came from. 'exif' for
+    # everything ingested so far; room for a future personal
+    # location-history service to backfill a position (with its own name
+    # here) for images with no EXIF GPS, while keeping that provenance
+    # visible since a location-history match is inherently less precise
+    # than an EXIF GPS tag.
+    gps_source = models.CharField(max_length=64, null=True, blank=True, default='exif')
+
+    geocode = models.ForeignKey(
+        GeocodeCache, on_delete=models.SET_NULL, null=True, blank=True, related_name='images'
+    )
 
     # Default for date added is now.
     dateAdded = models.DateTimeField( default=timezone.now )
@@ -459,13 +510,20 @@ class ImageFile(models.Model):
                 if type(self.gps_lat_decimal) == Fraction:
                     self.gps_lat_decimal = float(self.gps_lat_decimal)
                 if np.isnan(self.gps_lat_decimal):
-                    self.gps_lat_decimal = 0
+                    # Bug fix: this used to fall back to 0 instead of the
+                    # -999 "no GPS" sentinel used everywhere else (see
+                    # get_decimal_coordinates() above, which does this
+                    # correctly) -- (0, 0) is a real, valid-looking
+                    # coordinate (off the coast of Africa), so a malformed
+                    # GPS fraction that produced NaN was silently recorded
+                    # as if the photo was actually taken there.
+                    self.gps_lat_decimal = -999
 
                 self.gps_lon_decimal = self.exifDict['GPSInfo']['GPSLonDec']
                 if type(self.gps_lon_decimal) == Fraction:
                     self.gps_lon_decimal = float(self.gps_lon_decimal)
                 if np.isnan(self.gps_lon_decimal):
-                    self.gps_lon_decimal = 0
+                    self.gps_lon_decimal = -999
                     
             if 'Orientation' in self.exifDict.keys():
                 self.orientation = self.exifDict['Orientation']
