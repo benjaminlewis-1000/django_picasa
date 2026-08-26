@@ -5,9 +5,8 @@ RUN apk add --no-cache supervisor
 RUN mkdir /etc/supervisor.d
 COPY postgres_cron.ini /etc/supervisor.d/postgres_cron.ini
 
-# ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/daily/postgres_bak_sh
-COPY postgres_bak.sh /etc/periodic/daily/postgres_bak_sh
-RUN chmod +x /etc/periodic/daily/postgres_bak_sh
-
+# postgres_bak.sh is bind-mounted (see docker-compose.yaml), not baked in here --
+# its executable bit comes from the host file itself (preserved through the bind
+# mount), so make sure dockerize/postgres_bak.sh stays chmod +x on the host.
 
 ENTRYPOINT ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]

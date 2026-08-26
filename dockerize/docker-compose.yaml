@@ -111,11 +111,13 @@ services:
       - ${DB_FILES_LOCATION}:/var/lib/postgresql/data
       # Initialization script - see Postgres Docker documentation.
       - ${DJANGO_FILES_ROOT}/dockerize/psql_init.sh:/docker-entrypoint-initdb.d/psql_init.sh
-      # Add a file to the weekly crontab directory that backs up the database. 
-      # Run by the run-parts command, which hates periods in filenames, hence why 
-      # I don't make a .sh suffix in the container. 
-#      - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/weekly/postgres_bak_sh
-#      - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/daily/postgres_bak_sh
+      # Add a file to the daily crontab directory that backs up the database.
+      # Run by the run-parts command, which hates periods in filenames, hence why
+      # I don't make a .sh suffix in the container. Bind-mounted (not baked into
+      # the image via Dockerfile_postgres) so editing it takes effect on a plain
+      # container restart -- same fix applied to picasa_api's startup.sh earlier,
+      # after that one silently didn't pick up an edit until a full rebuild.
+      - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/daily/postgres_bak_sh
       - /mnt/fast_storage/appdata/django_picasa/backups:/backup
     labels:
       - "user=postgres"

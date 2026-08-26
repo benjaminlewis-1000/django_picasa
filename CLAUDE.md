@@ -217,6 +217,17 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+- **TODO: `faceAssigner.execute()` (`face_manager/assign_faces.py`) never initializes
+  `self.embedding_dict`/`self.norm_dict`/`self.candidate_dict` when there are <= 100 unassigned
+  faces to classify** — `load_encodings()` (the only thing that sets them) is only called when
+  `num_unassigned > 100`. Any run with a small batch crashes `classify_unassigned()` for every
+  face in it with `AttributeError: 'faceAssigner' object has no attribute 'embedding_dict'`.
+  Confirmed live in production (2026-08-26, post-DB-restore) — contained by the per-face
+  try/except added earlier this session (logs a warning, skips the face, doesn't abort the run),
+  but the practical effect is that **small classification batches currently classify nothing at
+  all**, silently, every time this threshold isn't crossed. Fix: call `load_encodings()`
+  unconditionally regardless of batch size. Not fixed yet.
+
 **Where things stand (2026-08-26, end of session)**: `backend_upgrade` is pushed
 (`9475adf`) with three fixes made *after* HEIC/PR #44 was already merged to `master` and
 deployed — these are **not yet on `master`/deployed**:
