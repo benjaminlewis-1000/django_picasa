@@ -104,7 +104,11 @@ def _get_nominatim_geocode():
     # ReadTimeoutError (never surfaced in tests, which mock the network
     # call entirely).
     geolocator = Nominatim(user_agent=settings.NOMINATIM_USER_AGENT, timeout=10)
-    return RateLimiter(geolocator.reverse, min_delay_seconds=1.1, max_retries=2, error_wait_seconds=5.0)
+    # min_delay_seconds=1.1 (just over Nominatim's stated 1 req/sec limit)
+    # still drew frequent 429s during a real backfill run -- 2.0s gives
+    # more headroom and, being a background batch job with no user
+    # waiting on it, the slower throughput costs nothing.
+    return RateLimiter(geolocator.reverse, min_delay_seconds=2.0, max_retries=2, error_wait_seconds=5.0)
 
 
 def reverse_geocode_precise(lat, lon):
