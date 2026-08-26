@@ -496,6 +496,47 @@ class UpdateListOfNoMatchingDetectsTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class CleanupChronicallyUnmatchedFacesTests(TestCase):
+    """A face on an orientation 6/8 image that's reencoded=True but still
+    carries the NON_DETECTED_FACE_ENCODING sentinel has never been
+    geometrically verified under the corrected decode path -- since a
+    wrongly-positioned box can never match a real detection, it would
+    otherwise persist forever. This command deletes those outright and
+    marks their images unprocessed for redetection."""
+
+    def test_deletes_chronically_unmatched_faces_and_marks_images_unprocessed(self):
+        img = make_image()
+        ImageFile.objects.filter(pk=img.pk).update(orientation=8, isProcessed=True)
+        stale_face = make_face(img, reencoded=True, face_encoding_512=list(settings.NON_DETECTED_FACE_ENCODING))
+
+        call_command("cleanup_chronically_unmatched_faces", "--yes")
+
+        self.assertFalse(Face.objects.filter(pk=stale_face.pk).exists())
+        img.refresh_from_db()
+        self.assertFalse(img.isProcessed)
+
+    def test_leaves_verified_faces_alone(self):
+        img = make_image()
+        ImageFile.objects.filter(pk=img.pk).update(orientation=8, isProcessed=True)
+        good_face = make_face(img, reencoded=True, face_encoding_512=[0.1] * 512)
+
+        call_command("cleanup_chronically_unmatched_faces", "--yes")
+
+        self.assertTrue(Face.objects.filter(pk=good_face.pk).exists())
+        img.refresh_from_db()
+        self.assertTrue(img.isProcessed)
+
+    def test_dry_run_writes_nothing(self):
+        img = make_image()
+        ImageFile.objects.filter(pk=img.pk).update(orientation=8, isProcessed=True)
+        stale_face = make_face(img, reencoded=True, face_encoding_512=list(settings.NON_DETECTED_FACE_ENCODING))
+
+        call_command("cleanup_chronically_unmatched_faces", "--dry-run")
+
+        self.assertTrue(Face.objects.filter(pk=stale_face.pk).exists())
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class MergeAnotherIgnoreIntoIgnoreTests(TestCase):
     """'.another_ignore' used to be a separate sentinel Person from '.ignore'
     (see settings.SOFT_IGNORE_NAME) -- created by the assign_faces
