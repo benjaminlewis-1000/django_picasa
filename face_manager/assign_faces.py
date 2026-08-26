@@ -194,15 +194,21 @@ class faceAssigner():
         u_idx = 0
         s = time.time()
         for u_img in tqdm(unassigned.iterator()):
-            # try:
             elps = time.time() - s
             s = time.time()
             if self.DEBUG:
                 print(f"Assigning: {u_idx+1}/{num_unassigned} | {elps:.2f}")
                 u_idx += 1
-            self.classify_unassigned(u_img)
-            # except Exception as e:
-            #     print(f"Exception! {e}")
+            try:
+                self.classify_unassigned(u_img)
+            except Exception as e:
+                # A failure classifying one face must not abort the entire
+                # scheduled run -- every other already-queued face in this
+                # batch would otherwise silently never get classified
+                # either. See classify_unassigned()'s array-sizing fix
+                # above for the bug this specifically guards against.
+                print(f"Exception classifying face {u_img.id}: {e}")
+                settings.LOGGER.error(f"Exception classifying face {u_img.id}: {e}")
 
         # Finish up by "trueing up" the num_assigned for each person:
         print("Verifying face counts...")
@@ -252,10 +258,36 @@ class faceAssigner():
             rejected_ids = []
 
         candidate_ids = list(set(self.likely_people_ids) - set(rejected_ids))
+
+        if len(candidate_ids) == 0:
+            # Every currently-"likely" person has already been rejected as
+            # a candidate for this face -- there's nothing left to compare
+            # against. Assign straight to the soft-ignore person rather
+            # than running similarity math over zero candidates: with the
+            # array now sized to len(candidate_ids) below (not the fixed
+            # self.num_likely_people), a size-0 array here would make
+            # np.max()/np.argmax() in the "no match" branch below raise
+            # ValueError on an empty reduction.
+            unassigned_face.set_possible_person(self.ignore_person_id, 1, 1.0)
+            return
+
         candidate_id_arr = np.array(candidate_ids)
 
-        # Pre-populate a metrics array
-        metrics_array = np.zeros((self.num_likely_people, 3))
+        # Pre-populate a metrics array. Bug fix: this used to be sized to
+        # self.num_likely_people (the *full* candidate roster) rather than
+        # len(candidate_ids) (this face's roster minus whatever's already
+        # been rejected for it) -- whenever a rejection had shrunk the
+        # candidate list, the array's tail rows were left as stale
+        # np.zeros() padding representing no real person. That padding
+        # could pollute np.max()/np.argmax() below (a real similarity can
+        # be negative, so a padded 0 can look like the best match), and
+        # np.argmax() over the full-size array could return an index
+        # beyond the end of the smaller candidate_id_arr, raising
+        # IndexError -- which, since execute()'s per-face try/except was
+        # commented out, aborted the *entire* scheduled assign_faces run,
+        # not just this one face. Sizing to len(candidate_ids) keeps every
+        # row real and every index in bounds.
+        metrics_array = np.zeros((len(candidate_ids), 3))
 
         for row_num, db_id in enumerate(candidate_ids):
             cmp_face_encodings = self.embedding_dict[db_id]
