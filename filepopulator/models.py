@@ -111,10 +111,13 @@ class Directory(models.Model):
 #        imgs = [i.id for i in imgs]
 #        return imgs
 
-    def __get_filtered_img_dates__(self):
+    def __get_filtered_img_dates__(self, require_valid=True):
         imgs = ImageFile.objects.filter(directory__dir_path=self.dir_path)
 
-        img_date = [time.mktime(i.dateTaken.timetuple()) for i in imgs if i.dateTakenValid]
+        if require_valid:
+            img_date = [time.mktime(i.dateTaken.timetuple()) for i in imgs if i.dateTakenValid]
+        else:
+            img_date = [time.mktime(i.dateTaken.timetuple()) for i in imgs if i.dateTaken is not None]
         img_date = np.array(img_date)
 
         def reject_outliers(data, m = 2.):
@@ -129,22 +132,33 @@ class Directory(models.Model):
         else:
             return img_date.reshape(-1)
 
+    def __get_best_available_img_dates__(self):
+        # Prefer EXIF-confirmed dates; if none of this directory's images
+        # have a valid one (e.g. no EXIF DateTimeOriginal, so dateTaken
+        # fell back to file-processing time), fall back to using whatever
+        # dateTaken values exist anyway rather than defaulting to "now" --
+        # a stale/unreliable date is still far more useful than the date
+        # this happened to be recomputed on. Only when a directory has no
+        # images with any dateTaken at all does this return None.
+        img_dates = self.__get_filtered_img_dates__(require_valid=True)
+        if img_dates is not None:
+            return img_dates
+        return self.__get_filtered_img_dates__(require_valid=False)
+
     def average_date_taken(self):
-        img_dates = self.__get_filtered_img_dates__()
+        img_dates = self.__get_best_available_img_dates__()
         if img_dates is None:
-            # self.mean_datesec = datetime.fromtimestamp(timezone.now(), pytz.utc)
-            self.mean_datesec = time.mktime(datetime.now().timetuple()) # datetime.now().total_seconds()
+            self.mean_datesec = time.mktime(datetime.now().timetuple())
             self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, pytz.utc)
         else:
             self.mean_datesec = float(np.mean(img_dates))
             self.mean_datetime = datetime.fromtimestamp(self.mean_datesec, pytz.utc)
 
     def beginning_date_taken(self):
-        img_dates = self.__get_filtered_img_dates__()
+        img_dates = self.__get_best_available_img_dates__()
         if img_dates is None:
-            # self.first_datesec = datetime.fromtimestamp(timezone.now(), pytz.utc)
-            self.first_datesec = time.mktime(datetime.now().timetuple()) # datetime.fromtimestamp(timezone.now(), pytz.utc)
-            self.first_datetime = datetime.fromtimestamp(self.mean_datesec, pytz.utc)
+            self.first_datesec = time.mktime(datetime.now().timetuple())
+            self.first_datetime = datetime.fromtimestamp(self.first_datesec, pytz.utc)
         else:
             img_dates.sort()
             first_date = img_dates[0]

@@ -6,6 +6,7 @@ from django import forms
 from django.conf import settings
 import os
 import binascii
+from datetime import datetime
 from textwrap import wrap # for splitting string
 import os
 import shutil
@@ -781,6 +782,79 @@ class DirectoryTests(TestCase):
         for d in dirs:
             print("Average after: ", d.mean_datesec)
             self.assertNotEqual(d.mean_datesec, -1)
+
+
+class DirectoryDateFallbackTests(TestCase):
+    """Regression test for a real bug found via a user report: a directory
+    whose images all have dateTakenValid=False (no trustworthy EXIF date,
+    so dateTaken fell back to file-processing time) used to make
+    average_date_taken()/beginning_date_taken() fall back to datetime.now()
+    -- so every scheduled filepopulator.update_dir_dates run kept
+    overwriting the directory's date to "whenever the task last ran"
+    instead of anything related to the photos themselves. Now falls back
+    to the images' actual (if EXIF-unconfirmed) dateTaken values first,
+    only using now() when a directory has no images with any dateTaken at
+    all."""
+
+    def _make_bare_image_file(self, filename, date_taken, date_taken_valid):
+        directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(filename))
+        obj = ImageFile(
+            filename=filename,
+            directory=directory,
+            thumbnail_big="", thumbnail_medium="", thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=10, height=10,
+            dateTaken=date_taken, dateTakenValid=date_taken_valid,
+        )
+        ImageFile.objects.bulk_create([obj])
+        return directory
+
+    def test_falls_back_to_unconfirmed_date_taken_instead_of_now(self):
+        from django.utils import timezone as dj_timezone
+        stale_date = dj_timezone.make_aware(datetime(2018, 6, 15))
+
+        directory = self._make_bare_image_file(
+            "/tmp/dir_date_fallback_test/a.jpg", stale_date, False,
+        )
+        self._make_bare_image_file(
+            "/tmp/dir_date_fallback_test/b.jpg", stale_date, False,
+        )
+
+        directory.average_date_taken()
+        directory.beginning_date_taken()
+
+        self.assertEqual(directory.mean_datetime.date(), stale_date.date())
+        self.assertEqual(directory.first_datetime.date(), stale_date.date())
+        now = dj_timezone.now()
+        self.assertNotEqual(directory.mean_datetime.year, now.year)
+
+    def test_still_falls_back_to_now_when_no_dates_at_all(self):
+        from django.utils import timezone as dj_timezone
+        directory, _ = Directory.objects.get_or_create(dir_path="/tmp/dir_date_fallback_test_empty")
+
+        directory.average_date_taken()
+        directory.beginning_date_taken()
+
+        now = dj_timezone.now()
+        self.assertEqual(directory.mean_datetime.date(), now.date())
+        self.assertEqual(directory.first_datetime.date(), now.date())
+
+    def test_prefers_valid_dates_over_unconfirmed_ones(self):
+        from django.utils import timezone as dj_timezone
+        stale_date = dj_timezone.make_aware(datetime(2018, 6, 15))
+        valid_date = dj_timezone.make_aware(datetime(2019, 3, 1))
+
+        directory = self._make_bare_image_file(
+            "/tmp/dir_date_fallback_test_mixed/a.jpg", stale_date, False,
+        )
+        self._make_bare_image_file(
+            "/tmp/dir_date_fallback_test_mixed/b.jpg", valid_date, True,
+        )
+
+        directory.average_date_taken()
+
+        self.assertEqual(directory.mean_datetime.date(), valid_date.date())
 
 
 @override_settings(MEDIA_ROOT='/tmp/filepopulator_test_media')
