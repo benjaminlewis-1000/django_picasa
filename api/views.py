@@ -486,7 +486,10 @@ class PersonParamView(APIView):
                 return render_404(request, f"Error: Requested ID {id_key} not available in database.")
 
 
-            image_set = ImageFile.objects.filter(directory=dir_obj).values_list('id', flat=True)
+            # Newest first - this id_list is what the frontend's Folders tab
+            # walks straight through for both tile order and modal prev/next
+            # paging, so ordering has to happen here rather than client-side.
+            image_set = ImageFile.objects.filter(directory=dir_obj).order_by('-dateTaken').values_list('id', flat=True)
             id_list = list(image_set)
 
         js = {'num_results': len(id_list), 'type': field, 'id_list': id_list,}
