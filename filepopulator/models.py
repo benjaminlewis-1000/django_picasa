@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 from fractions import Fraction
 from dateutil import parser
+import imagehash
 import common
 from PIL import ExifTags
 
@@ -91,6 +92,15 @@ def validate_lon(value):
     if value != -999:
         if not -180 < value < 180:
             raise ValidationError(f'{value} is not a valid latitude')
+
+def phash_to_bigint(image_hash):
+    """Converts an imagehash.ImageHash (a 64-bit unsigned value) to the
+    signed bigint Postgres/BigIntegerField actually stores -- same bit
+    pattern numpy's int64 uses under the hood, so comparison code
+    (filepopulator/similarity.py) can load this column straight into a
+    numpy int64 array with no conversion."""
+    unsigned = int(str(image_hash), 16)
+    return int(np.uint64(unsigned).astype(np.int64))
 
 class Directory(models.Model): 
     dir_path = models.CharField(max_length=512, unique=True)
@@ -321,6 +331,21 @@ class ImageFile(models.Model):
     # future frontend view is planned to list these for cleanup.
     image_load_failed = models.BooleanField(default=False)
     image_load_error = models.TextField(null=True, blank=True)
+
+    # 64-bit perceptual hash (imagehash.phash), stored as a signed bigint
+    # -- the same bit pattern numpy's int64 uses, so comparison code can
+    # load this column straight into a numpy array with no conversion.
+    # Null until computed (e.g. a corrupted image that failed to decode).
+    phash = models.BigIntegerField(null=True, blank=True, db_index=True)
+
+    # Whether this image has been compared against the rest of the
+    # library for near-duplicates (see filepopulator/similarity.py).
+    # Comparison only ever needs to happen once per image: it's compared
+    # against every other image that already has a phash at the time, and
+    # every future image will in turn compare itself against this one
+    # when its own turn comes -- same incremental-catch-up shape as
+    # GeocodeCache's coordinate backfill.
+    similarity_checked = models.BooleanField(default=False, db_index=True)
 
     # For storing tags
     tags = ArrayField(
@@ -635,6 +660,21 @@ class ImageFile(models.Model):
         self.pixel_hash = pixel_hash_md5.hexdigest()
         settings.LOGGER.debug(f'{self.pixel_hash}, {self.filename}')
 
+        # Perceptual hash for near-duplicate detection (see
+        # filepopulator/similarity.py). Computed here, not in a separate
+        # pass, so it reuses self.image while it's still the full
+        # decoded/oriented image -- _generate_thumbnail() (called right
+        # after this in save()) resizes self.image in place. Best-effort:
+        # a decode that got this far via the cv2.imread() fallback above
+        # may still fail here (self.image can be an unusable lazy-opened
+        # PIL handle on a truncated file); leave phash null rather than
+        # let it take down the whole save().
+        try:
+            self.phash = phash_to_bigint(imagehash.phash(self.image))
+        except Exception as e:
+            settings.LOGGER.debug(f"Could not compute phash for {self.filename}: {e}")
+            self.phash = None
+
         hash_file = hashlib.md5()
         # with open(self.filename, "rb") as f:
         #     for chunk in iter(lambda: f.read(4096), b""):
@@ -816,7 +856,43 @@ class ImageFile(models.Model):
 
     def exposure(self):
         return f"{self.exposure_num}/{self.exposure_denom}"
-        
+
     exposure.short_description = 'Exposure'
+
+
+class SimilarImagePair(models.Model):
+    """One edge in the near-duplicate graph: two ImageFiles whose phash
+    Hamming distance was <= settings.PHASH_SIMILARITY_THRESHOLD the last
+    time either was compared. image_a/image_b are always stored with
+    image_a_id < image_b_id (see record()) so the same pair can't be
+    inserted twice as (A, B) and (B, A) -- the incremental comparison
+    task compares every image against the full population each run, so
+    without this a pair would otherwise get rediscovered (and hit the
+    unique constraint or duplicate) from both directions.
+
+    CASCADE (not the sentinel-reassignment pattern Face uses) is correct
+    here: this is just a graph edge with no side effects of its own, so
+    deleting either endpoint should simply drop the edge.
+    """
+    image_a = models.ForeignKey(ImageFile, on_delete=models.CASCADE, related_name='similar_to_higher_id')
+    image_b = models.ForeignKey(ImageFile, on_delete=models.CASCADE, related_name='similar_to_lower_id')
+    hamming_distance = models.PositiveSmallIntegerField()
+    discovered_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['image_a', 'image_b'], name='unique_similar_image_pair')
+        ]
+
+    def __str__(self):
+        return f"SimilarImagePair({self.image_a_id}, {self.image_b_id}, dist={self.hamming_distance})"
+
+    @classmethod
+    def record(cls, image_id_a, image_id_b, distance):
+        lo, hi = sorted((image_id_a, image_id_b))
+        cls.objects.update_or_create(
+            image_a_id=lo, image_b_id=hi,
+            defaults={'hamming_distance': distance},
+        )
 
 
