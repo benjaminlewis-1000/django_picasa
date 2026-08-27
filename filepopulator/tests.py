@@ -1294,3 +1294,44 @@ class BackfillGeocodingTests(TestCase):
         self.assertTrue(img_fail.geocode.lookup_failed)
         self.assertFalse(img_ok.geocode.lookup_failed)
         self.assertEqual(img_ok.geocode.locality, 'Portland')
+
+    def test_concurrent_duplicate_coordinate_does_not_crash_the_batch(self):
+        # Regression test for a real production bug (2026-08-27): the
+        # recurring hourly geocode_new_images task and the one-time
+        # backfill_geocoding command can run concurrently, and both
+        # compute "what's missing" from the same snapshot -- if both
+        # decide to geocode the same coordinate, whichever saves second
+        # used to hit GeocodeCache's unique (lat, lon) constraint with no
+        # handling at all, crashing the entire run for every other
+        # coordinate queued behind it. Simulates the race by inserting a
+        # competing row *during* our own reverse_geocode_precise() call,
+        # the actual vulnerable window in production.
+        from filepopulator.models import GeocodeCache
+        img_race = self._make_bare_image_file("/tmp/geocode_test/race_a.jpg", 47.6062, -122.3321)
+        img_ok = self._make_bare_image_file("/tmp/geocode_test/race_b.jpg", 45.5152, -122.6784)
+
+        winner_result = {
+            'locality': 'Seattle', 'county': 'King', 'state': 'Washington',
+            'country': 'United States', 'display_name': 'Seattle, WA, USA',
+            'raw_response': {'address': {}},
+        }
+        portland_result = {
+            'locality': 'Portland', 'county': 'Multnomah', 'state': 'Oregon',
+            'country': 'United States', 'display_name': 'Portland, OR, USA',
+            'raw_response': {'address': {}},
+        }
+
+        def racy_geocode(lat, lon):
+            if round(lat, 2) == 47.61:
+                GeocodeCache.objects.create(lat=lat, lon=lon, locality='Concurrent Winner')
+                return winner_result
+            return portland_result
+
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise', side_effect=racy_geocode):
+            call_command('backfill_geocoding')
+
+        self.assertEqual(GeocodeCache.objects.count(), 2)
+        img_race.refresh_from_db()
+        img_ok.refresh_from_db()
+        self.assertEqual(img_race.geocode.locality, 'Concurrent Winner')
+        self.assertEqual(img_ok.geocode.locality, 'Portland')

@@ -16,6 +16,7 @@ import os
 import time
 
 from django.conf import settings
+from django.db import IntegrityError, transaction
 from django.db.models.functions import Round
 from django.utils import timezone
 
@@ -215,7 +216,20 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
             result['failed'] += 1
             log(f"Failed to geocode ({lat}, {lon}): {e}")
 
-        cache_entry.save()
+        try:
+            with transaction.atomic():
+                cache_entry.save()
+        except IntegrityError:
+            # Another concurrent run already inserted this exact
+            # coordinate between our "what's missing" query (computed
+            # once, up front) and this save -- the recurring hourly task
+            # and the one-time backfill command can genuinely run at the
+            # same time. Benign: adopt the winning row instead of letting
+            # an unhandled IntegrityError crash the entire batch over one
+            # coordinate, the same anti-pattern this session already
+            # fixed elsewhere (face_extraction, assign_faces).
+            log(f"Coordinate ({lat}, {lon}) already cached by a concurrent run -- reusing it.")
+            cache_entry = GeocodeCache.objects.get(lat=lat, lon=lon)
 
         matching = (
             has_gps
