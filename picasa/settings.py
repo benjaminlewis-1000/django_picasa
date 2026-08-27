@@ -138,6 +138,13 @@ DUPLICATES_FILE = '/code/duplicates.csv'
 # Nominatim's usage policy requires a real, identifying user agent -- it
 # rejects/blocks requests using geopy's generic default.
 NOMINATIM_USER_AGENT = 'django_picasa (self-hosted photo library, contact: ' + os.environ.get('NOMINATIM_CONTACT_EMAIL', 'unset@example.com') + ')'
+
+# Max phash Hamming distance (out of 64 bits) for two images to be
+# considered near-duplicates. Chosen from real production photos: exact
+# recompressed duplicates and true repeat-shots scored 0-6, genuinely
+# different (even time-adjacent) photos scored 20+ -- see
+# filepopulator/similarity.py.
+PHASH_SIMILARITY_THRESHOLD = 10
 # if os.path.isfile(LOCKFILE):
 #     os.remove(LOCKFILE)
 
@@ -495,6 +502,10 @@ CELERY_BEAT_SCHEDULE = {
    'geocode_new_images': {
         'task': 'filepopulator.geocode_new_images',
         'schedule': crontab(minute='30', hour='*'),
+    },
+   'find_similar_images': {
+        'task': 'filepopulator.find_similar_images',
+        'schedule': crontab(minute='45', hour='*'),
     },
 #   'reencode_images': {
 #        'task': 'face_manager.reencode', 

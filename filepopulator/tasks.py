@@ -89,3 +89,27 @@ def geocode_new_images():
 
     from .geocode import run_geocoding_backfill
     run_geocoding_backfill(limit=200, log=settings.LOGGER.debug)
+
+@shared_task(ignore_result=True, name='filepopulator.find_similar_images')
+def find_similar_images():
+    # Small recurring batch, not a one-time backfill: newly-ingested
+    # images accumulate between runs, but the comparison itself is cheap
+    # (vectorized numpy popcount(XOR), benchmarked at <1ms per image
+    # against a 200k-image population -- see filepopulator/similarity.py),
+    # so this cap is generous headroom, not a rate-limit workaround like
+    # geocode_new_images' is.
+    i = celery_app.control.inspect()
+    active_tasks = i.active()
+    num_this_task_running = 0
+    for k in active_tasks.keys():
+        tasks = active_tasks[k]
+        for tt in tasks:
+            if tt['name'] == 'filepopulator.find_similar_images':
+                num_this_task_running += 1
+
+    if num_this_task_running > 1:
+        settings.LOGGER.debug("Already running a similarity-check task, exiting.")
+        return
+
+    from .similarity import run_similarity_check
+    run_similarity_check(limit=2000, log=settings.LOGGER.debug)

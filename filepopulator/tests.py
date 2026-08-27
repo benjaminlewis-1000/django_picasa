@@ -1409,3 +1409,122 @@ class BackfillGeocodingTests(TestCase):
         img_ok.refresh_from_db()
         self.assertEqual(img_race.geocode.locality, 'Concurrent Winner')
         self.assertEqual(img_ok.geocode.locality, 'Portland')
+
+
+class SimilarityTests(TestCase):
+    """Exercises phash-based near-duplicate detection
+    (filepopulator/similarity.py) against bare ImageFile rows with
+    manually-set phash values, rather than real image files -- the
+    comparison logic itself (Hamming distance + threshold + bookkeeping)
+    doesn't depend on how the hash was produced."""
+
+    def _make_bare_image_file(self, filename, phash, similarity_checked=False):
+        directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(filename))
+        obj = ImageFile(
+            filename=filename,
+            directory=directory,
+            thumbnail_big="", thumbnail_medium="", thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=10, height=10,
+            phash=phash, similarity_checked=similarity_checked,
+        )
+        ImageFile.objects.bulk_create([obj])
+        return ImageFile.objects.get(filename=filename)
+
+    def test_finds_close_pair_and_skips_distant_pair(self):
+        from filepopulator.models import SimilarImagePair
+        from filepopulator.similarity import run_similarity_check
+
+        base = 0x0F0F0F0F0F0F0F0F
+        close = base ^ 0b111  # 3 bits different -- within default threshold
+        far = base ^ ((1 << 40) - 1)  # 40 bits different -- well outside it
+
+        img_base = self._make_bare_image_file("/tmp/similarity_test/base.jpg", base)
+        img_close = self._make_bare_image_file("/tmp/similarity_test/close.jpg", close)
+        img_far = self._make_bare_image_file("/tmp/similarity_test/far.jpg", far)
+
+        result = run_similarity_check()
+
+        self.assertEqual(result['checked'], 3)
+        self.assertEqual(SimilarImagePair.objects.count(), 1)
+        pair = SimilarImagePair.objects.get()
+        self.assertEqual({pair.image_a_id, pair.image_b_id}, {img_base.id, img_close.id})
+        self.assertEqual(pair.hamming_distance, 3)
+
+        for img in (img_base, img_close, img_far):
+            img.refresh_from_db()
+            self.assertTrue(img.similarity_checked)
+
+    def test_pair_stored_with_canonical_ordering_regardless_of_which_side_records_it(self):
+        from filepopulator.models import SimilarImagePair
+
+        img_a = self._make_bare_image_file("/tmp/similarity_test/order_a.jpg", 1)
+        img_b = self._make_bare_image_file("/tmp/similarity_test/order_b.jpg", 2)
+        lo, hi = sorted((img_a.id, img_b.id))
+
+        SimilarImagePair.record(img_b.id, img_a.id, 1)
+        SimilarImagePair.record(img_a.id, img_b.id, 1)
+
+        self.assertEqual(SimilarImagePair.objects.count(), 1)
+        pair = SimilarImagePair.objects.get()
+        self.assertEqual(pair.image_a_id, lo)
+        self.assertEqual(pair.image_b_id, hi)
+
+    def test_dry_run_writes_nothing(self):
+        from filepopulator.models import SimilarImagePair
+
+        self._make_bare_image_file("/tmp/similarity_test/dry_a.jpg", 1)
+        self._make_bare_image_file("/tmp/similarity_test/dry_b.jpg", 1)
+
+        call_command("backfill_similarity", "--dry-run")
+
+        self.assertEqual(SimilarImagePair.objects.count(), 0)
+        self.assertFalse(ImageFile.objects.filter(similarity_checked=True).exists())
+
+    def test_already_checked_images_are_not_recompared(self):
+        from filepopulator.similarity import run_similarity_check
+
+        img_a = self._make_bare_image_file("/tmp/similarity_test/prechecked.jpg", 1, similarity_checked=True)
+        img_b = self._make_bare_image_file("/tmp/similarity_test/newcomer.jpg", 1)
+
+        result = run_similarity_check()
+
+        # Only the unchecked image counts as "checked" by this run, even
+        # though it necessarily also compared against img_a to find it.
+        self.assertEqual(result['checked'], 1)
+        self.assertEqual(result['already_checked'], 1)
+
+    def test_incremental_run_still_finds_match_against_previously_checked_image(self):
+        from filepopulator.models import SimilarImagePair
+        from filepopulator.similarity import run_similarity_check
+
+        img_old = self._make_bare_image_file("/tmp/similarity_test/old.jpg", 0x1234, similarity_checked=True)
+        img_new = self._make_bare_image_file("/tmp/similarity_test/new.jpg", 0x1234)
+
+        run_similarity_check()
+
+        self.assertEqual(SimilarImagePair.objects.count(), 1)
+        pair = SimilarImagePair.objects.get()
+        self.assertEqual({pair.image_a_id, pair.image_b_id}, {img_old.id, img_new.id})
+        self.assertEqual(pair.hamming_distance, 0)
+
+
+class PhashComputationTests(TestCase):
+    """Confirms phash is actually computed and stored during real image
+    ingestion (not just exercised against bare rows above), and that two
+    genuinely different real photos land far apart."""
+
+    @override_settings(MEDIA_ROOT='/tmp')
+    def test_phash_populated_on_ingestion(self):
+        val_dir = settings.FILEPOPULATOR_VAL_DIRECTORY
+        src = os.path.join(val_dir, 'naming', 'good', '1.JPG')
+        tmp_path = '/tmp/phash_ingestion_test/1.JPG'
+        os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+        shutil.copy(src, tmp_path)
+
+        create_image_file(tmp_path)
+
+        obj = ImageFile.objects.get(filename=tmp_path)
+        self.assertIsNotNone(obj.phash)
+        self.assertFalse(obj.similarity_checked)
