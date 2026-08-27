@@ -515,6 +515,23 @@ class KeyedImageViewTests(ApiTestCase):
         self.assertIn("immutable", resp["Cache-Control"])
 
 
+class DirectoryPaginateObjIdsTests(ApiTestCase):
+    # The Folders tab (frontend) walks this id_list directly for both tile
+    # order and modal prev/next paging - it was previously unordered
+    # (plain DB insertion order), now newest-first by dateTaken.
+    def test_directory_ids_ordered_newest_first(self):
+        older = self.make_image("naming/good/1.JPG")
+        newer = self.make_image("naming/good/2.jpg")
+        ImageFile.objects.filter(pk=older.pk).update(dateTaken="2020-01-01T00:00:00Z")
+        ImageFile.objects.filter(pk=newer.pk).update(dateTaken="2024-06-15T00:00:00Z")
+
+        resp = self.client.get(f"/api/paginate_obj_ids/{older.directory_id}/directory")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        id_list = json.loads(resp.content)["id_list"]
+        self.assertEqual(id_list.index(newer.id), 0)
+        self.assertLess(id_list.index(newer.id), id_list.index(older.id))
+
+
 class MobileEndpointTests(ApiTestCase):
     def setUp(self):
         super().setUp()
