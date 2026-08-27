@@ -14,8 +14,14 @@ query; only the rare pairs that actually clear the similarity threshold
 ever get written back, one row each, to SimilarImagePair.
 """
 
+import multiprocessing
+
 import numpy as np
+import PIL.Image
+import imagehash
 from django.conf import settings
+
+import common
 
 
 def _load_hash_arrays():
@@ -40,6 +46,92 @@ def _hamming_distances(one_hash, all_hashes):
     identical either way, bitwise_count just requires an unsigned dtype)."""
     xored = np.bitwise_xor(one_hash, all_hashes)
     return np.bitwise_count(xored.view(np.uint64))
+
+
+def _compute_one_phash(args):
+    """Module-level (picklable) worker for the multiprocessing pool in
+    run_phash_backfill(). Only reads the file and does the CPU-bound
+    decode+hash -- no ORM access here, so this is safe to run in a
+    worker process forked from a Django process (the common case on
+    Linux; this pipeline has never been run/tested under the 'spawn'
+    start method, which would need Django re-initialized per worker)."""
+    from filepopulator.models import phash_to_bigint
+
+    image_id, filename, orientation = args
+    try:
+        image = PIL.Image.open(filename)
+        image = common.apply_exif_orientation(image, orientation)
+        image_hash = phash_to_bigint(imagehash.phash(image))
+        return image_id, image_hash, None
+    except Exception as e:
+        return image_id, None, str(e)
+
+
+def run_phash_backfill(limit=None, dry_run=False, log=print, processes=1, batch_size=500):
+    """One-time (but safely re-runnable) backfill: computes phash for
+    every existing ImageFile that doesn't have one yet. Only needed for
+    images ingested before phash computation was added to
+    ImageFile.save() -- every image saved from here on gets one
+    automatically, so unlike run_similarity_check() above, there's no
+    small recurring task pair for this.
+
+    Deliberately does NOT go through ImageFile.save() (which would
+    re-decode and rehash the full pixel MD5, regenerate thumbnails, etc.
+    -- exactly the expensive work this is trying to avoid for 200k+
+    already-ingested images) -- decodes the file directly, the same way
+    common.open_img_oriented()/ImageFile._init_image() do, then writes
+    just the phash column via bulk_update().
+
+    Benchmarked at ~250ms/image single-process (full decode + DCT) --
+    processes>1 uses a multiprocessing pool for the CPU-bound decode+hash
+    step, which is embarrassingly parallel (each image is independent,
+    no shared state).
+    """
+    from filepopulator.models import ImageFile
+
+    todo = ImageFile.objects.filter(phash__isnull=True).order_by('id')
+    total_missing = todo.count()
+
+    result = {'total_missing': total_missing, 'processed': 0, 'failed': 0}
+    log(f"Images missing phash: {total_missing}")
+
+    if dry_run:
+        log("Dry run -- no changes written.")
+        return result
+
+    if limit is not None:
+        todo = todo[:limit]
+
+    work_items = list(todo.values_list('id', 'filename', 'orientation'))
+
+    def handle_result(image_id, image_hash, error, batch):
+        nonlocal result
+        if error is not None:
+            result['failed'] += 1
+            log(f"Could not compute phash for ImageFile {image_id}: {error}")
+            return
+        obj = ImageFile(id=image_id, phash=image_hash)
+        batch.append(obj)
+        result['processed'] += 1
+        if len(batch) >= batch_size:
+            ImageFile.objects.bulk_update(batch, ['phash'], batch_size=batch_size)
+            batch.clear()
+
+    batch = []
+    if processes > 1:
+        with multiprocessing.Pool(processes) as pool:
+            for image_id, image_hash, error in pool.imap_unordered(_compute_one_phash, work_items):
+                handle_result(image_id, image_hash, error, batch)
+    else:
+        for args in work_items:
+            image_id, image_hash, error = _compute_one_phash(args)
+            handle_result(image_id, image_hash, error, batch)
+
+    if batch:
+        ImageFile.objects.bulk_update(batch, ['phash'], batch_size=batch_size)
+
+    log(f"Done. {result['processed']} processed, {result['failed']} failed.")
+    return result
 
 
 def run_similarity_check(limit=None, dry_run=False, log=print):

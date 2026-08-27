@@ -1528,3 +1528,65 @@ class PhashComputationTests(TestCase):
         obj = ImageFile.objects.get(filename=tmp_path)
         self.assertIsNotNone(obj.phash)
         self.assertFalse(obj.similarity_checked)
+
+
+@override_settings(MEDIA_ROOT='/tmp')
+class PhashBackfillTests(TestCase):
+    """Regression coverage for backfill_phash: images ingested before
+    phash computation existed (or where it's manually cleared here to
+    simulate that) get a phash computed directly from the file on disk,
+    without going through the expensive full ImageFile.save() pipeline
+    (which would also rehash pixel_hash/regenerate thumbnails)."""
+
+    def _ingest_real_image(self, name):
+        val_dir = settings.FILEPOPULATOR_VAL_DIRECTORY
+        src = os.path.join(val_dir, 'naming', 'good', name)
+        tmp_path = f'/tmp/phash_backfill_test/{name}'
+        os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+        shutil.copy(src, tmp_path)
+        create_image_file(tmp_path)
+        return ImageFile.objects.get(filename=tmp_path)
+
+    def test_backfill_computes_phash_for_existing_image_missing_one(self):
+        obj = self._ingest_real_image('1.JPG')
+        # Simulate a pre-phash-era row: has real pixel_hash/thumbnails
+        # already, just never got a phash.
+        ImageFile.objects.filter(id=obj.id).update(phash=None)
+
+        call_command('backfill_phash')
+
+        obj.refresh_from_db()
+        self.assertIsNotNone(obj.phash)
+
+    def test_dry_run_writes_nothing(self):
+        obj = self._ingest_real_image('2.jpg')
+        ImageFile.objects.filter(id=obj.id).update(phash=None)
+
+        call_command('backfill_phash', '--dry-run')
+
+        obj.refresh_from_db()
+        self.assertIsNone(obj.phash)
+
+    def test_does_not_touch_pixel_hash_or_thumbnails(self):
+        obj = self._ingest_real_image('1.JPG')
+        original_pixel_hash = obj.pixel_hash
+        original_thumb = obj.thumbnail_big.name
+        ImageFile.objects.filter(id=obj.id).update(phash=None)
+
+        call_command('backfill_phash')
+
+        obj.refresh_from_db()
+        self.assertEqual(obj.pixel_hash, original_pixel_hash)
+        self.assertEqual(obj.thumbnail_big.name, original_thumb)
+
+    def test_multiprocess_backfill_matches_single_process_result(self):
+        obj_a = self._ingest_real_image('1.JPG')
+        obj_b = self._ingest_real_image('2.jpg')
+        ImageFile.objects.filter(id__in=[obj_a.id, obj_b.id]).update(phash=None)
+
+        call_command('backfill_phash', '--processes', '2')
+
+        obj_a.refresh_from_db()
+        obj_b.refresh_from_db()
+        self.assertIsNotNone(obj_a.phash)
+        self.assertIsNotNone(obj_b.phash)
