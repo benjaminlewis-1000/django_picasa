@@ -217,6 +217,18 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+- **TODO: manual override tool for nearest-metro geocoding mismatches.** The nearest-metro
+  fallback (`filepopulator/geocode.py`'s `find_nearest_metro()`) picks the *largest* populated
+  place within the nearest qualifying radius band, not the most globally recognizable one --
+  spot-checked real production data 2026-08-27 and found a handful of cases where that diverges
+  from what a person would actually pick: Pisa, Italy resolves to Livorno (20km, real and
+  populous, but Florence -- the far more famous nearby city -- is ~80km away, outside the search
+  radius); a Heathrow-area London coordinate resolves to "Brent" rather than "London" itself for
+  the same reason. Small in number, but real. Wants a way to manually override/pin a specific
+  coordinate's metro (or precise locality) result, likely a frontend-facing tool backed by a
+  small API surface here (not scoped yet -- this repo doesn't have frontend visibility in this
+  session; needs a design pass covering both the override UI and the backend endpoint/storage
+  for it, e.g. an `is_manual_override` flag or similar on `GeocodeCache`). Not started.
 - **TODO: HEIC files with a non-1 EXIF orientation currently fail loudly instead of being
   handled.** Found 2026-08-26: a user rotated a real HEIC (`IMG_9370.HEIC`) via an external tool
   that only flipped the orientation tag (now 8) without re-encoding pixels (raw dimensions
