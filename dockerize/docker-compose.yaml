@@ -114,10 +114,15 @@ services:
       # Add a file to the daily crontab directory that backs up the database.
       # Run by the run-parts command, which hates periods in filenames, hence why
       # I don't make a .sh suffix in the container. Bind-mounted (not baked into
-      # the image via Dockerfile_postgres) so editing it takes effect on a plain
-      # container restart -- same fix applied to picasa_api's startup.sh earlier,
-      # after that one silently didn't pick up an edit until a full rebuild.
+      # the image via Dockerfile_postgres) so editing it doesn't require a full
+      # rebuild like it used to -- same fix applied to picasa_api's startup.sh.
+      # NOTE: a single-file bind mount like this stays attached to whatever
+      # inode existed at container-create time -- editing the host file (most
+      # editors replace-via-rename, which changes the inode) needs
+      # `docker compose up -d --force-recreate db_django` to actually pick up,
+      # not just a plain restart or a config-less `up -d`.
       - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/daily/postgres_bak_sh
+      - ${DJANGO_FILES_ROOT}/dockerize/prune_backups.py:/etc/periodic/daily/prune_backups.py
       - /mnt/fast_storage/appdata/django_picasa/backups:/backup
     labels:
       - "user=postgres"

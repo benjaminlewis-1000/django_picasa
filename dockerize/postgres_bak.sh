@@ -1,7 +1,9 @@
 #! /bin/bash
 set -e
 
-# Run a backup to the /backup directory.
+# Run a dated backup to the /backup directory, then prune old generations
+# per prune_backups.py's retention policy (7 daily, then one/week through
+# ~5 weeks, then one/month through 3 months, delete anything older).
 #
 # Directory-format dump (-F d --compress=none) + external multi-threaded
 # zstd compression, rather than pg_dump's own -Z compressor (which is
@@ -16,17 +18,20 @@ set -e
 # real win of this approach is *speed*, from actually using more than one
 # core.
 #
-# To restore:
+# To restore a given generation:
 #   mkdir /tmp/restore_dir
-#   zstd -d -T0 -c /backup/picasa_db.tar.zst | tar -x -C /tmp/restore_dir
+#   zstd -d -T0 -c /backup/picasa_db_YYYY-MM-DD.tar.zst | tar -x -C /tmp/restore_dir
 #   pg_restore -U postgres -d <target_db> --no-owner --no-acl -j 4 /tmp/restore_dir/picasa_dump_dir
 #   rm -rf /tmp/restore_dir
 
+DATE=$(date +%F)
 DUMP_DIR=/backup/picasa_dump_dir
 rm -rf "$DUMP_DIR"
 
 /usr/local/bin/pg_dump -U benjamin -w -F d --compress=none -j 4 -f "$DUMP_DIR" picasa
 
-tar -cf - -C /backup picasa_dump_dir | zstd -T0 -12 -o /backup/picasa_db.tar.zst
+tar -cf - -C /backup picasa_dump_dir | zstd -T0 -12 -o "/backup/picasa_db_${DATE}.tar.zst"
 
 rm -rf "$DUMP_DIR"
+
+python3 /etc/periodic/daily/prune_backups.py --backup-dir /backup
