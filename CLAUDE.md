@@ -217,6 +217,16 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+- **TODO: consider nulling `face_encoding_512` for `.ignore`/`.realignore` faces.** These two
+  sentinels together account for 216,061 faces / ~552MB of `face_manager_face`'s
+  `face_encoding_512` column (measured 2026-08-26, post-`face_encoding` column removal) — real
+  storage on disk (`pg_column_size`, TOAST/pglz-compressed), not raw. Since these faces are
+  already permanently "ignored," their embeddings are never usefully compared again in
+  `assign_faces`/`classify_unassigned()` — but nulling them is a one-way change (the actual
+  vectors would be gone, not just hidden), so decide deliberately rather than as a quick win.
+  Reclaiming the freed space would need another `VACUUM FULL face_manager_face` afterward, same
+  as the `face_encoding` removal. Not started -- explicitly deferred by the user ("we'll build to
+  it") pending further discussion.
 - **Removed `Face.face_encoding` (legacy 128-d dlib embedding), 2026-08-26.** Superseded by
   `face_encoding_512` (insightface) for years — the live pipeline (`face_extract_encode.py`)
   already hadn't written a real value to it, explicitly setting it to `None`. Freed ~371MB in
