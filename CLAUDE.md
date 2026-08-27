@@ -217,6 +217,47 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+**Where things stand (2026-08-27, end of session)**: a lot landed this session, all merged to
+`master` and live in production (`backend_upgrade`/`master` fully in sync at `98981e9`):
+- **DB restore from a 2-day-old snapshot, fully promoted to live.** A frontend bug forced a
+  restore of `picasa_db_2_day.tar` (`pg_dump -Ft`, dumped 2026-08-24 22:00). Restored into a
+  scratch DB first, verified (migrations, row counts, ORM sanity checks, known-problem images),
+  then re-ran the full post-restore checklist against it (`.another_ignore` merge, null-island
+  GPS normalization, the 1,647-face chronic-cleanup -- now a real `cleanup_chronically_unmatched_
+  faces` command, not an ad hoc script) before promoting it to replace live `picasa` via
+  `ALTER DATABASE ... RENAME`. The **old pre-restore DB is preserved**, not dropped, as
+  `picasa_pre_reset_2026_08_26` -- still sitting in `db_picasa` as a safety net; worth deciding
+  later whether/when it's safe to actually drop.
+- **Reverse geocoding fully backfilled**: 3,333/3,333 coordinates, 0 failures, ~8.6 hours
+  overnight. 52,736+ images linked. Found and fixed a real concurrency bug along the way (the
+  recurring hourly `geocode_new_images` task crashing every run on `IntegrityError` when it
+  raced the one-time backfill -- both trying to cache the same coordinate).
+  `NOMINATIM_CONTACT_EMAIL` needed setting in `.env` (was getting 403'd with the placeholder).
+- **Storage cleanup on `face_manager_face`** (the single biggest table by far): removed the
+  unused legacy `face_encoding` (128-d dlib) column, and converted `face_encoding_512` from
+  double precision to single precision (`real`) -- insightface's embeddings are natively
+  float32, verified with a full-population, zero-lossy-rows round-trip check across all 633k+
+  production rows before implementing. Combined: **~609MB freed** (2496MB -> 1887MB), each
+  requiring `VACUUM FULL` afterward to actually reclaim (not just `ALTER`/`DROP COLUMN`, which
+  alone don't shrink the table).
+- **DB backup rebuilt**: dated `picasa_db_YYYY-MM-DD.tar.zst` files (directory-format dump +
+  external multi-threaded `zstd`, ~2x faster than `pg_dump`'s own single-threaded compressor),
+  plus a tiered daily/weekly/monthly retention pruner (`prune_backups.py`) -- keep 7 daily, one
+  per ISO week through ~5 weeks, one per month through 3 months, delete anything older. Verified
+  end-to-end (real backup, real restore, row counts compared). **User asked to check back on
+  this over the next few days** once it's had a chance to run for real across day/tier
+  boundaries -- see the `backup-retention-check` memory if picking this up in a future session.
+- **Gotcha found and documented**: single-file Docker bind mounts (`picasa_api`'s `startup.sh`,
+  `db_picasa`'s `postgres_bak.sh`/`prune_backups.py`) go stale on any edit that replaces the file
+  rather than editing in place (this session's own `Write` tool does this) -- needs
+  `docker compose up -d --force-recreate <service>`, not a plain restart, to actually pick up.
+- **Open TODOs, not yet started** (see entries below): the manual-override tool for nearest-metro
+  mismatches; HEIC non-1-orientation handling (currently fails loudly, found via a real user
+  photo); `assign_faces.py`'s small-batch (`<=100` unassigned faces) `embedding_dict`
+  `AttributeError`, confirmed live, contained but not fixed; whether to null `face_encoding_512`
+  for `.ignore`/`.realignore` faces (~552MB, explicitly deferred by the user); the 29 known
+  duplicate `ImageFile` rows from before this session's dedup fix, still not cleaned up.
+
 - **TODO: manual override tool for nearest-metro geocoding mismatches.** The nearest-metro
   fallback (`filepopulator/geocode.py`'s `find_nearest_metro()`) picks the *largest* populated
   place within the nearest qualifying radius band, not the most globally recognizable one --
