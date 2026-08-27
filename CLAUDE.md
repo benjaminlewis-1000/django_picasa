@@ -228,7 +228,17 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   coordinate's metro (or precise locality) result, likely a frontend-facing tool backed by a
   small API surface here (not scoped yet -- this repo doesn't have frontend visibility in this
   session; needs a design pass covering both the override UI and the backend endpoint/storage
-  for it, e.g. an `is_manual_override` flag or similar on `GeocodeCache`). Not started.
+  for it, e.g. an `is_manual_override` flag or similar on `GeocodeCache`). Requirements gathered
+  so far (2026-08-27), not yet designed:
+  - A real API endpoint for the frontend to call (not scoped -- which `api/` view, auth, etc.).
+  - The override's stored shape must match `nearest_metro_name`/`nearest_metro_distance_km`'s
+    existing format exactly, so downstream consumers can't tell a manual pin apart from an
+    algorithm-produced one without checking the override flag specifically.
+  - Validate the override against a real place (reject unknown/typo'd countries, states,
+    localities) rather than accepting arbitrary free text -- likely reusing
+    `filepopulator/data/major_places.csv` (or a broader gazetteer if that's too narrow for
+    arbitrary manual entries) as the source of truth for what counts as valid.
+  Not started.
 - **TODO: HEIC files with a non-1 EXIF orientation currently fail loudly instead of being
   handled.** Found 2026-08-26: a user rotated a real HEIC (`IMG_9370.HEIC`) via an external tool
   that only flipped the orientation tag (now 8) without re-encoding pixels (raw dimensions
