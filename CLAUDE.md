@@ -217,6 +217,31 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+- **Gotcha: single-file Docker bind mounts go stale on any edit that replaces the file (rename over
+  original) rather than editing in place** — found 2026-08-26 while iterating on
+  `dockerize/postgres_bak.sh` (bind-mounted into `db_picasa` at `/etc/periodic/daily/postgres_bak_sh`,
+  see docker-compose.yaml). The container's mount stays attached to the *inode* that existed at
+  container-create time; a `docker restart` does NOT refresh it, and even `docker compose up -d`
+  won't either if compose sees no config diff (same volumes list, same image) — only
+  `docker compose up -d --force-recreate <service>` (or an equivalent recreate) actually
+  re-establishes the mount against the current file. Applies to `picasa_api`'s `startup.sh`
+  bind mount too, and any other single-file bind mount added the same way. Always verify with
+  `docker exec <container> cat <path>` after editing one of these, don't assume a plain restart
+  picked it up.
+- **Rebuilt the DB backup script (2026-08-26)** — `dockerize/postgres_bak.sh` now does
+  `pg_dump -F d --compress=none -j 4` (directory format, uncompressed) piped through
+  `tar | zstd -T0 -12` (external, multi-threaded compression) instead of `pg_dump`'s own
+  single-threaded `-Z` compressor. Measured against the live ~2.4GB DB: previous approach
+  (custom format, `-Z 6` gzip) took 17m23s for a 3.43GB backup; this one took ~11.5m (6m9s dump +
+  5m24s compress) for 2.28GB — better on both time and size, though the size win is mostly
+  incidental (this DB's data, `face_manager_face`'s high-entropy float embeddings, doesn't
+  compress much under *any* single-threaded algorithm — measured `pg_dump`'s own `-Z zstd:9` and
+  `-Z 6` both landing close to or above the live table's own already-TOAST-compressed on-disk
+  size; the real, reliable win here is speed from genuine multi-core use). Verified end-to-end:
+  real backup run, decompress + `pg_restore -j 4` into a scratch DB, row counts compared against
+  live. Restore is a different shape now (extract then `pg_restore` a directory, not
+  `pg_restore` a single file directly) -- see the comment at the top of `postgres_bak.sh` for the
+  exact commands.
 - **TODO: consider nulling `face_encoding_512` for `.ignore`/`.realignore` faces.** These two
   sentinels together account for 216,061 faces / ~552MB of `face_manager_face`'s
   `face_encoding_512` column (measured 2026-08-26, post-`face_encoding` column removal) — real
