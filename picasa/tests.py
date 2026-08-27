@@ -157,3 +157,10 @@ class SettingsSanityTests(TestCase):
 
     def test_jwt_signing_key_is_the_django_secret_key(self):
         self.assertEqual(settings.SIMPLE_JWT["SIGNING_KEY"], settings.SECRET_KEY)
+
+    def test_session_cookie_renews_on_activity(self):
+        # Without this, SESSION_COOKIE_AGE is a fixed lifetime from login
+        # (browser deletes the cookie 30 min later regardless of activity),
+        # not a sliding inactivity timeout - see picasa/settings.py's
+        # comment on SESSION_COOKIE_AGE for the full explanation.
+        self.assertTrue(settings.SESSION_SAVE_EVERY_REQUEST)

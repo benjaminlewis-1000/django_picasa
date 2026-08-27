@@ -275,6 +275,16 @@ LOGIN_URL = '/accounts/oidc/authelia/login/'
 LOGOUT_REDIRECT_URL = 'https://auth.exploretheworld.tech/logout'
 # Force Django to destroy its session cookie when the browser tab closes
 SESSION_COOKIE_AGE = 1800  # Expires after 30 minutes of inactivity
+# The comment above was aspirational, not actual: Django only resends a
+# fresh Set-Cookie (renewing SESSION_COOKIE_AGE from "now") when the
+# session is written to on a given request. Without this, the cookie's
+# expiry is fixed at login time + 30 minutes, active or not - a user
+# working continuously for 30+ minutes gets logged out anyway, and it
+# happens silently (the frontend has no periodic re-check - see
+# dev_facewire's isLoggedIn.jsx, only called once at mount). This makes
+# every authenticated request re-save the session, turning the 30-minute
+# window into a real sliding inactivity timeout as originally intended.
+SESSION_SAVE_EVERY_REQUEST = True
 SESSION_EXPIRE_AT_BROWSER_CLOSE = True
 SESSION_COOKIE_DOMAIN = '.exploretheworld.tech'
 
