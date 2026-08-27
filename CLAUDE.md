@@ -217,6 +217,88 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+**Face-classification outlier-rejection: investigation and ideas (2026-08-27).** Started from a
+real user observation: `face_manager/assign_faces.py`'s `classify_unassigned()` is good at
+correctly matching faces to known people, but frequently proposes outlier faces as matches too.
+Investigated via a real experiment methodology -- `.ignore`/`.realignore` confirmed faces used as
+known-outlier ("negative") queries, leave-one-out on real confirmed faces as "positive" queries,
+scored against the actual 441-person/273k-face gallery `assign_faces.py` uses. Findings and open
+ideas, so a future session doesn't have to redo this from scratch:
+- **Root cause identified, fix not yet implemented**: `classify_unassigned()` gates
+  accept/reject on `sim_max` (line ~300-312) -- a pure 1-nearest-neighbor comparison, maximally
+  vulnerable to any single noisy/mislabeled face in a person's gallery. The code already computes
+  `sim_99th` per candidate but only uses it as the display "weight," never as the actual gate.
+  **Swapping the gate from `sim_max` to `sim_99th`** (already computed, near one-line change) cut
+  false-positive rate from 2.8% to 1.0% at the existing `ASSIGN_THRESH=0.6`, at a cost of TPR
+  dropping from 86.5% to 79.5% (more real matches would get punted to `.ignore` needing manual
+  re-tagging). User decided this TPR cost isn't worth it alone -- wants to find something that
+  improves both sides at once before landing any threshold change. Not implemented yet.
+- **Tested and rejected: combining multiple percentiles (p50/p75/p90/p95/p99/max) via logistic
+  regression.** AUC barely improved over `p99` alone (0.968 vs 0.967) -- percentiles of the same
+  similarity distribution are too correlated with each other to add real complementary signal.
+  Top-k averaging (top-10/top-25) was *worse* than plain percentiles, likely because a fixed-k
+  average dilutes badly for people whose galleries are barely above `MIN_NUM_FACES=10`, while a
+  percentile automatically scales with each person's own gallery size.
+- **Validated: same-person cosine similarity decays substantially with photo date gap** (0.544
+  mean similarity at 0-3mo gap vs 0.285 at 15+yr gap, correlation -0.37, 3.4M same-person pairs
+  across 318 people). Real, strong effect -- but:
+- **Tested and rejected (for accept/reject purposes): general date-windowing** (only compare
+  against a candidate's own faces within N years of the query, N in 1-10). TPR barely moved,
+  FPR didn't improve. Explained by a follow-up measurement: windowing does cut the average
+  candidate field size a lot (e.g. only ~41% of 440 people survive a 1-year window) but the
+  people most likely to cause false positives -- those with large, temporally-broad galleries --
+  survive *any* window width, so windowing filters out people who were never going to win
+  anyway, not the actual troublemakers. Caveat: tight windows leave few points per candidate, so
+  the windowed metric falls back to `max` (noisier), which may itself be part of why it didn't
+  help -- not fully isolated from the small-sample-instability confound.
+- **Tested and blocked by a separate data-quality problem: birth-year-based hard cutoff.**
+  `Face.detected_age` (insightface, populated on 631,874/637,960 faces already) can estimate a
+  person's birth year as `median(photo_year - detected_age)` across their gallery -- precise to
+  well under a year for people with 1000+ faces (bootstrap 95% CI ~0.9yr), but investigation
+  found the *aggregate* precision doesn't mean the estimate is *accurate*: a known-preschooler
+  ("Liam Lewis") had 99.6% of his 17,485 confirmed faces show `detected_age > 15` (median 46) --
+  and two other people with very different presumed true ages (Nathaniel, Benjamin) showed
+  nearly identical medians (42, 46). That consistency suggests `detected_age` may not be a
+  usable per-photo age signal for this pipeline at all (possibly landing in a narrow band
+  regardless of true age -- face-crop quality/resolution feeding the age model, or a bug in how
+  the value is read from insightface's output, not investigated further). **Tabled by the user
+  pending a visual sanity-check** (pull a handful of real face thumbnails next to their
+  `detected_age` and eyeball whether it's remotely plausible) before reviving this idea.
+- **Separately discovered, real, previously-undocumented bug: `Face.dateTakenUTC` corruption.**
+  ~7,177+ faces have wildly corrupted dates (one as far back as year 0102 AD), and there are
+  large clusters of many *distinct* source images sharing one identical to-the-second timestamp
+  (e.g. 415 distinct images all at `2000-10-20 12:06:30`, all `.realignore` faces) -- not
+  plausible for real photography, smells like a fallback/default-date bug rather than genuine
+  EXIF data. Not investigated further this session (worked around via a sane `[1990, 2027]`
+  bound for the birth-year experiments); worth a real look given it could affect other
+  date-dependent logic (`Directory.average_date_taken()`, the geocode/date-decay work, etc.).
+- **Brainstormed, not yet tried** -- ideas for improving both TPR and FPR together rather than
+  trading one for the other, roughly in order of expected cost/promise:
+  - **Per-person calibrated threshold** instead of one global `ASSIGN_THRESH=0.6` for everyone --
+    calibrate each person's accept threshold from their own intra-gallery self-similarity spread
+    (e.g. their own median pairwise similarity minus a margin), so naturally "easy"
+    (tight-gallery) people get a tighter gate and naturally "hard" (diffuse-gallery) people get
+    an appropriately looser one.
+  - **Covariance-aware (Mahalanobis) distance** instead of isotropic cosine similarity -- scores
+    a query by how well it fits the *shape* of a person's embedding cloud (which directions of
+    variation are normal for them), not just raw distance to it. Real practical blocker sized up
+    already: a full 512x512 per-person covariance needs far more samples than most of this
+    gallery has (153/441 people have only 10-25 faces) to be invertible/well-estimated at all --
+    would need shrinkage estimation (e.g. Ledoit-Wolf), PCA dimensionality reduction first, or a
+    diagonal-only covariance approximation to be practical here.
+  - **Co-occurrence / social-context prior** -- if other faces in the *same photo* are already
+    confidently identified, and those people are frequently photographed together with a given
+    candidate (siblings, spouse, etc.), that's a real prior signal independent of the embedding
+    entirely (how early Picasa/Google Photos boosted tagging accuracy). Bigger lift -- needs new
+    co-occurrence-statistics infrastructure, not scoped.
+  - **Directory/event context prior** -- faces from the same source folder or day tend to
+    recur; if a directory is already heavily populated with a specific family group's confirmed
+    faces, that shifts the prior for an unlabeled face in that same directory. Also not scoped.
+  - Experiment scripts and cached data (gallery embeddings, negative pool, both keyed by
+    person/face id with dates attached) live only in `/tmp` inside `picasa_api` and the
+    session's own scratchpad -- not committed anywhere, will need rebuilding if a future session
+    picks this up (see this file's own description of the caching approach if reconstructing).
+
 **Where things stand (2026-08-27, end of session)**: a lot landed this session, all merged to
 `master` and live in production (`backend_upgrade`/`master` fully in sync at `98981e9`):
 - **DB restore from a 2-day-old snapshot, fully promoted to live.** A frontend bug forced a
@@ -542,10 +624,15 @@ active production issue, not just cleanup — worth prioritizing the deploy once
   `ensure_sentinel_people()` in `api/tests.py` is now effectively a no-op safety net (its
   `exists()` check short-circuits immediately) rather than the sole source of these rows.
 - **Investigate `ImageFile.save()`'s unconditional MD5 rehash** (see "Data model notes" above) —
-  it fully decodes the image and recomputes `_generate_md5_hash()` on *every* `.save()` call, not
-  just creation. Worth checking whether anything calls `.save()` on existing rows somewhere hot
+  it fully decodes the image and recomputes `_generate_md5_hash()` (and now phash, added
+  2026-08-27 — see the similarity-detection entry below) on *every* `.save()` call, not just
+  creation. Worth checking whether anything calls `.save()` on existing rows somewhere hot
   (bulk operations, periodic tasks) where this is pure wasted CPU, and whether the hash could be
-  computed once and skipped on later saves when the file's mtime/size haven't changed.
+  computed once and skipped on later saves when the file's mtime/size haven't changed. This has
+  come up repeatedly as a real cost, not just a theoretical one: `backfill_phash` (below) was
+  built specifically to avoid it — going through `.save()` to backfill 206k images' phash would
+  have redundantly rehashed pixel_hash and regenerated thumbnails for every one of them. Worth
+  actually fixing at the source rather than routing around it again next time.
 - **DONE (2026-08-26): HEIC support.** `pillow-heif` (already present in `picasa_img`, now explicitly pinned) registers a PIL plugin (`common/__init__.py`, at import time) so `PIL.Image.open()` handles `.heic`/`.heif` transparently. `ImageFile.filename`'s `RegexValidator`, `process_new_no_md5()`'s own check, and `create_image_file()`/`add_from_root_dir()`'s extension gates all now accept `.heic`/`.heif` via one shared `IMAGE_EXTENSION_REGEX` constant (`filepopulator/models.py`). Verified empirically against 8 real iPhone HEIC samples (models 12 through 17 Pro, from `/mnt/fast_storage/appdata/django_picasa/test_suite/heic_images/`, mounted read-only under `/photos/heic_stub`):
   - Decode always produces plain RGB (no alpha/exotic color modes to handle).
   - **EXIF orientation always reads back as `1`** regardless of the photo's actual portrait/landscape framing — `pillow_heif`/libheif auto-applies any container-level rotation transform (`irot`/`imir` boxes) during decode and resets the tag to match. This means the existing `apply_exif_orientation()` logic (which no-ops on orientation 1) is safe to reuse unchanged — no double-rotation risk materialized.
