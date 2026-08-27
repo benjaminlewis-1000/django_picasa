@@ -277,6 +277,24 @@ class FaceModelTests(TestCase):
         face.refresh_from_db()
         self.assertIsNone(face.declared_name)
 
+    def test_face_encoding_512_stores_at_float32_precision(self):
+        """face_encoding_512 is now backed by `real` (single precision),
+        not `double precision` -- insightface's embeddings are natively
+        float32 (verified directly against real detections), so storing
+        at float32 precision loses nothing the model didn't already lose.
+        A value with real double-precision-only bits should get rounded
+        to its nearest float32 representation on save, not preserved
+        exactly."""
+        double_only_value = 0.123456789012345  # not exactly representable in float32
+        face = make_face(self.image)
+        face.face_encoding_512 = [double_only_value] * 512
+        face.save()
+        face.refresh_from_db()
+
+        expected = float(np.float32(double_only_value))
+        self.assertEqual(face.face_encoding_512[0], expected)
+        self.assertNotEqual(face.face_encoding_512[0], double_only_value)
+
 
 @tag("slow")
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")

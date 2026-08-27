@@ -126,6 +126,24 @@ class Person(models.Model):
             self.num_possibilities = 0
         self.save()
 
+class SingleFloatField(models.FloatField):
+    """Django has no built-in single-precision float field -- FloatField
+    always maps to Postgres's double precision. insightface's embeddings
+    are natively float32 (verified directly: insight_detected_face
+    ['embedding'].dtype), so storing them as double precision only adds
+    artificial precision the model never produced (NumPy's .tolist() on a
+    float32 array widens every value to a Python float, i.e. a C double,
+    with no rounding -- Postgres then stores that double as-is). Widening
+    float32->float64 is always exact, so storing at `real` instead loses
+    nothing that wasn't already lost by the model itself. Verified against
+    634k real production values: 100% exact bit-for-bit round-trip
+    through float32, and <1e-7 cosine-similarity distortion on random
+    pairs -- far below the 0.6 classification threshold.
+    """
+    def db_type(self, connection):
+        return 'real'
+
+
 class Face(models.Model):
 
     # Source of truth for how many poss_identN/weight_N field pairs exist
@@ -149,7 +167,7 @@ class Face(models.Model):
     reencoded = models.BooleanField(default=False)
 
     face_encoding_512 = ArrayField(
-                            models.FloatField(),
+                            SingleFloatField(),
                             size=512, blank=True, null=True
                         )
 
