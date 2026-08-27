@@ -217,6 +217,19 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+- **TODO: HEIC files with a non-1 EXIF orientation currently fail loudly instead of being
+  handled.** Found 2026-08-26: a user rotated a real HEIC (`IMG_9370.HEIC`) via an external tool
+  that only flipped the orientation tag (now 8) without re-encoding pixels (raw dimensions
+  unchanged) -- unlike every real HEIC sample tested when this guard was built, where libheif
+  always baked the rotation into the pixels at decode and reset the tag to 1. `_init_image()`'s
+  HEIC-specific guard (`filepopulator/models.py`) deliberately raises `OSError` on any non-1
+  orientation rather than guessing, so this file will get flagged `image_load_failed=True`
+  instead of reprocessing with the new rotation. Possible fix: extend HEIC handling to actually
+  apply non-1 orientations via `apply_exif_orientation()` (the same function JPEG already uses)
+  instead of rejecting them outright -- a real behavior change, not done yet, needs discussion
+  first. Not a JPEG problem: JPEG's orientation-changed case is already correctly handled by
+  `create_image_file()`'s "same pixel hash, different orientation" branch (stale faces cleared,
+  row updated in place, redetection triggered).
 - **Gotcha: single-file Docker bind mounts go stale on any edit that replaces the file (rename over
   original) rather than editing in place** — found 2026-08-26 while iterating on
   `dockerize/postgres_bak.sh` (bind-mounted into `db_picasa` at `/etc/periodic/daily/postgres_bak_sh`,
