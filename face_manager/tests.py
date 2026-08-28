@@ -24,7 +24,7 @@ import numpy as np
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
-from django.test import TestCase, override_settings, tag
+from django.test import TestCase, TransactionTestCase, override_settings, tag
 
 from django.core.management import call_command
 
@@ -937,3 +937,65 @@ class LoadEncodingsCachingTests(TestCase):
         fresh_assigner.load_encodings()
 
         self.assertEqual(len(fresh_assigner.candidate_dict[self.person.id]), 2)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class ExecuteThreadingTests(TransactionTestCase):
+    """execute(num_threads>1) parallelizes the per-face classification
+    loop across a ThreadPoolExecutor -- confirms every face gets
+    processed exactly once (no thread starves or double-processes a
+    face) and nothing crashes under real concurrent DB writes to shared
+    Person rows (increment_possible_num()'s atomic F() update is what
+    makes that safe -- see face_manager/models.py).
+
+    Needs TransactionTestCase, not TestCase: TestCase wraps the whole
+    test in one uncommitted transaction on the main thread's connection,
+    which a worker thread's own separate connection can't see -- every
+    face this test creates would look like it doesn't exist yet to the
+    threads trying to classify it. TransactionTestCase actually commits,
+    matching how real separate connections/threads work in production.
+
+    serialized_rollback=True: TransactionTestCase's teardown flushes
+    (truncates) the whole DB rather than rolling back a transaction --
+    without this, that would also wipe the sentinel Person rows a data
+    migration seeds once (BLANK_FACE_NAME/.ignore/etc, see face_manager/
+    migrations/0003_seed_sentinel_people.py), breaking every other test
+    in the suite that runs after this one and expects them to exist."""
+
+    serialized_rollback = True
+
+    def test_execute_with_multiple_threads_processes_every_face(self):
+        img = make_image()
+        prolific = make_person("Prolific Threaded Person")
+
+        base = np.zeros(512)
+        base[0] = 1.0
+        # MIN_NUM_FACES=10 -- needs strictly more than that to count as
+        # a "likely" candidate at all.
+        for _ in range(12):
+            f = make_face(img, declared_name=prolific)
+            f.face_encoding_512 = base.tolist()
+            f.save()
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        unassigned_faces = []
+        for _ in range(6):
+            f = make_face(img, declared_name=blank_person)
+            f.face_encoding_512 = base.tolist()
+            f.save()
+            unassigned_faces.append(f)
+
+        assigner = faceAssigner()
+        assigner.ENCODINGS_PKL_FILE = "/tmp/face_manager_test_media/exec_threading_cache.pkl"
+        assigner.execute(redo_all=True, num_threads=3)
+
+        for f in unassigned_faces:
+            f.refresh_from_db()
+            self.assertIsNotNone(f.poss_ident1_id, f"face {f.id} was never classified")
+
+        prolific.refresh_from_db()
+        # All 6 identical-encoding unassigned faces should confidently
+        # match the one real candidate -- confirms the threaded run
+        # produced the same kind of result the sequential path would,
+        # not just "didn't crash."
+        self.assertEqual(prolific.face_poss1.count(), 6)

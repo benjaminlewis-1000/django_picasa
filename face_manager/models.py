@@ -105,8 +105,19 @@ class Person(models.Model):
         self.save()
 
     def increment_possible_num(self):
-        self.num_possibilities += 1
-        self.save()
+        # Atomic DB-side increment, not a Python-level read-modify-write:
+        # faceAssigner caches Person instances across many
+        # classify_unassigned() calls (see person_cache in
+        # assign_faces.py) to avoid a Person.objects.get() round trip
+        # per call, and a multi-threaded reprocess can genuinely call
+        # this concurrently on the SAME cached instance for a popular
+        # person -- a plain self.num_possibilities += 1; self.save()
+        # would lose increments under that race. F() makes the increment
+        # itself race-free; refresh_from_db() then syncs this in-memory
+        # instance (shared across threads) back to the true DB value
+        # rather than leaving it holding a stale local count.
+        Person.objects.filter(pk=self.pk).update(num_possibilities=models.F('num_possibilities') + 1)
+        self.refresh_from_db(fields=['num_possibilities'])
 
     def decrement_assigned(self):
         self.num_faces -= 1
@@ -326,15 +337,22 @@ class Face(models.Model):
         and isn't cheap (~20ms measured against production), so 5 calls
         each saving was a real, avoidable cost multiplier. Callers that
         pass save=False are responsible for calling .save() themselves
-        once they're done setting fields."""
+        once they're done setting fields.
+
+        person_id may be a Person instance instead of a raw id -- lets a
+        caller that's already cached the Person objects it needs (e.g.
+        faceAssigner.person_cache, avoiding a Person.objects.get() round
+        trip on every one of these calls across a large reprocess) pass
+        it straight through."""
 
         assert poss_idx > 0, 'The index correlateed to poss_ident must be a value between 1 and 5.'
         assert poss_idx <= 5, 'The index correlateed to poss_ident must be a value between 1 and 5.'
-        assert type(person_id) in [int, np.int32, np.int64], f"Person ID should be an int but is {type(person_id)}"
+        assert isinstance(person_id, (int, np.int32, np.int64, Person)), \
+            f"Person ID should be an int or Person but is {type(person_id)}"
         assert type(weight) in [int, float, np.float64], f"Weight should be an int or float; is {type(weight)}"
         assert weight >= 0
         assert weight <= 1.000001, f"weight was {weight}"
-        new_poss_id = Person.objects.get(id=person_id)
+        new_poss_id = person_id if isinstance(person_id, Person) else Person.objects.get(id=person_id)
         if poss_idx == 1:
             new_poss_id.increment_possible_num()
         # self.__dict__[f'weight_{poss_idx}'] = weight

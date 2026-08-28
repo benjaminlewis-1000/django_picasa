@@ -13,8 +13,10 @@
 # import torch.nn.functional
 # import torchvision
 # torch.backends.nnpack.enabled = False
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from django.conf import settings
+from django.db import connection as db_connection
 from django.db.models import Count, Q, F
 from django.db.models.functions import Abs
 from face_manager.models import Person, Face
@@ -24,6 +26,7 @@ import numpy as np
 import os
 import pandas as pd
 import pickle
+import threading
 import time
 
 
@@ -108,6 +111,15 @@ class faceAssigner():
     #         p.num_possibilities = p.face_poss1.count() # + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
     #         p.num_unverified_faces = p.face_declared.filter(validated=False).count()
     #         p.save()
+
+    def _cached_person(self, person_id):
+        """Person instance if person_cache has it (the normal case after
+        load_encodings()), else the raw id -- Face.set_possible_person()
+        accepts either, falling back to its own Person.objects.get() for
+        the id case. The fallback matters for tests that build a
+        faceAssigner and set embedding_dict/norm_dict directly without
+        going through load_encodings()."""
+        return getattr(self, 'person_cache', {}).get(person_id, person_id)
 
     def _p99_threshold_for_gallery_size(self, gallery_size: int) -> float:
         """Which bucket's calibrated sim_99th threshold applies to a
@@ -244,8 +256,21 @@ class faceAssigner():
                 os.remove(self.ENCODINGS_PKL_FILE)
 
         self._build_concatenated_gallery()
+        self._build_person_cache()
 
         print(f"Dataframe preloading: {time.time() - ss:.2f} seconds")
+
+    def _build_person_cache(self):
+        """Pre-fetches every Person object classify_unassigned() could
+        possibly pass to Face.set_possible_person() -- every likely
+        candidate plus the ignore sentinel -- so that method can skip its
+        own Person.objects.get() round trip. One query instead of up to
+        5 per face across a 140k-face reprocess is a real difference.
+        Cheap enough (a few hundred rows) to just rebuild every
+        load_encodings() call rather than try to keep it incrementally
+        in sync with the embedding cache."""
+        ids = list(self.embedding_dict.keys()) + [self.ignore_person_id]
+        self.person_cache = {p.id: p for p in Person.objects.filter(id__in=ids)}
 
     def _build_concatenated_gallery(self):
         """Concatenates every likely person's embedding matrix into one
@@ -278,9 +303,15 @@ class faceAssigner():
             self.all_embeddings = np.zeros((512, 0))
             self.all_norms = np.zeros(0)
 
-    def execute(self, redo_all: bool = False) -> None:
+    def execute(self, redo_all: bool = False, num_threads: int = 1) -> None:
         """
         DOCSTRING
+
+        num_threads > 1 parallelizes the per-face classification loop --
+        see the branch below for why that's safe here. Defaults to 1
+        (the original, purely sequential behavior) since this hasn't
+        been exercised from the scheduled Celery task, only from a
+        manual bulk reprocess.
         """
 
         if type(redo_all) != bool:
@@ -319,25 +350,63 @@ class faceAssigner():
         # pickle, no DB hit for the embedding data itself), so there's no
         # real cost to doing it unconditionally.
         self.load_encodings()
-        
-        u_idx = 0
-        s = time.time()
-        for u_img in tqdm(unassigned.iterator()):
-            elps = time.time() - s
-            s = time.time()
-            if self.DEBUG:
-                print(f"Assigning: {u_idx+1}/{num_unassigned} | {elps:.2f}")
-                u_idx += 1
-            try:
-                self.classify_unassigned(u_img)
-            except Exception as e:
-                # A failure classifying one face must not abort the entire
-                # scheduled run -- every other already-queued face in this
-                # batch would otherwise silently never get classified
-                # either. See classify_unassigned()'s array-sizing fix
-                # above for the bug this specifically guards against.
-                print(f"Exception classifying face {u_img.id}: {e}")
-                settings.LOGGER.error(f"Exception classifying face {u_img.id}: {e}")
+
+        if num_threads <= 1:
+            for u_img in tqdm(unassigned.iterator()):
+                self._classify_one_safely(u_img.id, u_img)
+        else:
+            # Each face is independent -- reads only the (already fully
+            # loaded, read-only during this run) embedding/person caches,
+            # writes only its own Face row plus whichever Person row(s)
+            # it proposes -- so this is safely parallelizable across
+            # threads, and the bottleneck here (DB round trips, not CPU)
+            # is exactly the kind threading helps with despite the GIL
+            # (psycopg2 releases it during a blocking network call).
+            # Materializing ids upfront (cheap -- plain ints) rather than
+            # streaming via .iterator(), since a shared queryset iterator
+            # isn't safe to pull from concurrently across threads.
+            #
+            # Each worker thread gets its own Django DB connection
+            # (thread-local by design -- django.db.connections is itself
+            # a threading.local, so closing "the" connection from this,
+            # the calling, thread would only ever close the MAIN thread's
+            # connection, never reaching the worker threads' separate
+            # ones). Closed at the end of every task rather than kept
+            # open for the thread's lifetime: simpler and safer than
+            # trying to hook a ThreadPoolExecutor worker's teardown, and
+            # confirmed necessary in practice -- leaving these open let
+            # a test's DB teardown fail with "database is being accessed
+            # by other users". The reconnect cost per face is small next
+            # to everything else classify_unassigned() already does
+            # (Face.save() alone measured ~20ms against production).
+            face_ids = list(unassigned.values_list('id', flat=True))
+            progress = tqdm(total=len(face_ids))
+            progress_lock = threading.Lock()
+
+            def classify_by_id(face_id):
+                try:
+                    face = Face.objects.select_related('declared_name').get(id=face_id)
+                    self._classify_one_safely(face_id, face)
+                finally:
+                    db_connection.close()
+                    with progress_lock:
+                        progress.update(1)
+
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                list(executor.map(classify_by_id, face_ids))
+            progress.close()
+
+    def _classify_one_safely(self, face_id, face):
+        try:
+            self.classify_unassigned(face)
+        except Exception as e:
+            # A failure classifying one face must not abort the entire
+            # scheduled run -- every other already-queued face in this
+            # batch would otherwise silently never get classified
+            # either. See classify_unassigned()'s array-sizing fix
+            # above for the bug this specifically guards against.
+            print(f"Exception classifying face {face_id}: {e}")
+            settings.LOGGER.error(f"Exception classifying face {face_id}: {e}")
 
         # Finish up by "trueing up" the num_assigned for each person:
         print("Verifying face counts...")
@@ -395,7 +464,7 @@ class faceAssigner():
             # self.num_likely_people), a size-0 array here would make
             # np.max()/np.argmax() in the "no match" branch below raise
             # ValueError on an empty reduction.
-            unassigned_face.set_possible_person(self.ignore_person_id, 1, 1.0)
+            unassigned_face.set_possible_person(self._cached_person(self.ignore_person_id), 1, 1.0)
             return
 
         candidate_id_arr = np.array(candidate_ids)
@@ -458,7 +527,7 @@ class faceAssigner():
                 # print("Need to reject the person")
                 max_idx = np.argmax(metrics_array[:, 0])
                 max_id = candidate_id_arr[max_idx]
-                unassigned_face.set_possible_person(max_id, 1, metric_max)
+                unassigned_face.set_possible_person(self._cached_person(int(max_id)), 1, metric_max)
             else:
                 # This weight answers a different question than a real
                 # match's weight does: not "how confident is this specific
@@ -482,7 +551,7 @@ class faceAssigner():
                 closest_call_margin = np.min(margins_below_threshold)  # smallest gap = nearest to passing
                 clamped_margin = np.clip(closest_call_margin, 0, self.IGNORE_WEIGHT_MARGIN_CLAMP)
                 weight = clamped_margin / self.IGNORE_WEIGHT_MARGIN_CLAMP  # 0 (marginal) .. 1 (far from everyone)
-                unassigned_face.set_possible_person(self.ignore_person_id, 1, weight)
+                unassigned_face.set_possible_person(self._cached_person(self.ignore_person_id), 1, weight)
         else:
             scores = metrics_array[possible_idcs, 0]
             assign_ids = metrics_array[possible_idcs, 2].astype(np.int64)
@@ -496,6 +565,7 @@ class faceAssigner():
             # a 140k-face reprocess.
             for precedence_idx, order_idx in enumerate(order):
                 # print(assign_ids[order_idx], precedence_idx, scores[order_idx])
-                unassigned_face.set_possible_person(int(assign_ids[order_idx]), precedence_idx + 1, float(scores[order_idx]), save=False)
+                candidate_person = self._cached_person(int(assign_ids[order_idx]))
+                unassigned_face.set_possible_person(candidate_person, precedence_idx + 1, float(scores[order_idx]), save=False)
             unassigned_face.save()
 
