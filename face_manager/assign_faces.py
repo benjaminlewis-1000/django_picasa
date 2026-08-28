@@ -396,6 +396,24 @@ class faceAssigner():
                 list(executor.map(classify_by_id, face_ids))
             progress.close()
 
+        # Finish up by "trueing up" the num_assigned for each person. Runs
+        # once, here, after the classification phase (either branch)
+        # fully completes -- NOT per face. (Regression note: this
+        # accidentally ended up inside _classify_one_safely() below in an
+        # earlier revision, so it ran once per face instead of once per
+        # execute() call -- 140k redundant 912-row Person iterations
+        # instead of one. Caught by the real reprocess run being
+        # dramatically slower than expected, not by a test; see
+        # ExecuteThreadingTests for what coverage exists, which didn't
+        # happen to catch this since it only checks final counts, not
+        # how many times this loop ran.)
+        print("Verifying face counts...")
+        for p in tqdm(Person.objects.all()):
+            p.num_faces = p.face_declared.count()
+            p.num_possibilities = p.face_poss1.count() # + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
+            p.num_unverified_faces = p.face_declared.filter(validated=False).count()
+            p.save()
+
     def _classify_one_safely(self, face_id, face):
         try:
             self.classify_unassigned(face)
@@ -407,14 +425,6 @@ class faceAssigner():
             # above for the bug this specifically guards against.
             print(f"Exception classifying face {face_id}: {e}")
             settings.LOGGER.error(f"Exception classifying face {face_id}: {e}")
-
-        # Finish up by "trueing up" the num_assigned for each person:
-        print("Verifying face counts...")
-        for p in tqdm(Person.objects.all()):
-            p.num_faces = p.face_declared.count()
-            p.num_possibilities = p.face_poss1.count() # + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
-            p.num_unverified_faces = p.face_declared.filter(validated=False).count()
-            p.save()
 
 
 

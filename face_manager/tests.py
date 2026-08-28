@@ -999,3 +999,39 @@ class ExecuteThreadingTests(TransactionTestCase):
         # produced the same kind of result the sequential path would,
         # not just "didn't crash."
         self.assertEqual(prolific.face_poss1.count(), 6)
+
+    def test_trueing_up_pass_runs_exactly_once_not_per_face(self):
+        # Regression test: the "Verifying face counts" trueing-up loop
+        # (Person.objects.all(), recomputing num_faces/num_possibilities/
+        # num_unverified_faces) once briefly ended up inside
+        # _classify_one_safely() instead of execute() -- ran once PER
+        # FACE instead of once per execute() call, turning a 140k-face
+        # reprocess into 140k redundant full-Person-table passes (a real
+        # production incident: an ETA of ~10 hours became ~92 hours).
+        img = make_image()
+        prolific = make_person("Trueing Up Person")
+        base = np.zeros(512)
+        base[0] = 1.0
+        for _ in range(12):
+            f = make_face(img, declared_name=prolific)
+            f.face_encoding_512 = base.tolist()
+            f.save()
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        for _ in range(4):
+            f = make_face(img, declared_name=blank_person)
+            f.face_encoding_512 = base.tolist()
+            f.save()
+
+        assigner = faceAssigner()
+        assigner.ENCODINGS_PKL_FILE = "/tmp/face_manager_test_media/exec_trueing_up_cache.pkl"
+
+        with patch.object(Person.objects, 'all', wraps=Person.objects.all) as mock_all:
+            assigner.execute(redo_all=True, num_threads=1)
+        self.assertEqual(mock_all.call_count, 1)
+
+        assigner2 = faceAssigner()
+        assigner2.ENCODINGS_PKL_FILE = "/tmp/face_manager_test_media/exec_trueing_up_cache2.pkl"
+        with patch.object(Person.objects, 'all', wraps=Person.objects.all) as mock_all2:
+            assigner2.execute(redo_all=True, num_threads=3)
+        self.assertEqual(mock_all2.call_count, 1)
