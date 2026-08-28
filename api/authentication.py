@@ -81,6 +81,11 @@ class AutheliaOIDCAuthentication(authentication.BaseAuthentication):
         except jwt.PyJWKClientError as exc:
             logger.warning("Authelia JWKS lookup failed: %s", exc)
             raise exceptions.AuthenticationFailed("Could not verify token signing key.")
+        except jwt.InvalidTokenError as exc:
+            # Bearer value isn't a well-formed JWT at all (get_signing_key_
+            # from_jwt has to parse the header to find the kid).
+            logger.warning("Malformed bearer token: %s", exc)
+            raise exceptions.AuthenticationFailed("Malformed token.")
 
         try:
             return jwt.decode(

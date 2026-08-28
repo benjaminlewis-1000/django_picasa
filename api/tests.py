@@ -705,6 +705,13 @@ class AutheliaOIDCAuthenticationTests(TestCase):
         resp = self.client.get("/api/mobile/name_list/")
         self.assertIn(resp.status_code, self.REJECTED)
 
+    def test_garbage_bearer_value_is_rejected_not_500(self):
+        # A bearer value that isn't a JWT at all -- get_signing_key_from_jwt
+        # raises jwt.DecodeError parsing the header; must not 500.
+        for junk in ["not.a.jwt", "garbage", "a.b.c"]:
+            resp = self._get(junk)
+            self.assertIn(resp.status_code, self.REJECTED, junk)
+
     def test_expired_token_rejected(self):
         now = int(self._time.time())
         resp = self._get(self._token(iat=now - 7200, exp=now - 3600))
