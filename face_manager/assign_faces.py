@@ -13,10 +13,8 @@
 # import torch.nn.functional
 # import torchvision
 # torch.backends.nnpack.enabled = False
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from django.conf import settings
-from django.db import connection as db_connection
 from django.db.models import Count, Q, F
 from django.db.models.functions import Abs
 from face_manager.models import Person, Face
@@ -26,7 +24,6 @@ import numpy as np
 import os
 import pandas as pd
 import pickle
-import threading
 import time
 
 
@@ -303,15 +300,9 @@ class faceAssigner():
             self.all_embeddings = np.zeros((512, 0))
             self.all_norms = np.zeros(0)
 
-    def execute(self, redo_all: bool = False, num_threads: int = 1) -> None:
+    def execute(self, redo_all: bool = False) -> None:
         """
         DOCSTRING
-
-        num_threads > 1 parallelizes the per-face classification loop --
-        see the branch below for why that's safe here. Defaults to 1
-        (the original, purely sequential behavior) since this hasn't
-        been exercised from the scheduled Celery task, only from a
-        manual bulk reprocess.
         """
 
         if type(redo_all) != bool:
@@ -351,62 +342,19 @@ class faceAssigner():
         # real cost to doing it unconditionally.
         self.load_encodings()
 
-        if num_threads <= 1:
-            for u_img in tqdm(unassigned.iterator()):
-                self._classify_one_safely(u_img.id, u_img)
-        else:
-            # Each face is independent -- reads only the (already fully
-            # loaded, read-only during this run) embedding/person caches,
-            # writes only its own Face row plus whichever Person row(s)
-            # it proposes -- so this is safely parallelizable across
-            # threads, and the bottleneck here (DB round trips, not CPU)
-            # is exactly the kind threading helps with despite the GIL
-            # (psycopg2 releases it during a blocking network call).
-            # Materializing ids upfront (cheap -- plain ints) rather than
-            # streaming via .iterator(), since a shared queryset iterator
-            # isn't safe to pull from concurrently across threads.
-            #
-            # Each worker thread gets its own Django DB connection
-            # (thread-local by design -- django.db.connections is itself
-            # a threading.local, so closing "the" connection from this,
-            # the calling, thread would only ever close the MAIN thread's
-            # connection, never reaching the worker threads' separate
-            # ones). Closed at the end of every task rather than kept
-            # open for the thread's lifetime: simpler and safer than
-            # trying to hook a ThreadPoolExecutor worker's teardown, and
-            # confirmed necessary in practice -- leaving these open let
-            # a test's DB teardown fail with "database is being accessed
-            # by other users". The reconnect cost per face is small next
-            # to everything else classify_unassigned() already does
-            # (Face.save() alone measured ~20ms against production).
-            face_ids = list(unassigned.values_list('id', flat=True))
-            progress = tqdm(total=len(face_ids))
-            progress_lock = threading.Lock()
-
-            def classify_by_id(face_id):
-                try:
-                    face = Face.objects.select_related('declared_name').get(id=face_id)
-                    self._classify_one_safely(face_id, face)
-                finally:
-                    db_connection.close()
-                    with progress_lock:
-                        progress.update(1)
-
-            with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                list(executor.map(classify_by_id, face_ids))
-            progress.close()
+        for u_img in tqdm(unassigned.iterator()):
+            self._classify_one_safely(u_img.id, u_img)
 
         # Finish up by "trueing up" the num_assigned for each person. Runs
-        # once, here, after the classification phase (either branch)
-        # fully completes -- NOT per face. (Regression note: this
-        # accidentally ended up inside _classify_one_safely() below in an
-        # earlier revision, so it ran once per face instead of once per
+        # once, here, after the classification loop fully completes --
+        # NOT per face. (Regression note: this briefly ended up inside
+        # _classify_one_safely() below during a since-reverted threading
+        # experiment, running once per face instead of once per
         # execute() call -- 140k redundant 912-row Person iterations
-        # instead of one. Caught by the real reprocess run being
-        # dramatically slower than expected, not by a test; see
-        # ExecuteThreadingTests for what coverage exists, which didn't
-        # happen to catch this since it only checks final counts, not
-        # how many times this loop ran.)
+        # instead of one, caught by a real reprocess run's ETA jumping
+        # from ~10 hours to ~92. The regression test added for that,
+        # ExecuteThreadingTests.test_trueing_up_pass_runs_exactly_once_
+        # not_per_face, is worth keeping even post-revert.)
         print("Verifying face counts...")
         for p in tqdm(Person.objects.all()):
             p.num_faces = p.face_declared.count()
