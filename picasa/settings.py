@@ -263,6 +263,25 @@ SOCIALACCOUNT_EMAIL_AUTHENTICATION_AUTO_CONNECT = True
 # Bypass the "You are about to sign in" intermediate warning page
 SOCIALACCOUNT_LOGIN_ON_GET = True
 
+# --- PhotoVerify mobile app: direct OIDC bearer-token auth ---------------
+# The mobile app runs its own Authorization Code + PKCE flow against
+# Authelia (public client) and sends the ID token as a Bearer token.
+# api/authentication.py:AutheliaOIDCAuthentication validates it.
+# Non-secret values, so plain defaults keep local dev working without new
+# required env vars (see CLAUDE.md note on both-branch settings).
+AUTHELIA_ISSUER = os.environ.get(
+    'AUTHELIA_ISSUER', 'https://auth.exploretheworld.tech'
+)
+AUTHELIA_JWKS_URL = os.environ.get(
+    'AUTHELIA_JWKS_URL', f'{AUTHELIA_ISSUER}/jwks.json'
+)
+AUTHELIA_MOBILE_CLIENT_ID = os.environ.get(
+    'AUTHELIA_MOBILE_CLIENT_ID', 'photoverify_mobile'
+)
+AUTHELIA_JWKS_CACHE_SECONDS = int(
+    os.environ.get('AUTHELIA_JWKS_CACHE_SECONDS', '3600')
+)
+
 # Where to send users after a successful login
 LOGIN_REDIRECT_URL = f"https://{os.environ['API_DOMAIN']}/"
 
@@ -423,7 +442,9 @@ REST_FRAMEWORK = {
         # 'rest_framework.authentication.BasicAuthentication',
         'rest_framework.authentication.SessionAuthentication',
         'rest_framework.authentication.TokenAuthentication',  # <-- And here
-        'rest_framework_simplejwt.authentication.JWTAuthentication'
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        # PhotoVerify mobile app: Authelia OIDC ID token as a Bearer token.
+        'api.authentication.AutheliaOIDCAuthentication',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': 100, 
