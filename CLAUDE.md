@@ -224,15 +224,41 @@ Investigated via a real experiment methodology -- `.ignore`/`.realignore` confir
 known-outlier ("negative") queries, leave-one-out on real confirmed faces as "positive" queries,
 scored against the actual 441-person/273k-face gallery `assign_faces.py` uses. Findings and open
 ideas, so a future session doesn't have to redo this from scratch:
-- **Root cause identified, fix not yet implemented**: `classify_unassigned()` gates
-  accept/reject on `sim_max` (line ~300-312) -- a pure 1-nearest-neighbor comparison, maximally
-  vulnerable to any single noisy/mislabeled face in a person's gallery. The code already computes
-  `sim_99th` per candidate but only uses it as the display "weight," never as the actual gate.
-  **Swapping the gate from `sim_max` to `sim_99th`** (already computed, near one-line change) cut
-  false-positive rate from 2.8% to 1.0% at the existing `ASSIGN_THRESH=0.6`, at a cost of TPR
-  dropping from 86.5% to 79.5% (more real matches would get punted to `.ignore` needing manual
-  re-tagging). User decided this TPR cost isn't worth it alone -- wants to find something that
-  improves both sides at once before landing any threshold change. Not implemented yet.
+- **DESIGN FINALIZED, not yet implemented: gallery-size-adaptive `p99` gate, 4 buckets.**
+  `classify_unassigned()` currently gates accept/reject on `sim_max` (line ~300-312) -- a pure
+  1-nearest-neighbor comparison, maximally vulnerable to any single noisy/mislabeled face in a
+  person's gallery. The code already computes `sim_99th` per candidate but only uses it as the
+  display "weight," never as the actual gate. A single global swap from `sim_max` to `sim_99th`
+  helps FPR but costs TPR unevenly -- a much bigger, size-dependent re-run (up to 50 leave-one-out
+  holdouts per person, 3000 negatives, `p99` computed via one batched `np.percentile` call per
+  candidate rather than N separate calls) found the TPR cost is concentrated almost entirely on
+  large-gallery people (TPR 91.5%->60.9% for 1000+-face people at `ASSIGN_THRESH=0.6`, vs
+  85.2%->84.4% for 10-25-face people, essentially free there). Root cause: percentile rank scales
+  with sample size, so a fixed percentile is silently stricter for people with more faces --
+  exactly backwards from what's wanted, since large/growing galleries are the ones future photos
+  keep landing in. **Final design**: split the 441-person gallery into 4 buckets by face count --
+  `[10,50)`, `[50,200)`, `[200,500)`, `[500+)` -- each with its own `p99` threshold calibrated to
+  its own target TPR, searching *within* that bucket only (not the full mixed population, which
+  matters -- see below). Chosen thresholds/targets, from the fully cached experiment data:
+  `[10,50)` thresh=0.558 (target 90% TPR), `[50,200)` thresh=0.551 (90%), `[200,500)` thresh=0.486
+  (90%), `[500+)` thresh=0.394 (target bumped to **95%** specifically for this bucket, per user
+  request to further protect TPR for the most-photographed/fastest-growing people -- costs the
+  system ~0.4pp of total FPR, deliberately accepted). **Critical methodological correction made
+  mid-investigation**: an early "blended FPR" metric (positive-count-weighted average of each
+  bucket's own marginal FPR) *looked* like bucketing cut total FPR to a third (2.97%->1.00% for a
+  3-bucket version) -- this was wrong. A real unassigned face gets checked against all buckets at
+  once (identity unknown in advance), so the metric that matters is the *joint/union* FPR
+  (fraction of negatives accepted by *any* bucket), which came out at 2.9-3.3% -- essentially
+  identical to the original single-threshold `p99` approach. **Bucketing's real, validated value
+  is TPR fairness across gallery sizes at roughly the same total FPR cost, not a lower total FPR**
+  -- confirmed by sweeping the joint FPR across TPR targets 70-95%, where bucketed and unbucketed
+  track each other almost exactly at every point. Also confirmed (properly, holding TPR fixed
+  this time, unlike an initial flawed attempt that let TPR collapse to "prove" a false win): adding
+  `p50` as a second AND-condition alongside `p99` does not meaningfully help in any bucket
+  (largest observed gain: 1.03%->0.97% FPR at matched 90% TPR, well within noise for a 3000-sample
+  test) -- consistent with the logistic-regression finding below that percentiles of the same
+  distribution are too correlated to combine for real gain. **Not implemented in
+  `assign_faces.py` yet** -- this is a fully-specified, data-validated design ready to build.
 - **Tested and rejected: combining multiple percentiles (p50/p75/p90/p95/p99/max) via logistic
   regression.** AUC barely improved over `p99` alone (0.968 vs 0.967) -- percentiles of the same
   similarity distribution are too correlated with each other to add real complementary signal.
@@ -272,20 +298,22 @@ ideas, so a future session doesn't have to redo this from scratch:
   EXIF data. Not investigated further this session (worked around via a sane `[1990, 2027]`
   bound for the birth-year experiments); worth a real look given it could affect other
   date-dependent logic (`Directory.average_date_taken()`, the geocode/date-decay work, etc.).
-- **Brainstormed, not yet tried** -- ideas for improving both TPR and FPR together rather than
-  trading one for the other, roughly in order of expected cost/promise:
-  - **Per-person calibrated threshold** instead of one global `ASSIGN_THRESH=0.6` for everyone --
-    calibrate each person's accept threshold from their own intra-gallery self-similarity spread
-    (e.g. their own median pairwise similarity minus a margin), so naturally "easy"
-    (tight-gallery) people get a tighter gate and naturally "hard" (diffuse-gallery) people get
-    an appropriately looser one.
-  - **Covariance-aware (Mahalanobis) distance** instead of isotropic cosine similarity -- scores
-    a query by how well it fits the *shape* of a person's embedding cloud (which directions of
-    variation are normal for them), not just raw distance to it. Real practical blocker sized up
-    already: a full 512x512 per-person covariance needs far more samples than most of this
-    gallery has (153/441 people have only 10-25 faces) to be invertible/well-estimated at all --
-    would need shrinkage estimation (e.g. Ledoit-Wolf), PCA dimensionality reduction first, or a
-    diagonal-only covariance approximation to be practical here.
+- **Per-person calibrated threshold: superseded by the 4-bucket design above**, which is a
+  coarser (gallery-size-based, not fully per-person) version of the same idea and is now
+  data-validated and spec'd -- no need to separately pursue a per-person version unless the
+  4-bucket design proves insufficient in practice.
+- **Tested and rejected: covariance-aware (Mahalanobis) distance.** Tried a diagonal-only
+  approximation (per-dimension variance, not a full 512x512 covariance -- see the practical
+  blocker below) as a feature alongside `max`/percentiles/gap-features in a logistic regression,
+  restricted to large-gallery (200+ faces) people where there's enough data to estimate even the
+  diagonal reliably. Single-feature AUC=0.976, *worse* than `p99` alone (0.988), and it got a
+  near-zero, wrong-signed coefficient in the combined model -- didn't pull its weight. A full
+  (non-diagonal) Mahalanobis distance was never tried -- would need shrinkage estimation (e.g.
+  Ledoit-Wolf) or PCA dimensionality reduction to be estimable at all given most of this gallery's
+  people have far fewer faces than the 512 embedding dimensions -- but given the diagonal version
+  already underperformed, a full version isn't an obvious next step without a reason to expect
+  the *correlations* between dimensions (the part diagonal ignores) to carry the missing signal.
+- **Brainstormed, not yet tried**:
   - **Co-occurrence / social-context prior** -- if other faces in the *same photo* are already
     confidently identified, and those people are frequently photographed together with a given
     candidate (siblings, spouse, etc.), that's a real prior signal independent of the embedding
@@ -294,10 +322,11 @@ ideas, so a future session doesn't have to redo this from scratch:
   - **Directory/event context prior** -- faces from the same source folder or day tend to
     recur; if a directory is already heavily populated with a specific family group's confirmed
     faces, that shifts the prior for an unlabeled face in that same directory. Also not scoped.
-  - Experiment scripts and cached data (gallery embeddings, negative pool, both keyed by
-    person/face id with dates attached) live only in `/tmp` inside `picasa_api` and the
-    session's own scratchpad -- not committed anywhere, will need rebuilding if a future session
-    picks this up (see this file's own description of the caching approach if reconstructing).
+- Experiment scripts and cached data (gallery embeddings, negative pool, full per-query/per-
+  person/per-percentile profiles, all keyed by person/face id with dates attached) live only in
+  `/tmp` inside `picasa_api` and the session's own scratchpad -- not committed anywhere, will need
+  rebuilding if a future session picks this up (see this file's own description of the caching
+  approach if reconstructing).
 
 **Where things stand (2026-08-27, end of session)**: a lot landed this session, all merged to
 `master` and live in production (`backend_upgrade`/`master` fully in sync at `98981e9`):
