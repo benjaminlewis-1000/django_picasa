@@ -623,18 +623,38 @@ class MobileViewTests(ApiTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(json.loads(resp.content)["unlabeled_ids"], [])
 
-    def test_confident_unlabeled_includes_face_with_mixed_real_and_sentinel_guesses(self):
+    def test_confident_unlabeled_excludes_face_with_any_sentinel_guess(self):
+        # A single sentinel anywhere in the top five disqualifies the face,
+        # even alongside a real-person guess.
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
         ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
         real = Person.objects.create(person_name="Real Person")
         img = self.make_image()
+        self.make_face(
+            img,
+            declared_name=blank,
+            poss_ident1=real,
+            weight_1=0.9,
+            poss_ident2=ignore,
+            weight_2=0.7,
+        )
+
+        resp = self.client.get("/api/mobile/confident_unlabeled/")
+        self.assertEqual(json.loads(resp.content)["unlabeled_ids"], [])
+
+    def test_confident_unlabeled_includes_face_with_real_guesses_and_empty_slots(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        real1 = Person.objects.create(person_name="Real One")
+        real2 = Person.objects.create(person_name="Real Two")
+        img = self.make_image()
+        # poss_ident3..5 left null -- that must not disqualify the face.
         face = self.make_face(
             img,
             declared_name=blank,
-            poss_ident1=ignore,
+            poss_ident1=real1,
             weight_1=0.9,
-            poss_ident2=real,
-            weight_2=0.7,
+            poss_ident2=real2,
+            weight_2=0.6,
         )
 
         resp = self.client.get("/api/mobile/confident_unlabeled/")
