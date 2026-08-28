@@ -126,21 +126,45 @@ class UnlabeledMobileInfo(APIView):
 
 class ResetFace(APIView):
 
-    # Given a Face ID, reset it - make sure that there are no assigned names for that
-    # face. It will trigger a re-classification.
+    # Given a Face ID, reset it: drop any name assignment and all
+    # poss_identN guesses, and put it back in the unassigned pool so the
+    # classifier re-processes it.
     permission_classes = (IsAuthenticated,)
 
     def patch(self, request, *args, **kwargs):
 
         selected_id = kwargs['id']
 
-        face_object = Face.objects.get(id = selected_id)
-        face_object.clear_person()
+        face_object = Face.objects.get(id=selected_id)
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+
+        # Decrement the previous *real* owner's counts, if there was one.
+        prev = face_object.declared_name
+        if prev is not None and prev.person_name != settings.BLANK_FACE_NAME:
+            prev.decrement_assigned()
+            if not face_object.validated:
+                prev.decrement_unverified()
+
+        # Wipe all five poss_identN guesses + weights (this also saves).
+        face_object.set_possibles_zero()
+
+        # Put the face back in the unassigned pool as the *blank sentinel
+        # Person*, NOT NULL. The old clear_person() left declared_name
+        # NULL, which is invisible to both the "Unassigned" bucket and to
+        # assign_faces' re-classification -- both filter on
+        # declared_name__person_name == BLANK_FACE_NAME -- so a reset face
+        # just vanished instead of returning to the pool.
+        if face_object.declared_name_id != blank.id:
+            face_object.declared_name = blank
+            face_object.validated = False
+            face_object.written_to_photo_metadata = False
+            blank.increment_assigned()
+            blank.increment_unverified()
+            face_object.save()
 
         # Regression test for a fixed bug: this method had no return
         # statement, so DRF's dispatch() got None back instead of a
-        # Response and raised AssertionError -- this crashed on every
-        # single call, not just an edge case.
+        # Response and raised AssertionError -- crashed on every call.
         return HttpResponse(json.dumps({'success': True}), content_type='application/json')
 
 

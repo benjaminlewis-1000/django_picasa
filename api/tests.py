@@ -660,23 +660,53 @@ class MobileViewTests(ApiTestCase):
         resp = self.client.get("/api/mobile/confident_unlabeled/")
         self.assertEqual(json.loads(resp.content)["unlabeled_ids"], [face.id])
 
-    def test_reset_face_clears_person_and_returns_a_response(self):
-        # Regression test for a fixed bug: this method had no return
-        # statement, so DRF's dispatch() got None back instead of a
-        # Response and raised AssertionError -- this crashed on every
-        # single call, not just an edge case.
+    def test_reset_face_returns_it_to_the_unassigned_pool(self):
+        # Regression test: reset used to call clear_person(), which nulls
+        # declared_name -- invisible to both the Unassigned bucket and the
+        # re-classifier (both filter declared_name__person_name ==
+        # BLANK_FACE_NAME). Reset must land the face back on the blank
+        # sentinel Person, not NULL, with its guesses cleared.
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
         img = self.make_image()
         target = Person.objects.create(person_name="Resettable")
         target.highlight_img.save("r.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
-        face = self.make_face(img, declared_name=target)
+        other = Person.objects.create(person_name="Someone Else")
+        face = self.make_face(
+            img, declared_name=target, poss_ident1=other, weight_1=0.8
+        )
 
         resp = self.client.patch(f"/api/mobile/reset/{face.id}/")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
         face.refresh_from_db()
-        # clear_person() sets declared_name to None (not the blank
-        # sentinel Person) -- it's a nullable field, unlike associate_
-        # person()'s reassignment-based clearing elsewhere in this file.
-        self.assertIsNone(face.declared_name)
+        self.assertEqual(face.declared_name_id, blank.id)
+        self.assertIsNone(face.poss_ident1_id)
+        self.assertFalse(face.validated)
+        # And it now shows up in the unassigned listing.
+        self.assertEqual(
+            Face.objects.filter(
+                declared_name__person_name=settings.BLANK_FACE_NAME
+            ).filter(pk=face.pk).count(),
+            1,
+        )
+
+    def test_reset_face_already_unassigned_just_clears_guesses(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        other = Person.objects.create(person_name="Guess Person")
+        img = self.make_image()
+        face = self.make_face(
+            img, declared_name=blank, poss_ident1=other, weight_1=0.7
+        )
+        blank_faces_before = blank.face_declared.count()
+
+        resp = self.client.patch(f"/api/mobile/reset/{face.id}/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        face.refresh_from_db()
+        self.assertEqual(face.declared_name_id, blank.id)
+        self.assertIsNone(face.poss_ident1_id)
+        # No double-count: it was already the blank sentinel's face.
+        self.assertEqual(blank.face_declared.count(), blank_faces_before)
 
     def test_name_list_returns_real_people_and_excludes_sentinel_names(self):
         # Regression test for a fixed bug: this used to be an unfinished
