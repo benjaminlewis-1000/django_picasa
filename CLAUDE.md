@@ -368,6 +368,21 @@ ideas, so a future session doesn't have to redo this from scratch:
     the false-positive problem. Not scoped or started; would need real clustering infrastructure
     (e.g. a similarity-graph approach much like `filepopulator`'s new phash `SimilarImagePair`
     work earlier this session, but on face embeddings) and a frontend surface to review clusters.
+  - **Looser branch for faces with `.ignore` already in their reject list (2026-08-28).** A face
+    whose `rejected_fields` contains `.ignore` means a human previously declined an *auto-
+    proposed* soft-ignore for it -- i.e. someone already looked and said "no, this is a real
+    person, not noise." The user's hypothesis: these faces are disproportionately likely to
+    belong to one of the large-gallery people (the ones with enough photos that `.another_ignore`/
+    `.ignore` kept getting auto-suggested for their harder shots), so it's worth giving this
+    specific subset its own classification pass with looser (lower) `p99` thresholds than the
+    standard 4-bucket gate, rather than only ever comparing them at the same conservative
+    operating point as a brand-new unlabeled face. Complements the "cluster-then-recover the
+    `.ignore` bucket" idea just above but is narrower/cheaper to try first: no new clustering
+    infra needed, just a query for `rejected_fields` containing `.ignore` plus a second gate
+    threshold (or bucket set) applied only to that subset. Not scoped or started -- would want to
+    validate empirically first (same TPR/FPR methodology as the original bucket-threshold work)
+    that this subset's true-positive rate at a loosened threshold is actually higher than a
+    random unassigned face's, before shipping a change that's easy to mis-tune.
 - Experiment scripts and cached data (gallery embeddings, negative pool, full per-query/per-
   person/per-percentile profiles, all keyed by person/face id with dates attached) live only in
   `/tmp` inside `picasa_api` and the session's own scratchpad -- not committed anywhere, will need
@@ -716,7 +731,7 @@ active production issue, not just cleanup — worth prioritizing the deploy once
   - **Safety guards, per explicit request**: if a HEIC's orientation is ever anything other than `1`, or it has more than one frame (`n_frames > 1` — Live Photos/bursts carry multiple images per container), the file is *not* processed with a best-guess transform. It fails loudly instead — printed, logged via `settings.LOGGER.error`, and raised as a plain `OSError` from `_init_image()`, which routes through the exact same corrupted-image handling as everything else (`FailedImageFile`/`image_load_failed`, not retried forever) since `_init_image()` is only ever called from `process_new_no_md5()`, already wrapped in `try/except OSError` at both `create_image_file()` call sites. Neither guard has fired on any real file yet (all 8 samples were orientation 1, single-frame) — tested via mocking `getexif()`/`n_frames` directly, not a naturally-occurring bad file.
   - Thumbnailing and MD5/pixel hashing needed zero changes — both already operate purely on the already-decoded `self.image` (a PIL Image), format-agnostic by construction. (The `cv2.imread()` fallback used for corrupted-JPEG recovery doesn't work for HEIC — OpenCV has no HEIC codec — so a genuinely corrupted HEIC has no fallback decode path, just fails and gets flagged like any other unrecoverable file.)
   - Test coverage: `filepopulator.tests.HeicIngestionTests` (real fixtures locally, CI's single synthetic no-EXIF stub from `ci_fixtures/heic_stub/` otherwise — tests work with "whatever's present," no hardcoded counts/filenames) covers ingestion, `add_from_root_dir()` discovery, GPS conversion (skipped if no fixture has GPS), and both guards.
-- **Dead JWT auth code after the Authelia migration**: auth now goes through Authelia/OIDC (see `picasa/adapters.py`, `ACCOUNT_ADAPTER`), but `rest_framework_simplejwt` is still wired up in full — `SIMPLE_JWT` settings, `TokenPairWithUsername`/`api/token/obtain/`/`api/token/refresh/`, `token_blacklist` in `INSTALLED_APPS`, `PyJWT` as a direct dependency. Worth an audit for what's actually still reachable (the slideshow client? a mobile app?) vs. leftover from before Authelia, since it's a second parallel auth system to reason about/keep secure if nothing uses it anymore.
+- **JWT auth (`rest_framework_simplejwt`) is NOT dead code — confirmed live, do not remove.** Previously flagged here as a candidate "dead code after the Authelia migration" audit item. Checked 2026-08-28: the user found, from another project, that its login workflow actively calls this API's JWT endpoints (`/api/token/obtain/` → `TokenPairWithUsername`, `/api/token/refresh/`). So `SIMPLE_JWT` settings, `TokenPairWithUsername`, `token_blacklist` in `INSTALLED_APPS`, and `PyJWT` all stay. Still open: identify *which* project/client this is and whether it also relies on `token_blacklist` (logout/revocation) specifically, not just obtain/refresh — that determines how much of this could ever be trimmed later if that consumer is migrated to Authelia too. Until then, treat this as a second real parallel auth system, not leftover cruft.
 - **Face clustering quality**: how `face_manager/assign_faces.py`'s `faceAssigner` clusters/matches detected faces against existing `Person`s hasn't been reviewed this round — flagged as a bigger task of its own, separate from the pipeline plumbing bugs already found.
 - **Similar-image search**: find images that are visually similar (not just exact pixel-duplicate) — e.g. near-duplicate bursts, edited/re-exported versions of the same shot.
 - **Faster/better image hashing for duplicate detection**: `filepopulator` currently does a full MD5 over raw decoded pixels (`ImageFile._generate_md5_hash()`) to catch *exact* duplicates. A perceptual hash (pHash/dHash/aHash) would likely be faster and could double as the foundation for the similar-image search above, rather than solving them separately.
