@@ -675,6 +675,30 @@ class MobileViewTests(ApiTestCase):
         resp = self.client.get("/api/mobile/confident_unlabeled/")
         self.assertEqual(json.loads(resp.content)["unlabeled_ids"], [face.id])
 
+    def test_labeling_groups_grouped_by_top_guess_ordered_by_size(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        alice = Person.objects.create(person_name="Alice")
+        bob = Person.objects.create(person_name="Bob")
+        img = self.make_image()
+
+        # Alice: 1 face. Bob: 2 faces (should sort ahead of Alice).
+        a1 = self.make_face(img, declared_name=blank, poss_ident1=alice, weight_1=0.5)
+        b_lo = self.make_face(img, declared_name=blank, poss_ident1=bob, weight_1=0.3)
+        b_hi = self.make_face(img, declared_name=blank, poss_ident1=bob, weight_1=0.9)
+        # poss_ident1 == .ignore -> excluded from this endpoint entirely.
+        self.make_face(img, declared_name=blank, poss_ident1=ignore, weight_1=0.9)
+
+        resp = self.client.get("/api/mobile/labeling_groups/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        groups = json.loads(resp.content)["groups"]
+
+        self.assertEqual([g["person_name"] for g in groups], ["Bob", "Alice"])
+        self.assertEqual(groups[0]["count"], 2)
+        # Within a group: highest weight first.
+        self.assertEqual(groups[0]["face_ids"], [b_hi.id, b_lo.id])
+        self.assertEqual(groups[1]["face_ids"], [a1.id])
+
     def test_reset_face_returns_it_to_the_unassigned_pool(self):
         # Regression test: reset used to call clear_person(), which nulls
         # declared_name -- invisible to both the Unassigned bucket and the

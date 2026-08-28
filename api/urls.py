@@ -41,6 +41,7 @@ urlpatterns = [
     path(r'authelia_state/', views.AutheliaStateView.as_view(), name='authelia_state'),
     path(r'clean_logout/', views.CleanLogoutView.as_view(), name='clean_logout'),
     path(r'mobile/confident_unlabeled/', mobile_views.ConfidentUnlabeledView.as_view(), name='unlabeled'),
+    path(r'mobile/labeling_groups/', mobile_views.LabelingGroupsView.as_view(), name='labeling_groups'),
     path(r'mobile/unlabeled_instance/<int:id>/', mobile_views.UnlabeledMobileInfo.as_view(), name='unlabeled_instances'),
     path(r'mobile/reset/<int:id>/', mobile_views.ResetFace.as_view(), name='reset'),
     path(r'mobile/name_list/', mobile_views.MobileNameList.as_view(), name='name_list'),
