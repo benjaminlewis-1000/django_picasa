@@ -7,7 +7,7 @@
 import json
 
 from django.conf import settings
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.http import HttpResponse
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
@@ -80,6 +80,51 @@ class ConfidentUnlabeledView(APIView):
         unlabeled_ids = list(unlabeled.values_list('id', flat=True))
 
         js = {'unlabeled_ids': unlabeled_ids}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+
+class LabelingGroupsView(APIView):
+    """The mobile main-flow queue, grouped by top guess.
+
+    Unlabeled faces whose poss_ident1 is a *real* person (sentinels
+    excluded -- `.ignore`-topped faces belong to the ignore-review
+    screen). Faces are grouped by that person; groups come back ordered
+    by size (most candidate faces first), and each group's face_ids are
+    ordered by weight_1 descending. The app freezes this order for the
+    session so the "current person" doesn't shift as counts change.
+    """
+
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, *args, **kwargs):
+        qs = (
+            Face.objects
+            .filter(declared_name__person_name=settings.BLANK_FACE_NAME)
+            .filter(poss_ident1__isnull=False)
+            .exclude(poss_ident1__person_name__in=settings.IGNORED_NAMES)
+        )
+
+        counts = list(
+            qs.values('poss_ident1', 'poss_ident1__person_name')
+              .annotate(c=Count('id'))
+              .order_by('-c', 'poss_ident1__person_name')
+        )
+
+        faces_by_person = {}
+        for pid, fid in qs.order_by('-weight_1', '-id').values_list('poss_ident1', 'id'):
+            faces_by_person.setdefault(pid, []).append(fid)
+
+        groups = [
+            {
+                'person_id': row['poss_ident1'],
+                'person_name': row['poss_ident1__person_name'],
+                'count': row['c'],
+                'face_ids': faces_by_person.get(row['poss_ident1'], []),
+            }
+            for row in counts
+        ]
+
+        js = {'groups': groups}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 
