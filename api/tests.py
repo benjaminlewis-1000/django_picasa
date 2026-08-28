@@ -537,7 +537,10 @@ class MobileEndpointTests(ApiTestCase):
         super().setUp()
         self.image = self.make_image()
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
-        self.unlabeled_face = self.make_face(self.image, declared_name=blank, weight_1=0.9)
+        real = Person.objects.create(person_name="Mobile Test Person")
+        self.unlabeled_face = self.make_face(
+            self.image, declared_name=blank, poss_ident1=real, weight_1=0.9
+        )
 
     def test_confident_unlabeled_lists_unlabeled_faces(self):
         resp = self.client.get("/api/mobile/confident_unlabeled/")
@@ -593,11 +596,48 @@ class MobileViewTests(ApiTestCase):
 
     def test_confident_unlabeled_with_unlabeled_faces_returns_their_ids(self):
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        real = Person.objects.create(person_name="Real Person")
         img = self.make_image()
-        face = self.make_face(img, declared_name=blank)
+        # A face is only served if at least one poss_identN is a real person.
+        face = self.make_face(img, declared_name=blank, poss_ident1=real, weight_1=0.9)
 
         resp = self.client.get("/api/mobile/confident_unlabeled/")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(json.loads(resp.content)["unlabeled_ids"], [face.id])
+
+    def test_confident_unlabeled_excludes_faces_with_only_sentinel_guesses(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        realignore = Person.objects.get(person_name=".realignore")
+        img = self.make_image()
+
+        # No guesses at all -> excluded.
+        self.make_face(img, declared_name=blank)
+        # Only sentinel guesses -> excluded.
+        self.make_face(img, declared_name=blank, poss_ident1=ignore, weight_1=0.9)
+        self.make_face(
+            img, declared_name=blank, poss_ident1=realignore, poss_ident2=blank
+        )
+
+        resp = self.client.get("/api/mobile/confident_unlabeled/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(json.loads(resp.content)["unlabeled_ids"], [])
+
+    def test_confident_unlabeled_includes_face_with_mixed_real_and_sentinel_guesses(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        real = Person.objects.create(person_name="Real Person")
+        img = self.make_image()
+        face = self.make_face(
+            img,
+            declared_name=blank,
+            poss_ident1=ignore,
+            weight_1=0.9,
+            poss_ident2=real,
+            weight_2=0.7,
+        )
+
+        resp = self.client.get("/api/mobile/confident_unlabeled/")
         self.assertEqual(json.loads(resp.content)["unlabeled_ids"], [face.id])
 
     def test_reset_face_clears_person_and_returns_a_response(self):
