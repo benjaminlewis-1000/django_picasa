@@ -44,4 +44,6 @@ urlpatterns = [
     path(r'mobile/unlabeled_instance/<int:id>/', mobile_views.UnlabeledMobileInfo.as_view(), name='unlabeled_instances'),
     path(r'mobile/reset/<int:id>/', mobile_views.ResetFace.as_view(), name='reset'),
     path(r'mobile/name_list/', mobile_views.MobileNameList.as_view(), name='name_list'),
+    path(r'mobile/unverified_ignore/', mobile_views.UnverifiedIgnoreList.as_view(), name='unverified_ignore'),
+    path(r'mobile/bulk_ignore_verify/', mobile_views.BulkIgnoreVerify.as_view(), name='bulk_ignore_verify'),
 ]
