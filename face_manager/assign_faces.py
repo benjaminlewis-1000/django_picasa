@@ -49,7 +49,25 @@ class faceAssigner():
         self.NUM_TO_AVERAGE = 1
         self.N_COMPARISONS = 25
 
-        self.ASSIGN_THRESH=0.6
+        # Gallery-size-adaptive accept/reject gate, replacing the old flat
+        # ASSIGN_THRESH=0.6 applied to sim_max. Root cause: gating on a
+        # single nearest-neighbor (sim_max) is maximally vulnerable to any
+        # one noisy/mislabeled face in a person's gallery; switching to a
+        # percentile (sim_99th, already computed below) helps, but a FIXED
+        # percentile gets silently stricter as a gallery grows (rank scales
+        # with sample size), crushing TPR specifically for the
+        # most-photographed people -- exactly backwards, since those are
+        # the people future photos keep landing on. Bucketing by gallery
+        # size and calibrating sim_99th's threshold per bucket fixes that
+        # unevenness. Boundaries/thresholds below are empirically derived
+        # (not guessed) -- see CLAUDE.md's "Face-classification
+        # outlier-rejection" section for the full experiment writeup
+        # (441-person/273k-face gallery, 3000 negative + 15,621 positive
+        # holdout queries). BUCKET_BOUNDARIES are upper-exclusive edges;
+        # BUCKET_THRESHOLDS has one more entry than BUCKET_BOUNDARIES (the
+        # last covers everyone at/above the final boundary).
+        self.BUCKET_BOUNDARIES = [50, 200, 500]
+        self.BUCKET_THRESHOLDS = [0.558, 0.551, 0.486, 0.394]
 
         # self.bogus_date = datetime(1990, 1, 1) # Very few images before that
         # self.bogus_date_utc = time.mktime(self.bogus_date.timetuple())
@@ -84,6 +102,29 @@ class faceAssigner():
     #         p.num_unverified_faces = p.face_declared.filter(validated=False).count()
     #         p.save()
 
+    def _p99_threshold_for_gallery_size(self, gallery_size: int) -> float:
+        """Which bucket's calibrated sim_99th threshold applies to a
+        candidate with this many confirmed faces. See BUCKET_BOUNDARIES/
+        BUCKET_THRESHOLDS above for where these numbers come from."""
+        for boundary, threshold in zip(self.BUCKET_BOUNDARIES, self.BUCKET_THRESHOLDS[:-1]):
+            if gallery_size < boundary:
+                return threshold
+        return self.BUCKET_THRESHOLDS[-1]
+
+    def _current_face_data_signature(self) -> int:
+        """Cheap proxy for 'has anything changed since the cache was last
+        built' -- total count of qualifying faces across all likely
+        people. Not perfect (a same-day swap of one face for another
+        wouldn't change the count), but Face has no modification
+        timestamp to check against, and this is a single aggregate query
+        rather than per-person work, cheap enough to run on every
+        load_encodings() call."""
+        has_long = ~Q(face_encoding_512=None)
+        long_encoded = ~Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
+        return Face.objects.filter(
+            Q(declared_name_id__in=self.likely_people_ids) & has_long & long_encoded
+        ).count()
+
     def reset_possible_assignments(self):
         Person.objects.all().update(num_possibilities = 0)
         Face.objects.filter(~Q(poss_ident1=None)).update(poss_ident1 = None)
@@ -99,20 +140,59 @@ class faceAssigner():
         Face.objects.filter(Q(declared_name__person_name=settings.BLANK_FACE_NAME)).update(rejected_fields = None)
 
     def load_encodings(self, reload_pkl_file: bool = False):
+        """Loads (and persistently caches to self.ENCODINGS_PKL_FILE) the
+        per-person embedding/norm data classify_unassigned() compares
+        against, so a normal run doesn't re-fetch and re-vectorize
+        hundreds of thousands of Face rows from the DB every time this
+        task fires (currently hourly).
+
+        Cache lifecycle: within the same calendar day, the cache is
+        trusted as-is and only topped up with any brand-new likely-people
+        not seen before (people freshly crossing MIN_NUM_FACES). Once a
+        new day has begun since the cache was last built, do one cheap
+        signature check (_current_face_data_signature()) -- if nothing
+        has actually changed (no faces (re)assigned to any likely person
+        since the last build), keep using the existing cache untouched
+        rather than pay for a rebuild nobody needs; if something did
+        change, rebuild the whole cache from scratch (not just top up),
+        since an existing person's gallery may have been added to or
+        corrected, not just brand-new people appearing. This naturally
+        catches "once a day, if there was activity that day" without a
+        separate scheduled invalidation task -- it just piggybacks on
+        whichever run happens first after the day rolls over.
+        """
 
         ss = time.time()
 
         self.candidate_dict = {}
         self.embedding_dict = {}
         self.norm_dict = {}
+
+        cache_is_valid = False
         if os.path.exists(self.ENCODINGS_PKL_FILE) and not reload_pkl_file:
             with open(self.ENCODINGS_PKL_FILE, 'rb') as ph:
                 combo_dict = pickle.load(ph)
 
+            cached_date = combo_dict.get('built_date')
+            today = datetime.now().date()
+
+            if cached_date == today:
+                cache_is_valid = True
+            else:
+                cached_signature = combo_dict.get('signature')
+                current_signature = self._current_face_data_signature()
+                if current_signature == cached_signature:
+                    print("Daily cache check: no face changes since last build -- keeping existing cache.")
+                    cache_is_valid = True
+                else:
+                    print("Daily cache check: face data changed since last build -- rebuilding full cache.")
+
+            if cache_is_valid:
                 self.candidate_dict = combo_dict['candidate_dict']
                 self.embedding_dict = combo_dict['embedding_dict']
                 self.norm_dict = combo_dict['norm_dict']
-        changed = False
+
+        changed = not cache_is_valid
 
         for face_id in tqdm(self.likely_people_ids):
 
@@ -127,13 +207,13 @@ class faceAssigner():
             faces_person = Q(declared_name__id=face_id)
             has_long = ~Q(face_encoding_512=None)
             long_encoded = ~Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
-            
+
             person_data = Face.objects \
                 .filter(faces_person & long_encoded & has_long)
             data = person_data.values_list('id', 'face_encoding_512', 'dateTakenUTC')
 
             df = pd.DataFrame(data, columns=['id', 'face_encoding_512', 'dateTakenUTC'])
-            
+
             self.candidate_dict[face_id] = df
 
             cmp_embedding = np.array(self.candidate_dict[face_id]['face_encoding_512'].tolist())
@@ -143,12 +223,13 @@ class faceAssigner():
             assert self.embedding_dict[face_id].shape[1] == len(norm_list)
             assert len(norm_list) == len(self.candidate_dict[face_id])
             self.norm_dict[face_id] = norm_list
-            
-        all_dict = {'candidate_dict': self.candidate_dict,
-                    'embedding_dict': self.embedding_dict,
-                    'norm_dict': self.norm_dict}
 
         if changed:
+            all_dict = {'candidate_dict': self.candidate_dict,
+                        'embedding_dict': self.embedding_dict,
+                        'norm_dict': self.norm_dict,
+                        'built_date': datetime.now().date(),
+                        'signature': self._current_face_data_signature()}
             try:
                 with open(self.ENCODINGS_PKL_FILE, 'wb') as ph:
                     pickle.dump(all_dict, ph)
@@ -184,12 +265,16 @@ class faceAssigner():
         num_unassigned = int(unassigned.count())
         print(f"There are {num_unassigned} faces to classify")
 
-        if num_unassigned > 100:
-            print(f"There are {num_unassigned} faces to classify.' +\
-                f' We are pre-loading the database's encodings, which may take several minutes.")
-            self.load_encodings()
-        else:
-            self.encoding_dataframe = None
+        # Always load encodings, regardless of batch size. This used to be
+        # skipped for small batches (num_unassigned <= 100), leaving
+        # embedding_dict/norm_dict/candidate_dict unset -- classify_
+        # unassigned() unconditionally reads those, so any run with a
+        # small batch crashed on every single face with AttributeError
+        # (confirmed live in production). The cache above makes this
+        # cheap for the common case anyway (same-day reruns just load the
+        # pickle, no DB hit for the embedding data itself), so there's no
+        # real cost to doing it unconditionally.
+        self.load_encodings()
         
         u_idx = 0
         s = time.time()
@@ -287,6 +372,12 @@ class faceAssigner():
         # commented out, aborted the *entire* scheduled assign_faces run,
         # not just this one face. Sizing to len(candidate_ids) keeps every
         # row real and every index in bounds.
+        #
+        # Columns: [sim_99th, per_candidate_threshold, db_id]. The gate
+        # and ranking both use sim_99th now, not sim_max -- see
+        # BUCKET_BOUNDARIES/BUCKET_THRESHOLDS above for why a flat
+        # sim_max gate was replaced with a gallery-size-calibrated
+        # percentile.
         metrics_array = np.zeros((len(candidate_ids), 3))
 
         for row_num, db_id in enumerate(candidate_ids):
@@ -297,19 +388,14 @@ class faceAssigner():
             similarity = dot_product / (cmp_encoding_norms * query_encoding_norm)
             assert len(similarity) == len(cmp_encoding_norms)
 
-            sim_max = np.max(similarity)
             sim_99th = np.percentile(similarity, 99)
-            # if sim_max > 0.5:
-            #     print(sim_max, sim_99th, db_id, unassigned_face.id)
+            candidate_threshold = self._p99_threshold_for_gallery_size(len(cmp_encoding_norms))
 
-            metrics_array[row_num, :] = [sim_max, sim_99th, db_id]
+            metrics_array[row_num, :] = [sim_99th, candidate_threshold, db_id]
             if self.DEBUG and db_id == debug_face_id and debug_face_id is not None:
                 print("Row values: ", metrics_array[row_num, :])
-            # print(np.max(similarity))
-            # similarity_ordered = np.sort(similarity)[::-1]
-            # print(similarity_ordered)
 
-        possible_idcs = np.where(metrics_array[:, 0] > self.ASSIGN_THRESH)[0]
+        possible_idcs = np.where(metrics_array[:, 0] > metrics_array[:, 1])[0]
         if self.DEBUG:
             print(possible_idcs, "poss len is", len(possible_idcs))
             print(metrics_array[possible_idcs, :])
@@ -318,7 +404,7 @@ class faceAssigner():
             metric_max = np.max(metrics_array[:, 0])
             weight = 1 - metric_max # High scores are presented on the
                 # screen first, so something that has a low similarity
-                # should have 1-value for a high score. 
+                # should have 1-value for a high score.
 
             if self.DEBUG:
                 row = np.argmax(metrics_array[:, 0])
@@ -335,12 +421,11 @@ class faceAssigner():
                 unassigned_face.set_possible_person(self.ignore_person_id, 1, weight)
         else:
             scores = metrics_array[possible_idcs, 0]
-            weights = metrics_array[possible_idcs, 1]
             assign_ids = metrics_array[possible_idcs, 2].astype(np.int64)
 
             order = np.argsort(scores)[::-1]
             order = order[:5]
             for precedence_idx, order_idx in enumerate(order):
-                # print(assign_ids[order_idx], precedence_idx, weights[order_idx])
-                unassigned_face.set_possible_person(int(assign_ids[order_idx]), precedence_idx + 1, float(weights[order_idx]))
+                # print(assign_ids[order_idx], precedence_idx, scores[order_idx])
+                unassigned_face.set_possible_person(int(assign_ids[order_idx]), precedence_idx + 1, float(scores[order_idx]))
 
