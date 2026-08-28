@@ -678,3 +678,188 @@ class ClassifyUnassignedArraySizingTests(TestCase):
             self.assigner.classify_unassigned(self.face)
 
         mock_set.assert_called_once_with(self.assigner.ignore_person_id, 1, 1.0)
+
+
+class P99ThresholdLookupTests(TestCase):
+    """_p99_threshold_for_gallery_size() implements the gallery-size-
+    adaptive accept/reject gate (see CLAUDE.md's "Face-classification
+    outlier-rejection" section for the experiment this is calibrated
+    from) -- checks the boundary edges land in the bucket they should."""
+
+    def setUp(self):
+        self.assigner = faceAssigner()
+
+    def test_boundary_edges(self):
+        t = self.assigner.BUCKET_THRESHOLDS
+        cases = [
+            (1, t[0]), (49, t[0]),
+            (50, t[1]), (199, t[1]),
+            (200, t[2]), (499, t[2]),
+            (500, t[3]), (10_000, t[3]),
+        ]
+        for gallery_size, expected in cases:
+            with self.subTest(gallery_size=gallery_size):
+                self.assertEqual(self.assigner._p99_threshold_for_gallery_size(gallery_size), expected)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class ClassifyUnassignedBucketGateTests(TestCase):
+    """Confirms the accept/reject gate actually varies by candidate
+    gallery size, not just that the lookup table itself is correct --
+    a candidate whose sim_99th clears its OWN bucket's (looser, large-
+    gallery) threshold but not a stricter small-gallery threshold must
+    still be accepted, and vice versa."""
+
+    def setUp(self):
+        self.assigner = faceAssigner()
+        self.small_person = make_person("Small Gallery Person")
+        self.large_person = make_person("Large Gallery Person")
+        self.assigner.likely_people_ids = [self.small_person.id, self.large_person.id]
+        self.assigner.num_likely_people = 2
+
+        self.query = np.zeros(512)
+        self.query[0] = 1.0
+
+        # A similarity strictly between the smallest bucket's threshold
+        # (0.558) and the largest bucket's threshold (0.394) -- accepted
+        # for a large gallery, rejected for a small one.
+        self.mid_similarity = 0.50
+        ref = self.query.copy()
+        ref[0] = self.mid_similarity
+        ref[1] = np.sqrt(1 - self.mid_similarity ** 2)  # unit vector at exactly mid_similarity cosine to query
+
+        small_gallery_size = 10   # falls in the [10,50) bucket -> threshold 0.558
+        large_gallery_size = 600  # falls in the [500+) bucket -> threshold 0.394
+
+        self.assigner.embedding_dict = {
+            self.small_person.id: np.tile(ref.reshape(512, 1), (1, small_gallery_size)),
+            self.large_person.id: np.tile(ref.reshape(512, 1), (1, large_gallery_size)),
+        }
+        self.assigner.norm_dict = {
+            self.small_person.id: np.ones(small_gallery_size),
+            self.large_person.id: np.ones(large_gallery_size),
+        }
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+        self.face = make_face(img, declared_name=blank_person)
+        self.face.face_encoding_512 = self.query.tolist()
+        self.face.save()
+
+    def test_same_similarity_accepted_for_large_gallery_rejected_for_small(self):
+        # Reject the small-gallery candidate and the ignore person up
+        # front, isolating whether the large-gallery candidate alone
+        # gets proposed -- this only happens if its looser threshold is
+        # actually being applied.
+        self.face.rejected_fields = [self.small_person.id]
+        self.face.save()
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            self.assigner.classify_unassigned(self.face)
+
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, self.large_person.id)
+
+    def test_same_similarity_rejects_small_gallery_when_it_is_the_only_candidate(self):
+        self.face.rejected_fields = [self.large_person.id, self.assigner.ignore_person_id]
+        self.face.save()
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            self.assigner.classify_unassigned(self.face)
+
+        # Falls through to the "no match cleared threshold" branch, which
+        # (since ignore_person_id is itself rejected here) proposes the
+        # best-scoring candidate anyway -- confirms it took the reject
+        # path, not a confident accept, for the identical similarity
+        # value that DID pass for the large-gallery candidate above.
+        mock_set.assert_called_once_with(self.small_person.id, 1, self.mid_similarity)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class LoadEncodingsCachingTests(TestCase):
+    """load_encodings()'s persistent cache: reused as-is within the same
+    day, reused across a day boundary if nothing changed, and fully
+    rebuilt across a day boundary if something did -- see the method's
+    own docstring for the full rationale."""
+
+    def setUp(self):
+        self.cache_path = "/tmp/face_manager_test_media/test_encodings_cache.pkl"
+        if os.path.exists(self.cache_path):
+            os.remove(self.cache_path)
+
+        self.assigner = faceAssigner()
+        self.assigner.ENCODINGS_PKL_FILE = self.cache_path
+        self.person = make_person("Cached Person")
+        self.assigner.likely_people_ids = [self.person.id]
+
+        img = make_image()
+        self.face = make_face(img, declared_name=self.person)
+        self.face.face_encoding_512 = ([0.1] * 512)
+        self.face.save()
+
+    def tearDown(self):
+        if os.path.exists(self.cache_path):
+            os.remove(self.cache_path)
+
+    def test_builds_and_persists_cache_on_first_call(self):
+        self.assigner.load_encodings()
+        self.assertTrue(os.path.exists(self.cache_path))
+        self.assertIn(self.person.id, self.assigner.embedding_dict)
+
+    def test_same_day_reuses_cache_without_requerying(self):
+        self.assigner.load_encodings()
+
+        with patch.object(faceAssigner, "_current_face_data_signature") as mock_sig:
+            fresh_assigner = faceAssigner()
+            fresh_assigner.ENCODINGS_PKL_FILE = self.cache_path
+            fresh_assigner.likely_people_ids = [self.person.id]
+            fresh_assigner.load_encodings()
+
+        mock_sig.assert_not_called()
+        self.assertIn(self.person.id, fresh_assigner.embedding_dict)
+
+    def test_next_day_no_changes_keeps_cache(self):
+        self.assigner.load_encodings()
+
+        with open(self.cache_path, "rb") as fh:
+            import pickle
+            cached = pickle.load(fh)
+        cached["built_date"] = cached["built_date"] - __import__("datetime").timedelta(days=1)
+        with open(self.cache_path, "wb") as fh:
+            pickle.dump(cached, fh)
+
+        fresh_assigner = faceAssigner()
+        fresh_assigner.ENCODINGS_PKL_FILE = self.cache_path
+        fresh_assigner.likely_people_ids = [self.person.id]
+        with patch.object(Face.objects, "filter", wraps=Face.objects.filter) as mock_filter:
+            fresh_assigner.load_encodings()
+        # The only DB access should be the cheap signature count query --
+        # not a full re-fetch of this person's face rows.
+        self.assertEqual(mock_filter.call_count, 1)
+        self.assertIn(self.person.id, fresh_assigner.embedding_dict)
+
+    def test_next_day_with_changes_rebuilds_cache(self):
+        self.assigner.load_encodings()
+
+        with open(self.cache_path, "rb") as fh:
+            import pickle
+            cached = pickle.load(fh)
+        cached["built_date"] = cached["built_date"] - __import__("datetime").timedelta(days=1)
+        cached["signature"] = -1  # force a mismatch against the real current count
+        with open(self.cache_path, "wb") as fh:
+            pickle.dump(cached, fh)
+
+        # Add a second confirmed face for this person -- a real change
+        # the stale cache doesn't know about.
+        img2 = make_image()
+        second_face = make_face(img2, declared_name=self.person)
+        second_face.face_encoding_512 = [0.2] * 512
+        second_face.save()
+
+        fresh_assigner = faceAssigner()
+        fresh_assigner.ENCODINGS_PKL_FILE = self.cache_path
+        fresh_assigner.likely_people_ids = [self.person.id]
+        fresh_assigner.load_encodings()
+
+        self.assertEqual(len(fresh_assigner.candidate_dict[self.person.id]), 2)
