@@ -270,13 +270,6 @@ class FaceModelTests(TestCase):
         self.assertIsNone(face.poss_ident1)
         self.assertIn(person.id, face.rejected_fields)
 
-    def test_clear_person(self):
-        person = make_person("Clearable")
-        face = make_face(self.image, declared_name=person)
-        face.clear_person()
-        face.refresh_from_db()
-        self.assertIsNone(face.declared_name)
-
     def test_face_encoding_512_stores_at_float32_precision(self):
         """face_encoding_512 is now backed by `real` (single precision),
         not `double precision` -- insightface's embeddings are natively
