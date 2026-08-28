@@ -740,11 +740,18 @@ class MobileViewTests(ApiTestCase):
         self.assertEqual(ids, [f_unverified.id])
         self.assertIn("access_key=", data["faces"][0]["face_img_url"])
 
-    def test_unverified_ignore_list_respects_limit(self):
-        for _ in range(4):
-            self._ignore_face()
-        resp = self.client.get("/api/mobile/unverified_ignore/?limit=2")
-        self.assertEqual(len(json.loads(resp.content)["faces"]), 2)
+    def test_unverified_ignore_list_respects_limit_and_offset(self):
+        faces = [self._ignore_face() for _ in range(4)]
+        newest_first = sorted((f.id for f in faces), reverse=True)
+
+        page1 = json.loads(
+            self.client.get("/api/mobile/unverified_ignore/?limit=2").content
+        )["faces"]
+        page2 = json.loads(
+            self.client.get("/api/mobile/unverified_ignore/?limit=2&offset=2").content
+        )["faces"]
+        self.assertEqual([f["id"] for f in page1], newest_first[:2])
+        self.assertEqual([f["id"] for f in page2], newest_first[2:])
 
     def test_bulk_ignore_verify_verifies_and_resets(self):
         ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
