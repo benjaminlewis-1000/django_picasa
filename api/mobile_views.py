@@ -84,6 +84,15 @@ class UnlabeledMobileInfo(APIView):
 
         face_object = Face.objects.get(id = selected_id)
 
+        # Whether this face is still an open tagging task. The mobile
+        # queue is a snapshot taken at login/refresh; by the time the app
+        # actually reaches a given face it may have been assigned in the
+        # web app, ignored, or moved by the classifier. The app uses this
+        # to silently skip faces that are no longer up for grabs.
+        declared = face_object.declared_name
+        declared_name = declared.person_name if declared is not None else None
+        is_unassigned = declared_name == settings.BLANK_FACE_NAME
+
         people_foreign_keys = [face_object.poss_ident1, \
             face_object.poss_ident2, \
             face_object.poss_ident3, \
@@ -119,6 +128,8 @@ class UnlabeledMobileInfo(APIView):
               'names': names,
               'ignore_url': ignore_url,
               'ignore_payload': ignore_payload,
+              'is_unassigned': is_unassigned,
+              'declared_name': declared_name,
               }
 
         return HttpResponse(json.dumps(js), content_type='application/json')
