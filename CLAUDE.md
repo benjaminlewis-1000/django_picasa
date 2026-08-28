@@ -224,7 +224,8 @@ Investigated via a real experiment methodology -- `.ignore`/`.realignore` confir
 known-outlier ("negative") queries, leave-one-out on real confirmed faces as "positive" queries,
 scored against the actual 441-person/273k-face gallery `assign_faces.py` uses. Findings and open
 ideas, so a future session doesn't have to redo this from scratch:
-- **DESIGN FINALIZED, not yet implemented: gallery-size-adaptive `p99` gate, 4 buckets.**
+- **IMPLEMENTED, DEPLOYED, AND REPROCESSED (2026-08-27/28): gallery-size-adaptive `p99` gate, 4
+  buckets.**
   `classify_unassigned()` currently gates accept/reject on `sim_max` (line ~300-312) -- a pure
   1-nearest-neighbor comparison, maximally vulnerable to any single noisy/mislabeled face in a
   person's gallery. The code already computes `sim_99th` per candidate but only uses it as the
@@ -257,8 +258,40 @@ ideas, so a future session doesn't have to redo this from scratch:
   `p50` as a second AND-condition alongside `p99` does not meaningfully help in any bucket
   (largest observed gain: 1.03%->0.97% FPR at matched 90% TPR, well within noise for a 3000-sample
   test) -- consistent with the logistic-regression finding below that percentiles of the same
-  distribution are too correlated to combine for real gain. **Not implemented in
-  `assign_faces.py` yet** -- this is a fully-specified, data-validated design ready to build.
+  distribution are too correlated to combine for real gain. **Implemented and live in
+  production.** The full 140,479-face unassigned-face library was reprocessed overnight
+  (`faceAssigner().execute(redo_all=True)`, ~8 hours, single-threaded -- see the reverted
+  multi-threading note below): 16,547 faces (11.8%) got a confident real-person suggestion,
+  123,933 (88.2%) fell back to `.ignore` -- the ignore-heavy split is expected and intentional,
+  trading auto-match volume for a much lower false-positive rate, exactly as designed. Only 1
+  face failed (thumbnail file missing from disk, unrelated to this change -- confirmed isolated
+  via a random sample, not systemic; fixed by deleting it and its sibling face on the same image,
+  one of them a previously-confirmed "Gwendolyn Lewis" tag now needing re-confirmation, and
+  marking the image `isProcessed=False` for redetection). **User's own anecdotal read after the
+  reprocess: "the face classification is looking a LOT better."**
+  - **Speedup work done alongside the reprocess, all kept except threading**: batched
+    `Face.save()` calls (`Face.set_possible_person()` gained a `save=False` option --
+    `classify_unassigned()` could call it up to 5x per face, each a real ~20ms validated save);
+    removed a fully-dead per-face `source_image_file.dateTaken` fetch (computed for a
+    commented-out debug print, never otherwise used, but still triggered a real query); added
+    `select_related('declared_name')` to `execute()`'s queryset (checked on every face, wasn't
+    prefetched); vectorized the per-candidate comparison into one big matmul against a
+    concatenated gallery matrix instead of ~441 separate small ones
+    (`_build_concatenated_gallery()`); and cached `Person` objects (`_build_person_cache()`) so
+    `set_possible_person()` skips its own `Person.objects.get()` round trip. **Multi-threading
+    (`num_threads` param, `ThreadPoolExecutor`) was tried and reverted** -- measured against the
+    real reprocess, 6 threads gave no real speedup over the single-threaded-but-optimized version
+    (~5 it/s either way) despite high CPU usage, most likely because numpy's matmul already uses
+    multiple BLAS threads per call, so N Python threads oversubscribe the same cores rather than
+    dividing work. Not worth the added complexity (thread-local DB connection handling,
+    `TransactionTestCase`-only test coverage) for zero measured benefit.
+  - **Real bug caught and fixed mid-implementation, not by a test**: the "trueing up" pass
+    (`Person.objects.all()`, recomputing `num_faces`/`num_possibilities`/`num_unverified_faces`)
+    briefly ended up inside the per-face helper during the threading work instead of staying in
+    `execute()` -- ran once per face instead of once per `execute()` call, turning the reprocess's
+    ETA from ~10 hours into ~92 projected. Caught by watching the real run's rate, not by the test
+    suite (existing coverage only checked final counts, not call counts) -- a regression test
+    (`ExecuteTrueingUpTests`) was added afterward and is kept even post-threading-revert.
 - **Tested and rejected: combining multiple percentiles (p50/p75/p90/p95/p99/max) via logistic
   regression.** AUC barely improved over `p99` alone (0.968 vs 0.967) -- percentiles of the same
   similarity distribution are too correlated with each other to add real complementary signal.
@@ -322,6 +355,19 @@ ideas, so a future session doesn't have to redo this from scratch:
   - **Directory/event context prior** -- faces from the same source folder or day tend to
     recur; if a directory is already heavily populated with a specific family group's confirmed
     faces, that shifts the prior for an unlabeled face in that same directory. Also not scoped.
+  - **Cluster-then-recover the `.ignore` bucket** (a scoped-down version of a "cluster first, name
+    the cluster, only match cluster-level exemplars against people" architecture like Google
+    Photos' -- discussed as a bigger structural alternative to per-face classification, too big to
+    take on wholesale here). Concretely: with 123,933 faces now sitting in `.ignore` after the
+    2026-08-27/28 reprocess, some real fraction are true matches that were correctly-but-
+    conservatively rejected (the TPR cost of the new gate) rather than genuine outliers. Since
+    `p99 @ 0.65`/`@0.70` gave much higher precision at lower recall in the threshold-sweep data,
+    a two-stage design -- auto-assign only at a high-precision operating point, then cluster
+    *within* the resulting `.ignore` pool and surface any tight cluster for a human to confirm/
+    re-insert in bulk -- could recover a meaningful chunk of that lost TPR without reintroducing
+    the false-positive problem. Not scoped or started; would need real clustering infrastructure
+    (e.g. a similarity-graph approach much like `filepopulator`'s new phash `SimilarImagePair`
+    work earlier this session, but on face embeddings) and a frontend surface to review clusters.
 - Experiment scripts and cached data (gallery embeddings, negative pool, full per-query/per-
   person/per-percentile profiles, all keyed by person/face id with dates attached) live only in
   `/tmp` inside `picasa_api` and the session's own scratchpad -- not committed anywhere, will need
