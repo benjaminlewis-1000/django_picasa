@@ -190,18 +190,21 @@ class UnverifiedIgnoreList(APIView):
     MAX_LIMIT = 60
 
     def get(self, request, *args, **kwargs):
-        try:
-            limit = int(request.query_params.get('limit', self.DEFAULT_LIMIT))
-        except (TypeError, ValueError):
-            limit = self.DEFAULT_LIMIT
-        limit = max(1, min(limit, self.MAX_LIMIT))
+        def _int(name, default):
+            try:
+                return int(request.query_params.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        limit = max(1, min(_int('limit', self.DEFAULT_LIMIT), self.MAX_LIMIT))
+        offset = max(0, _int('offset', 0))
 
         host_url = f'https://{request.get_host()}/api'
         faces = (
             Face.objects
             .filter(declared_name__person_name=settings.SOFT_IGNORE_NAME, validated=False)
             .order_by('-id')
-            .values_list('id', flat=True)[:limit]
+            .values_list('id', flat=True)[offset:offset + limit]
         )
 
         js = {'faces': [
