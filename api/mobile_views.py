@@ -20,13 +20,13 @@ class ConfidentUnlabeledView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request, *args, **kwargs):
-        # The tagging app only wants faces where a human actually has
-        # something to confirm: declared_name is still the blank sentinel
-        # AND at least one poss_identN guess points to a *real* person.
-        # Faces whose only proposed identities are sentinel rows
+        # The tagging app only wants faces where a human has a clean
+        # decision to make: declared_name is still the blank sentinel,
+        # at least one poss_identN guess points to a *real* person, and
+        # *none* of the five poss_identN slots is a sentinel row
         # (.ignore / .realignore / _NO_FACE_ASSIGNED_ / ..., per
-        # settings.IGNORED_NAMES) -- or which have no guesses at all --
-        # are excluded: there's nothing to tag.
+        # settings.IGNORED_NAMES). A single sentinel guess anywhere in the
+        # top five disqualifies the face. Empty (null) slots are fine.
         #
         # Regression test for a fixed bug: this used to do
         # `unlabeled[0].weight_1` unconditionally, which raised IndexError
@@ -34,15 +34,21 @@ class ConfidentUnlabeledView(APIView):
         # of the tagging workflow, not an edge case. It now just returns
         # whatever ids match, including none.
         has_real_guess = Q()
+        no_sentinel_guess = Q()
         for i in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1):
-            has_real_guess |= Q(**{f'poss_ident{i}__isnull': False}) & ~Q(
-                **{f'poss_ident{i}__person_name__in': settings.IGNORED_NAMES}
-            )
+            slot = f'poss_ident{i}'
+            not_sentinel = ~Q(**{f'{slot}__person_name__in': settings.IGNORED_NAMES})
+            has_real_guess |= Q(**{f'{slot}__isnull': False}) & not_sentinel
+            # An empty slot is fine; a filled slot must not be a sentinel.
+            # (Spelled out rather than a bare ~Q(...__in) so a NULL slot,
+            # whose person_name is NULL and fails `NOT IN`, still passes.)
+            no_sentinel_guess &= Q(**{f'{slot}__isnull': True}) | not_sentinel
 
         unlabeled = (
             Face.objects
             .filter(declared_name__person_name=settings.BLANK_FACE_NAME)
             .filter(has_real_guess)
+            .filter(no_sentinel_guess)
             .order_by('-weight_1')
         )
         unlabeled_ids = list(unlabeled.values_list('id', flat=True))
