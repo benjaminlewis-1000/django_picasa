@@ -777,6 +777,77 @@ class ClassifyUnassignedBucketGateTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class IgnoreWeightMarginTests(TestCase):
+    """The ignore-branch weight is deliberately the OPPOSITE sense of a
+    real-match weight: frontend sorts by weight descending, and a face
+    that's confidently far from every candidate (a safe, obvious ignore)
+    should surface before a face that nearly cleared someone's bar (a
+    genuine near-miss worth a human's eyes). Uses each candidate's own
+    margin below ITS bucket threshold, not a raw score, since raw scores
+    aren't comparable across differently-thresholded buckets."""
+
+    def _make_face_with_single_candidate(self, similarity, gallery_size):
+        assigner = faceAssigner()
+        person = make_person(f"Candidate {similarity}-{gallery_size}")
+        assigner.likely_people_ids = [person.id]
+
+        query = np.zeros(512)
+        query[0] = 1.0
+        ref = query.copy()
+        ref[0] = similarity
+        ref[1] = np.sqrt(max(0.0, 1 - similarity ** 2))
+
+        assigner.embedding_dict = {person.id: np.tile(ref.reshape(512, 1), (1, gallery_size))}
+        assigner.norm_dict = {person.id: np.ones(gallery_size)}
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+        face = make_face(img, declared_name=blank_person)
+        face.face_encoding_512 = query.tolist()
+        face.save()
+        return assigner, face
+
+    def test_near_miss_gets_low_ignore_weight(self):
+        # Large-gallery bucket threshold is 0.394; scoring 0.39 is a
+        # near-miss margin of 0.004 -- should sort near the back.
+        assigner, face = self._make_face_with_single_candidate(similarity=0.39, gallery_size=600)
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+
+        mock_set.assert_called_once()
+        _, precedence, weight = mock_set.call_args[0]
+        expected = 0.004 / assigner.IGNORE_WEIGHT_MARGIN_CLAMP
+        self.assertAlmostEqual(weight, expected, places=3)
+        self.assertLess(weight, 0.1)
+
+    def test_far_from_everyone_gets_high_ignore_weight(self):
+        # Same bucket/threshold, but scoring far below it (margin well
+        # past the clamp) -- should sort to the very front.
+        assigner, face = self._make_face_with_single_candidate(similarity=0.0, gallery_size=600)
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+
+        mock_set.assert_called_once()
+        _, precedence, weight = mock_set.call_args[0]
+        self.assertEqual(weight, 1.0)
+
+    def test_far_beats_near_miss_in_sort_order(self):
+        near_miss_assigner, near_miss_face = self._make_face_with_single_candidate(similarity=0.39, gallery_size=600)
+        far_assigner, far_face = self._make_face_with_single_candidate(similarity=0.0, gallery_size=600)
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            near_miss_assigner.classify_unassigned(near_miss_face)
+            near_miss_weight = mock_set.call_args[0][2]
+
+            far_assigner.classify_unassigned(far_face)
+            far_weight = mock_set.call_args[0][2]
+
+        self.assertGreater(far_weight, near_miss_weight)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class LoadEncodingsCachingTests(TestCase):
     """load_encodings()'s persistent cache: reused as-is within the same
     day, reused across a day boundary if nothing changed, and fully

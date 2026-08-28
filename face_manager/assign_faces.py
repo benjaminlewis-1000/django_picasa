@@ -69,6 +69,13 @@ class faceAssigner():
         self.BUCKET_BOUNDARIES = [50, 200, 500]
         self.BUCKET_THRESHOLDS = [0.558, 0.551, 0.486, 0.394]
 
+        # How far below its own bucket threshold a face's closest-call
+        # candidate needs to be before it's treated as "confidently far
+        # from everyone" for ignore-weight purposes (see the "no match"
+        # branch of classify_unassigned() below) -- beyond this margin,
+        # further distance doesn't make it any more clearly not-a-match.
+        self.IGNORE_WEIGHT_MARGIN_CLAMP = 0.3
+
         # self.bogus_date = datetime(1990, 1, 1) # Very few images before that
         # self.bogus_date_utc = time.mktime(self.bogus_date.timetuple())
         self.ignore_person = Person.objects.filter(person_name=settings.SOFT_IGNORE_NAME)[0]
@@ -402,9 +409,6 @@ class faceAssigner():
         if len(possible_idcs) == 0:
             # print("TODO: Assign to ignore person")
             metric_max = np.max(metrics_array[:, 0])
-            weight = 1 - metric_max # High scores are presented on the
-                # screen first, so something that has a low similarity
-                # should have 1-value for a high score.
 
             if self.DEBUG:
                 row = np.argmax(metrics_array[:, 0])
@@ -418,6 +422,28 @@ class faceAssigner():
                 max_id = candidate_id_arr[max_idx]
                 unassigned_face.set_possible_person(max_id, 1, metric_max)
             else:
+                # This weight answers a different question than a real
+                # match's weight does: not "how confident is this specific
+                # match" but "how confidently can this face be ignored."
+                # The frontend sorts by weight descending, so a face that's
+                # far from EVERY candidate (a safe, obvious ignore) should
+                # surface first; a face that nearly cleared someone's bar
+                # (a genuinely marginal near-miss, worth a human's eyes)
+                # should sort toward the back -- the opposite direction
+                # from a real-match weight, deliberately.
+                #
+                # Uses each candidate's own margin below ITS threshold,
+                # not a raw score -- comparing raw sim_99th values across
+                # candidates wouldn't be apples-to-apples now that
+                # thresholds vary by gallery-size bucket (a large-gallery
+                # candidate scoring 0.39 against a 0.394 threshold is a
+                # genuine near-miss; a small-gallery candidate scoring
+                # 0.35 against a 0.558 threshold isn't close at all, even
+                # though the raw scores look similar).
+                margins_below_threshold = metrics_array[:, 1] - metrics_array[:, 0]  # >=0 for every row here
+                closest_call_margin = np.min(margins_below_threshold)  # smallest gap = nearest to passing
+                clamped_margin = np.clip(closest_call_margin, 0, self.IGNORE_WEIGHT_MARGIN_CLAMP)
+                weight = clamped_margin / self.IGNORE_WEIGHT_MARGIN_CLAMP  # 0 (marginal) .. 1 (far from everyone)
                 unassigned_face.set_possible_person(self.ignore_person_id, 1, weight)
         else:
             scores = metrics_array[possible_idcs, 0]
