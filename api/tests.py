@@ -632,3 +632,123 @@ class MobileViewTests(ApiTestCase):
         self.assertIn("Bob", names)
         for ignored in settings.IGNORED_NAMES:
             self.assertNotIn(ignored, names)
+
+
+@override_settings(
+    AUTHELIA_ISSUER="https://auth.test.example",
+    AUTHELIA_MOBILE_CLIENT_ID="photoverify_mobile",
+)
+class AutheliaOIDCAuthenticationTests(TestCase):
+    """api/authentication.py:AutheliaOIDCAuthentication -- the PhotoVerify
+    mobile app sends an Authelia-issued OIDC ID token as a Bearer token;
+    this class verifies its RS256 signature against Authelia's JWKS and
+    maps the email claim to a local user. Here the JWKS lookup is stubbed
+    with a locally generated RSA keypair so no network / real Authelia is
+    involved."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ensure_sentinel_people()
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        cls._key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    def setUp(self):
+        import time
+        from unittest.mock import patch
+
+        self._time = time
+        self.user = User.objects.create_user(
+            username="mobileuser", email="Person@Example.com", password="pw123456"
+        )
+        # get_signing_key_from_jwt(token) -> object with a .key attribute
+        # (the verifying key). Return the public half of our test keypair.
+        signing_key = type("K", (), {"key": self._key.public_key()})()
+        patcher = patch(
+            "api.authentication._jwks_client.get_signing_key_from_jwt",
+            return_value=signing_key,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.client = APIClient()
+
+    def _token(self, **overrides):
+        import jwt
+
+        now = int(self._time.time())
+        claims = {
+            "iss": "https://auth.test.example",
+            "aud": "photoverify_mobile",
+            "sub": "abc123",
+            "iat": now,
+            "exp": now + 3600,
+            "email": "person@example.com",
+        }
+        claims.update(overrides)
+        for k in [k for k, v in overrides.items() if v is None]:
+            claims.pop(k, None)
+        return jwt.encode(claims, self._key, algorithm="RS256")
+
+    def _get(self, token):
+        return self.client.get(
+            "/api/mobile/name_list/", HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+
+    def test_valid_token_authenticates_and_maps_email_case_insensitively(self):
+        resp = self._get(self._token())
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    REJECTED = (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN)
+
+    def test_no_bearer_header_is_rejected_not_500(self):
+        resp = self.client.get("/api/mobile/name_list/")
+        self.assertIn(resp.status_code, self.REJECTED)
+
+    def test_expired_token_rejected(self):
+        now = int(self._time.time())
+        resp = self._get(self._token(iat=now - 7200, exp=now - 3600))
+        self.assertIn(resp.status_code, self.REJECTED)
+        self.assertIn("expired", resp.content.decode().lower())
+
+    def test_wrong_audience_rejected(self):
+        resp = self._get(self._token(aud="some_other_client"))
+        self.assertIn(resp.status_code, self.REJECTED)
+
+    def test_wrong_issuer_rejected(self):
+        resp = self._get(self._token(iss="https://evil.example"))
+        self.assertIn(resp.status_code, self.REJECTED)
+
+    def test_token_signed_by_a_different_key_rejected(self):
+        import jwt
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        attacker_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        now = int(self._time.time())
+        forged = jwt.encode(
+            {
+                "iss": "https://auth.test.example",
+                "aud": "photoverify_mobile",
+                "sub": "abc123",
+                "iat": now,
+                "exp": now + 3600,
+                "email": "person@example.com",
+            },
+            attacker_key,
+            algorithm="RS256",
+        )
+        self.assertIn(self._get(forged).status_code, self.REJECTED)
+
+    def test_unknown_email_rejected(self):
+        resp = self._get(self._token(email="nobody@example.com"))
+        self.assertIn(resp.status_code, self.REJECTED)
+
+    def test_missing_email_claim_rejected(self):
+        resp = self._get(self._token(email=None))
+        self.assertIn(resp.status_code, self.REJECTED)
+
+    def test_inactive_user_rejected(self):
+        self.user.is_active = False
+        self.user.save()
+        resp = self._get(self._token())
+        self.assertIn(resp.status_code, self.REJECTED)
