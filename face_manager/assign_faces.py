@@ -243,7 +243,40 @@ class faceAssigner():
             except:
                 os.remove(self.ENCODINGS_PKL_FILE)
 
+        self._build_concatenated_gallery()
+
         print(f"Dataframe preloading: {time.time() - ss:.2f} seconds")
+
+    def _build_concatenated_gallery(self):
+        """Concatenates every likely person's embedding matrix into one
+        big (512 x N) array, with an offsets map recording which column
+        range belongs to which person_id. classify_unassigned() then does
+        ONE matmul against this whole array per query instead of looping
+        over each of the ~441 candidates doing its own small np.dot() --
+        the same technique (and the same real speedup) validated
+        experimentally for the outlier-rejection analysis this design is
+        based on; see CLAUDE.md. Cheap to rebuild (just concatenation, no
+        DB access) every load_encodings() call, so it doesn't need its
+        own cache-invalidation logic."""
+        person_ids = list(self.embedding_dict.keys())
+        self.gallery_offsets = {}
+        cursor = 0
+        embedding_chunks = []
+        norm_chunks = []
+        for person_id in person_ids:
+            embeddings = self.embedding_dict[person_id]
+            n = embeddings.shape[1]
+            self.gallery_offsets[person_id] = (cursor, cursor + n)
+            embedding_chunks.append(embeddings)
+            norm_chunks.append(self.norm_dict[person_id])
+            cursor += n
+
+        if embedding_chunks:
+            self.all_embeddings = np.concatenate(embedding_chunks, axis=1)
+            self.all_norms = np.concatenate(norm_chunks)
+        else:
+            self.all_embeddings = np.zeros((512, 0))
+            self.all_norms = np.zeros(0)
 
     def execute(self, redo_all: bool = False) -> None:
         """
@@ -261,11 +294,15 @@ class faceAssigner():
         # then we do all the faces, otherwise just the ones that don't have an
         # assignment for poss_ident1, i.e. that have been rejected in the GUI. 
 
+        # select_related('declared_name'): classify_unassigned() checks
+        # unassigned_face.declared_name.person_name on every face (the
+        # concurrent-processing guard just below) -- without this, that's
+        # a separate DB round trip per face on top of everything else.
         if redo_all:
-            unassigned = Face.objects.filter(unassigned_crit & has_long & long_encoded).order_by('?')
+            unassigned = Face.objects.filter(unassigned_crit & has_long & long_encoded).select_related('declared_name').order_by('?')
         else:
             no_suggestions = Q(poss_ident1__person_name=None)
-            unassigned = Face.objects.filter(unassigned_crit & has_long & long_encoded).filter(no_suggestions).order_by('?')
+            unassigned = Face.objects.filter(unassigned_crit & has_long & long_encoded).filter(no_suggestions).select_related('declared_name').order_by('?')
 
         if self.DEBUG:
             unassigned = unassigned[:1001]
@@ -330,13 +367,11 @@ class faceAssigner():
             print("Already assigned")
             return
 
-        date_taken = unassigned_face.source_image_file.dateTaken.timestamp()
-        # print(unassigned_face.id)
-        # print(date)
-        date_string = time.strftime('%Y-%m-%d', time.localtime(date_taken))
-        # if self.DEBUG:
-        #     print(unassigned_face.face_thumbnail)
-        #     print(unassigned_face.source_image_file.dateTaken, date_taken)
+        # (Used to compute date_taken/date_string here from
+        # unassigned_face.source_image_file.dateTaken for a commented-out
+        # debug print -- removed. It was otherwise unused, but triggered
+        # a real per-face DB query for the source_image_file FK, since
+        # execute()'s queryset doesn't select_related it.)
 
         query_encoding = np.array(unassigned_face.face_encoding_512)
         query_encoding_norm = np.linalg.norm(query_encoding)
@@ -387,16 +422,19 @@ class faceAssigner():
         # percentile.
         metrics_array = np.zeros((len(candidate_ids), 3))
 
+        # One big matmul against the whole gallery (all likely people,
+        # not just this face's candidate_ids -- cheap either way, and
+        # simpler than rebuilding a filtered matrix per face) instead of
+        # a separate small np.dot() per candidate. Each candidate's
+        # slice is then just cheap array indexing via gallery_offsets.
+        all_similarity = (query_encoding @ self.all_embeddings) / (self.all_norms * query_encoding_norm)
+
         for row_num, db_id in enumerate(candidate_ids):
-            cmp_face_encodings = self.embedding_dict[db_id]
-            cmp_encoding_norms = self.norm_dict[db_id]
-            dot_product = np.dot(query_encoding, cmp_face_encodings)
-            assert len(dot_product) == len(cmp_encoding_norms)
-            similarity = dot_product / (cmp_encoding_norms * query_encoding_norm)
-            assert len(similarity) == len(cmp_encoding_norms)
+            lo, hi = self.gallery_offsets[db_id]
+            similarity = all_similarity[lo:hi]
 
             sim_99th = np.percentile(similarity, 99)
-            candidate_threshold = self._p99_threshold_for_gallery_size(len(cmp_encoding_norms))
+            candidate_threshold = self._p99_threshold_for_gallery_size(hi - lo)
 
             metrics_array[row_num, :] = [sim_99th, candidate_threshold, db_id]
             if self.DEBUG and db_id == debug_face_id and debug_face_id is not None:
@@ -451,7 +489,13 @@ class faceAssigner():
 
             order = np.argsort(scores)[::-1]
             order = order[:5]
+            # save=False + one save() at the end: up to 5 calls here (one
+            # per ranked candidate), and Face.save() does real validation
+            # work (~20ms measured against production) -- 5 separate
+            # saves per face was a real, avoidable cost multiplier across
+            # a 140k-face reprocess.
             for precedence_idx, order_idx in enumerate(order):
                 # print(assign_ids[order_idx], precedence_idx, scores[order_idx])
-                unassigned_face.set_possible_person(int(assign_ids[order_idx]), precedence_idx + 1, float(scores[order_idx]))
+                unassigned_face.set_possible_person(int(assign_ids[order_idx]), precedence_idx + 1, float(scores[order_idx]), save=False)
+            unassigned_face.save()
 

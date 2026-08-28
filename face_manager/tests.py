@@ -646,6 +646,7 @@ class ClassifyUnassignedArraySizingTests(TestCase):
         ref_a = -self.query.copy()
         self.assigner.embedding_dict = {self.person_a.id: ref_a.reshape(512, 1)}
         self.assigner.norm_dict = {self.person_a.id: np.array([1.0])}
+        self.assigner._build_concatenated_gallery()
 
         blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
         img = make_image()
@@ -739,6 +740,7 @@ class ClassifyUnassignedBucketGateTests(TestCase):
             self.small_person.id: np.ones(small_gallery_size),
             self.large_person.id: np.ones(large_gallery_size),
         }
+        self.assigner._build_concatenated_gallery()
 
         blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
         img = make_image()
@@ -799,6 +801,7 @@ class IgnoreWeightMarginTests(TestCase):
 
         assigner.embedding_dict = {person.id: np.tile(ref.reshape(512, 1), (1, gallery_size))}
         assigner.norm_dict = {person.id: np.ones(gallery_size)}
+        assigner._build_concatenated_gallery()
 
         blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
         img = make_image()

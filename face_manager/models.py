@@ -318,7 +318,15 @@ class Face(models.Model):
         self.validated = True
         self.save()
 
-    def set_possible_person(self, person_id, poss_idx, weight):
+    def set_possible_person(self, person_id, poss_idx, weight, save=True):
+        """save=False lets a caller setting multiple poss_identN slots on
+        the same face (assign_faces.py's classify_unassigned() does up to
+        5, once per ranked candidate) batch them into a single .save()
+        instead of one per call -- Face.save() does real validation work
+        and isn't cheap (~20ms measured against production), so 5 calls
+        each saving was a real, avoidable cost multiplier. Callers that
+        pass save=False are responsible for calling .save() themselves
+        once they're done setting fields."""
 
         assert poss_idx > 0, 'The index correlateed to poss_ident must be a value between 1 and 5.'
         assert poss_idx <= 5, 'The index correlateed to poss_ident must be a value between 1 and 5.'
@@ -334,7 +342,8 @@ class Face(models.Model):
         exec(f"self.poss_ident{poss_idx} = new_poss_id")
         exec(f"self.weight_{poss_idx} = weight")
 
-        self.save()
+        if save:
+            self.save()
 
     def set_possibles_zero(self):
         for poss_idx in range(1, self.NUM_POSSIBLE_IDENTITIES + 1):
