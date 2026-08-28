@@ -431,3 +431,20 @@ class Face(models.Model):
         self.rejected_fields = reject_list
         self.save()
 
+    def mark_person_rejected(self, person_id):
+        """Record that `person_id` is NOT this face -- the classifier
+        (assign_faces.py) skips anyone in rejected_fields when proposing
+        matches, and won't re-`.ignore` a face whose rejected_fields
+        contains the ignore person.
+
+        Unlike reject_association(), this does not touch poss_identN and
+        does not require the person to currently be a possible match --
+        so it's safe to call when rejecting a *declared* assignment (e.g.
+        pulling a wrongly auto-ignored face back out)."""
+        assert type(person_id) is int
+        reject_list = list(self.rejected_fields or [])
+        if person_id not in reject_list:
+            reject_list.append(person_id)
+            self.rejected_fields = reject_list
+            self.save()
+

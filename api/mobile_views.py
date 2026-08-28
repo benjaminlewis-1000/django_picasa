@@ -15,6 +15,32 @@ from rest_framework.views import APIView
 from face_manager.models import Face, Person
 
 
+def reset_face_to_pool(face_object, blank=None):
+    """Reset a face: drop any name assignment + all poss_identN guesses and
+    put it back in the unassigned pool as the *blank sentinel Person*
+    (NOT NULL -- the old clear_person() left declared_name NULL, invisible
+    to both the "Unassigned" bucket and assign_faces' re-classification,
+    which filter declared_name__person_name == BLANK_FACE_NAME)."""
+    if blank is None:
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+
+    prev = face_object.declared_name
+    if prev is not None and prev.person_name != settings.BLANK_FACE_NAME:
+        prev.decrement_assigned()
+        if not face_object.validated:
+            prev.decrement_unverified()
+
+    face_object.set_possibles_zero()  # clears poss_identN + weights, saves
+
+    if face_object.declared_name_id != blank.id:
+        face_object.declared_name = blank
+        face_object.validated = False
+        face_object.written_to_photo_metadata = False
+        blank.increment_assigned()
+        blank.increment_unverified()
+        face_object.save()
+
+
 class ConfidentUnlabeledView(APIView):
 
     permission_classes = (IsAuthenticated,)
@@ -145,38 +171,99 @@ class ResetFace(APIView):
     def patch(self, request, *args, **kwargs):
 
         selected_id = kwargs['id']
-
         face_object = Face.objects.get(id=selected_id)
-        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
-
-        # Decrement the previous *real* owner's counts, if there was one.
-        prev = face_object.declared_name
-        if prev is not None and prev.person_name != settings.BLANK_FACE_NAME:
-            prev.decrement_assigned()
-            if not face_object.validated:
-                prev.decrement_unverified()
-
-        # Wipe all five poss_identN guesses + weights (this also saves).
-        face_object.set_possibles_zero()
-
-        # Put the face back in the unassigned pool as the *blank sentinel
-        # Person*, NOT NULL. The old clear_person() left declared_name
-        # NULL, which is invisible to both the "Unassigned" bucket and to
-        # assign_faces' re-classification -- both filter on
-        # declared_name__person_name == BLANK_FACE_NAME -- so a reset face
-        # just vanished instead of returning to the pool.
-        if face_object.declared_name_id != blank.id:
-            face_object.declared_name = blank
-            face_object.validated = False
-            face_object.written_to_photo_metadata = False
-            blank.increment_assigned()
-            blank.increment_unverified()
-            face_object.save()
+        reset_face_to_pool(face_object)
 
         # Regression test for a fixed bug: this method had no return
         # statement, so DRF's dispatch() got None back instead of a
         # Response and raised AssertionError -- crashed on every call.
         return HttpResponse(json.dumps({'success': True}), content_type='application/json')
+
+
+class UnverifiedIgnoreList(APIView):
+    """Faces the classifier auto-assigned to `.ignore` that a human hasn't
+    confirmed yet (validated == False). Backs the mobile "review ignored
+    faces" grid."""
+
+    permission_classes = (IsAuthenticated,)
+    DEFAULT_LIMIT = 15
+    MAX_LIMIT = 60
+
+    def get(self, request, *args, **kwargs):
+        try:
+            limit = int(request.query_params.get('limit', self.DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_LIMIT
+        limit = max(1, min(limit, self.MAX_LIMIT))
+
+        host_url = f'https://{request.get_host()}/api'
+        faces = (
+            Face.objects
+            .filter(declared_name__person_name=settings.SOFT_IGNORE_NAME, validated=False)
+            .order_by('-id')
+            .values_list('id', flat=True)[:limit]
+        )
+
+        js = {'faces': [
+            {
+                'id': fid,
+                'face_img_url': (
+                    f"{host_url}/keyed_image/face_array/?id={fid}"
+                    f"&access_key={settings.RANDOM_ACCESS_KEY}"
+                ),
+            }
+            for fid in faces
+        ]}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+
+class BulkIgnoreVerify(APIView):
+    """Bulk-resolve a batch of unverified `.ignore` faces from the mobile
+    review grid:
+
+      - `verify_ids`: confirm as correctly ignored (validated = True).
+      - `reset_ids` : "this is actually a real person" -- reset to the
+        unassigned pool AND add `.ignore` to rejected_fields so the
+        classifier proposes a real match instead of re-ignoring it.
+
+    Synchronous (batches are small, <=60); stale/mismatched ids are
+    skipped rather than erroring the whole request.
+    """
+
+    permission_classes = (IsAuthenticated,)
+
+    def patch(self, request, *args, **kwargs):
+        verify_ids = request.data.get('verify_ids') or []
+        reset_ids = request.data.get('reset_ids') or []
+
+        ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+
+        verified = skipped = reset = 0
+
+        for fid in verify_ids:
+            face = Face.objects.filter(id=fid).first()
+            if (
+                face is None
+                or face.validated
+                or face.declared_name_id != ignore_person.id
+            ):
+                skipped += 1
+                continue
+            face.verify_person_in_image()  # validated=True, decrements .ignore unverified
+            verified += 1
+
+        for fid in reset_ids:
+            face = Face.objects.filter(id=fid).first()
+            if face is None:
+                skipped += 1
+                continue
+            reset_face_to_pool(face, blank=blank)
+            face.mark_person_rejected(ignore_person.id)
+            reset += 1
+
+        js = {'verified': verified, 'reset': reset, 'skipped': skipped}
+        return HttpResponse(json.dumps(js), content_type='application/json')
 
 
 class MobileNameList(APIView):
