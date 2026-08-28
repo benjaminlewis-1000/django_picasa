@@ -7,6 +7,7 @@
 import json
 
 from django.conf import settings
+from django.db.models import Q
 from django.http import HttpResponse
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
@@ -19,13 +20,31 @@ class ConfidentUnlabeledView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request, *args, **kwargs):
+        # The tagging app only wants faces where a human actually has
+        # something to confirm: declared_name is still the blank sentinel
+        # AND at least one poss_identN guess points to a *real* person.
+        # Faces whose only proposed identities are sentinel rows
+        # (.ignore / .realignore / _NO_FACE_ASSIGNED_ / ..., per
+        # settings.IGNORED_NAMES) -- or which have no guesses at all --
+        # are excluded: there's nothing to tag.
+        #
         # Regression test for a fixed bug: this used to do
         # `unlabeled[0].weight_1` unconditionally, which raised IndexError
         # the moment there were zero unlabeled faces -- the *goal* state
-        # of the tagging workflow, not an edge case, so this crashed
-        # whenever tagging was fully caught up. Just return whatever ids
-        # are there, including none.
-        unlabeled = Face.objects.filter(declared_name__person_name=settings.BLANK_FACE_NAME).order_by('-weight_1')
+        # of the tagging workflow, not an edge case. It now just returns
+        # whatever ids match, including none.
+        has_real_guess = Q()
+        for i in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1):
+            has_real_guess |= Q(**{f'poss_ident{i}__isnull': False}) & ~Q(
+                **{f'poss_ident{i}__person_name__in': settings.IGNORED_NAMES}
+            )
+
+        unlabeled = (
+            Face.objects
+            .filter(declared_name__person_name=settings.BLANK_FACE_NAME)
+            .filter(has_real_guess)
+            .order_by('-weight_1')
+        )
         unlabeled_ids = list(unlabeled.values_list('id', flat=True))
 
         js = {'unlabeled_ids': unlabeled_ids}
