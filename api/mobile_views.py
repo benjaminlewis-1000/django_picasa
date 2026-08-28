@@ -180,14 +180,15 @@ class ResetFace(APIView):
         return HttpResponse(json.dumps({'success': True}), content_type='application/json')
 
 
-class UnverifiedIgnoreList(APIView):
-    """Faces the classifier auto-assigned to `.ignore` that a human hasn't
-    confirmed yet (validated == False). Backs the mobile "review ignored
-    faces" grid."""
+class IgnoreCandidatesList(APIView):
+    """Still-unlabeled faces whose top classifier guess (poss_ident1) is
+    `.ignore`. The mobile "review ignored faces" grid bulk-confirms these
+    as `.ignore` -- a rough analogue of the frontend's "confirm row"
+    action on the `.ignore` person page."""
 
     permission_classes = (IsAuthenticated,)
     DEFAULT_LIMIT = 15
-    MAX_LIMIT = 60
+    MAX_LIMIT = 120
 
     def get(self, request, *args, **kwargs):
         def _int(name, default):
@@ -202,8 +203,11 @@ class UnverifiedIgnoreList(APIView):
         host_url = f'https://{request.get_host()}/api'
         faces = (
             Face.objects
-            .filter(declared_name__person_name=settings.SOFT_IGNORE_NAME, validated=False)
-            .order_by('-id')
+            .filter(
+                declared_name__person_name=settings.BLANK_FACE_NAME,
+                poss_ident1__person_name=settings.SOFT_IGNORE_NAME,
+            )
+            .order_by('-weight_1', '-id')
             .values_list('id', flat=True)[offset:offset + limit]
         )
 
@@ -220,61 +224,56 @@ class UnverifiedIgnoreList(APIView):
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 
-class BulkIgnoreVerify(APIView):
-    """Bulk-resolve a batch of unverified `.ignore` faces from the mobile
-    review grid:
+class BulkConfirmIgnore(APIView):
+    """Bulk-resolve a batch of "poss_ident1 == .ignore" candidates:
 
-      - `verify_ids`: confirm as correctly ignored (validated = True).
-      - `reset_ids` : "this is actually a real person" -- reset to the
-        unassigned pool AND add `.ignore` to rejected_fields so the
-        classifier proposes a real match instead of re-ignoring it.
+      - `confirm_ids`: assign the face to `.ignore` (associate_person) --
+        confirms the classifier's guess.
+      - `reject_ids` : "not actually ignorable" -- drop `.ignore` from the
+        face's possible-identity list and add it to rejected_fields
+        (reject_association), so the classifier proposes a real match
+        instead. The face stays unlabeled.
 
-    Synchronous (batches are small, <=60); stale/mismatched ids are
-    skipped rather than erroring the whole request.
+    Synchronous; stale/mismatched ids are skipped, not errored.
     """
 
     permission_classes = (IsAuthenticated,)
 
     def patch(self, request, *args, **kwargs):
-        verify_ids = request.data.get('verify_ids') or []
-        reset_ids = request.data.get('reset_ids') or []
-
-        # DIAGNOSTIC (temporary): confirm the mobile request arrives + auths.
-        print(
-            f"[MDIAG] bulk_ignore_verify user={request.user} "
-            f"auth={request.successful_authenticator.__class__.__name__ if request.successful_authenticator else None} "
-            f"verify={verify_ids} reset={reset_ids}",
-            flush=True,
-        )
+        confirm_ids = request.data.get('confirm_ids') or []
+        reject_ids = request.data.get('reject_ids') or []
 
         ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
-        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        blank_name = settings.BLANK_FACE_NAME
 
-        verified = skipped = reset = 0
+        confirmed = rejected = skipped = 0
 
-        for fid in verify_ids:
+        for fid in confirm_ids:
             face = Face.objects.filter(id=fid).first()
             if (
                 face is None
-                or face.validated
-                or face.declared_name_id != ignore_person.id
+                or face.declared_name is None
+                or face.declared_name.person_name != blank_name
+                or face.poss_ident1_id != ignore_person.id
             ):
                 skipped += 1
                 continue
-            face.verify_person_in_image()  # validated=True, decrements .ignore unverified
-            verified += 1
+            face.associate_person(ignore_person.id)  # blank -> declared .ignore
+            confirmed += 1
 
-        for fid in reset_ids:
+        for fid in reject_ids:
             face = Face.objects.filter(id=fid).first()
-            if face is None:
+            poss_ids = [
+                getattr(face, f'poss_ident{i}_id', None)
+                for i in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1)
+            ] if face is not None else []
+            if face is None or ignore_person.id not in poss_ids:
                 skipped += 1
                 continue
-            reset_face_to_pool(face, blank=blank)
-            face.mark_person_rejected(ignore_person.id)
-            reset += 1
+            face.reject_association(ignore_person.id)  # drop .ignore, mark rejected
+            rejected += 1
 
-        print(f"[MDIAG] bulk_ignore_verify result verified={verified} reset={reset} skipped={skipped}", flush=True)
-        js = {'verified': verified, 'reset': reset, 'skipped': skipped}
+        js = {'confirmed': confirmed, 'rejected': rejected, 'skipped': skipped}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 

@@ -723,73 +723,83 @@ class MobileViewTests(ApiTestCase):
         # No double-count: it was already the blank sentinel's face.
         self.assertEqual(blank.face_declared.count(), blank_faces_before)
 
-    def _ignore_face(self, validated=False):
+    def _ignore_candidate(self, **overrides):
+        """An unlabeled face whose #1 guess is .ignore -- what the mobile
+        ignore-review grid lists."""
         ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
-        return self.make_face(self.make_image(), declared_name=ignore, validated=validated)
-
-    def test_unverified_ignore_list_returns_only_unverified_ignore_faces(self):
-        f_unverified = self._ignore_face(validated=False)
-        self._ignore_face(validated=True)  # verified -> excluded
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
-        self.make_face(self.make_image(), declared_name=blank)  # not ignore -> excluded
+        kw = dict(declared_name=blank, poss_ident1=ignore, weight_1=0.9)
+        kw.update(overrides)
+        return self.make_face(self.make_image(), **kw)
 
-        resp = self.client.get("/api/mobile/unverified_ignore/")
+    def test_ignore_candidates_lists_unlabeled_faces_with_ignore_as_top_guess(self):
+        want = self._ignore_candidate()
+        # declared .ignore (already labelled) -> excluded
+        ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        self.make_face(self.make_image(), declared_name=ignore)
+        # .ignore is only guess #2 -> excluded
+        real = Person.objects.create(person_name="Real One")
+        self._ignore_candidate(poss_ident1=real, poss_ident2=ignore, weight_2=0.5)
+
+        resp = self.client.get("/api/mobile/ignore_candidates/")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         data = json.loads(resp.content)
-        ids = [f["id"] for f in data["faces"]]
-        self.assertEqual(ids, [f_unverified.id])
+        self.assertEqual([f["id"] for f in data["faces"]], [want.id])
         self.assertIn("access_key=", data["faces"][0]["face_img_url"])
 
-    def test_unverified_ignore_list_respects_limit_and_offset(self):
-        faces = [self._ignore_face() for _ in range(4)]
-        newest_first = sorted((f.id for f in faces), reverse=True)
+    def test_ignore_candidates_respects_limit_and_offset(self):
+        faces = [self._ignore_candidate(weight_1=0.9 - i * 0.01) for i in range(4)]
+        by_weight = [f.id for f in faces]  # already in descending weight order
 
         page1 = json.loads(
-            self.client.get("/api/mobile/unverified_ignore/?limit=2").content
+            self.client.get("/api/mobile/ignore_candidates/?limit=2").content
         )["faces"]
         page2 = json.loads(
-            self.client.get("/api/mobile/unverified_ignore/?limit=2&offset=2").content
+            self.client.get("/api/mobile/ignore_candidates/?limit=2&offset=2").content
         )["faces"]
-        self.assertEqual([f["id"] for f in page1], newest_first[:2])
-        self.assertEqual([f["id"] for f in page2], newest_first[2:])
+        self.assertEqual([f["id"] for f in page1], by_weight[:2])
+        self.assertEqual([f["id"] for f in page2], by_weight[2:])
 
-    def test_bulk_ignore_verify_verifies_and_resets(self):
+    def test_bulk_confirm_ignore_confirms_and_rejects(self):
         ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
-        keep = self._ignore_face()      # confirm as ignore
-        pull_out = self._ignore_face()  # excluded -> reset + reject .ignore
+        confirm = self._ignore_candidate()
+        real = Person.objects.create(person_name="Actually Someone")
+        reject = self._ignore_candidate(poss_ident2=real, weight_2=0.4)
 
         resp = self.client.patch(
-            "/api/mobile/bulk_ignore_verify/",
-            {"verify_ids": [keep.id], "reset_ids": [pull_out.id]},
+            "/api/mobile/bulk_confirm_ignore/",
+            {"confirm_ids": [confirm.id], "reject_ids": [reject.id]},
             format="json",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         body = json.loads(resp.content)
-        self.assertEqual(body["verified"], 1)
-        self.assertEqual(body["reset"], 1)
+        self.assertEqual(body["confirmed"], 1)
+        self.assertEqual(body["rejected"], 1)
 
-        keep.refresh_from_db()
-        self.assertTrue(keep.validated)
-        self.assertEqual(keep.declared_name_id, ignore.id)
+        confirm.refresh_from_db()
+        self.assertEqual(confirm.declared_name_id, ignore.id)
 
-        pull_out.refresh_from_db()
-        self.assertEqual(pull_out.declared_name_id, blank.id)
-        self.assertIn(ignore.id, pull_out.rejected_fields or [])
+        reject.refresh_from_db()
+        self.assertEqual(reject.declared_name_id, blank.id)  # still unlabeled
+        self.assertNotEqual(reject.poss_ident1_id, ignore.id)  # .ignore dropped
+        self.assertIn(ignore.id, reject.rejected_fields or [])
 
-    def test_bulk_ignore_verify_skips_stale_ids(self):
+    def test_bulk_confirm_ignore_skips_stale_ids(self):
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
-        not_ignored = self.make_face(self.make_image(), declared_name=blank)
-        already_verified = self._ignore_face(validated=True)
+        real = Person.objects.create(person_name="Not Ignore")
+        wrong_top_guess = self._ignore_candidate(poss_ident1=real)  # #1 isn't .ignore
+        already_declared = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        declared = self.make_face(self.make_image(), declared_name=already_declared)
 
         resp = self.client.patch(
-            "/api/mobile/bulk_ignore_verify/",
-            {"verify_ids": [not_ignored.id, already_verified.id, 999999], "reset_ids": []},
+            "/api/mobile/bulk_confirm_ignore/",
+            {"confirm_ids": [wrong_top_guess.id, declared.id, 999999], "reject_ids": []},
             format="json",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         body = json.loads(resp.content)
-        self.assertEqual(body["verified"], 0)
+        self.assertEqual(body["confirmed"], 0)
         self.assertEqual(body["skipped"], 3)
 
     def test_name_list_returns_real_people_and_excludes_sentinel_names(self):
