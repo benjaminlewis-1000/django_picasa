@@ -554,6 +554,21 @@ class MobileEndpointTests(ApiTestCase):
         data = json.loads(resp.content)
         self.assertIn("face_img_url", data)
         self.assertIn("ignore_url", data)
+        self.assertTrue(data["is_unassigned"])
+        self.assertEqual(data["declared_name"], settings.BLANK_FACE_NAME)
+
+    def test_unlabeled_instance_info_flags_a_face_resolved_elsewhere(self):
+        # Face got assigned to a real person after the mobile queue was
+        # snapshotted -- the app uses is_unassigned to skip it silently.
+        someone = Person.objects.create(person_name="Now Tagged")
+        someone.highlight_img.save("t.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
+        self.unlabeled_face.associate_person(someone.id)
+
+        resp = self.client.get(f"/api/mobile/unlabeled_instance/{self.unlabeled_face.id}/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = json.loads(resp.content)
+        self.assertFalse(data["is_unassigned"])
+        self.assertEqual(data["declared_name"], "Now Tagged")
 
 
 class StatsAndParametersTests(ApiTestCase):
