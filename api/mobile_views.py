@@ -236,6 +236,14 @@ class BulkIgnoreVerify(APIView):
         verify_ids = request.data.get('verify_ids') or []
         reset_ids = request.data.get('reset_ids') or []
 
+        # DIAGNOSTIC (temporary): confirm the mobile request arrives + auths.
+        print(
+            f"[MDIAG] bulk_ignore_verify user={request.user} "
+            f"auth={request.successful_authenticator.__class__.__name__ if request.successful_authenticator else None} "
+            f"verify={verify_ids} reset={reset_ids}",
+            flush=True,
+        )
+
         ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
 
@@ -262,6 +270,7 @@ class BulkIgnoreVerify(APIView):
             face.mark_person_rejected(ignore_person.id)
             reset += 1
 
+        print(f"[MDIAG] bulk_ignore_verify result verified={verified} reset={reset} skipped={skipped}", flush=True)
         js = {'verified': verified, 'reset': reset, 'skipped': skipped}
         return HttpResponse(json.dumps(js), content_type='application/json')
 

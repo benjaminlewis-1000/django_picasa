@@ -781,6 +781,13 @@ class FaceViewSet(viewsets.ModelViewSet):
             err_404 = render_404(request, msg_start)
             return err_404
 
+        print(
+            f"[MDIAG] ignore_face pk={pk} user={request.user} "
+            f"auth={request.successful_authenticator.__class__.__name__ if request.successful_authenticator else None} "
+            f"data={dict(request.data)}",
+            flush=True,
+        )
+
         if 'ignore_type' not in request.data.keys():
             return err_404("ignore_type not set in body")
         else:
@@ -790,6 +797,7 @@ class FaceViewSet(viewsets.ModelViewSet):
             return err_404("ignore_type body parameter must be either 'soft' or 'hard'.")
 
         face = self.get_object()
+        print(f"[MDIAG] ignore_face face {face.id} was declared {face.declared_name.person_name if face.declared_name else None}", flush=True)
 
         # print('ignore face', face, face.id)
         if ignore_type == 'soft':
@@ -809,6 +817,8 @@ class FaceViewSet(viewsets.ModelViewSet):
             
 
         face.associate_person(ignore_person[0].id)
+        face.refresh_from_db()
+        print(f"[MDIAG] ignore_face face {face.id} now declared {face.declared_name.person_name}", flush=True)
 
         js = {'success': True}
         return HttpResponse(json.dumps(js), content_type='application/json')
