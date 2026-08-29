@@ -47,6 +47,7 @@ urlpatterns = [
     path(r'mobile/name_list/', mobile_views.MobileNameList.as_view(), name='name_list'),
     path(r'mobile/ignore_candidates/', mobile_views.IgnoreCandidatesList.as_view(), name='ignore_candidates'),
     path(r'mobile/bulk_confirm_ignore/', mobile_views.BulkConfirmIgnore.as_view(), name='bulk_confirm_ignore'),
+    path(r'mobile/hide/', mobile_views.HideFromMobile.as_view(), name='mobile_hide'),
     path(r'mobile/verify_candidates/', mobile_views.VerifyCandidatesList.as_view(), name='verify_candidates'),
     path(r'mobile/verify_ignore_candidates/', mobile_views.VerifyIgnoreCandidatesList.as_view(), name='verify_ignore_candidates'),
     path(r'mobile/bulk_verify/', mobile_views.BulkVerify.as_view(), name='bulk_verify'),

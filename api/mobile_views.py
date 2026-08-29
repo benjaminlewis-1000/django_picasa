@@ -305,6 +305,30 @@ class BulkConfirmIgnore(APIView):
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 
+class HideFromMobile(APIView):
+    """Set Face.mobile_review_hidden = True for a batch of faces so the
+    mobile app stops surfacing them -- backs the main labeling screen's
+    "Skip" (a soft "not now, and don't ask again here"). The face is
+    otherwise untouched; the web app and classifier ignore this flag.
+    LabelingGroupsView already filters it out, so hidden faces drop off
+    the queue on the next refresh/login.
+
+    Body: `{face_ids: [...]}`. Idempotent; unknown ids are simply no-ops.
+    """
+
+    permission_classes = (IsAuthenticated,)
+
+    def patch(self, request, *args, **kwargs):
+        face_ids = request.data.get('face_ids') or []
+        hidden = (
+            Face.objects
+            .filter(id__in=face_ids)
+            .update(mobile_review_hidden=True)
+        )
+        js = {'hidden': hidden}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+
 class VerifyCandidatesList(APIView):
     """One *named* person's unconfirmed face assignments, for the mobile
     "verify people" grid. Works the biggest unverified piles first: picks

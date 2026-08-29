@@ -699,6 +699,27 @@ class MobileViewTests(ApiTestCase):
         self.assertEqual(groups[0]["face_ids"], [b_hi.id, b_lo.id])
         self.assertEqual(groups[1]["face_ids"], [a1.id])
 
+    def test_mobile_hide_marks_faces_and_drops_them_from_labeling_groups(self):
+        # The main screen's "Skip" hides a face from the mobile app via
+        # mobile_review_hidden; LabelingGroupsView must then stop listing it.
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        alice = Person.objects.create(person_name="Alice")
+        img = self.make_image()
+        keep = self.make_face(img, declared_name=blank, poss_ident1=alice, weight_1=0.9)
+        skip = self.make_face(img, declared_name=blank, poss_ident1=alice, weight_1=0.5)
+
+        resp = self.client.patch(
+            "/api/mobile/hide/", {"face_ids": [skip.id]}, format="json"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(json.loads(resp.content)["hidden"], 1)
+
+        skip.refresh_from_db()
+        self.assertTrue(skip.mobile_review_hidden)
+
+        groups = json.loads(self.client.get("/api/mobile/labeling_groups/").content)["groups"]
+        self.assertEqual(groups[0]["face_ids"], [keep.id])
+
     def test_reset_face_returns_it_to_the_unassigned_pool(self):
         # Regression test: reset used to call clear_person(), which nulls
         # declared_name -- invisible to both the Unassigned bucket and the
