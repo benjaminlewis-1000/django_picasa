@@ -336,11 +336,11 @@ class VerifyCandidatesList(APIView):
 
     The app pins a person for the session by passing `?person_id=`: as
     long as that person still has unverified faces (and isn't in
-    `exclude`), we keep serving them so `unverified_count` tracks exactly
-    what the reviewer is working on. Only once they're exhausted (or on
-    the first, unpinned call) do we pick the biggest remaining pile --
-    with a deterministic tiebreaker so equal-sized piles don't flip-flop
-    between loads.
+    `exclude`), we keep serving them (and their live `unverified_count`).
+    Only once they're exhausted (or on the first, unpinned call) do we
+    pick the biggest remaining pile -- with a deterministic tiebreaker so
+    equal-sized piles don't flip-flop between loads. The app awaits its
+    bulk_verify write before reloading, so this count is authoritative.
 
     Query params: `limit` (default 15), `person_id` (pin), `exclude`
     (comma-separated person ids to skip this session).
@@ -368,20 +368,19 @@ class VerifyCandidatesList(APIView):
         )
 
         pid = person_name = None
-        # `count` is the authoritative starting count the app latches onto
-        # when it lands on a person; thereafter the app tracks it locally
-        # (every face on the grid leaves the pile on submit). So we only
-        # pay for the COUNT on the biggest-pile pick -- pinned loads just
-        # need to know the person still has *some* work left.
-        count = None
+        count = 0
         if pin_id is not None and pin_id not in exclude_ids:
-            if unverified.filter(declared_name_id=pin_id).exists():
-                pid = pin_id
-                person_name = (
-                    Person.objects.filter(id=pin_id)
-                    .values_list('person_name', flat=True)
-                    .first()
-                )
+            pinned = (
+                unverified.filter(declared_name_id=pin_id)
+                .values('declared_name_id', 'declared_name__person_name')
+                .annotate(c=Count('id'))
+                .order_by('declared_name_id')
+                .first()
+            )
+            if pinned:
+                pid = pinned['declared_name_id']
+                person_name = pinned['declared_name__person_name']
+                count = pinned['c']
 
         if pid is None:
             top = (
