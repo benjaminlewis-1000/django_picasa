@@ -774,18 +774,24 @@ class MobileViewTests(ApiTestCase):
         self.assertEqual([f["id"] for f in data["faces"]], [want.id])
         self.assertIn("access_key=", data["faces"][0]["face_img_url"])
 
-    def test_ignore_candidates_respects_limit_and_offset(self):
-        faces = [self._ignore_candidate(weight_1=0.9 - i * 0.01) for i in range(4)]
-        by_weight = [f.id for f in faces]  # already in descending weight order
+    def test_ignore_candidates_respects_limit_and_samples_the_pool(self):
+        all_ids = {self._ignore_candidate().id for _ in range(8)}
 
-        page1 = json.loads(
-            self.client.get("/api/mobile/ignore_candidates/?limit=2").content
+        page = json.loads(
+            self.client.get("/api/mobile/ignore_candidates/?limit=3").content
         )["faces"]
-        page2 = json.loads(
-            self.client.get("/api/mobile/ignore_candidates/?limit=2&offset=2").content
-        )["faces"]
-        self.assertEqual([f["id"] for f in page1], by_weight[:2])
-        self.assertEqual([f["id"] for f in page2], by_weight[2:])
+        self.assertEqual(len(page), 3)
+        self.assertTrue({f["id"] for f in page} <= all_ids)
+
+        # Random order: over several calls we should see more than one
+        # distinct "first" face out of a pool of 8.
+        firsts = {
+            json.loads(
+                self.client.get("/api/mobile/ignore_candidates/?limit=1").content
+            )["faces"][0]["id"]
+            for _ in range(12)
+        }
+        self.assertGreater(len(firsts), 1)
 
     def test_bulk_confirm_ignore_confirms_and_hides(self):
         ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)

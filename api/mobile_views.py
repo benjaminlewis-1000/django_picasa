@@ -230,21 +230,24 @@ class IgnoreCandidatesList(APIView):
     """Still-unlabeled faces whose top classifier guess (poss_ident1) is
     `.ignore`. The mobile "review ignored faces" grid bulk-confirms these
     as `.ignore` -- a rough analogue of the frontend's "confirm row"
-    action on the `.ignore` person page."""
+    action on the `.ignore` person page.
+
+    Returns a *random* sample each call (there are ~120k candidates; a
+    fixed order would just replay the same high-weight faces). The app
+    dedupes by id across pages, so the legacy `offset` param is accepted
+    but ignored.
+    """
 
     permission_classes = (IsAuthenticated,)
     DEFAULT_LIMIT = 15
     MAX_LIMIT = 120
 
     def get(self, request, *args, **kwargs):
-        def _int(name, default):
-            try:
-                return int(request.query_params.get(name, default))
-            except (TypeError, ValueError):
-                return default
-
-        limit = max(1, min(_int('limit', self.DEFAULT_LIMIT), self.MAX_LIMIT))
-        offset = max(0, _int('offset', 0))
+        try:
+            limit = int(request.query_params.get('limit', self.DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_LIMIT
+        limit = max(1, min(limit, self.MAX_LIMIT))
 
         host_url = f'https://{request.get_host()}/api'
         faces = (
@@ -254,8 +257,8 @@ class IgnoreCandidatesList(APIView):
                 poss_ident1__person_name=settings.SOFT_IGNORE_NAME,
             )
             .filter(Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False))
-            .order_by('-weight_1', '-id')
-            .values_list('id', flat=True)[offset:offset + limit]
+            .order_by('?')
+            .values_list('id', flat=True)[:limit]
         )
 
         js = {'faces': [
