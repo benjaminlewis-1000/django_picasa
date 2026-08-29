@@ -102,6 +102,7 @@ class LabelingGroupsView(APIView):
             .filter(declared_name__person_name=settings.BLANK_FACE_NAME)
             .filter(poss_ident1__isnull=False)
             .exclude(poss_ident1__person_name__in=settings.IGNORED_NAMES)
+            .filter(Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False))
         )
 
         counts = list(
@@ -252,6 +253,7 @@ class IgnoreCandidatesList(APIView):
                 declared_name__person_name=settings.BLANK_FACE_NAME,
                 poss_ident1__person_name=settings.SOFT_IGNORE_NAME,
             )
+            .filter(Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False))
             .order_by('-weight_1', '-id')
             .values_list('id', flat=True)[offset:offset + limit]
         )
@@ -274,10 +276,9 @@ class BulkConfirmIgnore(APIView):
 
       - `confirm_ids`: assign the face to `.ignore` (associate_person) --
         confirms the classifier's guess.
-      - `reject_ids` : "not actually ignorable" -- drop `.ignore` from the
-        face's possible-identity list and add it to rejected_fields
-        (reject_association), so the classifier proposes a real match
-        instead. The face stays unlabeled.
+      - `hide_ids`   : just set Face.mobile_review_hidden = True. The face
+        is untouched otherwise (still an unlabeled proposed .ignore); it
+        simply stops showing up in the mobile review grid.
 
     Synchronous; stale/mismatched ids are skipped, not errored.
     """
@@ -286,12 +287,13 @@ class BulkConfirmIgnore(APIView):
 
     def patch(self, request, *args, **kwargs):
         confirm_ids = request.data.get('confirm_ids') or []
-        reject_ids = request.data.get('reject_ids') or []
+        # `reject_ids` kept as an accepted alias for older app builds.
+        hide_ids = request.data.get('hide_ids') or request.data.get('reject_ids') or []
 
         ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
         blank_name = settings.BLANK_FACE_NAME
 
-        confirmed = rejected = skipped = 0
+        confirmed = skipped = 0
 
         for fid in confirm_ids:
             face = Face.objects.filter(id=fid).first()
@@ -306,19 +308,18 @@ class BulkConfirmIgnore(APIView):
             face.associate_person(ignore_person.id)  # blank -> declared .ignore
             confirmed += 1
 
-        for fid in reject_ids:
-            face = Face.objects.filter(id=fid).first()
-            poss_ids = [
-                getattr(face, f'poss_ident{i}_id', None)
-                for i in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1)
-            ] if face is not None else []
-            if face is None or ignore_person.id not in poss_ids:
-                skipped += 1
-                continue
-            face.reject_association(ignore_person.id)  # drop .ignore, mark rejected
-            rejected += 1
+        hidden = (
+            Face.objects
+            .filter(
+                id__in=hide_ids,
+                declared_name__person_name=blank_name,
+                poss_ident1__person_name=settings.SOFT_IGNORE_NAME,
+            )
+            .update(mobile_review_hidden=True)
+        )
+        skipped += len(hide_ids) - hidden
 
-        js = {'confirmed': confirmed, 'rejected': rejected, 'skipped': skipped}
+        js = {'confirmed': confirmed, 'hidden': hidden, 'skipped': skipped}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 

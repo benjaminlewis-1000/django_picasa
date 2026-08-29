@@ -765,6 +765,9 @@ class MobileViewTests(ApiTestCase):
         real = Person.objects.create(person_name="Real One")
         self._ignore_candidate(poss_ident1=real, poss_ident2=ignore, weight_2=0.5)
 
+        # explicitly hidden -> excluded
+        self._ignore_candidate(mobile_review_hidden=True)
+
         resp = self.client.get("/api/mobile/ignore_candidates/")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         data = json.loads(resp.content)
@@ -784,30 +787,32 @@ class MobileViewTests(ApiTestCase):
         self.assertEqual([f["id"] for f in page1], by_weight[:2])
         self.assertEqual([f["id"] for f in page2], by_weight[2:])
 
-    def test_bulk_confirm_ignore_confirms_and_rejects(self):
+    def test_bulk_confirm_ignore_confirms_and_hides(self):
         ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
         confirm = self._ignore_candidate()
-        real = Person.objects.create(person_name="Actually Someone")
-        reject = self._ignore_candidate(poss_ident2=real, weight_2=0.4)
+        hide = self._ignore_candidate()
 
         resp = self.client.patch(
             "/api/mobile/bulk_confirm_ignore/",
-            {"confirm_ids": [confirm.id], "reject_ids": [reject.id]},
+            {"confirm_ids": [confirm.id], "hide_ids": [hide.id]},
             format="json",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         body = json.loads(resp.content)
         self.assertEqual(body["confirmed"], 1)
-        self.assertEqual(body["rejected"], 1)
+        self.assertEqual(body["hidden"], 1)
 
         confirm.refresh_from_db()
         self.assertEqual(confirm.declared_name_id, ignore.id)
 
-        reject.refresh_from_db()
-        self.assertEqual(reject.declared_name_id, blank.id)  # still unlabeled
-        self.assertNotEqual(reject.poss_ident1_id, ignore.id)  # .ignore dropped
-        self.assertIn(ignore.id, reject.rejected_fields or [])
+        hide.refresh_from_db()
+        self.assertEqual(hide.declared_name_id, blank.id)  # untouched...
+        self.assertEqual(hide.poss_ident1_id, ignore.id)  # ...still a proposed .ignore
+        self.assertTrue(hide.mobile_review_hidden)
+        # ...and no longer listed.
+        listed = json.loads(self.client.get("/api/mobile/ignore_candidates/").content)
+        self.assertNotIn(hide.id, [f["id"] for f in listed["faces"]])
 
     def test_bulk_confirm_ignore_skips_stale_ids(self):
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
@@ -818,13 +823,17 @@ class MobileViewTests(ApiTestCase):
 
         resp = self.client.patch(
             "/api/mobile/bulk_confirm_ignore/",
-            {"confirm_ids": [wrong_top_guess.id, declared.id, 999999], "reject_ids": []},
+            {
+                "confirm_ids": [wrong_top_guess.id, declared.id, 999999],
+                "hide_ids": [declared.id],
+            },
             format="json",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         body = json.loads(resp.content)
         self.assertEqual(body["confirmed"], 0)
-        self.assertEqual(body["skipped"], 3)
+        self.assertEqual(body["hidden"], 0)
+        self.assertEqual(body["skipped"], 4)
 
     def test_name_list_returns_real_people_and_excludes_sentinel_names(self):
         # Regression test for a fixed bug: this used to be an unfinished

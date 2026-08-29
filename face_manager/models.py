@@ -213,6 +213,13 @@ class Face(models.Model):
                             size=128, blank=True, null=True
                         )
 
+    # Set True by the PhotoVerify mobile app to hide this face from its
+    # review screens without touching the classification (the face stays
+    # whatever it was -- unlabeled, a proposed .ignore, etc). Nullable +
+    # default None so the ~all rows that are never hidden cost nothing
+    # beyond the existing per-row null bitmap.
+    mobile_review_hidden = models.BooleanField(null=True, blank=True, default=None)
+
 
     # Preserve the values of the face's bounding box.
     box_top = models.IntegerField(validators=[MinValueValidator(1)], default=-1)
