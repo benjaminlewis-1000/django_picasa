@@ -336,11 +336,17 @@ class VerifyCandidatesList(APIView):
 
     The app pins a person for the session by passing `?person_id=`: as
     long as that person still has unverified faces (and isn't in
-    `exclude`), we keep serving them (and their live `unverified_count`).
-    Only once they're exhausted (or on the first, unpinned call) do we
-    pick the biggest remaining pile -- with a deterministic tiebreaker so
-    equal-sized piles don't flip-flop between loads. The app awaits its
-    bulk_verify write before reloading, so this count is authoritative.
+    `exclude`), we keep serving them. Only once they're exhausted (or on
+    the first, unpinned call) do we pick the biggest remaining pile --
+    with a deterministic tiebreaker so equal-sized piles don't flip-flop
+    between loads.
+
+    `unverified_count` is the person's live count, but it's only computed
+    on the (unpinned) biggest-pile pick -- when the app first lands on a
+    person. Pinned loads do a cheap .exists() and return
+    `unverified_count: null`; the app latches the initial number and
+    tracks it locally from there (every face on the grid leaves the pile
+    on submit).
 
     Query params: `limit` (default 15), `person_id` (pin), `exclude`
     (comma-separated person ids to skip this session).
@@ -368,19 +374,15 @@ class VerifyCandidatesList(APIView):
         )
 
         pid = person_name = None
-        count = 0
+        count = None  # only filled on the biggest-pile pick (see docstring)
         if pin_id is not None and pin_id not in exclude_ids:
-            pinned = (
-                unverified.filter(declared_name_id=pin_id)
-                .values('declared_name_id', 'declared_name__person_name')
-                .annotate(c=Count('id'))
-                .order_by('declared_name_id')
-                .first()
-            )
-            if pinned:
-                pid = pinned['declared_name_id']
-                person_name = pinned['declared_name__person_name']
-                count = pinned['c']
+            if unverified.filter(declared_name_id=pin_id).exists():
+                pid = pin_id
+                person_name = (
+                    Person.objects.filter(id=pin_id)
+                    .values_list('person_name', flat=True)
+                    .first()
+                )
 
         if pid is None:
             top = (
