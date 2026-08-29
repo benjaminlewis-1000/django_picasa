@@ -15,30 +15,24 @@ from rest_framework.views import APIView
 from face_manager.models import Face, Person
 
 
-def reset_face_to_pool(face_object, blank=None):
-    """Reset a face: drop any name assignment + all poss_identN guesses and
-    put it back in the unassigned pool as the *blank sentinel Person*
-    (NOT NULL -- the old clear_person() left declared_name NULL, invisible
-    to both the "Unassigned" bucket and assign_faces' re-classification,
-    which filter declared_name__person_name == BLANK_FACE_NAME)."""
-    if blank is None:
-        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+def _face_thumb(host_url, fid):
+    """The {id, face_img_url} dict every mobile grid returns per face."""
+    return {
+        'id': fid,
+        'face_img_url': (
+            f"{host_url}/keyed_image/face_array/?id={fid}"
+            f"&access_key={settings.RANDOM_ACCESS_KEY}"
+        ),
+    }
 
-    prev = face_object.declared_name
-    if prev is not None and prev.person_name != settings.BLANK_FACE_NAME:
-        prev.decrement_assigned()
-        if not face_object.validated:
-            prev.decrement_unverified()
 
-    face_object.set_possibles_zero()  # clears poss_identN + weights, saves
-
-    if face_object.declared_name_id != blank.id:
-        face_object.declared_name = blank
-        face_object.validated = False
-        face_object.written_to_photo_metadata = False
-        blank.increment_assigned()
-        blank.increment_unverified()
-        face_object.save()
+def _clamped_limit(request, default=15, maximum=120):
+    """Parse ?limit=, falling back to `default` and capping at `maximum`."""
+    try:
+        n = int(request.query_params.get('limit', default))
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(n, maximum))
 
 
 class ConfidentUnlabeledView(APIView):
@@ -218,7 +212,7 @@ class ResetFace(APIView):
 
         selected_id = kwargs['id']
         face_object = Face.objects.get(id=selected_id)
-        reset_face_to_pool(face_object)
+        face_object.reset_to_pool()
 
         # Regression test for a fixed bug: this method had no return
         # statement, so DRF's dispatch() got None back instead of a
@@ -239,15 +233,9 @@ class IgnoreCandidatesList(APIView):
     """
 
     permission_classes = (IsAuthenticated,)
-    DEFAULT_LIMIT = 15
-    MAX_LIMIT = 120
 
     def get(self, request, *args, **kwargs):
-        try:
-            limit = int(request.query_params.get('limit', self.DEFAULT_LIMIT))
-        except (TypeError, ValueError):
-            limit = self.DEFAULT_LIMIT
-        limit = max(1, min(limit, self.MAX_LIMIT))
+        limit = _clamped_limit(request)
 
         host_url = f'https://{request.get_host()}/api'
         faces = (
@@ -261,16 +249,7 @@ class IgnoreCandidatesList(APIView):
             .values_list('id', flat=True)[:limit]
         )
 
-        js = {'faces': [
-            {
-                'id': fid,
-                'face_img_url': (
-                    f"{host_url}/keyed_image/face_array/?id={fid}"
-                    f"&access_key={settings.RANDOM_ACCESS_KEY}"
-                ),
-            }
-            for fid in faces
-        ]}
+        js = {'faces': [_face_thumb(host_url, fid) for fid in faces]}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 
@@ -338,15 +317,9 @@ class VerifyCandidatesList(APIView):
     """
 
     permission_classes = (IsAuthenticated,)
-    DEFAULT_LIMIT = 15
-    MAX_LIMIT = 120
 
     def get(self, request, *args, **kwargs):
-        try:
-            limit = int(request.query_params.get('limit', self.DEFAULT_LIMIT))
-        except (TypeError, ValueError):
-            limit = self.DEFAULT_LIMIT
-        limit = max(1, min(limit, self.MAX_LIMIT))
+        limit = _clamped_limit(request)
 
         exclude_ids = []
         for tok in (request.query_params.get('exclude', '') or '').split(','):
@@ -385,16 +358,7 @@ class VerifyCandidatesList(APIView):
             'person_id': pid,
             'person_name': top['declared_name__person_name'],
             'unverified_count': top['c'],
-            'faces': [
-                {
-                    'id': fid,
-                    'face_img_url': (
-                        f"{host_url}/keyed_image/face_array/?id={fid}"
-                        f"&access_key={settings.RANDOM_ACCESS_KEY}"
-                    ),
-                }
-                for fid in face_ids
-            ],
+            'faces': [_face_thumb(host_url, fid) for fid in face_ids],
         }
         return HttpResponse(json.dumps(js), content_type='application/json')
 
@@ -409,15 +373,9 @@ class VerifyIgnoreCandidatesList(APIView):
     """
 
     permission_classes = (IsAuthenticated,)
-    DEFAULT_LIMIT = 15
-    MAX_LIMIT = 120
 
     def get(self, request, *args, **kwargs):
-        try:
-            limit = int(request.query_params.get('limit', self.DEFAULT_LIMIT))
-        except (TypeError, ValueError):
-            limit = self.DEFAULT_LIMIT
-        limit = max(1, min(limit, self.MAX_LIMIT))
+        limit = _clamped_limit(request)
 
         host_url = f'https://{request.get_host()}/api'
         face_ids = (
@@ -426,16 +384,7 @@ class VerifyIgnoreCandidatesList(APIView):
             .order_by('?')
             .values_list('id', flat=True)[:limit]
         )
-        js = {'faces': [
-            {
-                'id': fid,
-                'face_img_url': (
-                    f"{host_url}/keyed_image/face_array/?id={fid}"
-                    f"&access_key={settings.RANDOM_ACCESS_KEY}"
-                ),
-            }
-            for fid in face_ids
-        ]}
+        js = {'faces': [_face_thumb(host_url, fid) for fid in face_ids]}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 
@@ -473,7 +422,7 @@ class BulkVerify(APIView):
             if face is None:
                 skipped += 1
                 continue
-            reset_face_to_pool(face)
+            face.reset_to_pool()
             reset += 1
 
         js = {'verified': verified, 'reset': reset, 'skipped': skipped}

@@ -261,6 +261,28 @@ class FaceModelTests(TestCase):
         face.refresh_from_db()
         self.assertTrue(face.validated)
 
+    def test_reset_to_pool_returns_face_to_blank_sentinel(self):
+        # reset_to_pool() must land the face on the blank sentinel Person,
+        # NOT NULL -- a NULL declared_name is invisible to the "Unassigned"
+        # bucket and to assign_faces.py's re-classification, both of which
+        # filter declared_name__person_name == settings.BLANK_FACE_NAME.
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        owner = make_person("PrevOwner")
+        owner.increment_assigned()
+        guesser = make_person("Guesser")
+        face = make_face(self.image, declared_name=owner)
+        face.set_possible_person(guesser.id, 1, 0.8)
+
+        face.reset_to_pool()
+        face.refresh_from_db()
+        owner.refresh_from_db()
+
+        self.assertEqual(face.declared_name_id, blank.id)
+        self.assertIsNotNone(face.declared_name)
+        self.assertFalse(face.validated)
+        self.assertIsNone(face.poss_ident1)
+        self.assertEqual(owner.num_faces, 0)
+
     def test_reject_association_removes_from_possibles(self):
         person = make_person("Rejectable")
         face = make_face(self.image)

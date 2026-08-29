@@ -336,6 +336,40 @@ class Face(models.Model):
         self.validated = True
         self.save()
 
+    def reset_to_pool(self, blank=None):
+        """Return this face to the unassigned pool for re-classification:
+        drop the name assignment and all poss_identN guesses, and set
+        declared_name to the blank sentinel Person.
+
+        declared_name is set to the sentinel, NOT NULL: a NULL
+        declared_name is invisible both to the "Unassigned" bucket and to
+        assign_faces.py's re-classification pass, which each filter on
+        declared_name__person_name == settings.BLANK_FACE_NAME. (The old
+        clear_person() nulled it, which stranded faces; see the regression
+        test in api/tests.py.)
+
+        Pass `blank` to reuse an already-fetched sentinel Person across a
+        batch and skip the per-call Person.objects.get().
+        """
+        if blank is None:
+            blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+
+        prev = self.declared_name
+        if prev is not None and prev.person_name != settings.BLANK_FACE_NAME:
+            prev.decrement_assigned()
+            if not self.validated:
+                prev.decrement_unverified()
+
+        self.set_possibles_zero()  # clears poss_identN + weights, saves
+
+        if self.declared_name_id != blank.id:
+            self.declared_name = blank
+            self.validated = False
+            self.written_to_photo_metadata = False
+            blank.increment_assigned()
+            blank.increment_unverified()
+            self.save()
+
     def set_possible_person(self, person_id, poss_idx, weight, save=True):
         """save=False lets a caller setting multiple poss_identN slots on
         the same face (assign_faces.py's classify_unassigned() does up to
