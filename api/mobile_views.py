@@ -326,6 +326,160 @@ class BulkConfirmIgnore(APIView):
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 
+class VerifyCandidatesList(APIView):
+    """One *named* person's unconfirmed face assignments, for the mobile
+    "verify people" grid. Works the biggest unverified piles first: picks
+    the real person with the most `validated == False` faces, then returns
+    a random sample of them. (`.ignore` etc. handled by
+    VerifyIgnoreCandidatesList instead.)
+
+    Query params: `limit` (default 15), `exclude` (comma-separated person
+    ids to skip this session).
+    """
+
+    permission_classes = (IsAuthenticated,)
+    DEFAULT_LIMIT = 15
+    MAX_LIMIT = 120
+
+    def get(self, request, *args, **kwargs):
+        try:
+            limit = int(request.query_params.get('limit', self.DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_LIMIT
+        limit = max(1, min(limit, self.MAX_LIMIT))
+
+        exclude_ids = []
+        for tok in (request.query_params.get('exclude', '') or '').split(','):
+            tok = tok.strip()
+            if tok.isdigit():
+                exclude_ids.append(int(tok))
+
+        unverified = (
+            Face.objects
+            .filter(validated=False, declared_name__isnull=False)
+            .exclude(declared_name__person_name__in=settings.IGNORED_NAMES)
+            .exclude(declared_name_id__in=exclude_ids)
+        )
+        top = (
+            unverified
+            .values('declared_name_id', 'declared_name__person_name')
+            .annotate(c=Count('id'))
+            .order_by('-c')
+            .first()
+        )
+
+        if not top:
+            js = {'person_id': None, 'person_name': None, 'unverified_count': 0, 'faces': []}
+            return HttpResponse(json.dumps(js), content_type='application/json')
+
+        pid = top['declared_name_id']
+        host_url = f'https://{request.get_host()}/api'
+        face_ids = (
+            Face.objects
+            .filter(declared_name_id=pid, validated=False)
+            .order_by('?')
+            .values_list('id', flat=True)[:limit]
+        )
+
+        js = {
+            'person_id': pid,
+            'person_name': top['declared_name__person_name'],
+            'unverified_count': top['c'],
+            'faces': [
+                {
+                    'id': fid,
+                    'face_img_url': (
+                        f"{host_url}/keyed_image/face_array/?id={fid}"
+                        f"&access_key={settings.RANDOM_ACCESS_KEY}"
+                    ),
+                }
+                for fid in face_ids
+            ],
+        }
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+
+class VerifyIgnoreCandidatesList(APIView):
+    """Faces already declared `.ignore` but not human-verified. Flat
+    random sample (no person grouping -- they're all `.ignore`). The
+    "verify ignored" grid confirms the good ones and resets the rest
+    (a real person the classifier wrongly ignored) for reprocessing.
+
+    Query param: `limit` (default 15).
+    """
+
+    permission_classes = (IsAuthenticated,)
+    DEFAULT_LIMIT = 15
+    MAX_LIMIT = 120
+
+    def get(self, request, *args, **kwargs):
+        try:
+            limit = int(request.query_params.get('limit', self.DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_LIMIT
+        limit = max(1, min(limit, self.MAX_LIMIT))
+
+        host_url = f'https://{request.get_host()}/api'
+        face_ids = (
+            Face.objects
+            .filter(declared_name__person_name=settings.SOFT_IGNORE_NAME, validated=False)
+            .order_by('?')
+            .values_list('id', flat=True)[:limit]
+        )
+        js = {'faces': [
+            {
+                'id': fid,
+                'face_img_url': (
+                    f"{host_url}/keyed_image/face_array/?id={fid}"
+                    f"&access_key={settings.RANDOM_ACCESS_KEY}"
+                ),
+            }
+            for fid in face_ids
+        ]}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+
+class BulkVerify(APIView):
+    """Bulk-resolve a batch of unverified faces (used by both the "verify
+    people" and "verify ignored" grids):
+
+      - `verify_ids`: confirm the current assignment
+        (verify_person_in_image -> validated = True).
+      - `reset_ids` : "wrong" -- send the face to the unassigned pool
+        (declared_name = blank sentinel, guesses cleared) for
+        re-classification.
+
+    Synchronous; stale/mismatched ids are skipped, not errored.
+    """
+
+    permission_classes = (IsAuthenticated,)
+
+    def patch(self, request, *args, **kwargs):
+        verify_ids = request.data.get('verify_ids') or []
+        reset_ids = request.data.get('reset_ids') or []
+
+        verified = reset = skipped = 0
+
+        for fid in verify_ids:
+            face = Face.objects.filter(id=fid).first()
+            if face is None or face.validated or face.declared_name is None:
+                skipped += 1
+                continue
+            face.verify_person_in_image()  # validated = True, decrements unverified
+            verified += 1
+
+        for fid in reset_ids:
+            face = Face.objects.filter(id=fid).first()
+            if face is None:
+                skipped += 1
+                continue
+            reset_face_to_pool(face)
+            reset += 1
+
+        js = {'verified': verified, 'reset': reset, 'skipped': skipped}
+        return HttpResponse(json.dumps(js), content_type='application/json')
+
+
 class MobileNameList(APIView):
     # Get a list of all defined person names, excluding the sentinel
     # "person" rows (blank/ignore placeholders) that aren't real people.
