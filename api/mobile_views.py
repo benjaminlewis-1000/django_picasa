@@ -331,13 +331,19 @@ class HideFromMobile(APIView):
 
 class VerifyCandidatesList(APIView):
     """One *named* person's unconfirmed face assignments, for the mobile
-    "verify people" grid. Works the biggest unverified piles first: picks
-    the real person with the most `validated == False` faces, then returns
-    a random sample of them. (`.ignore` etc. handled by
+    "verify people" grid. (`.ignore` etc. handled by
     VerifyIgnoreCandidatesList instead.)
 
-    Query params: `limit` (default 15), `exclude` (comma-separated person
-    ids to skip this session).
+    The app pins a person for the session by passing `?person_id=`: as
+    long as that person still has unverified faces (and isn't in
+    `exclude`), we keep serving them so `unverified_count` tracks exactly
+    what the reviewer is working on. Only once they're exhausted (or on
+    the first, unpinned call) do we pick the biggest remaining pile --
+    with a deterministic tiebreaker so equal-sized piles don't flip-flop
+    between loads.
+
+    Query params: `limit` (default 15), `person_id` (pin), `exclude`
+    (comma-separated person ids to skip this session).
     """
 
     permission_classes = (IsAuthenticated,)
@@ -351,25 +357,47 @@ class VerifyCandidatesList(APIView):
             if tok.isdigit():
                 exclude_ids.append(int(tok))
 
+        pin_id = request.query_params.get('person_id', '')
+        pin_id = int(pin_id) if pin_id.strip().isdigit() else None
+
         unverified = (
             Face.objects
             .filter(validated=False, declared_name__isnull=False)
             .exclude(declared_name__person_name__in=settings.IGNORED_NAMES)
             .exclude(declared_name_id__in=exclude_ids)
         )
-        top = (
-            unverified
-            .values('declared_name_id', 'declared_name__person_name')
-            .annotate(c=Count('id'))
-            .order_by('-c')
-            .first()
-        )
 
-        if not top:
-            js = {'person_id': None, 'person_name': None, 'unverified_count': 0, 'faces': []}
-            return HttpResponse(json.dumps(js), content_type='application/json')
+        pid = person_name = None
+        count = 0
+        if pin_id is not None and pin_id not in exclude_ids:
+            pinned = (
+                unverified.filter(declared_name_id=pin_id)
+                .values('declared_name_id', 'declared_name__person_name')
+                .annotate(c=Count('id'))
+                .order_by('declared_name_id')
+                .first()
+            )
+            if pinned:
+                pid = pinned['declared_name_id']
+                person_name = pinned['declared_name__person_name']
+                count = pinned['c']
 
-        pid = top['declared_name_id']
+        if pid is None:
+            top = (
+                unverified
+                .values('declared_name_id', 'declared_name__person_name')
+                .annotate(c=Count('id'))
+                .order_by('-c', 'declared_name_id')
+                .first()
+            )
+            if not top:
+                js = {'person_id': None, 'person_name': None,
+                      'unverified_count': 0, 'faces': []}
+                return HttpResponse(json.dumps(js), content_type='application/json')
+            pid = top['declared_name_id']
+            person_name = top['declared_name__person_name']
+            count = top['c']
+
         host_url = f'https://{request.get_host()}/api'
         face_ids = (
             Face.objects
@@ -380,8 +408,8 @@ class VerifyCandidatesList(APIView):
 
         js = {
             'person_id': pid,
-            'person_name': top['declared_name__person_name'],
-            'unverified_count': top['c'],
+            'person_name': person_name,
+            'unverified_count': count,
             'faces': [_face_thumb(host_url, fid) for fid in face_ids],
         }
         return HttpResponse(json.dumps(js), content_type='application/json')

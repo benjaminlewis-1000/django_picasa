@@ -903,6 +903,44 @@ class MobileViewTests(ApiTestCase):
         self.assertIsNone(data["person_id"])
         self.assertEqual(data["faces"], [])
 
+    def test_verify_candidates_person_id_pins_the_person_even_when_smaller(self):
+        # The app pins a person for the session so unverified_count tracks
+        # exactly what the reviewer is working on -- it must NOT jump to a
+        # now-bigger pile just because the pinned person shrank.
+        alice = Person.objects.create(person_name="Alice V")
+        bob = Person.objects.create(person_name="Bob V")
+        self._unverified_face(alice, 2)
+        self._unverified_face(bob, 5)
+
+        data = json.loads(
+            self.client.get(f"/api/mobile/verify_candidates/?person_id={alice.id}").content
+        )
+        self.assertEqual(data["person_name"], "Alice V")
+        self.assertEqual(data["unverified_count"], 2)
+
+    def test_verify_candidates_falls_off_pin_when_person_exhausted(self):
+        alice = Person.objects.create(person_name="Alice V")
+        bob = Person.objects.create(person_name="Bob V")
+        self._unverified_face(bob, 3)  # alice has none left
+
+        data = json.loads(
+            self.client.get(f"/api/mobile/verify_candidates/?person_id={alice.id}").content
+        )
+        self.assertEqual(data["person_name"], "Bob V")
+
+    def test_verify_candidates_pin_respects_exclude(self):
+        alice = Person.objects.create(person_name="Alice V")
+        bob = Person.objects.create(person_name="Bob V")
+        self._unverified_face(alice, 4)
+        self._unverified_face(bob, 1)
+
+        data = json.loads(
+            self.client.get(
+                f"/api/mobile/verify_candidates/?person_id={alice.id}&exclude={alice.id}"
+            ).content
+        )
+        self.assertEqual(data["person_name"], "Bob V")
+
     def test_bulk_verify_verifies_and_resets(self):
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
         alice = Person.objects.create(person_name="Alice V")
