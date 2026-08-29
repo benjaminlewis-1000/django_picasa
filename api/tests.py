@@ -916,7 +916,10 @@ class MobileViewTests(ApiTestCase):
             self.client.get(f"/api/mobile/verify_candidates/?person_id={alice.id}").content
         )
         self.assertEqual(data["person_name"], "Alice V")
-        self.assertEqual(data["unverified_count"], 2)
+        self.assertEqual(data["person_id"], alice.id)
+        self.assertTrue(len(data["faces"]) > 0)
+        # Pinned loads skip the COUNT -- the app tracks the number locally.
+        self.assertIsNone(data["unverified_count"])
 
     def test_verify_candidates_falls_off_pin_when_person_exhausted(self):
         alice = Person.objects.create(person_name="Alice V")

@@ -368,19 +368,20 @@ class VerifyCandidatesList(APIView):
         )
 
         pid = person_name = None
-        count = 0
+        # `count` is the authoritative starting count the app latches onto
+        # when it lands on a person; thereafter the app tracks it locally
+        # (every face on the grid leaves the pile on submit). So we only
+        # pay for the COUNT on the biggest-pile pick -- pinned loads just
+        # need to know the person still has *some* work left.
+        count = None
         if pin_id is not None and pin_id not in exclude_ids:
-            pinned = (
-                unverified.filter(declared_name_id=pin_id)
-                .values('declared_name_id', 'declared_name__person_name')
-                .annotate(c=Count('id'))
-                .order_by('declared_name_id')
-                .first()
-            )
-            if pinned:
-                pid = pinned['declared_name_id']
-                person_name = pinned['declared_name__person_name']
-                count = pinned['c']
+            if unverified.filter(declared_name_id=pin_id).exists():
+                pid = pin_id
+                person_name = (
+                    Person.objects.filter(id=pin_id)
+                    .values_list('person_name', flat=True)
+                    .first()
+                )
 
         if pid is None:
             top = (
