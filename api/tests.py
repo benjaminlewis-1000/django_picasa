@@ -841,6 +841,122 @@ class MobileViewTests(ApiTestCase):
         self.assertEqual(body["hidden"], 0)
         self.assertEqual(body["skipped"], 4)
 
+    # --- verify-faces screen ------------------------------------------------
+
+    def _unverified_face(self, person, n=1):
+        img = self.make_image()
+        return [
+            self.make_face(img, declared_name=person, validated=False) for _ in range(n)
+        ]
+
+    def test_verify_candidates_picks_the_biggest_unverified_pile(self):
+        alice = Person.objects.create(person_name="Alice V")
+        bob = Person.objects.create(person_name="Bob V")
+        self._unverified_face(alice, 2)
+        bob_faces = self._unverified_face(bob, 3)
+        # a verified Bob face and an ignore face should not count
+        vf = self._unverified_face(bob, 1)[0]
+        vf.validated = True
+        vf.save()
+
+        resp = self.client.get("/api/mobile/verify_candidates/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = json.loads(resp.content)
+        self.assertEqual(data["person_name"], "Bob V")
+        self.assertEqual(data["unverified_count"], 3)
+        self.assertTrue({f["id"] for f in data["faces"]} <= {f.id for f in bob_faces})
+
+    def test_verify_candidates_exclude_skips_a_person(self):
+        alice = Person.objects.create(person_name="Alice V")
+        bob = Person.objects.create(person_name="Bob V")
+        self._unverified_face(alice, 2)
+        self._unverified_face(bob, 5)
+
+        data = json.loads(
+            self.client.get(f"/api/mobile/verify_candidates/?exclude={bob.id}").content
+        )
+        self.assertEqual(data["person_name"], "Alice V")
+
+    def test_verify_candidates_empty_when_nothing_unverified(self):
+        data = json.loads(self.client.get("/api/mobile/verify_candidates/").content)
+        self.assertIsNone(data["person_id"])
+        self.assertEqual(data["faces"], [])
+
+    def test_bulk_verify_verifies_and_resets(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        alice = Person.objects.create(person_name="Alice V")
+        alice.highlight_img.save("a.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
+        keep, wrong = self._unverified_face(alice, 2)
+
+        resp = self.client.patch(
+            "/api/mobile/bulk_verify/",
+            {"verify_ids": [keep.id], "reset_ids": [wrong.id]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        body = json.loads(resp.content)
+        self.assertEqual(body["verified"], 1)
+        self.assertEqual(body["reset"], 1)
+
+        keep.refresh_from_db()
+        self.assertTrue(keep.validated)
+        self.assertEqual(keep.declared_name_id, alice.id)
+
+        wrong.refresh_from_db()
+        self.assertEqual(wrong.declared_name_id, blank.id)  # sent to unassigned
+        self.assertFalse(wrong.validated)
+
+    def test_bulk_verify_skips_already_verified(self):
+        alice = Person.objects.create(person_name="Alice V")
+        f = self._unverified_face(alice, 1)[0]
+        f.validated = True
+        f.save()
+
+        body = json.loads(
+            self.client.patch(
+                "/api/mobile/bulk_verify/",
+                {"verify_ids": [f.id, 999999], "reset_ids": []},
+                format="json",
+            ).content
+        )
+        self.assertEqual(body["verified"], 0)
+        self.assertEqual(body["skipped"], 2)
+
+    def test_verify_ignore_candidates_lists_unverified_ignore_faces(self):
+        ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        img = self.make_image()
+        want = self.make_face(img, declared_name=ignore, validated=False)
+        verified = self.make_face(img, declared_name=ignore, validated=True)
+        alice = Person.objects.create(person_name="Alice V")
+        self.make_face(img, declared_name=alice, validated=False)  # not .ignore
+
+        data = json.loads(
+            self.client.get("/api/mobile/verify_ignore_candidates/").content
+        )
+        self.assertEqual([f["id"] for f in data["faces"]], [want.id])
+
+    def test_bulk_verify_works_on_ignore_faces(self):
+        ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = self.make_image()
+        keep = self.make_face(img, declared_name=ignore, validated=False)
+        wrong = self.make_face(img, declared_name=ignore, validated=False)
+
+        body = json.loads(
+            self.client.patch(
+                "/api/mobile/bulk_verify/",
+                {"verify_ids": [keep.id], "reset_ids": [wrong.id]},
+                format="json",
+            ).content
+        )
+        self.assertEqual(body["verified"], 1)
+        self.assertEqual(body["reset"], 1)
+        keep.refresh_from_db()
+        self.assertTrue(keep.validated)
+        self.assertEqual(keep.declared_name_id, ignore.id)
+        wrong.refresh_from_db()
+        self.assertEqual(wrong.declared_name_id, blank.id)
+
     def test_name_list_returns_real_people_and_excludes_sentinel_names(self):
         # Regression test for a fixed bug: this used to be an unfinished
         # stub returning a hardcoded ['a', 'b', 'c', 'd'] regardless of
