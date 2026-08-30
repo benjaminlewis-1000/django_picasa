@@ -1019,6 +1019,128 @@ class MobileViewTests(ApiTestCase):
         wrong.refresh_from_db()
         self.assertEqual(wrong.declared_name_id, blank.id)
 
+    def test_bulk_verify_reset_skips_unknown_id(self):
+        alice = Person.objects.create(person_name="Alice V")
+        real = self._unverified_face(alice, 1)[0]
+        body = json.loads(
+            self.client.patch(
+                "/api/mobile/bulk_verify/",
+                {"verify_ids": [], "reset_ids": [real.id, 999999]},
+                format="json",
+            ).content
+        )
+        self.assertEqual(body["reset"], 1)
+        self.assertEqual(body["skipped"], 1)
+
+    def test_bulk_verify_empty_body_is_a_noop(self):
+        body = json.loads(
+            self.client.patch("/api/mobile/bulk_verify/", {}, format="json").content
+        )
+        self.assertEqual(body, {"verified": 0, "reset": 0, "skipped": 0})
+
+    def test_verify_candidates_excludes_sentinel_declared_faces(self):
+        # A pile of faces declared straight to .ignore must never be
+        # offered by the "verify people" endpoint, even if it's the
+        # biggest unverified pile -- those belong to verify_ignore_candidates.
+        ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        alice = Person.objects.create(person_name="Alice V")
+        self._unverified_face(ignore, 5)
+        self._unverified_face(alice, 2)
+
+        data = json.loads(self.client.get("/api/mobile/verify_candidates/").content)
+        self.assertEqual(data["person_name"], "Alice V")
+
+    def test_verify_ignore_candidates_respects_limit(self):
+        ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        img = self.make_image()
+        ids = {
+            self.make_face(img, declared_name=ignore, validated=False).id
+            for _ in range(6)
+        }
+        page = json.loads(
+            self.client.get("/api/mobile/verify_ignore_candidates/?limit=2").content
+        )["faces"]
+        self.assertEqual(len(page), 2)
+        self.assertTrue({f["id"] for f in page} <= ids)
+        self.assertIn("access_key=", page[0]["face_img_url"])
+
+    def test_labeling_groups_empty_when_nothing_to_label(self):
+        data = json.loads(self.client.get("/api/mobile/labeling_groups/").content)
+        self.assertEqual(data["groups"], [])
+
+    def test_labeling_groups_skips_faces_with_no_top_guess(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        alice = Person.objects.create(person_name="Alice")
+        img = self.make_image()
+        self.make_face(img, declared_name=blank, poss_ident1=alice, weight_1=0.8)
+        # poss_ident1 is null -> not groupable -> excluded
+        self.make_face(img, declared_name=blank)
+
+        groups = json.loads(
+            self.client.get("/api/mobile/labeling_groups/").content
+        )["groups"]
+        self.assertEqual([g["person_name"] for g in groups], ["Alice"])
+        self.assertEqual(groups[0]["count"], 1)
+
+    def test_mobile_hide_reports_count_and_ignores_unknown_ids(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        alice = Person.objects.create(person_name="Alice")
+        img = self.make_image()
+        f = self.make_face(img, declared_name=blank, poss_ident1=alice, weight_1=0.5)
+
+        body = json.loads(
+            self.client.patch(
+                "/api/mobile/hide/", {"face_ids": [f.id, 999999]}, format="json"
+            ).content
+        )
+        self.assertEqual(body["hidden"], 1)
+        f.refresh_from_db()
+        self.assertTrue(f.mobile_review_hidden)
+
+        # Idempotent: hiding it again still succeeds (update touches 1 row).
+        body2 = json.loads(
+            self.client.patch(
+                "/api/mobile/hide/", {"face_ids": [f.id]}, format="json"
+            ).content
+        )
+        self.assertEqual(body2["hidden"], 1)
+
+    def test_unlabeled_instance_names_carry_hateoas_confirm_action(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        alice = Person.objects.create(person_name="Alice")
+        alice.highlight_img.save("a.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
+        bob = Person.objects.create(person_name="Bob")
+        bob.highlight_img.save("b.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
+        face = self.make_face(
+            self.make_image(),
+            declared_name=blank,
+            poss_ident1=alice,
+            weight_1=0.9,
+            poss_ident2=bob,
+            weight_2=0.4,
+        )
+
+        data = json.loads(
+            self.client.get(f"/api/mobile/unlabeled_instance/{face.id}/").content
+        )
+        # The client never builds action URLs -- each candidate name embeds
+        # the exact PATCH URL + payload to confirm it.
+        self.assertEqual([n["name"] for n in data["names"]], ["Alice", "Bob"])
+        alice_action = data["names"][0]
+        self.assertTrue(
+            alice_action["confirm_patch_url"].endswith(
+                f"/faces/{face.id}/assign_face_to_person/"
+            )
+        )
+        self.assertEqual(
+            alice_action["confirm_patch_data"], {"declared_name_key": alice.id}
+        )
+        self.assertEqual(alice_action["weight"], 0.9)
+        self.assertTrue(
+            data["ignore_url"].endswith(f"/faces/{face.id}/ignore_face/")
+        )
+        self.assertEqual(data["ignore_payload"], {"ignore_type": "soft"})
+
     def test_name_list_returns_real_people_and_excludes_sentinel_names(self):
         # Regression test for a fixed bug: this used to be an unfinished
         # stub returning a hardcoded ['a', 'b', 'c', 'd'] regardless of
