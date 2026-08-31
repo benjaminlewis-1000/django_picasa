@@ -490,16 +490,81 @@ ideas, so a future session doesn't have to redo this from scratch:
   live. Restore is a different shape now (extract then `pg_restore` a directory, not
   `pg_restore` a single file directly) -- see the comment at the top of `postgres_bak.sh` for the
   exact commands.
-- **TODO: consider nulling `face_encoding_512` for `.ignore`/`.realignore` faces.** These two
-  sentinels together account for 216,061 faces / ~552MB of `face_manager_face`'s
-  `face_encoding_512` column (measured 2026-08-26, post-`face_encoding` column removal) — real
-  storage on disk (`pg_column_size`, TOAST/pglz-compressed), not raw. Since these faces are
-  already permanently "ignored," their embeddings are never usefully compared again in
-  `assign_faces`/`classify_unassigned()` — but nulling them is a one-way change (the actual
-  vectors would be gone, not just hidden), so decide deliberately rather than as a quick win.
-  Reclaiming the freed space would need another `VACUUM FULL face_manager_face` afterward, same
-  as the `face_encoding` removal. Not started -- explicitly deferred by the user ("we'll build to
-  it") pending further discussion.
+- **DONE (2026-08-31): `face_encoding_512` cleared for confirmed `.ignore`/`.realignore` faces.**
+  What was a deferred TODO ("we'll build to it") turned into a full mini-project once picked back
+  up. Landed in stages, all on `backend_upgrade` then merged/deployed to `master`/`picasa_api`:
+  - **`Face.kps`** (new nullable field, migration `0007_face_kps`): the 5 landmark points
+    InsightFace's detector produces, in the source image's absolute pixel coordinates. Populated
+    going forward by `add_new_face()`/`update_existing_face_to_insightface()`
+    (`face_extract_encode.py`). Exists specifically so a face's embedding can be **exactly**
+    reproduced later (verified empirically: ~1.0 cosine similarity against a same-run reference,
+    via `rec_model.get(img, Face(kps=...))` directly, no re-detection at all) rather than only
+    approximately.
+  - **`FaceExtractor.reencode_missing_faces()`** (`face_manager.reencode` Celery task, hourly):
+    re-encodes any face with `face_encoding_512` NULL that isn't declared `.ignore`/`.realignore`
+    — deliberately ignores the `reencoded` flag (that tracks pipeline provenance, not embedding
+    presence). Uses the exact kps-replay path when available; otherwise crops tightly around the
+    known box and runs a single detection pass on just that crop (validated against real
+    `.ignore`/`.realignore` faces specifically, since they skew smaller than assigned faces:
+    median ~0.97 cosine similarity, but a real tail — ~1 in 6 such faces find no detection at all).
+    Deliberately never falls back to full-image detection + IOU-matching — not worth the cost for
+    a face already this hard to redetect in isolation. A face with no detection at all gets
+    `settings.REENCODE_DEFAULT_ENCODING` (a neutral, unit-norm vector, every component
+    `sqrt(1/512)`) instead of being left NULL forever.
+  - **`clear_confirmed_ignore_encodings` management command** + **`Face.clear_confirmed_ignore_face_encodings()`**
+    (the shared write both it and the new `face_manager.clear_ignored_encodings` hourly task call):
+    nulls `face_encoding_512` only for faces **confirmed** (`declared_name`) to
+    `.ignore`/`.realignore` — never faces merely **suggested** (`poss_ident1` only,
+    `declared_name` still the blank sentinel). `classify_unassigned()` only ever writes
+    suggestions to `poss_ident1`, never to `declared_name` — `declared_name` reaching
+    `.ignore`/`.realignore` always means a human confirmed it via `associate_person()` (`close_
+    unassigned`/`close_ignored`/`confirm_proposed`). Validated against real production data
+    before running for real: 228,912 confirmed faces had an encoding, 114,656 suggested-only
+    faces correctly excluded, 0 overlap between the two sets. **Backfill run for real on
+    2026-08-31**: cleared all 228,912 (~442MB reclaimable, not yet reclaimed — see the vacuum
+    TODO below). All of them currently have no `kps` (the field had only just been deployed),
+    so all rely on the approximate crop-recovery path if ever reassigned away from
+    `.ignore`/`.realignore` — accepted deliberately per the user's own reasoning that these faces'
+    embeddings were already poor enough to not have matched anyone in the first place.
+  - **Real gap found and fixed along the way**: `bulk_thread`'s `close_assigned` ("Remove from
+    person") branch, when removing a face's actual `declared_name` (not declining a
+    `poss_identN` candidate), called `associate_person(blank_person.id)` but never recorded
+    anywhere that the former person had been explicitly removed — `classify_unassigned()` was
+    free to immediately re-propose the exact same assignment (e.g. re-suggesting `.ignore` right
+    after a human took a face out of it) on its very next run. Fixed by extracting
+    `reject_association()`'s existing append/dedupe `rejected_fields` logic into a reusable
+    `Face.add_to_rejected_fields()`, called with the former person's id before
+    `associate_person()` in that branch (same `save()`, no extra write).
+  - **TODO: after a few days, verify ONLY `.ignore`/`.realignore` encodings were actually
+    cleared** — spot-check that no other `declared_name` population was accidentally touched by
+    either the one-off command or the new hourly task, and that `.ignore`/`.realignore` faces
+    confirmed *after* the backfill are also getting cleared by the new scheduled task as
+    expected (not just the initial one-time backfill population). Requested explicitly by the
+    user as a follow-up check, not done yet.
+  - **TODO: weekly low-downtime `VACUUM FULL` via dump/restore/promote, plus backup-restore
+    testing — designed, not yet built.** `VACUUM FULL` in place would lock `face_manager_face`
+    (the most actively-written table) for its full runtime, blocking all live traffic and
+    scheduled face tasks for that whole window — unacceptable nightly, but reasonable as a rare
+    weekly maintenance op. Planned design: `pg_dump | pg_restore` (piped directly, no
+    intermediate dump file — a freshly-restored table has no bloat, so no separate `VACUUM FULL`
+    is even needed on the copy) into a scratch DB → verify (row counts, migration state, a few
+    real-row spot-checks) → on any failure, abort loudly, leave production untouched → on
+    success, stop `picasa_api`/celery, rename the live DB aside (dated, kept for a few days
+    rather than dropped immediately, with its own pruning), rename the scratch DB in, restart,
+    health-check the restart. Scheduled via host cron (not Celery beat, since it needs to
+    touch containers/services), targeting Monday 2am Eastern — not yet checked against what else
+    runs around that time. User wants the full swap automated end-to-end once tested (not just
+    verify-and-wait-for-manual-promotion), accepting the downtime-during-swap risk explicitly.
+    **Separately**, the user wants backup validity testing folded into the *existing* daily
+    backup/`prune_backups.py` retention flow (a different "promote," referring to
+    `prune_backups.py`'s own logic for keeping a daily backup file as that week's representative
+    once it ages out of the 7-day daily window) — reusing the same restore+verify machinery
+    against the actual stored backup file (not a fresh dump) once per week, at that promotion
+    point specifically (no need to re-verify the same file again later when it ages into the
+    monthly tier — it's the same bytes, already checked). On failure: write a persistent marker
+    that the next backup run logs loudly, and have `prune_backups.py` refuse to delete anything
+    while that marker exists. Neither piece built yet — explicitly sequenced by the user to come
+    after landing the encoding-clear backfill above.
 - **Removed `Face.face_encoding` (legacy 128-d dlib embedding), 2026-08-26.** Superseded by
   `face_encoding_512` (insightface) for years — the live pipeline (`face_extract_encode.py`)
   already hadn't written a real value to it, explicitly setting it to `None`. Freed ~371MB in
