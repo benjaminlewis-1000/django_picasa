@@ -529,16 +529,23 @@ class KeyedImageViewTests(ApiTestCase):
         r, g, b = pixel[:3]
         return r > 150 and g < 100 and b < 100
 
+    # Matches the view's own box_line_width * 3 margin (api/views.py) -
+    # the drawn line sits outside the actual detected box by this many
+    # scaled pixels, not flush against it (per the user: flush against it
+    # obscured the face's own edges).
+    _HIGHLIGHT_BOX_MARGIN = 4 * 3
+
     def test_face_source_highlight_box_draws_a_box_around_the_face(self):
         # The face fixture's box is (1,1)-(40,40) in the *original* image's
         # pixel space (see make_face) - face_source resizes to a fixed
         # 700px-tall image, so the drawn box has to land at the *scaled*
-        # coordinates, not the raw ones. Assert reddish pixels actually
-        # appear near the scaled box's top edge (within a couple rows,
-        # since resize blur softens exactly which row it lands on), and
-        # that the opposite corner of the image (nowhere near the box) is
-        # not - a cheap way to catch "drew nothing" or "drew at the wrong
-        # scale" without hand-computing every pixel.
+        # (and then outward-margined) coordinates, not the raw ones.
+        # Assert reddish pixels actually appear near the box's expanded
+        # top edge (within a few rows, since resize blur softens exactly
+        # which row it lands on), and that the opposite corner of the
+        # image (nowhere near the box) is not - a cheap way to catch
+        # "drew nothing" or "drew at the wrong scale/margin" without
+        # hand-computing every pixel.
         from PIL import Image
         from io import BytesIO
 
@@ -551,9 +558,9 @@ class KeyedImageViewTests(ApiTestCase):
         w, h = self.image.width, self.image.height
         scale_y = img.height / h
         scale_x = img.width / w
-        top_y = round(self.face.box_top * scale_y)
-        left_x = round(self.face.box_left * scale_x)
-        right_x = round(self.face.box_right * scale_x)
+        top_y = max(0, round(self.face.box_top * scale_y) - self._HIGHLIGHT_BOX_MARGIN)
+        left_x = max(0, round(self.face.box_left * scale_x) - self._HIGHLIGHT_BOX_MARGIN)
+        right_x = round(self.face.box_right * scale_x) + self._HIGHLIGHT_BOX_MARGIN
 
         found_red_near_top_edge = any(
             self._is_reddish(img.getpixel((x, y)))
@@ -574,9 +581,9 @@ class KeyedImageViewTests(ApiTestCase):
         w, h = self.image.width, self.image.height
         scale_y = img.height / h
         scale_x = img.width / w
-        top_y = round(self.face.box_top * scale_y)
-        left_x = round(self.face.box_left * scale_x)
-        right_x = round(self.face.box_right * scale_x)
+        top_y = max(0, round(self.face.box_top * scale_y) - self._HIGHLIGHT_BOX_MARGIN)
+        left_x = max(0, round(self.face.box_left * scale_x) - self._HIGHLIGHT_BOX_MARGIN)
+        right_x = round(self.face.box_right * scale_x) + self._HIGHLIGHT_BOX_MARGIN
         found_red = any(
             self._is_reddish(img.getpixel((x, y)))
             for y in range(max(0, top_y - 1), min(img.height, top_y + 4))
