@@ -182,6 +182,22 @@ class Face(models.Model):
                             size=512, blank=True, null=True
                         )
 
+    # The 5 facial landmark points (left eye, right eye, nose, left mouth
+    # corner, right mouth corner) InsightFace's detector produces, flattened
+    # to [x1, y1, x2, y2, x3, y3, x4, y4, x5, y5] in the SOURCE IMAGE's pixel
+    # coordinate space (not the face's own crop). These are what
+    # insightface.utils.face_align.norm_crop() uses to build the aligned
+    # 112x112 crop the recognition model actually sees -- with them saved,
+    # a face's embedding can be exactly reproduced later (e.g. after
+    # face_encoding_512 is cleared to save storage) via a single recognition
+    # pass against the original image, with no re-detection needed at all.
+    # Nullable since faces detected before this field existed have none;
+    # only newly detected/re-matched faces populate it going forward.
+    kps = ArrayField(
+                SingleFloatField(),
+                size=10, blank=True, null=True
+            )
+
     detected_age = models.IntegerField(default=-1)
     
     # This field will contain the top 5 possible identities as categorized

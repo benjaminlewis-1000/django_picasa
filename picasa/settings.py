@@ -479,7 +479,19 @@ LANGUAGE_CODE = 'en-us'
 
 TIME_ZONE = 'America/New_York'
 LOGGER.debug(f"Time zone is {TIME_ZONE}")
-NON_DETECTED_FACE_ENCODING = [-999] * 512 
+NON_DETECTED_FACE_ENCODING = [-999] * 512
+
+# Fallback for FaceExtractor.reencode_missing_faces(): used only when a face
+# has no stored kps AND a fresh crop-based detection also finds nothing (the
+# original face may be too small/blurry/occluded to redetect in isolation).
+# Deliberately a valid, unit-norm, uniform-magnitude vector -- unlike
+# NON_DETECTED_FACE_ENCODING above (an out-of-range sentinel for a
+# conceptually different case: an existing face whose box wasn't matched to
+# any detection during a full-image reprocessing pass) -- so it behaves as a
+# neutral, low-information point in the embedding space rather than an
+# obviously-invalid one, and won't crash cosine-similarity math done
+# elsewhere against real embeddings.
+REENCODE_DEFAULT_ENCODING = [512 ** -0.5] * 512
 
 USE_I18N = True
 
@@ -538,10 +550,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'filepopulator.find_similar_images',
         'schedule': crontab(minute='45', hour='*'),
     },
-#   'reencode_images': {
-#        'task': 'face_manager.reencode', 
-#        'schedule': crontab( minute = '*/10', hour='*/1'),
-#    },
+   'reencode_missing_faces': {
+        'task': 'face_manager.reencode',
+        'schedule': crontab(minute='20', hour='*'),
+    },
    'set_face_counts': {
        'task': 'face_manager.set_face_counts',
        'schedule': crontab( minute = '55', hour='*/4'),
