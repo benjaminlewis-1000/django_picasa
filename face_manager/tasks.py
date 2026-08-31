@@ -1,7 +1,7 @@
 from __future__ import absolute_import, unicode_literals
 
 # from .scripts import populateFromImageMultiGPU, establish_server_connection, establish_multi_server_connection
-from .models import Person, Face
+from .models import Person, Face, clear_confirmed_ignore_face_encodings
 from assign_faces import faceAssigner
 from celery import shared_task
 from django.conf import settings
@@ -93,6 +93,34 @@ def reencode_missing_faces():
         extractor.reencode_missing_faces()
     except:
         settings.LOGGER.debug("Ending reencode task")
+
+@shared_task(ignore_result=True, name='face_manager.clear_ignored_encodings')
+def clear_ignored_encodings():
+    # Ongoing counterpart to the one-off clear_confirmed_ignore_encodings
+    # management command (used for the initial backfill) -- keeps
+    # newly-confirmed .ignore/.realignore faces' encodings cleared going
+    # forward without needing the command re-run by hand. No FaceExtractor
+    # needed here (no ML model involved), just the shared DB update.
+    i = celery_app.control.inspect()
+    active_tasks = i.active()
+    num_this_task_running = 0
+    for k in active_tasks.keys():
+        tasks = active_tasks[k]
+        if len(tasks) != 0:
+            for tt in tasks:
+                if tt['name'] == 'face_manager.clear_ignored_encodings':
+                    num_this_task_running += 1
+
+    if num_this_task_running > 1:
+        settings.LOGGER.debug("Clear ignored encodings is locked, exiting.")
+        settings.LOGGER.warning("Clear ignored encodings locked!")
+        return
+
+    try:
+        updated = clear_confirmed_ignore_face_encodings()
+        settings.LOGGER.debug(f"Cleared face_encoding_512 for {updated} confirmed-ignore face(s).")
+    except:
+        settings.LOGGER.debug("Ending clear_ignored_encodings task")
 
 @shared_task(ignore_result=True, name='face_manager.assign_faces')
 def thistask(redo_all=False):

@@ -24,7 +24,7 @@
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from face_manager.models import Face
+from face_manager.models import Face, clear_confirmed_ignore_face_encodings
 
 
 class Command(BaseCommand):
@@ -82,5 +82,5 @@ class Command(BaseCommand):
                 self.stdout.write("Aborted.")
                 return
 
-        updated = qs.update(face_encoding_512=None)
+        updated = clear_confirmed_ignore_face_encodings()
         self.stdout.write(self.style.SUCCESS(f"Cleared face_encoding_512 for {updated} face(s)."))

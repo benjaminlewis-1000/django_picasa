@@ -485,3 +485,25 @@ class Face(models.Model):
         reject_list.append(person_id)
         self.rejected_fields = list(set(reject_list))
 
+
+def clear_confirmed_ignore_face_encodings():
+    """Null face_encoding_512 for every face CONFIRMED (declared_name) to
+    .ignore/.realignore, leaving Face.kps untouched so
+    FaceExtractor.reencode_missing_faces() can still recover a usable
+    embedding later if the face is ever reassigned away from that
+    sentinel. Never touches a face merely SUGGESTED as ignore
+    (poss_ident1 only, declared_name still the blank sentinel) --
+    classify_unassigned() only ever writes suggestions there, so
+    declared_name reaching .ignore/.realignore always means a human
+    confirmed it via associate_person(). Single source of truth for the
+    actual write, shared by the clear_confirmed_ignore_encodings
+    management command (one-off/backfill use) and the
+    face_manager.clear_ignored_encodings Celery task (ongoing use, for
+    faces confirmed after the backfill). Returns the number of faces
+    updated. Safe to call repeatedly -- matches nothing once already
+    cleared."""
+    qs = Face.objects.filter(
+        declared_name__person_name__in=[settings.SOFT_IGNORE_NAME, '.realignore'],
+    ).exclude(face_encoding_512__isnull=True)
+    return qs.update(face_encoding_512=None)
+

@@ -32,7 +32,7 @@ from unittest.mock import patch, MagicMock
 
 from face_manager.assign_faces import faceAssigner
 from face_manager.face_extract_encode import FaceExtractor
-from face_manager.models import Face, Person, get_default_blank_person
+from face_manager.models import Face, Person, get_default_blank_person, clear_confirmed_ignore_face_encodings
 from face_manager.pyramidal_detector import PyramidalDetector
 from face_manager.test_face_cache import cached_detect
 from filepopulator.models import Directory, ImageFile
@@ -729,6 +729,28 @@ class ClearConfirmedIgnoreEncodingsTests(TestCase):
 
         face.refresh_from_db()
         self.assertEqual(face.face_encoding_512, [0.5] * 512)
+
+    def test_shared_function_matches_command_behavior(self):
+        """clear_confirmed_ignore_face_encodings() (face_manager/models.py)
+        is the single source of truth the management command AND the
+        ongoing face_manager.clear_ignored_encodings Celery task both call
+        for the actual write -- covered directly here so a regression in
+        either caller's own logic can't hide the underlying function
+        breaking."""
+        confirmed = make_face(self.image, declared_name=self.ignore_person, face_encoding_512=[0.5] * 512)
+        suggested = make_face(
+            self.image, declared_name=self.blank_person,
+            poss_ident1=self.ignore_person, weight_1=0.9,
+            face_encoding_512=[0.5] * 512,
+        )
+
+        updated_count = clear_confirmed_ignore_face_encodings()
+
+        self.assertEqual(updated_count, 1)
+        confirmed.refresh_from_db()
+        suggested.refresh_from_db()
+        self.assertIsNone(confirmed.face_encoding_512)
+        self.assertEqual(suggested.face_encoding_512, [0.5] * 512)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")

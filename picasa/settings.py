@@ -554,6 +554,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'face_manager.reencode',
         'schedule': crontab(minute='20', hour='*'),
     },
+   'clear_ignored_encodings': {
+        'task': 'face_manager.clear_ignored_encodings',
+        'schedule': crontab(minute='35', hour='*'),
+    },
    'set_face_counts': {
        'task': 'face_manager.set_face_counts',
        'schedule': crontab( minute = '55', hour='*/4'),
