@@ -22,6 +22,7 @@
 # type "JWT ") is left in place and untouched as a fallback.
 
 import logging
+import time
 
 import jwt
 from django.conf import settings
@@ -43,6 +44,54 @@ _jwks_client = jwt.PyJWKClient(
     lifespan=settings.AUTHELIA_JWKS_CACHE_SECONDS,
     headers={"User-Agent": "django_picasa/AutheliaOIDCAuthentication"},
 )
+
+# Last signing key set that verified successfully. If a JWKS refetch fails
+# (Cloudflare hiccup, Authelia restart, transient network), we fall back
+# to this rather than 401-ing a perfectly valid token -- which used to
+# log the mobile app out en masse roughly once per cache lifespan.
+_last_good_keys = {}  # kid -> jwt.PyJWK
+
+_JWKS_FETCH_ATTEMPTS = 3
+_JWKS_FETCH_BACKOFF = 0.4
+
+
+class SigningKeysUnavailable(exceptions.APIException):
+    """503, not 401: the token may be fine -- we just can't reach Authelia
+    to check its signature right now. The client should retry, not
+    discard its session."""
+
+    status_code = 503
+    default_detail = "Authentication service temporarily unavailable; retry."
+    default_code = "signing_keys_unavailable"
+
+
+def _signing_key_for(token):
+    """Resolve the RS256 signing key for `token`, retrying the JWKS fetch a
+    few times and falling back to the last-known-good key on failure."""
+    unverified = jwt.get_unverified_header(token)  # raises InvalidTokenError if garbage
+    kid = unverified.get("kid")
+
+    last_exc = None
+    for attempt in range(1, _JWKS_FETCH_ATTEMPTS + 1):
+        try:
+            key = _jwks_client.get_signing_key_from_jwt(token)
+            _last_good_keys[kid] = key  # kid is None only for keys w/o a kid header
+            return key
+        except jwt.PyJWKClientError as exc:
+            last_exc = exc
+            if attempt < _JWKS_FETCH_ATTEMPTS:
+                time.sleep(_JWKS_FETCH_BACKOFF * attempt)
+
+    cached = _last_good_keys.get(kid)
+    if cached is not None:
+        logger.warning(
+            "Authelia JWKS fetch failing (%s); using last-known-good key for kid=%s",
+            last_exc, kid,
+        )
+        return cached
+
+    logger.warning("Authelia JWKS lookup failed and no cached key: %s", last_exc)
+    raise SigningKeysUnavailable()
 
 
 class AutheliaOIDCAuthentication(authentication.BaseAuthentication):
@@ -77,10 +126,7 @@ class AutheliaOIDCAuthentication(authentication.BaseAuthentication):
 
     def _decode(self, token):
         try:
-            signing_key = _jwks_client.get_signing_key_from_jwt(token)
-        except jwt.PyJWKClientError as exc:
-            logger.warning("Authelia JWKS lookup failed: %s", exc)
-            raise exceptions.AuthenticationFailed("Could not verify token signing key.")
+            signing_key = _signing_key_for(token)
         except jwt.InvalidTokenError as exc:
             # Bearer value isn't a well-formed JWT at all (get_signing_key_
             # from_jwt has to parse the header to find the kid).

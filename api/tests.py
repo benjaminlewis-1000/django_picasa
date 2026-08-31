@@ -1290,13 +1290,19 @@ class AutheliaOIDCAuthenticationTests(TestCase):
         )
         # get_signing_key_from_jwt(token) -> object with a .key attribute
         # (the verifying key). Return the public half of our test keypair.
-        signing_key = type("K", (), {"key": self._key.public_key()})()
-        patcher = patch(
+        self._signing_key = type("K", (), {"key": self._key.public_key()})()
+        self._jwks_patcher = patch(
             "api.authentication._jwks_client.get_signing_key_from_jwt",
-            return_value=signing_key,
+            return_value=self._signing_key,
         )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self._jwks_mock = self._jwks_patcher.start()
+        self.addCleanup(self._jwks_patcher.stop)
+
+        # The last-known-good key cache is a module global; isolate tests.
+        import api.authentication as _authmod
+        _authmod._last_good_keys.clear()
+        self.addCleanup(_authmod._last_good_keys.clear)
+
         self.client = APIClient()
 
     def _token(self, **overrides):
@@ -1385,3 +1391,21 @@ class AutheliaOIDCAuthenticationTests(TestCase):
         self.user.save()
         resp = self._get(self._token())
         self.assertIn(resp.status_code, self.REJECTED)
+
+    def test_jwks_fetch_failure_returns_503_not_401(self):
+        # A transient JWKS outage must NOT look like a bad token -- 401
+        # would make the app throw away a perfectly valid session.
+        import jwt as _jwt
+
+        self._jwks_mock.side_effect = _jwt.PyJWKClientError("boom")
+        resp = self._get(self._token())
+        self.assertEqual(resp.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    def test_jwks_fetch_failure_falls_back_to_last_known_good_key(self):
+        import jwt as _jwt
+
+        # 1st call succeeds -> caches the key.
+        self.assertEqual(self._get(self._token()).status_code, status.HTTP_200_OK)
+        # JWKS now unreachable, but we've seen this key before -> still 200.
+        self._jwks_mock.side_effect = _jwt.PyJWKClientError("boom")
+        self.assertEqual(self._get(self._token()).status_code, status.HTTP_200_OK)
