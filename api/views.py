@@ -17,7 +17,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from face_manager.models import Person, Face
 from filepopulator.models import ImageFile, Directory
 from io import BytesIO
-from PIL import Image, ExifTags
+from PIL import Image, ExifTags, ImageDraw
 from queue import Queue
 from rest_framework import viewsets, filters
 from rest_framework.authentication import SessionAuthentication
@@ -1046,6 +1046,30 @@ class KeyedImageView(APIView):
         except:
             pass
 
+        # Unverified-faces modal ("R" send-to-other-person aside) wants a
+        # box drawn around the specific face being reviewed, not just the
+        # whole source photo - only meaningful for face_source (the one
+        # type keyed by a Face id in the first place; slideshow/full_*
+        # are keyed by ImageFile and have no single face in mind).
+        # face.box_left/top/right/bottom are stored in the *original*
+        # (pre-resize) image's pixel space, so they need scaling by
+        # however much the image actually ended up resized - computed
+        # from the real before/after sizes rather than trusting the
+        # `height`/`width` locals above, since the resize try/except just
+        # above can silently leave `image` at its original size on
+        # failure (in which case this correctly computes a scale of 1).
+        if image_type == 'face_source' and params.get('highlight_box', '').lower() == 'true':
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            scale_x = image.width / w
+            scale_y = image.height / h
+            box = [
+                face.box_left * scale_x,
+                face.box_top * scale_y,
+                face.box_right * scale_x,
+                face.box_bottom * scale_y,
+            ]
+            ImageDraw.Draw(image).rectangle(box, outline=(255, 0, 0), width=4)
 
         FTYPE = 'JPEG'
         temp_thumb = BytesIO()
