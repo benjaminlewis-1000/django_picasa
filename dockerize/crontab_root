@@ -1,0 +1,17 @@
+# do daily/weekly/monthly maintenance
+# min	hour	day	month	weekday	command
+*/15	*	*	*	*	run-parts /etc/periodic/15min
+0	*	*	*	*	run-parts /etc/periodic/hourly
+0	2	*	*	*	run-parts /etc/periodic/daily
+0	3	*	*	6	run-parts /etc/periodic/weekly
+0	5	1	*	*	run-parts /etc/periodic/monthly
+
+# Weekly low-downtime VACUUM FULL via dump/restore/promote (see
+# weekly_vacuum_swap.py's own docstring). Deliberately 3am, not 2am --
+# the daily backup+prune above (0 2 * * *, which now also runs a restore
+# sanity-check on the day a backup is promoted into the weekly retention
+# tier) needs to be finished well before this starts, since both touch
+# the same DB and this one briefly stops picasa_api. Monday specifically
+# (weekday 1) so it doesn't collide with the stock weekly slot above
+# (Saturday, weekday 6).
+0	3	*	*	1	python3 /etc/periodic/weekly_vacuum_swap.py --promote >> /var/log/weekly_vacuum_swap.log 2>&1
