@@ -1,12 +1,18 @@
 # FROM postgres:12.1-alpine
 FROM postgres:17.5-alpine
 
-RUN apk add --no-cache supervisor
+RUN apk add --no-cache supervisor tzdata docker-cli
 RUN mkdir /etc/supervisor.d
 COPY postgres_cron.ini /etc/supervisor.d/postgres_cron.ini
 
-# postgres_bak.sh is bind-mounted (see docker-compose.yaml), not baked in here --
-# its executable bit comes from the host file itself (preserved through the bind
-# mount), so make sure dockerize/postgres_bak.sh stays chmod +x on the host.
+# TZ env var (set in docker-compose.yaml) needs tzdata installed to
+# actually take effect -- without it, TZ is silently ignored and
+# everything (including cron) stays on UTC.
+
+# postgres_bak.sh, prune_backups.py, weekly_vacuum_swap.py, and the
+# crontab itself are all bind-mounted (see docker-compose.yaml), not
+# baked in here -- their executable bits come from the host files
+# themselves (preserved through the bind mount), so make sure they stay
+# chmod +x on the host.
 
 ENTRYPOINT ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]

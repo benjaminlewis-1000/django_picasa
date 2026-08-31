@@ -106,6 +106,15 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+      # All cron-scheduled maintenance (backup, prune, weekly vacuum swap)
+      # lives in this container now -- set TZ so crontab_root's times mean
+      # Eastern, not UTC. tzdata (Dockerfile_postgres) has to be installed
+      # for this to actually take effect; without it Alpine silently stays
+      # on UTC. NOTE: this also shifts the *existing* daily backup's
+      # actual wall-clock time (it was already "0 2 * * *", just
+      # previously meaning 2am UTC == ~10pm Eastern the prior day; now it
+      # means 2am Eastern).
+      TZ: America/New_York
 #      PGDATA: /database
     volumes:
       - ${DB_FILES_LOCATION}:/var/lib/postgresql/data
@@ -123,10 +132,21 @@ services:
       # not just a plain restart or a config-less `up -d`.
       - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/daily/postgres_bak_sh
       - ${DJANGO_FILES_ROOT}/dockerize/prune_backups.py:/etc/periodic/daily/prune_backups.py
+      # Weekly vacuum-swap script + the full crontab (stock periodic
+      # entries + the Monday 3am line that runs it) -- see crontab_root's
+      # own comments for why 3am, not 2am.
+      - ${DJANGO_FILES_ROOT}/dockerize/weekly_vacuum_swap.py:/etc/periodic/weekly_vacuum_swap.py
+      - ${DJANGO_FILES_ROOT}/dockerize/crontab_root:/etc/crontabs/root
       - /mnt/fast_storage/appdata/django_picasa/backups:/backup
+      # Lets weekly_vacuum_swap.py stop/start/exec picasa_api directly --
+      # this is the standard Docker-outside-of-Docker pattern. Security
+      # tradeoff worth knowing: anything that can run arbitrary commands
+      # in THIS container can now also control (or escape to) the whole
+      # host via the Docker daemon, not just this DB.
+      - /var/run/docker.sock:/var/run/docker.sock
     labels:
       - "user=postgres"
-    container_name: db_picasa  
+    container_name: db_picasa
     ports:
       - '5433:5432'
     networks:
