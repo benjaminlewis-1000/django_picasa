@@ -7,7 +7,7 @@ import numpy as np
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.files.base import ContentFile
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils.functional import SimpleLazyObject
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -51,20 +51,12 @@ def ensure_sentinel_people():
         p.save()
 
 
-@override_settings(MEDIA_ROOT="/tmp/api_test_media")
-class ApiTestCase(TestCase):
-    """Base class for api/ tests: authenticated client + sentinel people."""
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        ensure_sentinel_people()
-
-    def setUp(self):
-        self.user = User.objects.create_user(username="tester", password="pw123456")
-        self.client = APIClient()
-        self.client.force_authenticate(user=self.user)
-        self.anon_client = APIClient()
+class FaceFixtureMixin:
+    """Shared fixture helpers (make_image/make_face) - pulled out of
+    ApiTestCase so a test that specifically needs TransactionTestCase
+    (real commits, visible to other DB connections/threads - see
+    IgnoreReviewFlaggedCountTests) can reuse them without inheriting
+    TestCase's rolled-back-transaction behavior."""
 
     def make_image(self, relative_fixture="naming/good/1.JPG"):
         """Create a real ImageFile row (with real thumbnails on disk) from
@@ -98,6 +90,22 @@ class ApiTestCase(TestCase):
         )
         face.save()
         return face
+
+
+@override_settings(MEDIA_ROOT="/tmp/api_test_media")
+class ApiTestCase(FaceFixtureMixin, TestCase):
+    """Base class for api/ tests: authenticated client + sentinel people."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ensure_sentinel_people()
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="tester", password="pw123456")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.anon_client = APIClient()
 
 
 class LazySentinelPersonTests(ApiTestCase):
@@ -633,6 +641,85 @@ class DirectoryPaginateObjIdsTests(ApiTestCase):
         id_list = json.loads(resp.content)["id_list"]
         self.assertEqual(id_list.index(newer.id), 0)
         self.assertLess(id_list.index(newer.id), id_list.index(older.id))
+
+
+class IgnoreReviewFlaggedPartitionTests(ApiTestCase):
+    # The frontend's ".ignore" main unlabeled screen and its "Flagged for
+    # review" subordinate row (PersonParamView's face_poss `flagged`
+    # param) are meant to be a complementary partition of the same
+    # poss_ident1 candidates - a face flagged via the mobile app's
+    # ignore-review flow (mobile_review_hidden=True) should show up in
+    # exactly one of the two, never both and never neither.
+    def setUp(self):
+        super().setUp()
+        self.image = self.make_image()
+        self.ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        self.flagged_face = self.make_face(
+            self.image, declared_name=blank, poss_ident1=self.ignore,
+            weight_1=0.9, mobile_review_hidden=True,
+        )
+        self.plain_face = self.make_face(
+            self.image, declared_name=blank, poss_ident1=self.ignore,
+            weight_1=0.5, mobile_review_hidden=False,
+        )
+        self.never_reviewed_face = self.make_face(
+            self.image, declared_name=blank, poss_ident1=self.ignore,
+            weight_1=0.3,
+        )
+
+    def test_default_face_poss_excludes_flagged(self):
+        resp = self.client.get(f"/api/paginate_obj_ids/{self.ignore.id}/face_poss")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        id_list = json.loads(resp.content)["id_list"]
+        self.assertNotIn(self.flagged_face.id, id_list)
+        self.assertIn(self.plain_face.id, id_list)
+        self.assertIn(self.never_reviewed_face.id, id_list)
+
+    def test_flagged_true_returns_only_flagged(self):
+        resp = self.client.get(f"/api/paginate_obj_ids/{self.ignore.id}/face_poss?flagged=true")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        id_list = json.loads(resp.content)["id_list"]
+        self.assertEqual(id_list, [self.flagged_face.id])
+
+
+@override_settings(MEDIA_ROOT="/tmp/api_test_media")
+class IgnoreReviewFlaggedCountTests(FaceFixtureMixin, TransactionTestCase):
+    # PersonListView farms its per-person work out to worker threads
+    # (api/views.py), each on its own DB connection - a plain TestCase's
+    # rolled-back-at-teardown transaction is only visible on the
+    # connection that opened it, so fixture rows created under a regular
+    # ApiTestCase are invisible to those worker threads' queries. Needs
+    # TransactionTestCase (real commits) instead, just for this one
+    # count - IgnoreReviewFlaggedPartitionTests above covers the
+    # non-threaded PersonParamView query the same fixture shape feeds.
+    def setUp(self):
+        ensure_sentinel_people()
+        self.user = User.objects.create_user(username="tester_flagged_count", password="pw123456")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+        self.image = self.make_image()
+        self.ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        self.make_face(
+            self.image, declared_name=blank, poss_ident1=self.ignore,
+            weight_1=0.9, mobile_review_hidden=True,
+        )
+
+    def test_person_list_num_possibilities_excludes_flagged_for_ignore(self):
+        # .ignore's stored num_possibilities counter (Person model field)
+        # counts every poss_ident1 candidate regardless of the flag - the
+        # sidebar's main-screen count needs the same exclusion the query
+        # above applies, or it would overcount relative to what the main
+        # screen actually shows.
+        Person.objects.filter(pk=self.ignore.pk).update(num_possibilities=3)
+        resp = self.client.get("/api/person_list/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        results = json.loads(resp.content)["results"]
+        ignore_dict = next(p for p in results if p["id"] == self.ignore.id)
+        self.assertEqual(ignore_dict["num_possibilities"], 2)
+        self.assertEqual(ignore_dict["num_review_flagged"], 1)
 
 
 class MobileEndpointTests(ApiTestCase):

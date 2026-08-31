@@ -382,9 +382,19 @@ class PersonListView(APIView):
                 # Only meaningful for .ignore; every other person gets 0
                 # rather than an extra query.
                 if p.person_name == settings.SOFT_IGNORE_NAME:
-                    p_dict['num_review_flagged'] = Face.objects.filter(
+                    num_flagged = Face.objects.filter(
                         poss_ident1=p, mobile_review_hidden=True
                     ).count()
+                    p_dict['num_review_flagged'] = num_flagged
+                    # The main ".ignore" unlabeled screen and its "Flagged
+                    # for review" subordinate row are a complementary
+                    # partition of the same poss_ident1 candidates now
+                    # (see PersonParamView's `flagged` param) - flagged
+                    # ones are excluded from the main screen's own query,
+                    # so its sidebar count needs the same exclusion or it
+                    # would overcount relative to what's actually shown
+                    # there.
+                    p_dict['num_possibilities'] = max(0, p_dict['num_possibilities'] - num_flagged)
                 else:
                     p_dict['num_review_flagged'] = 0
 
@@ -495,6 +505,14 @@ class PersonParamView(APIView):
                 poss_query = Q(poss_ident1=person_obj)
                 if do_flagged_only:
                     poss_query &= Q(mobile_review_hidden=True)
+                else:
+                    # Complementary to the flagged branch above - a face
+                    # already pulled aside for closer review (flagged via
+                    # the mobile app's ignore-review flow) shouldn't also
+                    # keep showing up in the normal candidate list it came
+                    # from. Together these two branches partition the same
+                    # poss_ident1 set with no overlap either way.
+                    poss_query &= (Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False))
 
                 faces1 = list(Face.objects.filter(poss_query).values_list('id', 'weight_1'))
                 # faces2 = list(Face.objects.filter(poss_ident2=person_obj).values_list('id', 'weight_2'))
