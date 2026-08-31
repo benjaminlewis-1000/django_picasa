@@ -519,6 +519,71 @@ class KeyedImageViewTests(ApiTestCase):
         self.assertIn("max-age", resp["Cache-Control"])
         self.assertIn("immutable", resp["Cache-Control"])
 
+    @staticmethod
+    def _is_reddish(pixel):
+        # BICUBIC resampling during face_source's resize blurs the drawn
+        # line's edges, so exact (255,0,0) only shows up a pixel or two
+        # into the line - a tolerant "red clearly dominates" check instead
+        # of exact equality, so this doesn't get brittle re-pinning exact
+        # pixel values to whatever resample filter happens to be in use.
+        r, g, b = pixel[:3]
+        return r > 150 and g < 100 and b < 100
+
+    def test_face_source_highlight_box_draws_a_box_around_the_face(self):
+        # The face fixture's box is (1,1)-(40,40) in the *original* image's
+        # pixel space (see make_face) - face_source resizes to a fixed
+        # 700px-tall image, so the drawn box has to land at the *scaled*
+        # coordinates, not the raw ones. Assert reddish pixels actually
+        # appear near the scaled box's top edge (within a couple rows,
+        # since resize blur softens exactly which row it lands on), and
+        # that the opposite corner of the image (nowhere near the box) is
+        # not - a cheap way to catch "drew nothing" or "drew at the wrong
+        # scale" without hand-computing every pixel.
+        from PIL import Image
+        from io import BytesIO
+
+        resp = self.client.get(
+            f"/api/keyed_image/face_source/?id={self.face.id}&highlight_box=true"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        img = Image.open(BytesIO(resp.content)).convert("RGB")
+
+        w, h = self.image.width, self.image.height
+        scale_y = img.height / h
+        scale_x = img.width / w
+        top_y = round(self.face.box_top * scale_y)
+        left_x = round(self.face.box_left * scale_x)
+        right_x = round(self.face.box_right * scale_x)
+
+        found_red_near_top_edge = any(
+            self._is_reddish(img.getpixel((x, y)))
+            for y in range(max(0, top_y - 1), min(img.height, top_y + 4))
+            for x in range(max(0, left_x), min(img.width, right_x + 1))
+        )
+        self.assertTrue(found_red_near_top_edge, "Expected reddish pixels near the box's top edge")
+        self.assertFalse(self._is_reddish(img.getpixel((img.width - 1, img.height - 1))))
+
+    def test_face_source_without_highlight_box_param_draws_nothing(self):
+        from PIL import Image
+        from io import BytesIO
+
+        resp = self.client.get(f"/api/keyed_image/face_source/?id={self.face.id}")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        img = Image.open(BytesIO(resp.content)).convert("RGB")
+        # No reddish pixels anywhere near where the box would have been.
+        w, h = self.image.width, self.image.height
+        scale_y = img.height / h
+        scale_x = img.width / w
+        top_y = round(self.face.box_top * scale_y)
+        left_x = round(self.face.box_left * scale_x)
+        right_x = round(self.face.box_right * scale_x)
+        found_red = any(
+            self._is_reddish(img.getpixel((x, y)))
+            for y in range(max(0, top_y - 1), min(img.height, top_y + 4))
+            for x in range(max(0, left_x), min(img.width, right_x + 1))
+        )
+        self.assertFalse(found_red)
+
 
 class DirectoryPaginateObjIdsTests(ApiTestCase):
     # The Folders tab (frontend) walks this id_list directly for both tile
