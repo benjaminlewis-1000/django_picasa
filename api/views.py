@@ -1063,13 +1063,20 @@ class KeyedImageView(APIView):
                 image = image.convert('RGB')
             scale_x = image.width / w
             scale_y = image.height / h
+            box_line_width = 4
+            # Drawn flush against the actual detected box, the line itself
+            # was covering the edges of the face rather than framing it -
+            # push it outward by (at least) 3x its own width in each
+            # direction so the box frames the face with room to spare,
+            # clamped so it can't run off the image edge.
+            box_margin = box_line_width * 3
             box = [
-                face.box_left * scale_x,
-                face.box_top * scale_y,
-                face.box_right * scale_x,
-                face.box_bottom * scale_y,
+                max(0, face.box_left * scale_x - box_margin),
+                max(0, face.box_top * scale_y - box_margin),
+                min(image.width, face.box_right * scale_x + box_margin),
+                min(image.height, face.box_bottom * scale_y + box_margin),
             ]
-            ImageDraw.Draw(image).rectangle(box, outline=(255, 0, 0), width=4)
+            ImageDraw.Draw(image).rectangle(box, outline=(255, 0, 0), width=box_line_width)
 
         FTYPE = 'JPEG'
         temp_thumb = BytesIO()
