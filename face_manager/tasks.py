@@ -71,6 +71,29 @@ def process_faces():
 
         settings.LOGGER.debug("Ending face adding task")
         
+@shared_task(ignore_result=True, name='face_manager.reencode')
+def reencode_missing_faces():
+    i = celery_app.control.inspect()
+    active_tasks = i.active()
+    num_this_task_running = 0
+    for k in active_tasks.keys():
+        tasks = active_tasks[k]
+        if len(tasks) != 0:
+            for tt in tasks:
+                if tt['name'] == 'face_manager.reencode':
+                    num_this_task_running += 1
+
+    if num_this_task_running > 1:
+        settings.LOGGER.debug("Reencode is locked, exiting.")
+        settings.LOGGER.warning("Reencode locked!")
+        return
+
+    try:
+        extractor = FaceExtractor()
+        extractor.reencode_missing_faces()
+    except:
+        settings.LOGGER.debug("Ending reencode task")
+
 @shared_task(ignore_result=True, name='face_manager.assign_faces')
 def thistask(redo_all=False):
 

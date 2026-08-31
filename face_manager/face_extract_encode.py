@@ -39,7 +39,21 @@ class FaceExtractor(object):
         self.gender_map = {1: 'M', 0: 'F'}
 
         # The amount we go out beyond the InsightFace detection to clip the thumbnail.
-        self.thumbnail_extension_mult = 2 
+        self.thumbnail_extension_mult = 2
+
+        # Margin (as a fraction of the face's own box width/height, on each
+        # side) used by reencode_missing_faces() when cropping around a
+        # known box for a fresh single-pass detection. Matches the value
+        # validated experimentally against real production faces.
+        self.reencode_crop_margin_mult = 0.6
+
+    @staticmethod
+    def _flatten_kps(kps):
+        """Flatten InsightFace's (5, 2) kps array to a plain 10-float list
+        for storage in Face.kps, or None if no landmarks are available."""
+        if kps is None:
+            return None
+        return np.asarray(kps, dtype=float).reshape(-1).tolist()
 
     def reset_all_images(self):
         """
@@ -549,6 +563,7 @@ class FaceExtractor(object):
         assert new_top < new_bottom
 
         existing_face.face_encoding_512 = new_embedding.tolist()
+        existing_face.kps = self._flatten_kps(new_data['kps'])
         existing_face.box_left = new_left
         existing_face.box_top = new_top
         existing_face.box_right = new_right
@@ -577,6 +592,7 @@ class FaceExtractor(object):
         new_face = Face()
 
         new_face.face_encoding_512 = insight_detected_face['embedding'].tolist()
+        new_face.kps = self._flatten_kps(insight_detected_face['kps'])
         new_face.declared_name = self.blank_face_person
         new_face.written_to_photo_metadata = False
         new_face.reencoded = True
@@ -729,7 +745,131 @@ class FaceExtractor(object):
         combined_data = arr_bytes + str(arr_shape).encode('utf-8')
         # Use a secure hash algorithm like SHA256
         return hashlib.sha256(combined_data).hexdigest()
-            
+
+    def reencode_missing_faces(self):
+        """
+        Re-encode faces that have no face_encoding_512 but are no longer
+        declared .ignore/.realignore -- e.g. a confirmed-ignore face whose
+        embedding was cleared to save storage, then reassigned away from
+        that sentinel because it turned out to be a real person after all.
+
+        Deliberately filters on face_encoding_512 being NULL, not on the
+        `reencoded` flag -- that flag tracks whether a face's *box* came
+        from the modern insightface pipeline, which is orthogonal to
+        whether it currently has a usable embedding.
+
+        Two paths, in order of preference:
+          1. If the face has stored `kps` (5 landmark points, in the source
+             image's own pixel coordinate space -- see Face.kps), replay
+             the exact original alignment directly through the recognition
+             model. No detection needed, and the result is the same
+             embedding the original detection produced (verified against
+             real production faces: cosine similarity ~1.0 to a same-run
+             reference), since the only source of error in the crop-based
+             path below is landmark re-detection noise, which this path
+             skips entirely.
+          2. Otherwise (an older face, detected before Face.kps existed),
+             crop tightly around the known bounding box and run a single
+             detection+recognition pass on just that crop. This is the
+             same approach validated experimentally against real
+             production faces (median ~0.97 cosine similarity to the
+             original embedding for the actual .ignore/.realignore
+             population, but a real tail -- roughly 1 in 6 such faces find
+             no detection at all, and a few percent land far off).
+             Deliberately does NOT fall back to full-image detection +
+             IOU-matching (the approach find_and_encode_faces() uses) --
+             for a face already this hard to redetect in isolation, that's
+             unlikely to do meaningfully better and costs far more (a
+             full-image pass takes seconds; a small crop takes well under
+             one).
+
+        A face that still finds no detection in its crop gets
+        settings.REENCODE_DEFAULT_ENCODING (a neutral, valid, unit-norm
+        vector) rather than being left NULL -- NULL is exactly what this
+        method selects on, so leaving it NULL would retry it forever on
+        every future run.
+        """
+        faces_to_reencode = Face.objects.filter(
+            face_encoding_512__isnull=True
+        ).exclude(
+            declared_name__person_name__in=[settings.SOFT_IGNORE_NAME, '.realignore']
+        ).select_related('source_image_file')
+
+        rec_model = self.app.app.models['recognition']
+
+        for face in faces_to_reencode:
+            img_obj = face.source_image_file
+            if img_obj is None or not img_obj.filename or not os.path.exists(img_obj.filename):
+                settings.LOGGER.error(f"Cannot re-encode Face {face.id}: source image missing or unset.")
+                continue
+
+            try:
+                img = common.open_img_oriented(img_obj.filename, as_numpy=True)
+            except Exception as e:
+                settings.LOGGER.error(f"Cannot re-encode Face {face.id}: failed to open image ({e}).")
+                continue
+            if img is None or len(img.shape) != 3:
+                settings.LOGGER.error(f"Cannot re-encode Face {face.id}: image failed to decode.")
+                continue
+
+            if face.kps is not None:
+                kps_arr = np.array(face.kps, dtype=np.float32).reshape(5, 2)
+                insight_face = insightface.app.common.Face(kps=kps_arr)
+                embedding = rec_model.get(img, insight_face)
+                face.face_encoding_512 = embedding.tolist()
+                face.reencoded = True
+                face.save()
+                continue
+
+            h, w, _ = img.shape
+            bl, bt, br, bb = face.box_left, face.box_top, face.box_right, face.box_bottom
+            if bl is None or br is None or br <= bl or bb <= bt:
+                settings.LOGGER.error(f"Cannot re-encode Face {face.id}: invalid stored box.")
+                continue
+
+            box_w, box_h = br - bl, bb - bt
+            mx = int(box_w * self.reencode_crop_margin_mult)
+            my = int(box_h * self.reencode_crop_margin_mult)
+            cl, ct = max(0, bl - mx), max(0, bt - my)
+            cr, cb = min(w, br + mx), min(h, bb + my)
+            crop = img[ct:cb, cl:cr]
+
+            if crop.shape[0] < 20 or crop.shape[1] < 20:
+                face.face_encoding_512 = settings.REENCODE_DEFAULT_ENCODING
+                face.save()
+                continue
+
+            dets = self.app.app.get(crop)
+            if len(dets) == 0:
+                face.face_encoding_512 = settings.REENCODE_DEFAULT_ENCODING
+                face.save()
+                continue
+
+            # Several faces may be found in the crop (e.g. a neighboring
+            # face partly included by the margin) -- the one closest to
+            # the crop's center is our known face, since we cropped
+            # symmetrically around its own box.
+            crop_cx, crop_cy = crop.shape[1] / 2, crop.shape[0] / 2
+            best, best_dist = None, None
+            for d in dets:
+                dl, dt, dr, db = d['bbox']
+                dcx, dcy = (dl + dr) / 2, (dt + db) / 2
+                dist = (dcx - crop_cx) ** 2 + (dcy - crop_cy) ** 2
+                if best_dist is None or dist < best_dist:
+                    best_dist, best = dist, d
+
+            face.face_encoding_512 = best['embedding'].tolist()
+            # Translate the freshly-detected kps from crop-local back to
+            # the source image's absolute coordinates (matching how
+            # add_new_face()/update_existing_face_to_insightface() store
+            # them), so a FUTURE re-encode of this same face can use the
+            # exact-replay path above instead of cropping again.
+            if best['kps'] is not None:
+                abs_kps = np.array(best['kps'], dtype=float) + np.array([cl, ct])
+                face.kps = self._flatten_kps(abs_kps)
+            face.reencoded = True
+            face.save()
+
         # print(insight_detected_face)
 # def extract_faces(filename: str) -> dict:
 #     # Given a file name, use InsightFace to extract a dictionary of

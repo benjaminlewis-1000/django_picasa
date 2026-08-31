@@ -138,7 +138,14 @@ def bulk_thread(dataframe: dict):
             elif face.declared_name_id == current_person_id:
                 # Actually declared to this person - peel off the declared
                 # name tag itself, same mechanism close_unassigned uses to
-                # reassign a face to '.ignore'.
+                # reassign a face to '.ignore'. Record the former person as
+                # rejected first - associate_person() doesn't touch
+                # rejected_fields on its own, and without this,
+                # classify_unassigned() would be free to immediately
+                # re-propose the exact assignment a human just removed
+                # (e.g. re-suggesting '.ignore' right after "Remove from
+                # person" took a face out of it).
+                face.add_to_rejected_fields(current_person_id)
                 face.associate_person(blank_person.id)
             else:
                 print(f"close_assigned: face {face.id} is neither declared to nor "

@@ -390,6 +390,11 @@ class FaceViewSetTests(ApiTestCase):
         })
         self.face.refresh_from_db()
         self.assertEqual(self.face.declared_name.person_name, settings.BLANK_FACE_NAME)
+        # Regression: "Remove from person" used to leave no record that
+        # this person was tried and explicitly removed - classify_
+        # unassigned() was free to immediately re-propose the exact same
+        # assignment on its very next run.
+        self.assertIn(current_person_id, self.face.rejected_fields)
 
     def test_bulk_close_assigned_on_possible_match_still_declines_it(self):
         # Declining a proposed candidate - reject_association()'s original,

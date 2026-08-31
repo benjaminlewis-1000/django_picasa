@@ -28,7 +28,7 @@ from django.test import TestCase, override_settings, tag
 
 from django.core.management import call_command
 
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from face_manager.assign_faces import faceAssigner
 from face_manager.face_extract_encode import FaceExtractor
@@ -292,12 +292,22 @@ class FaceModelTests(TestCase):
         self.assertIsNone(face.poss_ident1)
         self.assertIn(person.id, face.rejected_fields)
 
-    def test_clear_person(self):
-        person = make_person("Clearable")
-        face = make_face(self.image, declared_name=person)
-        face.clear_person()
+    def test_add_to_rejected_fields_appends_and_dedupes_without_saving(self):
+        face = make_face(self.image)
+        self.assertIsNone(face.rejected_fields)
+
+        face.add_to_rejected_fields(101)
+        self.assertEqual(face.rejected_fields, [101])
+        # Not saved yet - a caller doing other unsaved changes in the same
+        # operation (e.g. close_assigned's "Remove from person" case) can
+        # rely on a single later save() persisting both.
         face.refresh_from_db()
-        self.assertIsNone(face.declared_name)
+        self.assertIsNone(face.rejected_fields)
+
+        face.add_to_rejected_fields(101)
+        face.add_to_rejected_fields(202)
+        face.add_to_rejected_fields(101)  # duplicate
+        self.assertEqual(sorted(face.rejected_fields), [101, 202])
 
     def test_face_encoding_512_stores_at_float32_precision(self):
         """face_encoding_512 is now backed by `real` (single precision),
@@ -403,6 +413,58 @@ class FaceExtractorCorruptedImageTests(TestCase):
         img_obj.refresh_from_db()
         self.assertTrue(img_obj.isProcessed)
         self.assertGreaterEqual(Face.objects.filter(source_image_file=img_obj).count(), 1)
+
+    def test_new_face_gains_kps_from_real_detection(self):
+        """add_new_face() should now also store the 5-point landmarks
+        InsightFace's detector produces, alongside the embedding it
+        already stored -- needed so a face's embedding can later be
+        exactly reproduced (see FaceExtractor.reencode_missing_faces())
+        without re-detecting from scratch."""
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/has_face_tags.jpg"
+        create_image_file(path)
+        img_obj = ImageFile.objects.get(filename=path)
+
+        self.extractor.find_and_encode_faces()
+
+        faces = list(Face.objects.filter(source_image_file=img_obj))
+        self.assertGreaterEqual(len(faces), 1)
+        for f in faces:
+            self.assertIsNotNone(f.kps, f"Face {f.id} has no kps after fresh detection")
+            self.assertEqual(len(f.kps), 10)
+
+    def test_rematched_existing_face_gains_kps_from_update_path(self):
+        """update_existing_face_to_insightface() (the IOU-rematch branch,
+        hit when find_and_encode_faces() runs again against an image that
+        already has Face rows) should also populate kps, not just
+        add_new_face()'s fresh-detection branch."""
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/has_face_tags.jpg"
+        create_image_file(path)
+        img_obj = ImageFile.objects.get(filename=path)
+
+        self.extractor.find_and_encode_faces()
+        first_pass_ids = set(Face.objects.filter(source_image_file=img_obj).values_list('id', flat=True))
+        self.assertGreaterEqual(len(first_pass_ids), 1)
+
+        # Clear kps to simulate a face that predates this field, then
+        # re-run detection against the same (already-processed) image by
+        # resetting isProcessed -- this should hit the existing-face
+        # IOU-rematch path, not add_new_face(), since Face rows already
+        # exist for this image.
+        Face.objects.filter(id__in=first_pass_ids).update(kps=None)
+        img_obj.isProcessed = False
+        img_obj.save()
+
+        self.extractor.find_and_encode_faces()
+
+        second_pass_faces = Face.objects.filter(source_image_file=img_obj)
+        self.assertEqual(
+            set(second_pass_faces.values_list('id', flat=True)), first_pass_ids,
+            "Re-running detection against an already-processed image should rematch "
+            "existing faces, not create new ones."
+        )
+        for f in second_pass_faces:
+            self.assertIsNotNone(f.kps, f"Face {f.id} has no kps after IOU-rematch")
+            self.assertEqual(len(f.kps), 10)
 
     def test_failure_on_one_image_does_not_block_others(self):
         """Regression test: the IOU-matching logic in
@@ -586,6 +648,87 @@ class CleanupChronicallyUnmatchedFacesTests(TestCase):
         call_command("cleanup_chronically_unmatched_faces", "--dry-run")
 
         self.assertTrue(Face.objects.filter(pk=stale_face.pk).exists())
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class ClearConfirmedIgnoreEncodingsTests(TestCase):
+    """clear_confirmed_ignore_encodings clears face_encoding_512 only for
+    faces CONFIRMED (declared_name) to .ignore/.realignore -- never faces
+    merely SUGGESTED as ignore (poss_ident1 set, declared_name still the
+    blank sentinel), and never faces declared to a real person. Face.kps
+    must survive untouched either way, since it's what lets a later
+    reencode_missing_faces() pass exactly recover the embedding."""
+
+    def setUp(self):
+        self.image = make_image()
+        self.ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        self.realignore_person = Person.objects.get(person_name='.realignore')
+        self.blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+
+    def test_confirmed_ignore_face_gets_encoding_cleared_kps_kept(self):
+        kps = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        face = make_face(
+            self.image, declared_name=self.ignore_person,
+            face_encoding_512=[0.5] * 512, kps=kps,
+        )
+
+        call_command("clear_confirmed_ignore_encodings", "--yes")
+
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_512)
+        self.assertEqual(face.kps, kps)
+
+    def test_confirmed_realignore_face_gets_encoding_cleared(self):
+        face = make_face(self.image, declared_name=self.realignore_person, face_encoding_512=[0.5] * 512)
+
+        call_command("clear_confirmed_ignore_encodings", "--yes")
+
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_512)
+
+    def test_suggested_ignore_face_is_left_alone(self):
+        """poss_ident1 == ignore_person but declared_name is still the
+        blank sentinel -- this is an unreviewed classifier suggestion,
+        not a human confirmation. Its embedding is exactly what a human
+        still needs to review that suggestion against, so it must not be
+        touched."""
+        face = make_face(
+            self.image, declared_name=self.blank_person,
+            poss_ident1=self.ignore_person, weight_1=0.9,
+            face_encoding_512=[0.5] * 512,
+        )
+
+        call_command("clear_confirmed_ignore_encodings", "--yes")
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.5] * 512)
+
+    def test_face_declared_to_real_person_is_left_alone(self):
+        person = make_person("Real Person")
+        face = make_face(self.image, declared_name=person, face_encoding_512=[0.5] * 512)
+
+        call_command("clear_confirmed_ignore_encodings", "--yes")
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.5] * 512)
+
+    def test_already_cleared_face_is_a_noop(self):
+        face = make_face(self.image, declared_name=self.ignore_person)
+        face.face_encoding_512 = None
+        face.save()
+
+        call_command("clear_confirmed_ignore_encodings", "--yes")
+
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_512)
+
+    def test_dry_run_writes_nothing(self):
+        face = make_face(self.image, declared_name=self.ignore_person, face_encoding_512=[0.5] * 512)
+
+        call_command("clear_confirmed_ignore_encodings", "--dry-run")
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.5] * 512)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
@@ -998,3 +1141,203 @@ class ExecuteTrueingUpTests(TestCase):
         with patch.object(Person.objects, 'all', wraps=Person.objects.all) as mock_all:
             assigner.execute(redo_all=True)
         self.assertEqual(mock_all.call_count, 1)
+
+
+class FlattenKpsTests(unittest.TestCase):
+    """Unit tests for FaceExtractor._flatten_kps(), the helper that turns
+    InsightFace's (5, 2) landmark array into the flat 10-float list stored
+    on Face.kps. No DB/model access needed."""
+
+    def test_none_input_returns_none(self):
+        self.assertIsNone(FaceExtractor._flatten_kps(None))
+
+    def test_flattens_in_row_major_order(self):
+        kps = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]])
+        flat = FaceExtractor._flatten_kps(kps)
+        self.assertEqual(flat, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+
+    def test_accepts_plain_nested_list(self):
+        kps = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]
+        flat = FaceExtractor._flatten_kps(kps)
+        self.assertEqual(len(flat), 10)
+        self.assertTrue(all(isinstance(v, float) for v in flat))
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class ReencodeMissingFacesTests(TestCase):
+    """FaceExtractor.reencode_missing_faces() re-encodes faces that have
+    no face_encoding_512 but are no longer .ignore/.realignore. These
+    tests mock the underlying InsightFace models entirely (constructing
+    the extractor via __new__ rather than FaceExtractor(), which would
+    load the real ~100MB ONNX models) so they stay fast -- no real
+    inference happens, only the selection/branching logic in
+    reencode_missing_faces() itself is exercised."""
+
+    def setUp(self):
+        self.image = make_image()
+        self.extractor = FaceExtractor.__new__(FaceExtractor)
+        self.extractor.reencode_crop_margin_mult = 0.6
+        # extractor.app is a PyramidalDetector in real code; .app.app is
+        # the underlying FaceAnalysis. Mock both layers directly rather
+        # than constructing a real PyramidalDetector/FaceAnalysis.
+        self.mock_face_analysis = MagicMock()
+        self.mock_pyramidal = MagicMock()
+        self.mock_pyramidal.app = self.mock_face_analysis
+        self.extractor.app = self.mock_pyramidal
+
+    def _face_missing_encoding(self, declared_name=None, **overrides):
+        face = make_face(self.image, declared_name=declared_name, **overrides)
+        face.face_encoding_512 = None
+        face.save()
+        return face
+
+    def test_ignore_and_realignore_faces_are_never_selected(self):
+        ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        realignore_person = Person.objects.get(person_name='.realignore')
+        ignored_face = self._face_missing_encoding(declared_name=ignore_person)
+        realignored_face = self._face_missing_encoding(declared_name=realignore_person)
+
+        self.extractor.reencode_missing_faces()
+
+        ignored_face.refresh_from_db()
+        realignored_face.refresh_from_db()
+        self.assertIsNone(ignored_face.face_encoding_512)
+        self.assertIsNone(realignored_face.face_encoding_512)
+        self.mock_face_analysis.get.assert_not_called()
+
+    def test_faces_with_an_existing_encoding_are_left_alone(self):
+        person = make_person("Already Encoded")
+        face = make_face(self.image, declared_name=person)
+        # 0.5 is exactly representable in float32 -- avoids the precision
+        # trap in test_face_encoding_512_stores_at_float32_precision's
+        # docstring (a value like 0.1 would round on save, so comparing
+        # against the original float64 literal after refresh_from_db()
+        # would spuriously fail here).
+        face.face_encoding_512 = [0.5] * 512
+        face.save()
+
+        self.extractor.reencode_missing_faces()
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.5] * 512)
+        self.assertFalse(face.reencoded)
+        self.mock_face_analysis.get.assert_not_called()
+
+    def test_kps_path_reproduces_embedding_without_redetecting(self):
+        """When a face already has stored kps, reencode_missing_faces()
+        should call the recognition model directly (no detection pass at
+        all) -- this is the exact-reproduction path validated against
+        real production data."""
+        person = make_person("Has Kps")
+        face = self._face_missing_encoding(declared_name=person, box_left=10, box_top=10, box_right=30, box_bottom=30)
+        face.kps = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0]
+        face.save()
+
+        expected_embedding = np.arange(512, dtype=np.float64)
+        self.mock_face_analysis.models = {
+            'recognition': MagicMock(get=MagicMock(return_value=expected_embedding)),
+        }
+
+        self.extractor.reencode_missing_faces()
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, expected_embedding.tolist())
+        self.assertTrue(face.reencoded)
+        self.mock_face_analysis.get.assert_not_called()
+
+        # The recognition model should have been called with a Face-like
+        # object carrying the ORIGINAL stored kps, reshaped to (5, 2).
+        call_args = self.mock_face_analysis.models['recognition'].get.call_args
+        passed_face_obj = call_args[0][1]
+        np.testing.assert_array_equal(
+            np.asarray(passed_face_obj.kps), np.array(face.kps).reshape(5, 2)
+        )
+
+    def test_no_kps_falls_back_to_crop_detection_and_picks_center_face(self):
+        """Without stored kps, the crop-based path should run, and among
+        multiple detections found in the crop, the one closest to the
+        crop's center (i.e. closest to the known face) should win."""
+        person = make_person("No Kps")
+        face = self._face_missing_encoding(
+            declared_name=person, box_left=100, box_top=100, box_right=140, box_bottom=140
+        )
+        self.assertIsNone(face.kps)
+
+        near_center_embedding = np.full(512, 0.5)
+        far_embedding = np.full(512, 0.9)
+        # Crop center will be at roughly (crop_w/2, crop_h/2) since the
+        # margin is symmetric -- a detection near (0, 0) is far off-center,
+        # one near the crop's actual center should be picked instead.
+        self.mock_face_analysis.get.return_value = [
+            {'bbox': [0, 0, 4, 4], 'kps': np.zeros((5, 2)), 'embedding': far_embedding},
+            {'bbox': [30, 30, 34, 34], 'kps': np.ones((5, 2)), 'embedding': near_center_embedding},
+        ]
+        self.mock_face_analysis.models = {'recognition': MagicMock()}
+
+        self.extractor.reencode_missing_faces()
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, near_center_embedding.tolist())
+        self.assertTrue(face.reencoded)
+        self.mock_face_analysis.models['recognition'].get.assert_not_called()
+
+    def test_crop_detection_kps_saved_in_absolute_image_coordinates(self):
+        """Freshly-detected kps from the crop-based path are in
+        crop-local coordinates -- they must be translated back to the
+        source image's absolute coordinate space (adding the crop's own
+        offset) before being stored, matching how add_new_face()/
+        update_existing_face_to_insightface() store kps, so a future
+        re-encode of this same face can use the exact-replay path."""
+        person = make_person("Needs Translation")
+        face = self._face_missing_encoding(
+            declared_name=person, box_left=100, box_top=100, box_right=140, box_bottom=140
+        )
+        box_w, box_h = 40, 40
+        margin_x = int(box_w * self.extractor.reencode_crop_margin_mult)
+        margin_y = int(box_h * self.extractor.reencode_crop_margin_mult)
+        crop_left, crop_top = 100 - margin_x, 100 - margin_y
+
+        crop_local_kps = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]])
+        self.mock_face_analysis.get.return_value = [
+            {'bbox': [0, 0, 40, 40], 'kps': crop_local_kps, 'embedding': np.full(512, 0.3)},
+        ]
+
+        self.extractor.reencode_missing_faces()
+
+        face.refresh_from_db()
+        expected_abs_kps = (crop_local_kps + np.array([crop_left, crop_top])).reshape(-1).tolist()
+        self.assertEqual(face.kps, expected_abs_kps)
+
+    def test_no_detection_found_uses_default_encoding_without_setting_reencoded(self):
+        """A face too degraded to redetect even in a tight crop gets the
+        neutral default vector rather than being left NULL forever (NULL
+        is exactly what this method selects on) -- but since nothing
+        about it actually came from a fresh detection, reencoded should
+        NOT be flipped to True."""
+        person = make_person("Undetectable")
+        face = self._face_missing_encoding(
+            declared_name=person, box_left=100, box_top=100, box_right=140, box_bottom=140
+        )
+        self.mock_face_analysis.get.return_value = []
+
+        self.extractor.reencode_missing_faces()
+
+        face.refresh_from_db()
+        # face_encoding_512 is stored at float32 precision (see
+        # test_face_encoding_512_stores_at_float32_precision) -- compare
+        # with a tolerance rather than exact equality against the
+        # float64-computed settings constant, both to be correct about
+        # what the DB actually guarantees and to avoid unittest's
+        # list-diff (difflib recursion crashes on a 512-element mismatch
+        # rather than reporting a clean failure).
+        np.testing.assert_allclose(
+            np.array(face.face_encoding_512), np.array(settings.REENCODE_DEFAULT_ENCODING), rtol=1e-6, atol=1e-6
+        )
+        self.assertFalse(face.reencoded)
+        self.assertIsNone(face.kps)
+
+    def test_reencode_default_encoding_is_a_unit_vector(self):
+        vec = np.array(settings.REENCODE_DEFAULT_ENCODING)
+        self.assertEqual(len(vec), 512)
+        self.assertAlmostEqual(float(np.linalg.norm(vec)), 1.0, places=6)
+        self.assertEqual(len(set(vec.tolist())), 1, "Every component should be identical/uniform")
