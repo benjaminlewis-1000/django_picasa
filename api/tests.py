@@ -682,6 +682,28 @@ class IgnoreReviewFlaggedPartitionTests(ApiTestCase):
         id_list = json.loads(resp.content)["id_list"]
         self.assertEqual(id_list, [self.flagged_face.id])
 
+    def test_flagged_and_unflagged_partition_the_full_poss_ident1_set(self):
+        # Explicit invariant, not just implied by the two tests above:
+        # every face with poss_ident1=.ignore appears in exactly one of
+        # the two queries, and their union is the whole set with no
+        # overlap - queried straight against the DB (not the stored
+        # Person.num_possibilities counter, which is separate
+        # bookkeeping - see IgnoreReviewFlaggedCountTests below) so this
+        # would catch the query itself regressing back to overlapping or
+        # dropping rows, independent of that counter ever being right.
+        main_ids = set(json.loads(
+            self.client.get(f"/api/paginate_obj_ids/{self.ignore.id}/face_poss").content
+        )["id_list"])
+        flagged_ids = set(json.loads(
+            self.client.get(f"/api/paginate_obj_ids/{self.ignore.id}/face_poss?flagged=true").content
+        )["id_list"])
+        all_poss_ident1_ids = set(
+            Face.objects.filter(poss_ident1=self.ignore).values_list("id", flat=True)
+        )
+
+        self.assertEqual(main_ids & flagged_ids, set(), "a face should never appear in both")
+        self.assertEqual(main_ids | flagged_ids, all_poss_ident1_ids, "union should cover every poss_ident1 face")
+
 
 @override_settings(MEDIA_ROOT="/tmp/api_test_media")
 class IgnoreReviewFlaggedCountTests(FaceFixtureMixin, TransactionTestCase):
