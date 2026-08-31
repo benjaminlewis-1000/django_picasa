@@ -468,14 +468,20 @@ class Face(models.Model):
             #     assert source_idcs[0] == 1
             #     assert dest_idcs[0] == 0
 
+        self.add_to_rejected_fields(person_unassociate_id)
+        self.save()
+
+    def add_to_rejected_fields(self, person_id):
+        """Record that `person_id` has been explicitly ruled out for this
+        face -- classify_unassigned() checks this list so it doesn't just
+        re-propose a candidate a human already declined. Does NOT save;
+        callers that also make other changes in the same operation (e.g.
+        close_assigned's "Remove from person" case, which immediately
+        calls associate_person()) can set this first and let that other
+        call's own save() persist both changes together."""
         reject_list = self.rejected_fields
         if reject_list is None:
             reject_list = []
-
-        reject_list.append(person_unassociate_id)
-        # Remove duplicates
-        reject_list = list(set(reject_list))
-
-        self.rejected_fields = reject_list
-        self.save()
+        reject_list.append(person_id)
+        self.rejected_fields = list(set(reject_list))
 

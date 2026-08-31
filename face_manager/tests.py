@@ -292,6 +292,23 @@ class FaceModelTests(TestCase):
         self.assertIsNone(face.poss_ident1)
         self.assertIn(person.id, face.rejected_fields)
 
+    def test_add_to_rejected_fields_appends_and_dedupes_without_saving(self):
+        face = make_face(self.image)
+        self.assertIsNone(face.rejected_fields)
+
+        face.add_to_rejected_fields(101)
+        self.assertEqual(face.rejected_fields, [101])
+        # Not saved yet - a caller doing other unsaved changes in the same
+        # operation (e.g. close_assigned's "Remove from person" case) can
+        # rely on a single later save() persisting both.
+        face.refresh_from_db()
+        self.assertIsNone(face.rejected_fields)
+
+        face.add_to_rejected_fields(101)
+        face.add_to_rejected_fields(202)
+        face.add_to_rejected_fields(101)  # duplicate
+        self.assertEqual(sorted(face.rejected_fields), [101, 202])
+
     def test_face_encoding_512_stores_at_float32_precision(self):
         """face_encoding_512 is now backed by `real` (single precision),
         not `double precision` -- insightface's embeddings are natively
@@ -631,6 +648,87 @@ class CleanupChronicallyUnmatchedFacesTests(TestCase):
         call_command("cleanup_chronically_unmatched_faces", "--dry-run")
 
         self.assertTrue(Face.objects.filter(pk=stale_face.pk).exists())
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class ClearConfirmedIgnoreEncodingsTests(TestCase):
+    """clear_confirmed_ignore_encodings clears face_encoding_512 only for
+    faces CONFIRMED (declared_name) to .ignore/.realignore -- never faces
+    merely SUGGESTED as ignore (poss_ident1 set, declared_name still the
+    blank sentinel), and never faces declared to a real person. Face.kps
+    must survive untouched either way, since it's what lets a later
+    reencode_missing_faces() pass exactly recover the embedding."""
+
+    def setUp(self):
+        self.image = make_image()
+        self.ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        self.realignore_person = Person.objects.get(person_name='.realignore')
+        self.blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+
+    def test_confirmed_ignore_face_gets_encoding_cleared_kps_kept(self):
+        kps = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        face = make_face(
+            self.image, declared_name=self.ignore_person,
+            face_encoding_512=[0.5] * 512, kps=kps,
+        )
+
+        call_command("clear_confirmed_ignore_encodings", "--yes")
+
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_512)
+        self.assertEqual(face.kps, kps)
+
+    def test_confirmed_realignore_face_gets_encoding_cleared(self):
+        face = make_face(self.image, declared_name=self.realignore_person, face_encoding_512=[0.5] * 512)
+
+        call_command("clear_confirmed_ignore_encodings", "--yes")
+
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_512)
+
+    def test_suggested_ignore_face_is_left_alone(self):
+        """poss_ident1 == ignore_person but declared_name is still the
+        blank sentinel -- this is an unreviewed classifier suggestion,
+        not a human confirmation. Its embedding is exactly what a human
+        still needs to review that suggestion against, so it must not be
+        touched."""
+        face = make_face(
+            self.image, declared_name=self.blank_person,
+            poss_ident1=self.ignore_person, weight_1=0.9,
+            face_encoding_512=[0.5] * 512,
+        )
+
+        call_command("clear_confirmed_ignore_encodings", "--yes")
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.5] * 512)
+
+    def test_face_declared_to_real_person_is_left_alone(self):
+        person = make_person("Real Person")
+        face = make_face(self.image, declared_name=person, face_encoding_512=[0.5] * 512)
+
+        call_command("clear_confirmed_ignore_encodings", "--yes")
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.5] * 512)
+
+    def test_already_cleared_face_is_a_noop(self):
+        face = make_face(self.image, declared_name=self.ignore_person)
+        face.face_encoding_512 = None
+        face.save()
+
+        call_command("clear_confirmed_ignore_encodings", "--yes")
+
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_512)
+
+    def test_dry_run_writes_nothing(self):
+        face = make_face(self.image, declared_name=self.ignore_person, face_encoding_512=[0.5] * 512)
+
+        call_command("clear_confirmed_ignore_encodings", "--dry-run")
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.5] * 512)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
