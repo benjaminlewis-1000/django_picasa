@@ -1023,9 +1023,24 @@ class KeyedImageView(APIView):
         except:
             return err_404(f'Bad id for object of type {image_type}')
 
+        # Frontend's full-size modal wants the photo's capture date
+        # alongside the image itself - reuses this view's own id/type
+        # resolution and access-key/auth check above rather than a
+        # separate endpoint, and returns before the (comparatively
+        # expensive) decode/resize/redraw below since nothing past this
+        # point is needed for a date lookup.
+        if params.get('date', '').lower() == 'true':
+            if image_type in ('face_array', 'face_source'):
+                date_taken = face.source_image_file.dateTaken
+            elif image_type in ('slideshow', 'full_big', 'full_medium', 'full_small'):
+                date_taken = img_obj.dateTaken
+            else:
+                date_taken = None
+            js = {'date_taken': date_taken.isoformat() if date_taken else None}
+            return HttpResponse(json.dumps(js), content_type='application/json')
 
         # print("Type of image is ", type(image), image_type, dir(image))
-        # if type(image) == 
+        # if type(image) ==
         image = common.open_img_oriented(image, as_numpy = False)
 
         # Resize image. Allow for upsampling now. 

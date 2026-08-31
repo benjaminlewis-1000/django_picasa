@@ -591,6 +591,32 @@ class KeyedImageViewTests(ApiTestCase):
         )
         self.assertFalse(found_red)
 
+    def test_face_source_date_param_returns_json_not_image_bytes(self):
+        # Frontend's full-size modal fetches this alongside the image
+        # itself (see gallery.jsx) to show the photo's capture date -
+        # reuses face_source's own id/type resolution rather than a
+        # separate endpoint, and returns before any decode/resize work.
+        ImageFile.objects.filter(pk=self.image.pk).update(dateTaken="2012-12-20T08:30:00Z")
+        resp = self.client.get(
+            f"/api/keyed_image/face_source/?id={self.face.id}&date=true"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp["Content-Type"], "application/json")
+        data = json.loads(resp.content)
+        self.assertTrue(data["date_taken"].startswith("2012-12-20"))
+
+    def test_slideshow_date_param_returns_json_not_image_bytes(self):
+        # Folders tab's modal uses slideshow (keyed by ImageFile id, not
+        # Face id) - same date param, different id resolution branch.
+        ImageFile.objects.filter(pk=self.image.pk).update(dateTaken="2012-12-20T08:30:00Z")
+        resp = self.client.get(
+            f"/api/keyed_image/slideshow/?id={self.image.id}&date=true"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp["Content-Type"], "application/json")
+        data = json.loads(resp.content)
+        self.assertTrue(data["date_taken"].startswith("2012-12-20"))
+
 
 class DirectoryPaginateObjIdsTests(ApiTestCase):
     # The Folders tab (frontend) walks this id_list directly for both tile
