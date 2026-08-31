@@ -375,7 +375,19 @@ class PersonListView(APIView):
                 else:
                     p_dict['num_possibilities'] = p.num_possibilities # face_poss1.count() + p.face_poss2.count()
                     p_dict['num_unverified_faces'] = p.num_unverified_faces # face_declared.filter(validated=False).count()
-                    
+
+                # Count backing the frontend's ".ignore" sidebar subordinate
+                # row ("Flagged for review") - see PersonParamView's
+                # `flagged` param above for what this actually counts.
+                # Only meaningful for .ignore; every other person gets 0
+                # rather than an extra query.
+                if p.person_name == settings.SOFT_IGNORE_NAME:
+                    p_dict['num_review_flagged'] = Face.objects.filter(
+                        poss_ident1=p, mobile_review_hidden=True
+                    ).count()
+                else:
+                    p_dict['num_review_flagged'] = 0
+
                 result_list.append(p_dict)
                 p_queue.task_done()
                 # return p_dict
@@ -449,6 +461,15 @@ class PersonParamView(APIView):
         else:
             do_only_unverified = False
 
+        # Frontend's ".ignore" sidebar subordinate row ("Flagged for
+        # review") - faces still proposed as .ignore (poss_ident1) that
+        # were reviewed once already via the mobile app's ignore-review
+        # flow and marked mobile_review_hidden=True instead of being
+        # confirmed as .ignore outright (see api/mobile_views.py's
+        # BulkConfirmIgnore) - i.e. "looked at, might actually be
+        # someone." Only meaningful on the face_poss branch below.
+        do_flagged_only = params.get('flagged', '').lower() == 'true'
+
         id_key = kwargs['id']
         field = kwargs['field']
 
@@ -471,7 +492,11 @@ class PersonParamView(APIView):
                     faces = Face.objects.filter(default_query).values_list('id', flat=True)
             else:
 
-                faces1 = list(Face.objects.filter(poss_ident1=person_obj).values_list('id', 'weight_1'))
+                poss_query = Q(poss_ident1=person_obj)
+                if do_flagged_only:
+                    poss_query &= Q(mobile_review_hidden=True)
+
+                faces1 = list(Face.objects.filter(poss_query).values_list('id', 'weight_1'))
                 # faces2 = list(Face.objects.filter(poss_ident2=person_obj).values_list('id', 'weight_2'))
                 # faces3 = list(Face.objects.filter(poss_ident3=person_obj).values_list('id', 'weight_3'))
                 # faces4 = list(Face.objects.filter(poss_ident4=person_obj).values_list('id', 'weight_4'))
