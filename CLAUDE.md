@@ -541,30 +541,67 @@ ideas, so a future session doesn't have to redo this from scratch:
     confirmed *after* the backfill are also getting cleared by the new scheduled task as
     expected (not just the initial one-time backfill population). Requested explicitly by the
     user as a follow-up check, not done yet.
-  - **TODO: weekly low-downtime `VACUUM FULL` via dump/restore/promote, plus backup-restore
-    testing — designed, not yet built.** `VACUUM FULL` in place would lock `face_manager_face`
-    (the most actively-written table) for its full runtime, blocking all live traffic and
-    scheduled face tasks for that whole window — unacceptable nightly, but reasonable as a rare
-    weekly maintenance op. Planned design: `pg_dump | pg_restore` (piped directly, no
-    intermediate dump file — a freshly-restored table has no bloat, so no separate `VACUUM FULL`
-    is even needed on the copy) into a scratch DB → verify (row counts, migration state, a few
-    real-row spot-checks) → on any failure, abort loudly, leave production untouched → on
-    success, stop `picasa_api`/celery, rename the live DB aside (dated, kept for a few days
-    rather than dropped immediately, with its own pruning), rename the scratch DB in, restart,
-    health-check the restart. Scheduled via host cron (not Celery beat, since it needs to
-    touch containers/services), targeting Monday 2am Eastern — not yet checked against what else
-    runs around that time. User wants the full swap automated end-to-end once tested (not just
-    verify-and-wait-for-manual-promotion), accepting the downtime-during-swap risk explicitly.
-    **Separately**, the user wants backup validity testing folded into the *existing* daily
-    backup/`prune_backups.py` retention flow (a different "promote," referring to
-    `prune_backups.py`'s own logic for keeping a daily backup file as that week's representative
-    once it ages out of the 7-day daily window) — reusing the same restore+verify machinery
-    against the actual stored backup file (not a fresh dump) once per week, at that promotion
-    point specifically (no need to re-verify the same file again later when it ages into the
-    monthly tier — it's the same bytes, already checked). On failure: write a persistent marker
-    that the next backup run logs loudly, and have `prune_backups.py` refuse to delete anything
-    while that marker exists. Neither piece built yet — explicitly sequenced by the user to come
-    after landing the encoding-clear backfill above.
+  - **DONE (2026-08-31): manual `VACUUM FULL` + weekly low-downtime automation + backup-restore
+    testing, all built, tested, and deployed.**
+    - **One-off manual `VACUUM FULL face_manager_face`**, run right after the confirmed-ignore
+      backfill above: 2324MB → 1312MB (~1GB reclaimed — more than the ~442MB estimate, since it
+      also cleaned up other accumulated bloat). Took under a minute; app verified healthy
+      immediately after.
+    - **`dockerize/weekly_vacuum_swap.py`**: the ongoing, low-downtime replacement for running
+      `VACUUM FULL` in place (which would exclusive-lock `face_manager_face`, the most
+      actively-written table, for its whole runtime — fine as a rare manual op, not nightly).
+      Dumps+restores the live DB into a scratch DB (piped `pg_dump | pg_restore`, no intermediate
+      file — a freshly-restored table has no bloat, so no separate `VACUUM FULL` is needed on the
+      copy), verifies row counts on a handful of real tables across apps, then (`--promote` only)
+      stops `picasa_api`, renames the live DB aside (`picasa_prevacuum_YYYY_MM_DD`, kept for 2
+      generations rather than dropped immediately) and the scratch DB into its place, restarts,
+      and health-checks the restart — aborting loudly before touching anything live if
+      verification fails at any point. `--rehearse` mode (dump+restore+verify only, app stays
+      live) is the safe default for testing. Rehearsed and promoted for real against production:
+      exact row-count match both times. One real bug caught and fixed during the first live
+      promote attempt: an unquoted hyphenated Postgres identifier
+      (`picasa_prevacuum_2026-08-31`) is a syntax error — hyphens aren't valid in unquoted
+      identifiers. Fixed by using underscores (matching the existing `picasa_pre_reset_2026_08_26`
+      naming precedent) and added a rollback path (rename the live DB back) if the second of the
+      two renames ever fails after the first succeeds. The failed first attempt left `picasa`
+      completely untouched (the failure was in the very first rename call) — no data was ever at
+      risk.
+    - **`prune_backups.py`** now also restore-tests the actual *stored backup file* once per
+      week — specifically the day a daily backup ages out of the 7-day daily-retention window
+      and becomes that ISO week's kept representative (its existing `classify()` promotion
+      logic), not re-checked again later when the same file ages into the monthly tier (same
+      bytes, already validated). A failed restore test writes a persistent
+      `BACKUP_TEST_FAILED` marker in the backup directory: every future run logs it loudly and
+      refuses to prune anything until a human investigates and removes it by hand. Covered by
+      `dockerize/test_prune_backups.py` (13 tests, plain `unittest`, no Django — matches the
+      script's own no-Django-dependency design so it can run anywhere, including inside the
+      minimal `db_picasa` image). Verified live against a real stored backup file, not just the
+      unit tests.
+    - **All cron scheduling moved into `db_picasa` itself**, per the user's explicit request,
+      rather than split between host cron and container cron. Required two real infra additions:
+      `tzdata` + `TZ=America/New_York` (Dockerfile + compose `environment:` — without `tzdata`
+      installed, Alpine silently ignores `TZ` and stays on UTC), and `docker-cli` + the host's
+      Docker socket bind-mounted in, so `weekly_vacuum_swap.py` can `stop`/`start`/`exec` the
+      separate `picasa_api` container (standard Docker-outside-of-Docker pattern — accepted
+      tradeoff, flagged explicitly: anything with exec access to `db_picasa` now also has full
+      host Docker control, not just this one database, confirmed via `docker exec db_picasa
+      docker ps` seeing every container on the host, not just picasa-related ones). Scheduling
+      now lives in a managed `dockerize/crontab_root` (bind-mounted, replacing Alpine's stock
+      default crontab — preserves its existing hourly/daily/monthly/Saturday-weekly periodic
+      entries). **Real, user-caught scheduling bug avoided before it shipped**: the user asked
+      "wouldn't those two cron jobs fire at the same time on Monday?" — correct, since setting
+      `TZ=America/New_York` shifts the *existing* daily backup+prune from firing at 2am UTC
+      (≈10pm Eastern the prior day) to genuinely 2am Eastern, which would have collided head-on
+      with a naively-scheduled "Monday 2am Eastern" vacuum-swap job. Fixed by scheduling the
+      vacuum swap for **3am Monday** instead (an hour of buffer past the daily job, and a
+      different weekday than Alpine's own stock Saturday-3am weekly slot). Image rebuilt,
+      container recreated (`docker compose up -d --force-recreate db_django` — blocked by the
+      harness's own safety classifier for both the coordinating and follow-up attempts, since
+      it restarts a production service; the user ran it directly via `!`); verified afterward
+      that `TZ`, the `docker` CLI, the new crontab, and all existing databases (`picasa`,
+      `picasa_prevacuum_2026_08_31`, `picasa_pre_reset_2026_08_26`) survived intact — a container
+      recreate doesn't touch the bind-mounted data volume, only the container's own filesystem
+      layer and config.
 - **Removed `Face.face_encoding` (legacy 128-d dlib embedding), 2026-08-26.** Superseded by
   `face_encoding_512` (insightface) for years — the live pipeline (`face_extract_encode.py`)
   already hadn't written a real value to it, explicitly setting it to `None`. Freed ~371MB in
