@@ -278,8 +278,13 @@ AUTHELIA_JWKS_URL = os.environ.get(
 AUTHELIA_MOBILE_CLIENT_ID = os.environ.get(
     'AUTHELIA_MOBILE_CLIENT_ID', 'photoverify_mobile'
 )
+# Authelia signing keys rotate very rarely (only on an explicit config
+# change), so cache them for a day. A shorter lifespan just means more
+# refetches -> more chances for a transient fetch failure to reject a
+# valid token. api/authentication.py also retries the fetch and falls
+# back to the last-known-good key, so key rotation is still picked up.
 AUTHELIA_JWKS_CACHE_SECONDS = int(
-    os.environ.get('AUTHELIA_JWKS_CACHE_SECONDS', '3600')
+    os.environ.get('AUTHELIA_JWKS_CACHE_SECONDS', '86400')
 )
 
 # Where to send users after a successful login
