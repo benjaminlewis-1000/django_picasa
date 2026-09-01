@@ -132,11 +132,12 @@ services:
       # not just a plain restart or a config-less `up -d`.
       - ${DJANGO_FILES_ROOT}/dockerize/postgres_bak.sh:/etc/periodic/daily/postgres_bak_sh
       - ${DJANGO_FILES_ROOT}/dockerize/prune_backups.py:/etc/periodic/daily/prune_backups.py
-      # Weekly vacuum-swap script + the full crontab (stock periodic
-      # entries + the Monday 3am line that runs it) -- see crontab_root's
-      # own comments for why 3am, not 2am.
+      # Weekly vacuum-swap script (the crontab that runs it is COPY'd into
+      # the image at build time, not bind-mounted here -- see
+      # Dockerfile_postgres's comment on crontab_root for why: BusyBox
+      # crond silently ignores a crontab not owned by root, and a bind
+      # mount would keep it owned by whatever this file's host owner is).
       - ${DJANGO_FILES_ROOT}/dockerize/weekly_vacuum_swap.py:/etc/periodic/weekly_vacuum_swap.py
-      - ${DJANGO_FILES_ROOT}/dockerize/crontab_root:/etc/crontabs/root
       - /mnt/fast_storage/appdata/django_picasa/backups:/backup
       # Lets weekly_vacuum_swap.py stop/start/exec picasa_api directly --
       # this is the standard Docker-outside-of-Docker pattern. Security
