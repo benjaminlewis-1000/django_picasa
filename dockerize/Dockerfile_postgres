@@ -9,10 +9,27 @@ COPY postgres_cron.ini /etc/supervisor.d/postgres_cron.ini
 # actually take effect -- without it, TZ is silently ignored and
 # everything (including cron) stays on UTC.
 
-# postgres_bak.sh, prune_backups.py, weekly_vacuum_swap.py, and the
-# crontab itself are all bind-mounted (see docker-compose.yaml), not
-# baked in here -- their executable bits come from the host files
-# themselves (preserved through the bind mount), so make sure they stay
-# chmod +x on the host.
+# crontab_root is COPY'd (baked into the image), deliberately NOT
+# bind-mounted like the scripts below. BusyBox crond silently ignores a
+# crontab whose file owner doesn't match the target user (root, for
+# /etc/crontabs/root) -- found 2026-09-01 the hard way: a bind mount
+# preserves the HOST file's ownership (the host user, not root), so
+# crond loaded fine but never actually ran a single scheduled job, with
+# zero errors anywhere (this image has no syslog daemon for crond to
+# report to even if it wanted to). COPY runs as root during the image
+# build, so the file lands owned by root with no extra step -- and
+# critically, chown'ing a bind-mounted file (which is what fixing this
+# in place required) changes the HOST file's ownership too, since it's
+# the same inode -- not something to solve by bind-mounting harder.
+# Editing the crontab now needs a rebuild + `--force-recreate`, same
+# tradeoff already accepted for postgres_cron.ini above.
+COPY crontab_root /etc/crontabs/root
+
+# postgres_bak.sh, prune_backups.py, and weekly_vacuum_swap.py are still
+# bind-mounted (see docker-compose.yaml) -- their executable bits come
+# from the host files themselves (preserved through the bind mount), so
+# make sure they stay chmod +x on the host. Unlike the crontab, crond
+# doesn't care about THEIR ownership -- it just execs whatever the
+# crontab tells it to.
 
 ENTRYPOINT ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
