@@ -586,9 +586,11 @@ ideas, so a future session doesn't have to redo this from scratch:
       tradeoff, flagged explicitly: anything with exec access to `db_picasa` now also has full
       host Docker control, not just this one database, confirmed via `docker exec db_picasa
       docker ps` seeing every container on the host, not just picasa-related ones). Scheduling
-      now lives in a managed `dockerize/crontab_root` (bind-mounted, replacing Alpine's stock
-      default crontab — preserves its existing hourly/daily/monthly/Saturday-weekly periodic
-      entries). **Real, user-caught scheduling bug avoided before it shipped**: the user asked
+      now lives in a managed `dockerize/crontab_root` (**`COPY`'d into the image at build time,
+      not bind-mounted** — see the 2026-09-01 incident below for why that changed — replacing
+      Alpine's stock default crontab, preserving its existing
+      hourly/daily/monthly/Saturday-weekly periodic entries). **Real, user-caught scheduling bug
+      avoided before it shipped**: the user asked
       "wouldn't those two cron jobs fire at the same time on Monday?" — correct, since setting
       `TZ=America/New_York` shifts the *existing* daily backup+prune from firing at 2am UTC
       (≈10pm Eastern the prior day) to genuinely 2am Eastern, which would have collided head-on
@@ -602,6 +604,42 @@ ideas, so a future session doesn't have to redo this from scratch:
       `picasa_prevacuum_2026_08_31`, `picasa_pre_reset_2026_08_26`) survived intact — a container
       recreate doesn't touch the bind-mounted data volume, only the container's own filesystem
       layer and config.
+    - **Real incident, found and fixed 2026-09-01: the daily backup silently never ran at all
+      for a full day, with zero errors anywhere.** Found because the user noticed the backup
+      file "dated" 2026-08-31 hadn't shrunk despite that day's cleanup work, then noticed there
+      was no 2026-09-01 file either even though it was already evening on 2026-09-01. Root
+      cause: BusyBox `crond` silently ignores a crontab file whose owner doesn't match the
+      target user (`root`, for `/etc/crontabs/root`) — the bind-mounted `crontab_root` preserved
+      its *host* file's ownership (the host user, not root) once inside the container, so `crond`
+      started fine and stayed running, but never actually executed a single scheduled job, and
+      this image has no syslog daemon for it to report that to even if it wanted to. Confirmed
+      by manually running `run-parts /etc/periodic/daily`, which worked perfectly and produced a
+      real backup — proving the scripts themselves were never the problem, only cron's silent
+      refusal to fire them. That manual run also gave the first real post-cleanup number: **975
+      MB compressed, down from ~1568 MB** (a 2.39 GiB raw dump compressing to 975 MB — smaller
+      than the live DB's 1579 MB on-disk total because indexes aren't dumped as raw bytes and
+      zstd compresses the surviving float-array data better than Postgres's own TOAST pglz
+      compression). **Fixed** by switching `crontab_root` from a bind mount to a `COPY` baked
+      into the image at build time (`Dockerfile_postgres`) — a build-time `COPY` runs as root, so
+      the file lands correctly owned with no extra step, and critically, this stops a `chown`
+      fix from ever again also silently rewriting the *host* file's ownership (bind mounts share
+      the same inode both ways — the first attempt at fixing this in place, `chown root:root` on
+      the live container's `/etc/crontabs/root`, flipped the host copy of `dockerize/crontab_root`
+      to root-owned too, needing a second `chown` from inside the container, back to the host
+      uid, to undo). Image rebuilt, container recreated again; verified `/etc/crontabs/root` is
+      now `root:root` inside the fresh container while the host file stayed normally-owned.
+      **TODO / ongoing: keep an eye on this.** The user explicitly wants database backups (and by
+      extension the weekly vacuum-swap job, which depends on the same crontab) to stay watched
+      for "useful and uncorrupted" — the backup-restore-testing work earlier in this file only
+      validates individual backup *files* once a week at their promotion point, it says nothing
+      about whether a backup ran *at all* on any given night, which is exactly the class of
+      failure this incident was. Confirmed the crontab fix is live by watching for the next
+      scheduled 2am Eastern run (2026-09-02) to actually produce `picasa_db_2026-09-02.tar.zst`
+      before considering this closed — check whether that file exists and land the result here
+      if this session didn't get to see it confirmed live before ending. No automated "did last
+      night's backup actually happen" freshness check exists yet (e.g. alerting if the newest
+      backup file's mtime is more than ~26h old) — worth considering given this exact failure
+      mode produced zero errors anywhere on its own.
 - **Removed `Face.face_encoding` (legacy 128-d dlib embedding), 2026-08-26.** Superseded by
   `face_encoding_512` (insightface) for years — the live pipeline (`face_extract_encode.py`)
   already hadn't written a real value to it, explicitly setting it to `None`. Freed ~371MB in
