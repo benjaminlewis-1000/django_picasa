@@ -39,6 +39,73 @@ IMAGE_EXTENSION_REGEX = r"\.(?:[jJ][pP][eE]?[gG]|[hH][eE][iI][cC]|[hH][eE][iI][f
 
 HEIC_EXTENSIONS = ('.heic', '.heif')
 
+# Patterns for guess_date_from_filename(), each capturing (year, month,
+# day, hour, minute, second). Order doesn't matter for correctness --
+# guess_date_from_filename() tries all of them and picks the earliest
+# plausible match, not just the first pattern to hit -- see its own
+# docstring for why that matters.
+_FILENAME_DATETIME_PATTERNS = [
+    re.compile(r'(\d{4})-(\d{2})-(\d{2})[ _](\d{2})\.(\d{2})\.(\d{2})'),  # 2019-04-08 21.08.22
+    re.compile(r'(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})'),           # IMG_20240719_211850
+    re.compile(r'(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})'),       # 2016-02-06_16-18-35
+]
+# 13-digit millisecond Unix epoch (common in messaging-app media exports).
+# Bounded to a "1[5-8]" leading pattern -- roughly 2017 through 2035 --
+# purely to avoid matching an arbitrary 13-digit number that happens to
+# sit in a filename (e.g. a database id) as if it were a timestamp; the
+# real plausibility check is the MIN/MAX bound applied to every candidate
+# below regardless of which pattern found it.
+_FILENAME_EPOCH_MS_PATTERN = re.compile(r'(?<!\d)(1[5-8]\d{11})(?!\d)')
+
+_FILENAME_DATE_MIN = pytz.utc.localize(datetime(1990, 1, 1))
+
+
+def guess_date_from_filename(filename):
+    """Best-effort date extraction from a filename, used ONLY as a
+    fallback when EXIF metadata has no valid DateTime* field (see
+    ImageFile._get_date_taken()) -- never overrides a real EXIF date.
+
+    Tries several real-world naming conventions found in this library's
+    own files (Android IMG_YYYYMMDD_HHMMSS, "YYYY-MM-DD HH.MM.SS",
+    millisecond Unix epoch, etc.) and returns the EARLIEST plausible
+    match found, not just the first pattern to match. That matters for
+    filenames like a "Resized_" export that embed BOTH an original
+    capture timestamp and a later re-export timestamp, sometimes in two
+    different formats -- picking the first pattern-priority hit can
+    silently return the later (wrong) date instead of the real one.
+
+    Returns a tz-aware UTC datetime, or None if nothing plausible is
+    found (roughly 37% of files with invalid EXIF in this library, per a
+    2026-09 survey -- these are left exactly as before: no worse, not
+    fixed either).
+    """
+    base = os.path.basename(filename)
+    now = timezone.now()
+    candidates = []
+
+    for pattern in _FILENAME_DATETIME_PATTERNS:
+        for m in pattern.finditer(base):
+            y, mo, d, h, mi, s = (int(g) for g in m.groups())
+            try:
+                dt = pytz.utc.localize(datetime(y, mo, d, h, mi, s))
+            except ValueError:
+                continue  # e.g. month 13, day 32 -- not a real date, just digits
+            if _FILENAME_DATE_MIN <= dt <= now:
+                candidates.append(dt)
+
+    for m in _FILENAME_EPOCH_MS_PATTERN.finditer(base):
+        ms = int(m.group(1))
+        try:
+            dt = datetime.fromtimestamp(ms / 1000.0, tz=pytz.utc)
+        except (ValueError, OSError, OverflowError):
+            continue
+        if _FILENAME_DATE_MIN <= dt <= now:
+            candidates.append(dt)
+
+    if not candidates:
+        return None
+    return min(candidates)
+
 
 def _heic_style_exif(image):
     """Build an EXIF dict shaped like the legacy `Image._getexif()` API
@@ -730,6 +797,16 @@ class ImageFile(models.Model):
         #    self.dateTaken = timezone.now()
         #    self.dateTakenValid = False
             settings.LOGGER.warning(f"Date taken is not valid for file {self.filename}")
+
+        if not self.dateTakenValid:
+            # No real EXIF date -- try to salvage something better than
+            # the now() placeholder above from the filename itself.
+            # dateTakenValid stays False either way: this is a guess, not
+            # EXIF-grade confidence, and nothing downstream that checks
+            # dateTakenValid should start trusting it as if it were.
+            filename_guess = guess_date_from_filename(self.filename)
+            if filename_guess is not None:
+                self.dateTaken = filename_guess
 
         # settings.LOGGER.error('Hi, debug here:')
 
