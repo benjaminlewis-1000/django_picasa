@@ -1,11 +1,13 @@
 import os
 
+import cv2
 import numpy as np
 from django.conf import settings
 from django.test import TestCase
 from PIL import Image
 
 from common.open_img_oriented import open_img_oriented, apply_exif_orientation
+from common.equalize import clahe_equalize_bgr
 
 
 class OpenImgOrientedTests(TestCase):
@@ -145,3 +147,68 @@ class OpenImgOrientedRealOrientationFixturesTests(TestCase):
                     self.assertGreater(img.size[1], img.size[0])
                 else:
                     self.assertGreater(img.size[0], img.size[1])
+
+
+class ClaheEqualizeTests(TestCase):
+    """clahe_equalize_bgr() -- used to brighten/even out dark or
+    unevenly-lit face thumbnails (see api/views.py's face_array branch),
+    found via a real user complaint about dark faces in the frontend."""
+
+    def test_output_has_same_shape_and_dtype_as_input(self):
+        img = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        out = clahe_equalize_bgr(img)
+        self.assertEqual(out.shape, img.shape)
+        self.assertEqual(out.dtype, img.dtype)
+
+    def test_uniformly_dark_image_is_brightened(self):
+        # A flat dark gray square -- no local contrast for CLAHE to work
+        # with, but the L channel's overall level should still come up
+        # noticeably, since CLAHE's histogram-equalization step operates
+        # on absolute intensity, not just local contrast.
+        dark = np.full((100, 100, 3), 30, dtype=np.uint8)
+        out = clahe_equalize_bgr(dark)
+        self.assertGreater(out.mean(), dark.mean())
+
+    def test_half_dark_half_bright_image_evens_out_the_dark_half(self):
+        # A real "unevenly lit face" case: one half of the image much
+        # darker than the other. CLAHE (tile-adaptive) should raise the
+        # dark half's brightness substantially more than a global
+        # technique would, since each tile equalizes against its own
+        # local neighborhood.
+        img = np.zeros((100, 100, 3), dtype=np.uint8)
+        img[:, :50] = 20   # dark half
+        img[:, 50:] = 200  # bright half
+
+        out = clahe_equalize_bgr(img)
+        dark_half_before = img[:, :50].mean()
+        dark_half_after = out[:, :50].mean()
+        self.assertGreater(dark_half_after, dark_half_before)
+
+    def test_pure_black_image_does_not_crash(self):
+        black = np.zeros((50, 50, 3), dtype=np.uint8)
+        out = clahe_equalize_bgr(black)
+        self.assertEqual(out.shape, black.shape)
+
+    def test_preserves_color_better_than_naive_per_channel_equalization(self):
+        # Equalizing L in LAB (what clahe_equalize_bgr does) shouldn't
+        # introduce the color shift that equalizing B/G/R independently
+        # would -- a rough check: a gray (equal BGR) pixel region should
+        # stay close to gray after equalization, not drift toward a
+        # particular hue.
+        gray_dark = np.full((100, 100, 3), 40, dtype=np.uint8)
+        out = clahe_equalize_bgr(gray_dark)
+        b, g, r = out[..., 0].mean(), out[..., 1].mean(), out[..., 2].mean()
+        self.assertLess(max(b, g, r) - min(b, g, r), 5)
+
+    def test_real_dark_face_thumbnail_gets_brighter(self):
+        # Uses a real fixture image rather than only synthetic arrays,
+        # so this fails if the LAB round-trip or CLAHE parameters ever
+        # stop doing anything meaningful on real JPEG-compressed photos.
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/naming/good/1.JPG"
+        img = cv2.imread(path)
+        self.assertIsNotNone(img)
+        # Darken it artificially to simulate a dark face crop, since the
+        # fixture itself isn't necessarily dark.
+        dark_img = (img.astype(np.float32) * 0.25).astype(np.uint8)
+        out = clahe_equalize_bgr(dark_img)
+        self.assertGreater(out.mean(), dark_img.mean())
