@@ -628,18 +628,19 @@ ideas, so a future session doesn't have to redo this from scratch:
       to root-owned too, needing a second `chown` from inside the container, back to the host
       uid, to undo). Image rebuilt, container recreated again; verified `/etc/crontabs/root` is
       now `root:root` inside the fresh container while the host file stayed normally-owned.
-      **TODO / ongoing: keep an eye on this.** The user explicitly wants database backups (and by
-      extension the weekly vacuum-swap job, which depends on the same crontab) to stay watched
-      for "useful and uncorrupted" — the backup-restore-testing work earlier in this file only
-      validates individual backup *files* once a week at their promotion point, it says nothing
-      about whether a backup ran *at all* on any given night, which is exactly the class of
-      failure this incident was. Confirmed the crontab fix is live by watching for the next
-      scheduled 2am Eastern run (2026-09-02) to actually produce `picasa_db_2026-09-02.tar.zst`
-      before considering this closed — check whether that file exists and land the result here
-      if this session didn't get to see it confirmed live before ending. No automated "did last
-      night's backup actually happen" freshness check exists yet (e.g. alerting if the newest
-      backup file's mtime is more than ~26h old) — worth considering given this exact failure
-      mode produced zero errors anywhere on its own.
+      **Confirmed fixed, 2026-09-02: the first real overnight run under the new setup worked.**
+      Watched for the next scheduled 2am Eastern run to actually fire on its own (no manual
+      trigger) — `picasa_db_2026-09-02.tar.zst` appeared at 02:03 Eastern, ~974MB, consistent
+      with the 975MB manual run two nights prior (the cleanup's size reduction is holding
+      steady night to night, not a one-off), no `BACKUP_TEST_FAILED` marker. Crontab fix is
+      confirmed live and self-sustaining, not just working when manually poked.
+      **Still open**: the backup-restore-testing work earlier in this file only validates
+      individual backup *files* once a week at their promotion point — it says nothing about
+      whether a backup ran *at all* on any given night, which is exactly the class of failure
+      this incident was. No automated "did last night's backup actually happen" freshness check
+      exists yet (e.g. alerting if the newest backup file's mtime is more than ~26h old) — worth
+      considering given this exact failure mode produced zero errors anywhere on its own and was
+      only caught because the user happened to notice a backup file hadn't shrunk.
 - **Removed `Face.face_encoding` (legacy 128-d dlib embedding), 2026-08-26.** Superseded by
   `face_encoding_512` (insightface) for years — the live pipeline (`face_extract_encode.py`)
   already hadn't written a real value to it, explicitly setting it to `None`. Freed ~371MB in
