@@ -507,19 +507,26 @@ class KeyedImageViewTests(ApiTestCase):
         resp = self.client.get("/api/keyed_image/face_array/")
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_face_array_serves_thumbnail_bytes_directly(self):
-        # face_array used to decode/resize/re-encode the thumbnail via PIL
-        # on every request even though no resize was ever actually applied
-        # (no height/width is set for this branch) - it now serves the
-        # pre-generated file's bytes as-is. A byte-exact match here would
-        # catch a regression back to the PIL round-trip, since re-encoding
-        # a JPEG (even at identical dimensions) reliably changes its bytes.
+    def test_face_array_applies_clahe_equalization(self):
+        # face_array now decodes, CLAHE-equalizes (common.clahe_equalize_bgr
+        # -- brightens/evens out dark faces), and re-encodes the thumbnail
+        # on every request, rather than serving the pre-generated file's
+        # bytes as-is. Re-encoding a JPEG reliably changes its bytes even
+        # at identical dimensions, so a byte difference here confirms the
+        # equalization path actually ran rather than the old shortcut.
+        self.face.face_thumbnail.open("rb")
+        original_bytes = self.face.face_thumbnail.read()
+        self.face.face_thumbnail.close()
+
         resp = self.client.get(f"/api/keyed_image/face_array/?id={self.face.id}")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.face.face_thumbnail.open("rb")
-        expected = self.face.face_thumbnail.read()
-        self.face.face_thumbnail.close()
-        self.assertEqual(resp.content, expected)
+        self.assertEqual(resp["Content-Type"], "image/jpeg")
+        self.assertNotEqual(resp.content, original_bytes)
+
+        original_img = cv2.imdecode(np.frombuffer(original_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        equalized_img = cv2.imdecode(np.frombuffer(resp.content, dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertIsNotNone(equalized_img)
+        self.assertEqual(equalized_img.shape, original_img.shape)
 
     def test_keyed_image_response_is_cacheable(self):
         resp = self.client.get(f"/api/keyed_image/face_array/?id={self.face.id}")

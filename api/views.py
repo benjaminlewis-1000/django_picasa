@@ -993,26 +993,38 @@ class KeyedImageView(APIView):
                 width = 1920 / 1080 * height
             elif image_type == 'face_array':
                 face = getAndCheckID('face', id_key)
-                # face_thumbnail is already a pre-generated, pre-cropped
-                # square JPEG (created once at face-extraction time - see
+                # face_thumbnail is a pre-generated, pre-cropped square
+                # JPEG (created once at face-extraction time - see
                 # face_extract_encode.py's get_square_face_img/
-                # cv2.imencode(".jpg", ...)), not the full source photo -
-                # serve those bytes directly rather than falling through to
-                # the shared open/resize/re-encode tail below. That tail
-                # never actually resized this branch anyway (no height/width
-                # is set here, so `width = int(w / h * height)` below raised
-                # NameError on `height`, silently swallowed by its own bare
-                # except) - it was doing a real PIL decode + JPEG re-encode
-                # of the *unmodified* thumbnail on every single request for
-                # no purpose. This is the hottest path in the view (one
-                # request per gallery tile, every tile, every load), so
-                # skipping that round-trip here is the single biggest
-                # per-request win available in this file.
+                # cv2.imencode(".jpg", ...)), not the full source photo.
+                # Decoded, CLAHE-equalized (common.clahe_equalize_bgr --
+                # brightens/evens out dark or unevenly-lit faces, a real
+                # user complaint), and re-encoded on every request rather
+                # than precomputed/cached at ingestion time: these are
+                # tiny crops, so the decode+equalize+encode cost is
+                # negligible even on this view's hottest path (one
+                # request per gallery tile, every tile, every load), and
+                # _set_image_cache_headers' long-lived immutable cache
+                # means a browser only pays it once per face anyway.
                 face.face_thumbnail.open('rb')
                 try:
-                    response = HttpResponse(face.face_thumbnail.read(), content_type='image/jpeg')
+                    raw_bytes = face.face_thumbnail.read()
                 finally:
                     face.face_thumbnail.close()
+
+                arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    equalized = common.clahe_equalize_bgr(img)
+                    success, encoded = cv2.imencode('.jpg', equalized)
+                    if success:
+                        response = HttpResponse(encoded.tobytes(), content_type='image/jpeg')
+                        return _set_image_cache_headers(response)
+
+                # Decode/equalize/encode failed for some reason (e.g. a
+                # corrupted thumbnail file) -- fall back to the original
+                # bytes rather than a broken image.
+                response = HttpResponse(raw_bytes, content_type='image/jpeg')
                 return _set_image_cache_headers(response)
             elif image_type == 'face_source':
                 face = getAndCheckID('face', id_key)
