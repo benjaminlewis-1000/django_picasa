@@ -503,16 +503,31 @@ class PersonParamView(APIView):
             else:
 
                 poss_query = Q(poss_ident1=person_obj)
-                if do_flagged_only:
-                    poss_query &= Q(mobile_review_hidden=True)
-                else:
-                    # Complementary to the flagged branch above - a face
-                    # already pulled aside for closer review (flagged via
-                    # the mobile app's ignore-review flow) shouldn't also
-                    # keep showing up in the normal candidate list it came
-                    # from. Together these two branches partition the same
-                    # poss_ident1 set with no overlap either way.
-                    poss_query &= (Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False))
+                # mobile_review_hidden is a general-purpose "hide from the
+                # mobile app's own queues" flag - set not just by the
+                # .ignore-review flow this `flagged` param models, but also
+                # by the mobile app's plain "Skip" action on any *real*
+                # person's suggestion queue (HideFromMobile/
+                # LabelingGroupsView, api/mobile_views.py). Only .ignore
+                # has a frontend view that actually surfaces flagged faces
+                # (the "Flagged for review" sidebar row) - filtering by it
+                # for every other person made a mobile-skipped candidate
+                # disappear from their gallery entirely, with nowhere to
+                # find it again, while their sidebar count (a separately
+                # stored field, untouched by this query) still included
+                # it. Scope the filtering to .ignore specifically instead
+                # of applying it to every person's face_poss query.
+                if person_obj.person_name == settings.SOFT_IGNORE_NAME:
+                    if do_flagged_only:
+                        poss_query &= Q(mobile_review_hidden=True)
+                    else:
+                        # Complementary to the flagged branch above - a
+                        # face already pulled aside for closer review
+                        # shouldn't also keep showing up in .ignore's own
+                        # main candidate list. Together these two branches
+                        # partition .ignore's poss_ident1 set with no
+                        # overlap either way.
+                        poss_query &= (Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False))
 
                 faces1 = list(Face.objects.filter(poss_query).values_list('id', 'weight_1'))
                 # faces2 = list(Face.objects.filter(poss_ident2=person_obj).values_list('id', 'weight_2'))
