@@ -711,6 +711,28 @@ class IgnoreReviewFlaggedPartitionTests(ApiTestCase):
         self.assertEqual(main_ids & flagged_ids, set(), "a face should never appear in both")
         self.assertEqual(main_ids | flagged_ids, all_poss_ident1_ids, "union should cover every poss_ident1 face")
 
+    def test_real_person_still_shows_a_mobile_review_hidden_candidate(self):
+        # Regression test: mobile_review_hidden is set not just by the
+        # .ignore-review flow, but also by the mobile app's plain "Skip"
+        # action on *any* real person's suggestion queue
+        # (HideFromMobile/LabelingGroupsView) - a real person has no
+        # "Flagged for review" view the way .ignore does, so excluding
+        # mobile_review_hidden=True faces from their face_poss query made
+        # a skipped candidate disappear from the gallery entirely (while
+        # still counting toward the sidebar's num_possibilities, a
+        # separate stored field) - reported by the user 2026-09-02 as "a
+        # person shows one unlabeled face but the gallery is empty."
+        real_person = Person.objects.create(person_name="Garrett Egan Test")
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        skipped_face = self.make_face(
+            self.image, declared_name=blank, poss_ident1=real_person,
+            weight_1=0.2, mobile_review_hidden=True,
+        )
+        resp = self.client.get(f"/api/paginate_obj_ids/{real_person.id}/face_poss")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        id_list = json.loads(resp.content)["id_list"]
+        self.assertIn(skipped_face.id, id_list)
+
 
 @override_settings(MEDIA_ROOT="/tmp/api_test_media")
 class IgnoreReviewFlaggedCountTests(FaceFixtureMixin, TransactionTestCase):
