@@ -261,21 +261,31 @@ class BulkConfirmIgnore(APIView):
       - `hide_ids`   : just set Face.mobile_review_hidden = True. The face
         is untouched otherwise (still an unlabeled proposed .ignore); it
         simply stops showing up in the mobile review grid.
+      - `undo_ids`   : reverse a prior `confirm_ids` from the "undo last
+        screen" flow. Send the face back to unlabeled with `.ignore`
+        restored as the top guess (weight 1.0, matching assign_faces.py),
+        and hide it from the grid. Idempotent -- also fine on a face that
+        was only hidden, or is already back in the pool.
 
     Synchronous; stale/mismatched ids are skipped, not errored.
     """
 
     permission_classes = (IsAuthenticated,)
 
+    # assign_faces.py sets weight 1.0 when the classifier's top guess is
+    # `.ignore`; match that when we restore the guess.
+    IGNORE_GUESS_WEIGHT = 1.0
+
     def patch(self, request, *args, **kwargs):
         confirm_ids = request.data.get('confirm_ids') or []
         # `reject_ids` kept as an accepted alias for older app builds.
         hide_ids = request.data.get('hide_ids') or request.data.get('reject_ids') or []
+        undo_ids = request.data.get('undo_ids') or []
 
         ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
         blank_name = settings.BLANK_FACE_NAME
 
-        confirmed = skipped = 0
+        confirmed = undone = skipped = 0
 
         for fid in confirm_ids:
             face = Face.objects.filter(id=fid).first()
@@ -301,7 +311,27 @@ class BulkConfirmIgnore(APIView):
         )
         skipped += len(hide_ids) - hidden
 
-        js = {'confirmed': confirmed, 'hidden': hidden, 'skipped': skipped}
+        for fid in undo_ids:
+            face = Face.objects.filter(id=fid).first()
+            if face is None:
+                skipped += 1
+                continue
+            # Drop any name assignment + guesses (counts settle back to the
+            # blank sentinel), then restore .ignore as the top guess and
+            # hide the face from this grid.
+            face.reset_to_pool()
+            face.set_possible_person(ignore_person, 1, self.IGNORE_GUESS_WEIGHT)
+            if not face.mobile_review_hidden:
+                face.mobile_review_hidden = True
+                face.save(update_fields=['mobile_review_hidden'])
+            undone += 1
+
+        js = {
+            'confirmed': confirmed,
+            'hidden': hidden,
+            'undone': undone,
+            'skipped': skipped,
+        }
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 
