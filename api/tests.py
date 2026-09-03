@@ -1103,6 +1103,55 @@ class MobileViewTests(ApiTestCase):
         self.assertEqual(body["hidden"], 0)
         self.assertEqual(body["skipped"], 4)
 
+    def test_bulk_confirm_ignore_undo_reverts_confirm_and_hides(self):
+        """The "undo last screen" path: a face that was confirmed as
+        .ignore goes back to unlabeled with .ignore restored as the top
+        guess, and hidden from the grid."""
+        ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        face = self._ignore_candidate()
+
+        # Forward: confirm it as .ignore.
+        self.client.patch(
+            "/api/mobile/bulk_confirm_ignore/",
+            {"confirm_ids": [face.id]},
+            format="json",
+        )
+        face.refresh_from_db()
+        self.assertEqual(face.declared_name_id, ignore.id)
+
+        # Undo: tapped on the go-back screen.
+        resp = self.client.patch(
+            "/api/mobile/bulk_confirm_ignore/",
+            {"undo_ids": [face.id]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(json.loads(resp.content)["undone"], 1)
+
+        face.refresh_from_db()
+        self.assertEqual(face.declared_name_id, blank.id)     # back to unlabeled
+        self.assertEqual(face.poss_ident1_id, ignore.id)      # .ignore restored as #1
+        self.assertEqual(face.weight_1, 1.0)
+        self.assertIsNone(face.poss_ident2_id)
+        self.assertFalse(face.validated)
+        self.assertTrue(face.mobile_review_hidden)
+
+        # No longer listed (hidden).
+        listed = json.loads(self.client.get("/api/mobile/ignore_candidates/").content)
+        self.assertNotIn(face.id, [f["id"] for f in listed["faces"]])
+
+    def test_bulk_confirm_ignore_undo_skips_unknown_ids(self):
+        resp = self.client.patch(
+            "/api/mobile/bulk_confirm_ignore/",
+            {"undo_ids": [999999]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        body = json.loads(resp.content)
+        self.assertEqual(body["undone"], 0)
+        self.assertEqual(body["skipped"], 1)
+
     # --- verify-faces screen ------------------------------------------------
 
     def _unverified_face(self, person, n=1):
