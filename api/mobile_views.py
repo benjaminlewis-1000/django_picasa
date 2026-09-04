@@ -378,6 +378,14 @@ class VerifyCandidatesList(APIView):
     tracks it locally from there (every face on the grid leaves the pile
     on submit).
 
+    Faces with a `verification_cluster_group` (the nightly
+    face_manager.cluster_unverified_faces job) are excluded entirely --
+    those belong to a visually-coherent batch the web app's "Group by
+    cluster" verify mode reviews all at once, which is a better fit than
+    one-at-a-time on mobile. A person whose whole pile is clustered simply
+    never gets picked/pinned here; any of their faces outside a cluster
+    still show up normally.
+
     Query params: `limit` (default 15), `person_id` (pin), `exclude`
     (comma-separated person ids to skip this session).
     """
@@ -398,7 +406,11 @@ class VerifyCandidatesList(APIView):
 
         unverified = (
             Face.objects
-            .filter(validated=False, declared_name__isnull=False)
+            .filter(
+                validated=False,
+                declared_name__isnull=False,
+                verification_cluster_group__isnull=True,
+            )
             .exclude(declared_name__person_name__in=settings.IGNORED_NAMES)
             .exclude(declared_name_id__in=exclude_ids)
         )
@@ -433,7 +445,11 @@ class VerifyCandidatesList(APIView):
         host_url = f'https://{request.get_host()}/api'
         face_ids = (
             Face.objects
-            .filter(declared_name_id=pid, validated=False)
+            .filter(
+                declared_name_id=pid,
+                validated=False,
+                verification_cluster_group__isnull=True,
+            )
             .order_by('?')
             .values_list('id', flat=True)[:limit]
         )

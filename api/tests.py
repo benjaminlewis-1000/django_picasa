@@ -1229,6 +1229,50 @@ class MobileViewTests(ApiTestCase):
         self.assertEqual(data["unverified_count"], 3)
         self.assertTrue({f["id"] for f in data["faces"]} <= {f.id for f in bob_faces})
 
+    def test_verify_candidates_excludes_clustered_faces(self):
+        # A face with a verification_cluster_group belongs to a batch the
+        # web app's "Group by cluster" mode reviews in bulk -- mobile
+        # should never serve it, and it shouldn't count toward the pile.
+        bob = Person.objects.create(person_name="Bob V")
+        img = self.make_image()
+        clustered = [
+            self.make_face(
+                img, declared_name=bob, validated=False, verification_cluster_group=0,
+            )
+            for _ in range(3)
+        ]
+        singleton = self.make_face(img, declared_name=bob, validated=False)
+
+        data = json.loads(self.client.get("/api/mobile/verify_candidates/").content)
+        self.assertEqual(data["person_name"], "Bob V")
+        self.assertEqual(data["unverified_count"], 1)
+        served = {f["id"] for f in data["faces"]}
+        self.assertEqual(served, {singleton.id})
+        self.assertFalse(served & {f.id for f in clustered})
+
+    def test_verify_candidates_skips_person_whose_whole_pile_is_clustered(self):
+        clustered_person = Person.objects.create(person_name="All Clustered")
+        img = self.make_image()
+        for _ in range(4):
+            self.make_face(
+                img, declared_name=clustered_person, validated=False,
+                verification_cluster_group=1,
+            )
+        alice = Person.objects.create(person_name="Alice V")
+        self._unverified_face(alice, 2)
+
+        data = json.loads(self.client.get("/api/mobile/verify_candidates/").content)
+        self.assertEqual(data["person_name"], "Alice V")
+
+        # Pinning the fully-clustered person directly also falls through
+        # to nothing (their pile is entirely ineligible).
+        pinned = json.loads(
+            self.client.get(
+                f"/api/mobile/verify_candidates/?person_id={clustered_person.id}"
+            ).content
+        )
+        self.assertNotEqual(pinned["person_id"], clustered_person.id)
+
     def test_verify_candidates_exclude_skips_a_person(self):
         alice = Person.objects.create(person_name="Alice V")
         bob = Person.objects.create(person_name="Bob V")
