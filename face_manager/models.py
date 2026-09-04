@@ -198,8 +198,23 @@ class Face(models.Model):
                 size=10, blank=True, null=True
             )
 
+    # Populated by the nightly face_manager.cluster_unverified_faces task:
+    # per-person complete-linkage clustering (see verification_clustering.py)
+    # over this person's own unverified faces, so a human reviewing a run
+    # can spot-check a whole visually-coherent group at once. Group ids are
+    # 0-indexed PER PERSON (not globally unique) and assigned only to
+    # clusters of size >=2 -- a singleton face is left NULL, same as a face
+    # that's ineligible for clustering entirely (verified, ignored, no
+    # usable embedding). Cleared to NULL immediately whenever a face's
+    # assignment changes (associate_person/verify_person_in_image/
+    # reset_to_pool) rather than waiting for the next nightly rebuild, and
+    # also cleared for every face at the start of each nightly run before
+    # re-clustering from scratch -- no attempt is made to preserve group
+    # identity night-to-night.
+    verification_cluster_group = models.IntegerField(null=True, blank=True, default=None)
+
     detected_age = models.IntegerField(default=-1)
-    
+
     # This field will contain the top 5 possible identities as categorized
     # by the FC network.
     # Like the declared name, these also have the on_delete method set. 
@@ -331,6 +346,7 @@ class Face(models.Model):
         new_id.increment_unverified()
         self.validated = False
         self.written_to_photo_metadata = False
+        self.verification_cluster_group = None
 
         for poss_idx in range(1, self.NUM_POSSIBLE_IDENTITIES + 1):
             self.remove_poss_ident(poss_idx)
@@ -341,6 +357,7 @@ class Face(models.Model):
         self.declared_name.decrement_unverified()
 
         self.validated = True
+        self.verification_cluster_group = None
         self.save()
 
     def reset_to_pool(self, blank=None):
@@ -360,6 +377,8 @@ class Face(models.Model):
         """
         if blank is None:
             blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+
+        self.verification_cluster_group = None
 
         prev = self.declared_name
         if prev is not None and prev.person_name != settings.BLANK_FACE_NAME:

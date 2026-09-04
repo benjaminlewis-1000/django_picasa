@@ -3,6 +3,7 @@ from __future__ import absolute_import, unicode_literals
 # from .scripts import populateFromImageMultiGPU, establish_server_connection, establish_multi_server_connection
 from .models import Person, Face, clear_confirmed_ignore_face_encodings
 from assign_faces import faceAssigner
+from verification_clustering import cluster_all_unverified_faces
 from celery import shared_task
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -156,6 +157,31 @@ def classifier_pkl_file_reload():
 @shared_task(ignore_result=True, name='face_manager.api_bulk_operation')
 def api_bulk_operation(input_dict: dict):
     print("Executing a bulk operation task", input_dict)
+
+@shared_task(ignore_result=True, name='face_manager.cluster_unverified_faces')
+def cluster_unverified_faces_task():
+    i = celery_app.control.inspect()
+    active_tasks = i.active()
+    num_this_task_running = 0
+    for k in active_tasks.keys():
+        tasks = active_tasks[k]
+        if len(tasks) != 0:
+            for tt in tasks:
+                if tt['name'] == 'face_manager.cluster_unverified_faces':
+                    num_this_task_running += 1
+
+    if num_this_task_running > 1:
+        settings.LOGGER.debug("Cluster unverified faces is locked, exiting.")
+        settings.LOGGER.warning("Cluster unverified faces locked!")
+        return
+
+    try:
+        num_people, num_faces = cluster_all_unverified_faces()
+        settings.LOGGER.debug(
+            f"Clustered {num_faces} unverified face(s) across {num_people} person(s)."
+        )
+    except:
+        settings.LOGGER.debug("Ending cluster_unverified_faces task")
 
 @shared_task(ignore_result=True, name='face_manager.set_face_counts')
 def reset_task():

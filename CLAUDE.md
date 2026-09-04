@@ -441,32 +441,44 @@ ideas, so a future session doesn't have to redo this from scratch:
       leak partway through (206 failures), fixed the leak, re-ran against just the 206 remaining
       -- see whether that final re-run's result got recorded below if this note wasn't updated
       again afterward.
-    - **TODO, in progress, NOT YET BUILT: `Face.verification_cluster_group` nightly clustering
-      feature.** User's plan, agreed: a new nullable `IntegerField` on `Face`, populated by a new
-      nightly Celery task that runs complete-linkage clustering (cos threshold 0.7 default,
-      configurable -- 0.65 found more/bigger groups in the comparison, 0.7 chosen as the safer
-      default for a verification tool where false groupings cost more than missed ones)
-      independently **per real person** (never mixing galleries) over each person's
-      **unverified** (`validated=False`), **valid-encoding** (excludes NULL and the
-      `NON_DETECTED_FACE_ENCODING` sentinel via the same fix above), **non-ignore**
-      (`declared_name` not in `settings.IGNORED_NAMES`) faces. Real scope checked: 65,371 such
-      faces across only 49 distinct people (much smaller/more tractable than the abandoned 100k
-      `.ignore` population), dominated by two ~10.5k-face people (Liam Lewis, Nathaniel Lewis,
-      each costing roughly what Erica's 15k did per threshold, ~35-45s) -- expect the whole
-      nightly job to take well under 10 minutes. Group ids are assigned per-person starting at 0
-      (so "group 0" exists independently for every person, no global uniqueness needed) to
-      clusters of size >=2 only; singletons get `NULL`. Each nightly run clears ALL
-      `verification_cluster_group` values first and rebuilds from scratch, rather than trying to
-      preserve group identity night-to-night. **Additional requirement from the user, not yet
-      implemented**: `verification_cluster_group` must also be cleared immediately (not just at
-      the next nightly rebuild) any time a face's assignment changes for any reason -- renamed,
-      confirmed, unassigned -- which all route through `Face.associate_person()`, plus when a face
-      gets verified via `Face.verify_person_in_image()` (since verification is exactly what drops
-      a face out of this feature's eligibility pool). Neither the field/migration, the clustering
-      task itself, nor these two model-method hooks have been written yet -- this is the very next
-      thing to build when resuming. The frontend surface for actually using this (grouped review
-      UI) is explicitly out of scope for this repo/session -- the user plans to design that
-      separately once the backend/data side exists.
+    - **DONE (2026-09-03/04): `Face.verification_cluster_group` nightly clustering feature,
+      built as planned, merged to `master` and deployed.** New
+      nullable `IntegerField` on `Face` (migration `0008_face_verification_cluster_group`),
+      populated by `face_manager/verification_clustering.py`'s `cluster_all_unverified_faces()`
+      -- complete-linkage clustering (`sklearn.cluster.AgglomerativeClustering(linkage='complete',
+      metric='euclidean')` on L2-normalized embeddings, cos threshold 0.7 default/configurable via
+      a function argument, `dist = sqrt(2 - 2*cos_sim)`) run independently **per real person**
+      (never mixing galleries, one `AgglomerativeClustering` call per person) over
+      `eligible_faces_queryset()`: **unverified** (`validated=False`), **valid-encoding**
+      (excludes NULL and the `NON_DETECTED_FACE_ENCODING` sentinel), **non-ignore**
+      (`declared_name__person_name` not in `settings.IGNORED_NAMES`) faces. Group ids are
+      0-indexed per person (independent across people, no global uniqueness) and assigned only to
+      clusters of size >=2; singletons and ineligible faces are left/reset to `NULL`. Wired into a
+      new `face_manager.cluster_unverified_faces` Celery task (`face_manager/tasks.py`, same
+      already-running-lock-check pattern as the other scheduled tasks here), scheduled nightly at
+      1am Eastern (`CELERY_BEAT_SCHEDULE['cluster_unverified_faces']`, `picasa/settings.py`) --
+      deliberately ahead of `db_picasa`'s 2am daily backup and 3am-Monday vacuum-swap jobs so
+      nothing overlaps. Each run clears **every** `Face.verification_cluster_group` value db-wide
+      first, then rebuilds from scratch (no attempt to preserve group identity night-to-night, per
+      the original plan). **The "clear immediately on reassignment" requirement is implemented in
+      three places, not the originally-planned two**: `Face.associate_person()` and
+      `Face.verify_person_in_image()` as planned, plus `Face.reset_to_pool()` -- found while
+      implementing that `reset_to_pool()` is a third, actively-used (`api/mobile_views.py`)
+      assignment-changing path distinct from `associate_person()`, so it needed the same hook to
+      actually satisfy the "any time a face's assignment changes for any reason" requirement.
+      Tested via 9 new cases in `face_manager/tests.py::VerificationClusterGroupTests` (synthetic
+      512-d embeddings clustered around near-orthogonal base directions, not real face data):
+      distinct-cluster-ids-plus-singleton-stays-null, per-person id independence, and every
+      exclusion (`validated=True`, ignored sentinel names, NULL encoding, sentinel encoding) each
+      checked individually, a nightly-clears-stale-groups case, and one hook test per
+      reassignment path. Full fast suite run afterward: 279/281 passing, the 2 failures pre-existing
+      and unrelated (a corrupted-image fixture path not mounted in that exec context, and an
+      already-known float32-precision rounding assertion) -- confirmed neither touches this
+      feature's files. Deployed to production (`picasa_api` restarted to pick up the new task/
+      migration) and run once immediately as a manual backfill rather than waiting for the first
+      1am scheduled run -- see the dated note below for the real backfill numbers. The frontend
+      surface for actually using this (grouped review UI) remains explicitly out of scope for this
+      repo -- the user plans to design that separately once the backend/data side is live.
   - **Looser branch for faces with `.ignore` already in their reject list (2026-08-28).** A face
     whose `rejected_fields` contains `.ignore` means a human previously declined an *auto-
     proposed* soft-ignore for it -- i.e. someone already looked and said "no, this is a real

@@ -35,6 +35,7 @@ from face_manager.face_extract_encode import FaceExtractor
 from face_manager.models import Face, Person, get_default_blank_person, clear_confirmed_ignore_face_encodings
 from face_manager.pyramidal_detector import PyramidalDetector
 from face_manager.test_face_cache import cached_detect
+from face_manager.verification_clustering import cluster_all_unverified_faces
 from filepopulator.models import Directory, ImageFile
 from filepopulator.scripts import create_image_file
 
@@ -43,6 +44,21 @@ def _tiny_jpeg_bytes(size=(50, 50)):
     img = np.zeros((size[1], size[0], 3), dtype=np.uint8)
     ok, buf = cv2.imencode(".jpg", img)
     return BytesIO(buf).read()
+
+
+def _embedding(base_idx, seed, dim=512, noise_scale=0.01):
+    """A synthetic 512-d embedding clustered around one of several
+    near-orthogonal base directions (one per base_idx), with a small
+    amount of per-face noise. At noise_scale=0.01 same-base_idx vectors
+    land around cos~0.95 (comfortably above the 0.7 default cluster
+    threshold) while different-base_idx vectors land near cos~0 -- lets
+    tests build "these faces should cluster together" / "these shouldn't"
+    fixtures without depending on real face data."""
+    vec = np.zeros(dim)
+    vec[base_idx] = 1.0
+    rng = np.random.RandomState(seed)
+    vec = vec + rng.normal(scale=noise_scale, size=dim)
+    return vec
 
 
 def make_person(name):
@@ -1035,6 +1051,136 @@ class IgnoreWeightMarginTests(TestCase):
             far_weight = mock_set.call_args[0][2]
 
         self.assertGreater(far_weight, near_miss_weight)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class VerificationClusterGroupTests(TestCase):
+    """Face.verification_cluster_group: nightly per-person complete-linkage
+    clustering of confirmed-but-unverified faces, so a human reviewer can
+    spot-check a whole visually-coherent group at once. See
+    verification_clustering.py / CLAUDE.md for the full investigation
+    behind why complete linkage, per-person-only, was chosen."""
+
+    def setUp(self):
+        self.person = make_person("Cluster Person")
+        self.other_person = make_person("Other Cluster Person")
+        self.img = make_image()
+
+    def _make_unverified_face(self, person, embedding, **overrides):
+        overrides.setdefault('validated', False)
+        return make_face(
+            self.img, declared_name=person,
+            face_encoding_512=embedding.tolist(), **overrides,
+        )
+
+    def test_two_tight_clusters_get_distinct_group_ids_and_singleton_stays_null(self):
+        cluster_a = [self._make_unverified_face(self.person, _embedding(0, seed=i)) for i in range(4)]
+        cluster_b = [self._make_unverified_face(self.person, _embedding(1, seed=100 + i)) for i in range(3)]
+        singleton = self._make_unverified_face(self.person, _embedding(2, seed=200))
+
+        cluster_all_unverified_faces()
+
+        groups_a = {Face.objects.get(pk=f.pk).verification_cluster_group for f in cluster_a}
+        groups_b = {Face.objects.get(pk=f.pk).verification_cluster_group for f in cluster_b}
+        self.assertEqual(len(groups_a), 1)
+        self.assertEqual(len(groups_b), 1)
+        self.assertNotIn(None, groups_a)
+        self.assertNotIn(None, groups_b)
+        self.assertNotEqual(groups_a, groups_b)
+        self.assertIsNone(Face.objects.get(pk=singleton.pk).verification_cluster_group)
+
+    def test_group_ids_are_independent_per_person(self):
+        # Both people's tight clusters should each land on group id 0 --
+        # ids are 0-indexed PER PERSON, not globally unique.
+        cluster_a = [self._make_unverified_face(self.person, _embedding(0, seed=i)) for i in range(3)]
+        cluster_b = [self._make_unverified_face(self.other_person, _embedding(0, seed=50 + i)) for i in range(3)]
+
+        cluster_all_unverified_faces()
+
+        self.assertEqual(Face.objects.get(pk=cluster_a[0].pk).verification_cluster_group, 0)
+        self.assertEqual(Face.objects.get(pk=cluster_b[0].pk).verification_cluster_group, 0)
+
+    def test_validated_faces_are_excluded(self):
+        already_verified = self._make_unverified_face(self.person, _embedding(0, seed=1), validated=True)
+        unverified = [self._make_unverified_face(self.person, _embedding(0, seed=i)) for i in range(2, 4)]
+
+        cluster_all_unverified_faces()
+
+        self.assertIsNone(Face.objects.get(pk=already_verified.pk).verification_cluster_group)
+        self.assertIsNotNone(Face.objects.get(pk=unverified[0].pk).verification_cluster_group)
+
+    def test_ignored_sentinel_person_faces_are_excluded(self):
+        ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        faces = [self._make_unverified_face(ignore_person, _embedding(0, seed=i)) for i in range(3)]
+
+        cluster_all_unverified_faces()
+
+        for f in faces:
+            self.assertIsNone(Face.objects.get(pk=f.pk).verification_cluster_group)
+
+    def test_null_and_sentinel_encodings_are_excluded(self):
+        f_null = self._make_unverified_face(self.person, _embedding(0, seed=1))
+        f_null.face_encoding_512 = None
+        f_null.save()
+
+        f_sentinel = self._make_unverified_face(self.person, _embedding(0, seed=2))
+        f_sentinel.face_encoding_512 = list(settings.NON_DETECTED_FACE_ENCODING)
+        f_sentinel.save()
+
+        f_real_a = self._make_unverified_face(self.person, _embedding(0, seed=3))
+        f_real_b = self._make_unverified_face(self.person, _embedding(0, seed=4))
+
+        cluster_all_unverified_faces()
+
+        self.assertIsNone(Face.objects.get(pk=f_null.pk).verification_cluster_group)
+        self.assertIsNone(Face.objects.get(pk=f_sentinel.pk).verification_cluster_group)
+        self.assertEqual(
+            Face.objects.get(pk=f_real_a.pk).verification_cluster_group,
+            Face.objects.get(pk=f_real_b.pk).verification_cluster_group,
+        )
+        self.assertIsNotNone(Face.objects.get(pk=f_real_a.pk).verification_cluster_group)
+
+    def test_nightly_rebuild_clears_stale_groups_not_reproduced_this_run(self):
+        # A face that was grouped by a previous run but is no longer
+        # eligible (e.g. since verified) must not be left with a stale
+        # group id -- the nightly rebuild clears ALL faces first.
+        stale = self._make_unverified_face(self.person, _embedding(0, seed=1))
+        stale.verification_cluster_group = 7
+        stale.validated = True
+        stale.save()
+
+        cluster_all_unverified_faces()
+
+        self.assertIsNone(Face.objects.get(pk=stale.pk).verification_cluster_group)
+
+    def test_associate_person_clears_group_immediately(self):
+        faces = [self._make_unverified_face(self.person, _embedding(0, seed=i)) for i in range(3)]
+        cluster_all_unverified_faces()
+        self.assertIsNotNone(Face.objects.get(pk=faces[0].pk).verification_cluster_group)
+
+        other = make_person("Reassign Target")
+        face = Face.objects.get(pk=faces[0].pk)
+        face.associate_person(other.id)
+
+        self.assertIsNone(Face.objects.get(pk=faces[0].pk).verification_cluster_group)
+
+    def test_verify_person_in_image_clears_group_immediately(self):
+        faces = [self._make_unverified_face(self.person, _embedding(0, seed=i)) for i in range(3)]
+        cluster_all_unverified_faces()
+
+        face = Face.objects.get(pk=faces[0].pk)
+        face.verify_person_in_image()
+
+        self.assertIsNone(Face.objects.get(pk=faces[0].pk).verification_cluster_group)
+
+    def test_reset_to_pool_clears_group_immediately(self):
+        faces = [self._make_unverified_face(self.person, _embedding(0, seed=i)) for i in range(3)]
+        cluster_all_unverified_faces()
+
+        face = Face.objects.get(pk=faces[0].pk)
+        face.reset_to_pool()
+
+        self.assertIsNone(Face.objects.get(pk=faces[0].pk).verification_cluster_group)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
