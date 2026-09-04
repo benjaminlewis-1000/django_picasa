@@ -277,8 +277,8 @@ via the user's own two example faces (1060610/1076848) plus a broader id-delta a
     tests.FaceExtractorCorruptedImageTests` case (same shape, against real `find_and_encode_
     faces()` with real detection). Full fast suite: 290/292 passing (the same 2 pre-existing,
     unrelated failures as before -- fixture path availability and float32-precision rounding).
-    Not yet ported to `master`/deployed as of this note -- see the top-level "Where things stand"
-    section once that lands.
+    Merged to `master` and deployed 2026-09-04 (`picasa_api` restarted to load the new code --
+    no migration needed, no model/schema changes involved).
   - **TODO, NOT YET FOUND: root cause #2, the ~1,064 far-apart-id same-image duplicate pairs.**
     Checked the known "reset isProcessed=False without deleting stale Face rows first" management
     commands (`cleanDB.py`, both `clearfaces.py` variants, `cleanup_chronically_unmatched_faces.
