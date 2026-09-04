@@ -446,8 +446,9 @@ ideas, so a future session doesn't have to redo this from scratch:
       nullable `IntegerField` on `Face` (migration `0008_face_verification_cluster_group`),
       populated by `face_manager/verification_clustering.py`'s `cluster_all_unverified_faces()`
       -- complete-linkage clustering (`sklearn.cluster.AgglomerativeClustering(linkage='complete',
-      metric='euclidean')` on L2-normalized embeddings, cos threshold 0.7 default/configurable via
-      a function argument, `dist = sqrt(2 - 2*cos_sim)`) run independently **per real person**
+      metric='euclidean')` on L2-normalized embeddings, cos threshold **0.65 default** (changed
+      from the original 0.7 -- see the dated note below), configurable via a function argument,
+      `dist = sqrt(2 - 2*cos_sim)`) run independently **per real person**
       (never mixing galleries, one `AgglomerativeClustering` call per person) over
       `eligible_faces_queryset()`: **unverified** (`validated=False`), **valid-encoding**
       (excludes NULL and the `NON_DETECTED_FACE_ENCODING` sentinel), **non-ignore**
@@ -487,6 +488,25 @@ ideas, so a future session doesn't have to redo this from scratch:
       Jessica Lewis (2,955), Gwendolyn Lewis (2,633), Benjamin Lewis (1,850). The frontend surface
       for actually using this (grouped review UI) remains explicitly out of scope for this repo --
       the user plans to design that separately once the backend/data side is live.
+      **Real backup-restore rehearsal, same day (2026-09-04)**: at the user's request, restored
+      that morning's `picasa_db_2026-09-04.tar.zst` (02:03am backup, predating both the migration
+      and the backfill above) into a scratch DB, verified row counts matched exactly
+      (638,116 faces / 206,666 images), then promoted it to replace live `picasa` (old DB kept
+      aside as `picasa_prerestore_2026_09_04`, `picasa_api` stopped/restarted around the swap,
+      same mechanism as `weekly_vacuum_swap.py`), re-applied migration `0008`, and re-ran the
+      clustering -- got the identical 30-people/37,812-faces result, confirming the whole
+      pipeline (migrate + cluster) works cleanly against a real restored backup, not just the
+      already-live DB. The three parked DB generations (`picasa_prerestore_2026_09_04`,
+      `picasa_prevacuum_2026_08_31`, `picasa_pre_reset_2026_08_26`) were dropped afterward at the
+      user's request, once satisfied with the result -- only `picasa` remains.
+      **Threshold changed 0.7 -> 0.65 (2026-09-04)**: the user asked to see 0.65's real effect
+      compared to 0.7 (the 0.65 vs 0.7 comparison had been tested during the original
+      investigation, but only via cached experiment data, never as a real production run) --
+      re-ran `cluster_all_unverified_faces(cos_threshold=0.65)` against live production: still
+      30 people, but 41,756 of 65,383 eligible faces grouped (up from 37,812 at 0.7, ~4pp more
+      coverage). User's call after comparing both real results: keep 0.65. `DEFAULT_COS_THRESHOLD`
+      in `verification_clustering.py` updated to match, so the nightly 1am task uses it going
+      forward too, not just this one-off run.
   - **Looser branch for faces with `.ignore` already in their reject list (2026-08-28).** A face
     whose `rejected_fields` contains `.ignore` means a human previously declined an *auto-
     proposed* soft-ignore for it -- i.e. someone already looked and said "no, this is a real
