@@ -355,19 +355,118 @@ ideas, so a future session doesn't have to redo this from scratch:
   - **Directory/event context prior** -- faces from the same source folder or day tend to
     recur; if a directory is already heavily populated with a specific family group's confirmed
     faces, that shifts the prior for an unlabeled face in that same directory. Also not scoped.
-  - **Cluster-then-recover the `.ignore` bucket** (a scoped-down version of a "cluster first, name
-    the cluster, only match cluster-level exemplars against people" architecture like Google
-    Photos' -- discussed as a bigger structural alternative to per-face classification, too big to
-    take on wholesale here). Concretely: with 123,933 faces now sitting in `.ignore` after the
-    2026-08-27/28 reprocess, some real fraction are true matches that were correctly-but-
-    conservatively rejected (the TPR cost of the new gate) rather than genuine outliers. Since
-    `p99 @ 0.65`/`@0.70` gave much higher precision at lower recall in the threshold-sweep data,
-    a two-stage design -- auto-assign only at a high-precision operating point, then cluster
-    *within* the resulting `.ignore` pool and surface any tight cluster for a human to confirm/
-    re-insert in bulk -- could recover a meaningful chunk of that lost TPR without reintroducing
-    the false-positive problem. Not scoped or started; would need real clustering infrastructure
-    (e.g. a similarity-graph approach much like `filepopulator`'s new phash `SimilarImagePair`
-    work earlier this session, but on face embeddings) and a frontend surface to review clusters.
+  - **Cluster-then-recover the `.ignore` bucket -- investigated 2026-09-03, real progress, still
+    open.** Started from the idea above (cluster within `.ignore`/suggested faces to recover TPR
+    lost to the conservative gate) but evolved once real experiments started: the actual driving
+    goal became "reduce human review cognitive load" more than "recover matches automatically" --
+    grouping visually-similar faces so a person can spot-check a whole run at once, not
+    necessarily reconstructing per-person identity.
+    - **Methods tried against the ~100,405-face `poss_ident1=.ignore` (suggested, not confirmed)
+      population**, sampled at n=10k-40k throughout: HDBSCAN (`eom` selection kept collapsing into
+      one dominant blob covering up to ~40% of the sample the moment `min_cluster_size>=3`; `leaf`
+      selection avoided the blob but fragmented into tiny 3-15-face pieces with 90%+ noise;
+      `max_cluster_size` capping HDBSCAN's `eom` output revealed a real structural gap -- capped
+      output plateaus identically across a wide range of cap values, e.g. Erica's own gallery
+      showed *zero* change from cap=100 to cap=200 -- there's no smooth continuum of medium
+      clusters hiding inside the blob, just "small pieces" or "the whole blob," nothing between).
+      kNN-graph + Louvain community detection and kNN + plain connected-components were also
+      tried and both reproduced the same one-dominant-blob failure mode (classic single-linkage
+      chaining: A-B-C-D all merge transitively even if A and D aren't alike). DBSCAN with epsilon
+      derived from the already-calibrated `classify_unassigned()` cosine thresholds (0.4–0.6) did
+      the same. **Complete-linkage agglomerative clustering (`sklearn.cluster.
+      AgglomerativeClustering(linkage='complete', distance_threshold=..., metric='euclidean')` on
+      L2-normalized embeddings) was the one method that never produced a giant blob**, at any
+      threshold or scale tested (confirmed at both a single person's ~15k-face gallery and 10k/20k
+      chunks of the real heterogeneous `.ignore` population) -- because it requires the *worst*
+      pairwise distance within a candidate cluster to still be under threshold, not just one
+      bridging pair, which structurally blocks the chaining every single-linkage-family method
+      (DBSCAN, connected-components, Louvain, HDBSCAN's own mutual-reachability core) suffered
+      from. `average` linkage sits in between -- less bloblike than single-linkage, but still
+      blobbed badly at large n (Erica: max cluster 8222 at cos=0.4, vs. complete linkage's max
+      500 at the same threshold on the same data).
+    - **Verdict on the `.ignore` population specifically: abandoned.** Chunking 100k into 10k or
+      20k pieces (accepting some cross-chunk matches would be missed) and running complete linkage
+      at cos_threshold=0.5 found real structure (10k chunks: 4,519 groups, 24.6% of the population
+      grouped, ~5 min total; 20k chunks: 4,940 groups, 27.3% grouped, ~11 min -- diminishing
+      returns on chunk size, same shape as everything else in this investigation) -- but visually
+      inspecting real contact sheets of the resulting groups (built from real production face
+      thumbnails, both at cos=0.5 and a stricter cos=0.7) showed the groups were NOT
+      single-identity -- e.g. the largest 0.5-threshold group (36 faces) was multiple different
+      (related) family members mixed together, not one person, even at 0.7. The user's own
+      conclusion: not worth pursuing further for this population -- these embeddings are simply
+      too unreliable/low-information (matches this population's already-known skew toward
+      small/blurry/low-quality detections) for similarity-based grouping to reliably separate
+      individuals, regardless of algorithm or threshold.
+    - **Pivoted to confirmed people's own UNVERIFIED faces instead -- this direction looks
+      genuinely promising and is what's being built now.** Tested complete linkage (thresholds
+      0.65/0.7/0.75) on real confirmed galleries spanning size buckets: Mack Holyoak (14),
+      Cutler Kid (35), Elder Thomas (63), Benjamin Stevens (106), Angie (242), Alissa Lewis (963),
+      Peter Van Katwyk (1818), Erica Bradshaw (14,983). At cos=0.7, contact sheets of Erica's
+      5 biggest resulting sub-clusters (sizes 99, 84, 59, 43, 38) showed 4 of the 5 genuinely
+      visually coherent (real, consistent-looking sub-groups/eras of the same person) -- **the
+      user's own read: "pretty coherent."** The one exception (the 99-face group) looked
+      scattershot despite being the most stable/reproducible cluster boundary across every method
+      tried (HDBSCAN uncapped, the `max_cluster_size` sweep, and complete linkage all
+      independently drew the same line around it) -- investigating why led to a real, separate bug
+      fix (see below): those 99 "faces" were real, distinct photos that all happened to carry the
+      literal same placeholder sentinel embedding, not genuine visual similarity.
+    - **Real bugs found and FIXED via this investigation, both already merged to
+      `master`/`backend_upgrade` and deployed:**
+      1. **`reencode_missing_faces()` only matched NULL `face_encoding_512`, missing a second,
+         larger population of broken faces.** `update_list_of_no_matching_detects()`
+         (`face_extract_encode.py`) stamps `settings.NON_DETECTED_FACE_ENCODING` (`[-999]*512`)
+         onto a face whose box wasn't matched to any detection during a full-image reprocessing
+         pass -- a real, declared-to-a-real-person face left with a garbage embedding, not NULL,
+         so invisible to the original filter and not `.ignore`/`.realignore` either. Found: 1,207
+         faces database-wide had this sentinel; the existing `cleanup_chronically_unmatched_faces`
+         command (scoped to a narrower, already-fixed orientation-6/8 bug) only caught 1 of them.
+         Fixed by extending `reencode_missing_faces()`'s selection query to also match the
+         sentinel value directly (`Q(face_encoding_512__isnull=True) |
+         Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)`), treating it the same as NULL.
+      2. **File-descriptor leak in `common/open_img_oriented.py`, found while actually running the
+         fix above against the real 1,219 affected faces.** The run hit `[Errno 24] Too many open
+         files` partway through (`ulimit -n` 1024), making 206 perfectly good images fail with a
+         misleading "decode error" -- not corruption, resource exhaustion. Root cause: Pillow's
+         `Image.load()` is documented to close the underlying file once decoded, but neither
+         `_getexif()` (metadata-only read) nor `convert()`/`transpose()` (each returns an
+         independent new object) guaranteed that ever happened for the file object
+         `PIL.Image.open()` originally returned -- a tight loop over many images (exactly what
+         `reencode_missing_faces()` and `find_and_encode_faces()` both do) leaked one fd per call.
+         Fixed by keeping a reference to the originally-opened image and calling `.load()` on it
+         in a `finally` block regardless of which code path ran -- harmless no-op if already
+         loaded some other way, never touches whatever derived object is actually returned.
+      Both fixes covered by regression tests (`ReencodeMissingFacesTests`, `OpenImgOrientedTests`)
+      and confirmed against real production data: re-ran `reencode_missing_faces()` against
+      production after the sentinel-query fix landed (1,219 eligible faces, ~22 min), hit the fd
+      leak partway through (206 failures), fixed the leak, re-ran against just the 206 remaining
+      -- see whether that final re-run's result got recorded below if this note wasn't updated
+      again afterward.
+    - **TODO, in progress, NOT YET BUILT: `Face.verification_cluster_group` nightly clustering
+      feature.** User's plan, agreed: a new nullable `IntegerField` on `Face`, populated by a new
+      nightly Celery task that runs complete-linkage clustering (cos threshold 0.7 default,
+      configurable -- 0.65 found more/bigger groups in the comparison, 0.7 chosen as the safer
+      default for a verification tool where false groupings cost more than missed ones)
+      independently **per real person** (never mixing galleries) over each person's
+      **unverified** (`validated=False`), **valid-encoding** (excludes NULL and the
+      `NON_DETECTED_FACE_ENCODING` sentinel via the same fix above), **non-ignore**
+      (`declared_name` not in `settings.IGNORED_NAMES`) faces. Real scope checked: 65,371 such
+      faces across only 49 distinct people (much smaller/more tractable than the abandoned 100k
+      `.ignore` population), dominated by two ~10.5k-face people (Liam Lewis, Nathaniel Lewis,
+      each costing roughly what Erica's 15k did per threshold, ~35-45s) -- expect the whole
+      nightly job to take well under 10 minutes. Group ids are assigned per-person starting at 0
+      (so "group 0" exists independently for every person, no global uniqueness needed) to
+      clusters of size >=2 only; singletons get `NULL`. Each nightly run clears ALL
+      `verification_cluster_group` values first and rebuilds from scratch, rather than trying to
+      preserve group identity night-to-night. **Additional requirement from the user, not yet
+      implemented**: `verification_cluster_group` must also be cleared immediately (not just at
+      the next nightly rebuild) any time a face's assignment changes for any reason -- renamed,
+      confirmed, unassigned -- which all route through `Face.associate_person()`, plus when a face
+      gets verified via `Face.verify_person_in_image()` (since verification is exactly what drops
+      a face out of this feature's eligibility pool). Neither the field/migration, the clustering
+      task itself, nor these two model-method hooks have been written yet -- this is the very next
+      thing to build when resuming. The frontend surface for actually using this (grouped review
+      UI) is explicitly out of scope for this repo/session -- the user plans to design that
+      separately once the backend/data side exists.
   - **Looser branch for faces with `.ignore` already in their reject list (2026-08-28).** A face
     whose `rejected_fields` contains `.ignore` means a human previously declined an *auto-
     proposed* soft-ignore for it -- i.e. someone already looked and said "no, this is a real
