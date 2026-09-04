@@ -1600,3 +1600,116 @@ class ReencodeMissingFacesTests(TestCase):
         self.assertEqual(len(vec), 512)
         self.assertAlmostEqual(float(np.linalg.norm(vec)), 1.0, places=6)
         self.assertEqual(len(set(vec.tolist())), 1, "Every component should be identical/uniform")
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class DedupeOverlappingFacesTests(TestCase):
+    """dedupe_overlapping_faces management command -- cleans up the
+    duplicate Face rows left behind by the (now-fixed, see common/
+    advisory_lock.py) find_and_encode_faces() race condition: two
+    concurrent runs on the same never-before-processed image could each
+    insert a Face row for the same real face, pixel-identical box."""
+
+    def setUp(self):
+        self.person = make_person("Dup Person")
+        self.other_person = make_person("Other Dup Person")
+        self.img = make_image()
+
+    def _duplicate_pair(self, **overrides_a):
+        overrides_b = dict(overrides_a)
+        a = make_face(self.img, declared_name=self.person, box_left=1, box_top=1,
+                       box_right=30, box_bottom=30, **overrides_a)
+        b = make_face(self.img, declared_name=self.person, box_left=1, box_top=1,
+                       box_right=30, box_bottom=30, **overrides_b)
+        return a, b
+
+    def test_dry_run_reports_but_changes_nothing(self):
+        a, b = self._duplicate_pair()
+        call_command('dedupe_overlapping_faces', '--dry-run')
+        self.assertEqual(Face.objects.filter(pk__in=[a.pk, b.pk]).count(), 2)
+
+    def test_identical_pair_collapses_to_one_survivor(self):
+        a, b = self._duplicate_pair()
+        call_command('dedupe_overlapping_faces', '--yes')
+        self.assertEqual(Face.objects.filter(source_image_file=self.img).count(), 1)
+
+    def test_validated_face_is_kept_over_unvalidated(self):
+        a, b = self._duplicate_pair()
+        b.validated = True
+        b.save()
+        call_command('dedupe_overlapping_faces', '--yes')
+        remaining = Face.objects.get(source_image_file=self.img)
+        self.assertEqual(remaining.pk, b.pk)
+
+    def test_labeled_face_is_kept_over_unlabeled_when_neither_validated(self):
+        # Common real scenario: a human tagged one copy of a duplicate
+        # pair without knowing the other copy existed, leaving it at the
+        # blank sentinel forever. The labeled copy should survive.
+        blank = get_default_blank_person()
+        a = make_face(self.img, declared_name=blank, box_left=1, box_top=1, box_right=30, box_bottom=30)
+        b = make_face(self.img, declared_name=self.person, box_left=1, box_top=1, box_right=30, box_bottom=30)
+        call_command('dedupe_overlapping_faces', '--yes')
+        remaining = Face.objects.get(source_image_file=self.img)
+        self.assertEqual(remaining.pk, b.pk)
+
+    def test_validated_takes_priority_over_label_when_the_validated_one_is_unlabeled(self):
+        # Validated (real completed human verification) still outranks
+        # "has a label" -- shouldn't actually diverge in practice (a
+        # validated face should already be labeled), but the ordering
+        # itself should hold regardless.
+        blank = get_default_blank_person()
+        a = make_face(self.img, declared_name=blank, box_left=1, box_top=1, box_right=30, box_bottom=30,
+                      validated=True)
+        b = make_face(self.img, declared_name=self.person, box_left=1, box_top=1, box_right=30, box_bottom=30)
+        call_command('dedupe_overlapping_faces', '--yes')
+        remaining = Face.objects.get(source_image_file=self.img)
+        self.assertEqual(remaining.pk, a.pk)
+
+    def test_face_with_kps_is_kept_over_one_without_when_neither_validated(self):
+        a, b = self._duplicate_pair()
+        b.kps = [1.0] * 10
+        b.save()
+        call_command('dedupe_overlapping_faces', '--yes')
+        remaining = Face.objects.get(source_image_file=self.img)
+        self.assertEqual(remaining.pk, b.pk)
+
+    def test_lowest_id_is_kept_as_final_tiebreaker(self):
+        a, b = self._duplicate_pair()
+        call_command('dedupe_overlapping_faces', '--yes')
+        remaining = Face.objects.get(source_image_file=self.img)
+        self.assertEqual(remaining.pk, min(a.pk, b.pk))
+
+    def test_deleted_faces_thumbnail_file_is_removed(self):
+        a, b = self._duplicate_pair()
+        loser_path = a.face_thumbnail.path if a.pk != min(a.pk, b.pk) else b.face_thumbnail.path
+        self.assertTrue(os.path.exists(loser_path))
+        call_command('dedupe_overlapping_faces', '--yes')
+        self.assertFalse(os.path.exists(loser_path))
+
+    def test_two_separate_duplicate_pairs_on_same_image_both_collapse(self):
+        a1 = make_face(self.img, declared_name=self.person, box_left=1, box_top=1, box_right=30, box_bottom=30)
+        a2 = make_face(self.img, declared_name=self.person, box_left=1, box_top=1, box_right=30, box_bottom=30)
+        b1 = make_face(self.img, declared_name=self.other_person, box_left=50, box_top=50, box_right=80, box_bottom=80)
+        b2 = make_face(self.img, declared_name=self.other_person, box_left=50, box_top=50, box_right=80, box_bottom=80)
+        call_command('dedupe_overlapping_faces', '--yes')
+        self.assertEqual(Face.objects.filter(source_image_file=self.img).count(), 2)
+
+    def test_non_overlapping_faces_on_same_image_are_left_alone(self):
+        a = make_face(self.img, declared_name=self.person, box_left=1, box_top=1, box_right=30, box_bottom=30)
+        b = make_face(self.img, declared_name=self.other_person, box_left=50, box_top=50, box_right=80, box_bottom=80)
+        call_command('dedupe_overlapping_faces', '--yes')
+        self.assertEqual(Face.objects.filter(pk__in=[a.pk, b.pk]).count(), 2)
+
+    def test_person_face_counts_are_recomputed_after_dedupe(self):
+        a, b = self._duplicate_pair()
+        self.person.num_faces = 999  # deliberately stale
+        self.person.save()
+        call_command('dedupe_overlapping_faces', '--yes')
+        self.person.refresh_from_db()
+        self.assertEqual(self.person.num_faces, 1)
+
+    def test_rerunning_after_cleanup_finds_nothing(self):
+        self._duplicate_pair()
+        call_command('dedupe_overlapping_faces', '--yes')
+        call_command('dedupe_overlapping_faces', '--dry-run')
+        self.assertEqual(Face.objects.filter(source_image_file=self.img).count(), 1)
