@@ -480,6 +480,10 @@ class PersonParamView(APIView):
         # someone." Only meaningful on the face_poss branch below.
         do_flagged_only = params.get('flagged', '').lower() == 'true'
 
+        # Populated only for field == 'face_declared' with
+        # only_unverified=true - see there for what this is.
+        cluster_groups = {}
+
         id_key = kwargs['id']
         field = kwargs['field']
 
@@ -496,8 +500,24 @@ class PersonParamView(APIView):
 
                 default_query = Q(declared_name=person_obj)
                 unverified_query = Q(validated=False)
+                # verification_cluster_group (face_manager/
+                # verification_clustering.py's nightly job) only ever gets
+                # set on faces this exact query already targets when
+                # do_only_unverified is true (validated=False, declared to
+                # a real person) - grouping information the frontend's
+                # verify-screen "Group by cluster" mode uses to review a
+                # whole visually-coherent batch at once instead of one
+                # face at a time. Only clusters of size >=2 get a group id
+                # (see that module); a face with no group id is a
+                # singleton, always still verified individually.
                 if do_only_unverified:
-                    faces = Face.objects.filter(default_query & unverified_query).values_list('id', flat=True)
+                    faces_qs = Face.objects.filter(default_query & unverified_query)
+                    cluster_groups = {
+                        str(fid): group for fid, group in
+                        faces_qs.values_list('id', 'verification_cluster_group')
+                        if group is not None
+                    }
+                    faces = faces_qs.values_list('id', flat=True)
                 else:
                     faces = Face.objects.filter(default_query).values_list('id', flat=True)
             else:
@@ -557,7 +577,7 @@ class PersonParamView(APIView):
             image_set = ImageFile.objects.filter(directory=dir_obj).order_by('-dateTaken').values_list('id', flat=True)
             id_list = list(image_set)
 
-        js = {'num_results': len(id_list), 'type': field, 'id_list': id_list,}
+        js = {'num_results': len(id_list), 'type': field, 'id_list': id_list, 'cluster_groups': cluster_groups}
 
         return HttpResponse(json.dumps(js), content_type='application/json')
 
