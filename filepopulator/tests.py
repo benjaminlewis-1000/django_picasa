@@ -5,6 +5,9 @@ from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django import forms
 from django.conf import settings
+from django.db import connection
+import psycopg2
+import zlib
 import os
 import binascii
 from datetime import datetime
@@ -726,6 +729,39 @@ class ImageFileTests(TestCase):
         # print(dir_objs)
         directory_list = [x.dir_path for x in dir_objs]
         self.assertEqual(len(directory_list), len(set(directory_list)))
+
+    def test_add_from_root_dir_skips_entirely_when_lock_already_held(self):
+        # Regression test for the settings.LOCKFILE -> Postgres advisory
+        # lock change (common/advisory_lock.py): while another instance
+        # holds the lock, this call must do nothing at all (not create
+        # any ImageFile/Directory rows), same as the old "Locked!" no-op,
+        # but via a real held advisory lock instead of a file on disk.
+        #
+        # Postgres advisory locks are reentrant PER SESSION -- acquiring
+        # the same key again from the same connection would just succeed
+        # again, not block -- so the "other holder" here has to be a
+        # genuinely separate connection, not another `with advisory_lock`
+        # on Django's own (shared, single) test connection.
+        cfg = connection.settings_dict
+        other = psycopg2.connect(
+            dbname=cfg['NAME'], user=cfg['USER'], password=cfg['PASSWORD'],
+            host=cfg['HOST'] or 'localhost', port=cfg['PORT'] or 5432,
+        )
+        other.autocommit = True
+        self.addCleanup(other.close)
+        key = zlib.crc32(b'filepopulator.add_from_root_dir')
+        with other.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", [key])
+            self.assertTrue(cur.fetchone()[0])
+
+            add_from_root_dir(self.tmp_valid_dir)
+            self.assertEqual(ImageFile.objects.count(), 0)
+
+            cur.execute("SELECT pg_advisory_unlock(%s)", [key])
+
+        # Once free again, a normal run still works.
+        add_from_root_dir(self.tmp_valid_dir)
+        self.assertGreater(ImageFile.objects.count(), 0)
 
 
 class DirectoryTests(TestCase):

@@ -41,22 +41,15 @@ def process_faces():
     try:
         settings.LOGGER.debug("Starting face extraction...")
 
-        i = celery_app.control.inspect()
-        active_tasks = i.active()
-        task_running = False
-        num_this_task_running = 0
-        for k in active_tasks.keys():
-            tasks = active_tasks[k]
-            if len(tasks) != 0:
-                for tt in tasks:
-                    if tt['name'] == 'face_manager.face_extraction':
-                        num_this_task_running += 1
-
-        if num_this_task_running > 1:
-            # This task will be one, so looking for other tasks.
-            settings.LOGGER.debug("Face file is locked, exiting.")
-            settings.LOGGER.warning("Face adding locked!")
-            return
+        # Overlap protection used to live here as a celery_app.control.
+        # inspect().active() check -- a check-then-act race (two tasks
+        # starting close together can each see "0 others running" before
+        # either registers), and one that only covered other Celery
+        # invocations of this same task, not a direct manage.py shell/
+        # management-command call. find_and_encode_faces() itself now
+        # holds a Postgres advisory lock for its whole run (see
+        # common/advisory_lock.py), which is atomic and covers every
+        # entry point, so this task no longer needs its own check.
 
         unprocessed_imgs = ImageFile.objects.filter(isProcessed=False).all()
         unprocessed_count = ImageFile.objects.filter(isProcessed=False).count()

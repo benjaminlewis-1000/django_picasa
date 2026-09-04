@@ -1,6 +1,7 @@
 #! /usr/bin/env python
 
 from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, IMAGE_EXTENSION_REGEX, HEIC_EXTENSIONS
+import common
 from datetime import datetime
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -368,16 +369,18 @@ def create_image_file(file_path):
 
 def add_from_root_dir(root_dir):
 
-    lockfile = settings.LOCKFILE
-    
-    print(f"Adding lockfile is {lockfile}")
-    if os.path.isfile(lockfile):
-        print("Locked!")
-        return
-    else:
-
-        f = open(lockfile, 'w')
-        f.close()
+    # Postgres advisory lock (see common/advisory_lock.py), replacing the
+    # old settings.LOCKFILE file-based lock: that mechanism was a plain
+    # os.path.isfile() check-then-create with no wait/retry/timeout, and
+    # a hard kill/OOM/container restart mid-run could leave the file
+    # behind forever, silently no-op'ing every future scheduled run
+    # ("Locked!" then return) with no alerting. An advisory lock is tied
+    # to the database session, so it can't be left stale that way -- it
+    # releases automatically the moment the holding connection drops.
+    with common.advisory_lock('filepopulator.add_from_root_dir') as acquired:
+        if not acquired:
+            print("Locked!")
+            return
 
         count = 0
 
@@ -456,10 +459,6 @@ def add_from_root_dir(root_dir):
             settings.LOGGER.error(stack_trace) 
         finally:
             print("Finished adding from root!")
-            try:
-                os.remove(lockfile)
-            except FileNotFoundError:
-                pass
 
 def check_file_mods():
     try:
