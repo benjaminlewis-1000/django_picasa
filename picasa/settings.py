@@ -567,6 +567,12 @@ CELERY_BEAT_SCHEDULE = {
        'task': 'face_manager.set_face_counts',
        'schedule': crontab( minute = '55', hour='*/4'),
    },
+   'cluster_unverified_faces': {
+        'task': 'face_manager.cluster_unverified_faces',
+        # 1am -- clear of db_picasa's daily backup (2am) and weekly
+        # vacuum-swap (3am Monday) jobs.
+        'schedule': crontab(minute='0', hour='1'),
+    },
   'classify_unlabeled': {
       'task': 'face_manager.assign_faces',
       'schedule': crontab( minute = '0', hour='*'),
