@@ -633,6 +633,58 @@ class KeyedImageViewTests(ApiTestCase):
         self.assertTrue(data["date_taken"].startswith("2012-12-20"))
 
 
+class FaceDeclaredClusterGroupTests(ApiTestCase):
+    # PersonParamView's face_declared branch, only_unverified=true -
+    # surfaces Face.verification_cluster_group (set by the nightly
+    # face_manager.cluster_unverified_faces job) so the frontend's verify-
+    # screen "Group by cluster" mode can group visually similar faces for
+    # bulk review instead of one at a time.
+    def setUp(self):
+        super().setUp()
+        self.image = self.make_image()
+        self.person = Person.objects.create(person_name="Cluster Test Person")
+        self.clustered_a = self.make_face(
+            self.image, declared_name=self.person, validated=False,
+            verification_cluster_group=0,
+        )
+        self.clustered_b = self.make_face(
+            self.image, declared_name=self.person, validated=False,
+            verification_cluster_group=0,
+        )
+        self.singleton = self.make_face(
+            self.image, declared_name=self.person, validated=False,
+        )
+        self.already_verified = self.make_face(
+            self.image, declared_name=self.person, validated=True,
+        )
+
+    def test_cluster_groups_present_for_unverified_only(self):
+        resp = self.client.get(f"/api/paginate_obj_ids/{self.person.id}/face_declared?only_unverified=true")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = json.loads(resp.content)
+        self.assertIn(self.clustered_a.id, data["id_list"])
+        self.assertIn(self.singleton.id, data["id_list"])
+        self.assertNotIn(self.already_verified.id, data["id_list"])
+
+        cluster_groups = data["cluster_groups"]
+        self.assertEqual(cluster_groups[str(self.clustered_a.id)], 0)
+        self.assertEqual(cluster_groups[str(self.clustered_b.id)], 0)
+        # Singletons (and anything validated, since it's excluded from
+        # id_list entirely) simply don't appear in the map.
+        self.assertNotIn(str(self.singleton.id), cluster_groups)
+        self.assertNotIn(str(self.already_verified.id), cluster_groups)
+
+    def test_cluster_groups_empty_without_only_unverified(self):
+        # Not meaningful outside the verify screen's own filtered view -
+        # deliberately not computed (extra query) when the plain
+        # face_declared list (validated + unvalidated together) is
+        # requested instead.
+        resp = self.client.get(f"/api/paginate_obj_ids/{self.person.id}/face_declared")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = json.loads(resp.content)
+        self.assertEqual(data["cluster_groups"], {})
+
+
 class DirectoryPaginateObjIdsTests(ApiTestCase):
     # The Folders tab (frontend) walks this id_list directly for both tile
     # order and modal prev/next paging - it was previously unordered
