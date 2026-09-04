@@ -8,3 +8,4 @@ pillow_heif.register_heif_opener()
 
 from .open_img_oriented import open_img_oriented, apply_exif_orientation
 from .equalize import clahe_equalize_bgr
+from .advisory_lock import advisory_lock

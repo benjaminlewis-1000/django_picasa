@@ -217,6 +217,92 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
 
 ## Planned work
 
+**DONE (2026-09-04): investigated user-reported "near-exact overlap" duplicate faces; found and
+fixed a real race condition, plus a new open TODO.** Started from the user noticing duplicate/
+near-duplicate detected faces in the frontend. Quantified against real production data (pairwise
+IOU over all images with 2-8 faces, ~566k pairs checked): 3,745 same-image Face-row pairs with
+IOU > 0.9 (nearly all exactly 1.0 -- pixel-identical boxes). Two distinct causes found, confirmed
+via the user's own two example faces (1060610/1076848) plus a broader id-delta analysis:
+- **Root cause #1, ~72% of pairs (2,681), FIXED: a real race condition in
+  `find_and_encode_faces()` (`face_manager/face_extract_encode.py`)**, not a pyramid-detector/NMS
+  bug -- `pyramidal_detector.py`'s own `nms(iou_threshold=0.1 or 0.3 depending on caller)` looked
+  correctly aggressive and wasn't implicated. The real gap: `find_and_encode_faces()` pulls
+  `ImageFile.objects.filter(isProcessed=False)` and only marks `isProcessed=True` *after* fully
+  processing an image -- nothing claims the row up front. Two concurrent invocations (from ANY
+  entry point) processing the same never-before-processed image would each see `n_existing=0`,
+  each run detection independently (deterministic, so pixel-identical boxes), and each call
+  `add_new_face()` -- producing exactly the doubled rows found. The only existing guard was in the
+  Celery task wrapper (`tasks.py`'s `process_faces()`), checking `celery_app.control.inspect().
+  active()` -- a classic check-then-act race (two tasks starting close together can each see "0
+  others running" before either registers) that also didn't apply at all to a direct call (e.g.
+  `manage.py shell`, a management command) bypassing the Celery wrapper entirely. Confirmed via
+  id-delta analysis: 2,681 of the 3,745 pairs had ids within delta <=5 of each other (682 adjacent,
+  delta<=1) -- exactly the signature of two near-simultaneous processes each inserting the same 2
+  faces back-to-back; the remaining ~1,064 pairs had much larger id deltas (up to 14,528), a
+  separate, still-unidentified "reprocessed without clearing old faces" mechanism (see the TODO
+  below).
+  - **Fix, discussed and agreed with the user (who correctly flagged that a naive "mark done
+    before actually done, then unset on failure" claim scheme is fragile)**: a new
+    `common/advisory_lock.py` -- a Postgres advisory-lock context manager (`pg_try_advisory_lock`/
+    `pg_advisory_unlock`, key = `zlib.crc32(name.encode())`), non-blocking, tied to the DB session
+    rather than any row/file. Unlike a per-row "claim" flag, there's no separate unclaim-on-failure
+    path to get wrong -- the lock is released automatically on any exit from the `with` block
+    (including via exception) and, critically, also automatically by Postgres itself if the
+    holding connection ever drops (crash, OOM-kill, container restart) -- no timeout/heartbeat
+    logic needed. Scoped only to whatever name is passed in; doesn't touch any table, row, or other
+    Postgres locking machinery, and has zero effect on any other lock name (verified: a lock on one
+    name can be held while a different name is acquired freely, and it doesn't block ordinary
+    queries at all -- only another `advisory_lock()` call using the *same* name).
+  - **Applied to two tasks, per the user's explicit request to generalize beyond just this one
+    fix**: `find_and_encode_faces()` (`face_manager.find_and_encode_faces` key) -- refactored into
+    a thin `find_and_encode_faces()` wrapper that acquires the lock and skips (logging a warning)
+    if already held, calling the unchanged original body (now `_find_and_encode_faces_locked()`)
+    only once acquired; and `filepopulator/scripts.py`'s `add_from_root_dir()`
+    (`filepopulator.add_from_root_dir` key), **replacing** the old `settings.LOCKFILE`
+    file-based lock entirely -- that mechanism was a plain `os.path.isfile()` check-then-create
+    with no wait/retry/timeout, and (per an already-known-but-unactioned TODO) a hard kill/OOM/
+    container restart mid-run could leave the lockfile behind forever, silently no-op'ing every
+    future scheduled run ("Locked!" then return) with no alerting -- the advisory lock closes that
+    gap too, for free. `tasks.py`'s `process_faces()` had its now-redundant-and-racy `inspect().
+    active()` check removed (the advisory lock inside `find_and_encode_faces()` supersedes it and
+    is atomic). `settings.LOCKFILE` itself was left defined but is now dead, same as the
+    already-unused `FACE_LOCKFILE`/`CLASSIFY_LOCKFILE` settings next to it -- not cleaned up.
+  - Tested on `backend_upgrade`/`picasa_api_dev_test`: 6 new `common.tests.AdvisoryLockTests`
+    (uncontended acquire, reacquire after release, release-on-exception, cross-session contention
+    and release via a genuinely separate `psycopg2` connection -- Postgres advisory locks are
+    reentrant *per session*, so simulating real contention requires a second connection, not
+    another `with advisory_lock(...)` on the same one), 1 new
+    `filepopulator.tests.ImageFileTests` case (`add_from_root_dir` does nothing at all while
+    another session holds its lock, then works normally once free), and 1 new `face_manager.
+    tests.FaceExtractorCorruptedImageTests` case (same shape, against real `find_and_encode_
+    faces()` with real detection). Full fast suite: 290/292 passing (the same 2 pre-existing,
+    unrelated failures as before -- fixture path availability and float32-precision rounding).
+    Not yet ported to `master`/deployed as of this note -- see the top-level "Where things stand"
+    section once that lands.
+  - **TODO, NOT YET FOUND: root cause #2, the ~1,064 far-apart-id same-image duplicate pairs.**
+    Checked the known "reset isProcessed=False without deleting stale Face rows first" management
+    commands (`cleanDB.py`, both `clearfaces.py` variants, `cleanup_chronically_unmatched_faces.
+    py`) -- all correctly delete before resetting, none is the culprit. Some other trigger,
+    not yet identified, is causing this. Worth a fresh investigation pass (same id-delta/contact-
+    sheet methodology) once time allows.
+- **TODO, NOT STARTED: a separate, unrelated duplicate problem noticed while investigating the
+  above -- files being ingested twice, producing two distinct `ImageFile` rows with an IDENTICAL
+  MD5 hash.** Confirmed via the user's own example (faces 1060610/1076848, on `ImageFile`s 340565
+  and 346648): same `pixel_hash`-equivalent MD5 (`c3e6fce0cc3c8adeb545380d44acc826`), same
+  dimensions, same `dateTaken`, different paths (`/photos/aggregated/20260725_211618.jpg` vs
+  `.../Seattle Family Reunion and Josh Wedding/20260725_211618.jpg`) -- already flagged in
+  `SimilarImagePair` (`hamming_distance=0`) since 2026-08-27, but never merged/pruned, so each row
+  gets its own independent face-detection pass and (since the pixel content is identical) produces
+  identical-box "duplicate" faces downstream -- a *symptom* of this bug, not a cause, and NOT
+  fixed by the race-condition fix above (that fix only stops the SAME `ImageFile` from being
+  double-processed; two separate `ImageFile` rows for the same real photo are a filepopulator/
+  ingestion-side problem, not a face-detection one). Not investigated further this session --
+  explicitly flagged by the user as a real but non-mainline TODO. Needs its own look at
+  `filepopulator/scripts.py`'s duplicate-detection logic (`create_image_file()`'s pixel-hash/
+  file-hash matching, `DuplicateFile`) to understand why a file already known (by MD5) to be
+  identical to an existing row still gets its own new `ImageFile` row instead of being recorded as
+  a `DuplicateFile` and skipped, the way a same-path re-ingest already is.
+
 **Face-classification outlier-rejection: investigation and ideas (2026-08-27).** Started from a
 real user observation: `face_manager/assign_faces.py`'s `classify_unassigned()` is good at
 correctly matching faces to known people, but frequently proposes outlier faces as matches too.

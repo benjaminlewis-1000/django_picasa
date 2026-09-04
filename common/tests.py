@@ -1,11 +1,15 @@
 import os
+import zlib
 
 import cv2
 import numpy as np
+import psycopg2
 from django.conf import settings
+from django.db import connection
 from django.test import TestCase
 from PIL import Image
 
+from common.advisory_lock import advisory_lock
 from common.open_img_oriented import open_img_oriented, apply_exif_orientation
 from common.equalize import clahe_equalize_bgr
 
@@ -231,3 +235,73 @@ class ClaheEqualizeTests(TestCase):
         dark_img = (img.astype(np.float32) * 0.25).astype(np.uint8)
         out = clahe_equalize_bgr(dark_img)
         self.assertGreater(out.mean(), dark_img.mean())
+
+
+class AdvisoryLockTests(TestCase):
+    """common.advisory_lock -- a Postgres advisory-lock mutex built to
+    close a real race in find_and_encode_faces() (see CLAUDE.md): two
+    concurrent invocations of that function, from any entry point, could
+    each see an image as unprocessed and both insert duplicate Face rows
+    for the same detected face. Unlike a lockfile, the lock is tied to
+    the DB session, so a crash can't leave it stuck.
+
+    django.db.connection's own settings_dict is used (rather than
+    hardcoding a database name) to open a genuinely separate raw
+    connection against whatever DB Django's test runner is actually
+    using, so these tests exercise real cross-session contention."""
+
+    def _second_connection(self):
+        cfg = connection.settings_dict
+        conn = psycopg2.connect(
+            dbname=cfg['NAME'], user=cfg['USER'], password=cfg['PASSWORD'],
+            host=cfg['HOST'] or 'localhost', port=cfg['PORT'] or 5432,
+        )
+        conn.autocommit = True
+        self.addCleanup(conn.close)
+        return conn
+
+    def test_acquires_and_releases_an_uncontended_lock(self):
+        with advisory_lock('common.tests.uncontended') as acquired:
+            self.assertTrue(acquired)
+
+    def test_lock_is_free_again_after_the_with_block_exits(self):
+        with advisory_lock('common.tests.reusable'):
+            pass
+        with advisory_lock('common.tests.reusable') as acquired:
+            self.assertTrue(acquired)
+
+    def test_lock_is_released_even_if_the_block_raises(self):
+        with self.assertRaises(ValueError):
+            with advisory_lock('common.tests.raises'):
+                raise ValueError("boom")
+        with advisory_lock('common.tests.raises') as acquired:
+            self.assertTrue(acquired)
+
+    def test_second_session_cannot_acquire_a_held_lock(self):
+        other = self._second_connection()
+        with other.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", [
+                zlib.crc32(b'common.tests.contended')
+            ])
+            self.assertTrue(cur.fetchone()[0])
+
+        with advisory_lock('common.tests.contended') as acquired:
+            self.assertFalse(acquired)
+
+    def test_releasing_the_other_session_frees_it_for_this_one(self):
+        other = self._second_connection()
+        key_name = 'common.tests.contended_then_freed'
+        key = zlib.crc32(key_name.encode())
+        with other.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", [key])
+            self.assertTrue(cur.fetchone()[0])
+            cur.execute("SELECT pg_advisory_unlock(%s)", [key])
+
+        with advisory_lock(key_name) as acquired:
+            self.assertTrue(acquired)
+
+    def test_different_lock_names_do_not_contend_with_each_other(self):
+        with advisory_lock('common.tests.name_a') as acquired_a:
+            with advisory_lock('common.tests.name_b') as acquired_b:
+                self.assertTrue(acquired_a)
+                self.assertTrue(acquired_b)

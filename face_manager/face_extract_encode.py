@@ -143,9 +143,28 @@ class FaceExtractor(object):
         Workhorse function that finds faces for all unprocessed
         ImageFile objects. If the ImageFile already has Face objects
         attached to it, then the function will endeavor to match those faces
-        with detected faces. 
-        """
+        with detected faces.
 
+        Wrapped in a Postgres advisory lock (common.advisory_lock) so at
+        most one invocation of this function -- from ANY entry point
+        (the scheduled Celery task, a direct manage.py shell call, a
+        management command), not just other Celery tasks of the same
+        name -- ever runs at once. Without this, two concurrent
+        invocations processing the same never-before-processed image
+        each see n_existing=0, both run detection independently, and
+        both insert new Face rows for the same face -- confirmed against
+        real production data as the cause of a large fraction of
+        same-image duplicate-Face-row pairs (see CLAUDE.md).
+        """
+        with common.advisory_lock('face_manager.find_and_encode_faces') as acquired:
+            if not acquired:
+                settings.LOGGER.warning(
+                    "find_and_encode_faces() already running elsewhere -- skipping this run."
+                )
+                return
+            self._find_and_encode_faces_locked()
+
+    def _find_and_encode_faces_locked(self):
         # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Completed/Pictures_finished/Nicholas\' Pictures/Christmas time and Goblin Valley/PC094087.JPG') # SOLVED 
         # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/2023/Nathaniel Preschool/Bloomz_e4d23164-bcab-4615-ad57-a20dc169de1b.jpeg') # SOLVED 
         # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Completed/Pictures_finished/Family Pictures/2016/February 2016/Meagan Leaves/_DSC0247.JPG') # SOLVED 

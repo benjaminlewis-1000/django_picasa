@@ -17,13 +17,16 @@ Run just the fast ones with:
 """
 import os
 import unittest
+import zlib
 from io import BytesIO
 
 import cv2
 import numpy as np
+import psycopg2
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
+from django.db import connection
 from django.test import TestCase, override_settings, tag
 
 from django.core.management import call_command
@@ -517,6 +520,54 @@ class FaceExtractorCorruptedImageTests(TestCase):
         img_b.refresh_from_db()
         self.assertFalse(img_a.isProcessed)
         self.assertTrue(img_b.isProcessed)
+
+    def test_skips_entirely_when_advisory_lock_already_held(self):
+        # Regression test for a real production bug: find_and_encode_faces()
+        # used to have no locking of its own at all -- only the Celery task
+        # wrapper checked celery_app.control.inspect().active(), a
+        # check-then-act race that also didn't cover a direct call like
+        # this one. Two concurrent runs against the same never-before-
+        # processed image each saw n_existing=0 and both inserted a Face
+        # row for the same detected face -- confirmed against real
+        # production data (~72% of found same-image duplicate-Face-row
+        # pairs had adjacent/near-adjacent ids). Now find_and_encode_faces()
+        # holds a Postgres advisory lock (common/advisory_lock.py) for its
+        # whole run; while another session holds it, this call must do
+        # nothing at all, not even mark the image processed.
+        #
+        # Advisory locks are reentrant PER SESSION, so the "other holder"
+        # has to be a genuinely separate connection, not another lock
+        # acquired on Django's own (shared, single) test connection.
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/has_face_tags.jpg"
+        create_image_file(path)
+        img_obj = ImageFile.objects.get(filename=path)
+
+        cfg = connection.settings_dict
+        other = psycopg2.connect(
+            dbname=cfg['NAME'], user=cfg['USER'], password=cfg['PASSWORD'],
+            host=cfg['HOST'] or 'localhost', port=cfg['PORT'] or 5432,
+        )
+        other.autocommit = True
+        try:
+            key = zlib.crc32(b'face_manager.find_and_encode_faces')
+            with other.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", [key])
+                self.assertTrue(cur.fetchone()[0])
+
+                self.extractor.find_and_encode_faces()
+
+                img_obj.refresh_from_db()
+                self.assertFalse(img_obj.isProcessed)
+                self.assertEqual(Face.objects.filter(source_image_file=img_obj).count(), 0)
+
+                cur.execute("SELECT pg_advisory_unlock(%s)", [key])
+        finally:
+            other.close()
+
+        # Once free again, a normal run still works.
+        self.extractor.find_and_encode_faces()
+        img_obj.refresh_from_db()
+        self.assertTrue(img_obj.isProcessed)
 
 
 class UpdateListOfNoMatchingDetectsTests(TestCase):
