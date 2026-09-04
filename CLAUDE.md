@@ -760,6 +760,23 @@ ideas, so a future session doesn't have to redo this from scratch:
       exists yet (e.g. alerting if the newest backup file's mtime is more than ~26h old) — worth
       considering given this exact failure mode produced zero errors anywhere on its own and was
       only caught because the user happened to notice a backup file hadn't shrunk.
+- **`weekly_vacuum_swap.py` downgraded from weekly to monthly (2026-09-04).** The user's
+  observation: `postgres_bak.sh`'s `.tar.zst`-compressed backups already come out small, so is
+  the weekly downtime still worth it? Clarified the actual mechanism first, since the premise
+  needed a correction: `pg_dump` (what the backup script uses) is a logical dump — it only ever
+  contains live row data, never dead tuples/free space, regardless of how bloated the source
+  table is. So backup size was never affected by live-DB bloat either way; the vacuum-swap
+  job's only real purpose is shrinking the LIVE `db_picasa` volume's on-disk footprint (regular
+  autovacuum already keeps the table usable/performant on its own without it, just doesn't
+  return the space to the OS). Given that, weekly `picasa_api` downtime for a pure disk-space
+  reclaim wasn't judged worth it — the user's compromise: run it monthly instead of weekly,
+  rather than dropping it entirely. Implemented as `0 3 1-7 * 1` in `crontab_root` ("day-of-month
+  1-7" AND "weekday Monday" together only matches the first Monday of the month) — keeps the
+  existing Monday-3am rationale (clear of the 2am daily backup and Saturday's stock weekly slot)
+  at a lower cadence. `weekly_vacuum_swap.py` itself is unchanged (still runnable by hand any time
+  disk usage gets tight before the next scheduled run) — only its docstring and the crontab
+  entry were updated. Requires the same rebuild + `--force-recreate db_django` as any other
+  `crontab_root` change (it's `COPY`'d into the image, not bind-mounted).
 - **Removed `Face.face_encoding` (legacy 128-d dlib embedding), 2026-08-26.** Superseded by
   `face_encoding_512` (insightface) for years — the live pipeline (`face_extract_encode.py`)
   already hadn't written a real value to it, explicitly setting it to `None`. Freed ~371MB in
