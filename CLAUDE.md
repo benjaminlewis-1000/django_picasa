@@ -360,7 +360,42 @@ via the user's own two example faces (1060610/1076848) plus a broader id-delta a
     recompute on a losing collapse, re-run-finds-nothing), full fast suite still green (311/313,
     same 2 pre-existing failures). **Dry-run against real production data: 1,197 contaminated rows
     -- 948 resolvable (a clear primary found), 249 unresolved (no primary found, left alone), 4,202
-    faces would be transferred.** Not yet run for real -- awaiting the user's go-ahead.
+    faces would be transferred.** **Run for real 2026-09-04: 948 merged and deleted, 4,202 faces
+    transferred, 4,096 of those collapsed as exact-duplicate pairs on the primary (nearly all --
+    expected, since the two source photos were pixel-identical), ~106 survived as genuinely new
+    faces only one of the two copies had detected, 48 people's face counts recomputed. App healthy
+    afterward; remaining contaminated count matched the 249 unresolved exactly.**
+    Investigated the 249 unresolved further at the user's request: **247 of them have no other
+    ImageFile row sharing their content at all** -- their primary was deleted at some point (e.g.
+    `delete_removed_photos()` ran after the original file vanished from disk), leaving the
+    duplicate-flagged copy stranded with nothing to merge into (but nothing lost either -- there
+    was only ever the one surviving copy). **The other 2 are a single reciprocal-flagging pair**
+    (`.../Kings Island/20251025_194106.jpg` and `.../cbbbc672-...-copied-media~2.jpg`) -- both real
+    photos exist, but each independently ended up with its own `DuplicateFile` record pointing at
+    the other, so the command's safety check (only pick a primary that isn't itself flagged)
+    excludes both. Not fixed -- a narrow, 2-row edge case, noted here rather than chased further.
+  - **DONE (2026-09-04): `DuplicateFile.original` FK, closing the root design gap the 247-of-249
+    case above exposed.** `DuplicateFile` previously stored only a bare `filename` -- no reference
+    at all to which primary `ImageFile` it was a duplicate of, so there was no way to notice "the
+    primary this pointed at just got deleted." Added `original = ForeignKey(ImageFile,
+    on_delete=CASCADE, null=True)` (migration `filepopulator.0006_duplicatefile_original`),
+    populated by `create_image_file()`'s two duplicate-recording branches going forward. The
+    `CASCADE` is the actual point: when a primary `ImageFile` is later deleted, its `DuplicateFile`
+    records now go with it automatically, freeing the surviving duplicate file to be genuinely
+    re-ingested as a real photo the next time it's scanned -- exactly the gap that stranded the
+    247. (The reverse direction -- the *duplicate* file being deleted instead -- needs no special
+    handling: the primary stays completely valid either way, and a `DuplicateFile` row whose own
+    path no longer exists is harmless, inert clutter, not a correctness problem.)
+    **`backfill_duplicatefile_original`**: one-time (safely re-runnable) command resolving the
+    ~17,330 pre-existing `DuplicateFile` rows that predate this field -- for each with `original`
+    still NULL: if its own file is gone, delete the row (moot either way); if the file decodes and
+    exactly one `ImageFile` shares its `pixel_hash`, set `original`; if none do, delete the row
+    (same reasoning as the 247 case -- frees the sole surviving copy); if the file exists but fails
+    to decode, or more than one current `ImageFile` shares the hash (ambiguous), leave it alone
+    rather than guess. 12 new tests total (FK population on both create_image_file() branches,
+    CASCADE-on-primary-delete, and the backfill's four outcomes -- resolved / file-gone-deleted /
+    no-primary-deleted / corrupted-left-alone -- plus dry-run and re-run idempotency). Full fast
+    suite: 319/321 passing (same 2 pre-existing, unrelated failures).
 
 **Face-classification outlier-rejection: investigation and ideas (2026-08-27).** Started from a
 real user observation: `face_manager/assign_faces.py`'s `classify_unassigned()` is good at

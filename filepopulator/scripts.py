@@ -395,7 +395,7 @@ def create_image_file(file_path):
             # duplicates.
             for each in exist_with_same_hash:
                 if _pixel_arrays_match(new_photo, each.filename):
-                    new_dup = DuplicateFile(filename=file_path)
+                    new_dup = DuplicateFile(filename=file_path, original=each)
                     print("File exists (multiple)...", file_path, '. Marking as duplicate.')
                     new_dup.save()
                     return
@@ -415,7 +415,7 @@ def create_image_file(file_path):
             # file got correctly recorded as a DuplicateFile AND
             # incorrectly given its own full ImageFile row).
             if _pixel_arrays_match(new_photo, exist_with_same_hash[0].filename):
-                new_dup = DuplicateFile(filename=file_path)
+                new_dup = DuplicateFile(filename=file_path, original=exist_with_same_hash[0])
                 print("File exists...", file_path, exist_with_same_hash[0].filename, '. Marking as duplicate.')
                 new_dup.save()
                 return

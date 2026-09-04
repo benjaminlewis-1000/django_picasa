@@ -226,6 +226,105 @@ class ImageFileTests(TestCase):
         self.assertEqual(ImageFile.objects.filter(filename=duplicate_path).count(), 0)
         self.assertTrue(DuplicateFile.objects.filter(filename=duplicate_path).exists())
 
+    def test_duplicatefile_original_points_at_the_primary(self):
+        original = self.goodFiles[0]
+        duplicate_path = os.path.join(os.path.dirname(original), 'duplicate_copy.jpg')
+        shutil.copyfile(original, duplicate_path)
+
+        create_image_file(original)
+        primary = ImageFile.objects.get(filename=original)
+        create_image_file(duplicate_path)
+
+        dup_record = DuplicateFile.objects.get(filename=duplicate_path)
+        self.assertEqual(dup_record.original_id, primary.id)
+
+    def test_deleting_the_primary_cascades_to_delete_the_duplicatefile_record(self):
+        # The actual point of DuplicateFile.original: if the primary is
+        # later deleted (e.g. the file vanished from disk and
+        # delete_removed_photos() ran), the stale DuplicateFile record
+        # must go with it -- otherwise the surviving duplicate file is
+        # permanently blocked from ever being re-ingested as a real
+        # photo, with nothing left for it to be "a duplicate of."
+        original = self.goodFiles[0]
+        duplicate_path = os.path.join(os.path.dirname(original), 'duplicate_copy.jpg')
+        shutil.copyfile(original, duplicate_path)
+
+        create_image_file(original)
+        primary = ImageFile.objects.get(filename=original)
+        create_image_file(duplicate_path)
+        self.assertTrue(DuplicateFile.objects.filter(filename=duplicate_path).exists())
+
+        primary.delete()
+
+        self.assertFalse(DuplicateFile.objects.filter(filename=duplicate_path).exists())
+
+    def test_backfill_sets_original_for_a_resolvable_legacy_duplicate(self):
+        # Legacy DuplicateFile rows predate the `original` field -- this
+        # simulates one (file still on disk, primary still exists) and
+        # confirms the backfill command resolves it purely from content,
+        # the same way create_image_file() does for new duplicates.
+        original = self.goodFiles[0]
+        create_image_file(original)
+        primary = ImageFile.objects.get(filename=original)
+
+        duplicate_path = os.path.join(os.path.dirname(original), 'legacy_dup.jpg')
+        shutil.copyfile(original, duplicate_path)
+        legacy_dup = DuplicateFile.objects.create(filename=duplicate_path)  # original left NULL
+
+        call_command('backfill_duplicatefile_original', '--yes')
+
+        legacy_dup.refresh_from_db()
+        self.assertEqual(legacy_dup.original_id, primary.id)
+
+    def test_backfill_deletes_a_stale_record_whose_file_no_longer_exists(self):
+        legacy_dup = DuplicateFile.objects.create(filename='/tmp/does_not_exist_anymore.jpg')
+
+        call_command('backfill_duplicatefile_original', '--yes')
+
+        self.assertFalse(DuplicateFile.objects.filter(pk=legacy_dup.pk).exists())
+
+    def test_backfill_deletes_a_stale_record_with_no_surviving_primary(self):
+        # File still on disk, but nothing in the DB shares its content
+        # anymore -- the primary was deleted before this field existed.
+        # Deleting frees this now-sole-surviving copy for real
+        # re-ingestion on the next scan.
+        orphan_path = os.path.join(self.tmp_valid_dir, 'orphaned_dup.jpg')
+        shutil.copyfile(self.goodFiles[0], orphan_path)
+        legacy_dup = DuplicateFile.objects.create(filename=orphan_path)
+
+        call_command('backfill_duplicatefile_original', '--yes')
+
+        self.assertFalse(DuplicateFile.objects.filter(pk=legacy_dup.pk).exists())
+
+    def test_backfill_leaves_a_corrupted_file_untouched(self):
+        corrupted_path = os.path.join(self.tmp_valid_dir, 'corrupted_dup.jpg')
+        with open(corrupted_path, 'wb') as f:
+            f.write(b'not a real jpeg')
+        legacy_dup = DuplicateFile.objects.create(filename=corrupted_path)
+
+        call_command('backfill_duplicatefile_original', '--yes')
+
+        legacy_dup.refresh_from_db()
+        self.assertIsNone(legacy_dup.original)
+
+    def test_backfill_dry_run_changes_nothing(self):
+        legacy_dup = DuplicateFile.objects.create(filename='/tmp/does_not_exist_anymore.jpg')
+
+        call_command('backfill_duplicatefile_original', '--dry-run')
+
+        self.assertTrue(DuplicateFile.objects.filter(pk=legacy_dup.pk).exists())
+
+    def test_backfill_rerun_finds_nothing_more_to_do(self):
+        create_image_file(self.goodFiles[0])
+        duplicate_path = os.path.join(os.path.dirname(self.goodFiles[0]), 'legacy_dup2.jpg')
+        shutil.copyfile(self.goodFiles[0], duplicate_path)
+        DuplicateFile.objects.create(filename=duplicate_path)
+
+        call_command('backfill_duplicatefile_original', '--yes')
+        call_command('backfill_duplicatefile_original', '--dry-run')
+
+        self.assertEqual(DuplicateFile.objects.filter(original__isnull=True).count(), 0)
+
     def test_multiple_existing_same_hash_rows_still_recognize_a_genuine_duplicate(self):
         # Exercises the len(exist_with_same_hash) > 1 branch, which has
         # the same missing-return shape of bug as the single-candidate
