@@ -337,6 +337,30 @@ via the user's own two example faces (1060610/1076848) plus a broader id-delta a
   assertion loosened to "becomes an ImageFile OR a recorded DuplicateFile," since the real
   validation fixture directory has always contained a deliberate duplicate pair. Full fast suite:
   305/307 passing (same 2 pre-existing, unrelated failures as always).
+  - **Existing contamination, mocked up (dry-run), not yet cleaned up: `filepopulator/management/
+    commands/merge_duplicate_imagefiles.py`.** Fixing the bug going forward doesn't undo the
+    1,197 already-contaminated `ImageFile` rows sitting in production (an `ImageFile` whose own
+    filename also has a `DuplicateFile` record). Real risk found before building anything: **5,009
+    faces sit on those 1,197 rows, 1,190 of them validated, 4,190 carrying a real label** -- a
+    human tagged these without knowing the photo was a duplicate, so a naive "just delete the
+    contaminated rows" cleanup would have destroyed real completed work. Per the user's explicit
+    call ("we should keep all the info we have"), the command instead: finds each contaminated
+    row's "primary" (another `ImageFile` sharing the same `pixel_hash`, itself not flagged as a
+    duplicate), reassigns every `Face` on the duplicate over to the primary
+    (`Face.objects.filter(...).update(source_image_file=primary)` -- bulk, valid since the two
+    rows are pixel-identical and share width/height), then **collapses any resulting same-image
+    duplicate face pairs on the primary** by reusing `dedupe_overlapping_faces`'s own grouping/
+    survivor-preference logic directly (imported, not reimplemented) -- since the two source
+    images are pixel-identical, a face present on both will usually land at the same box after the
+    transfer, needing the same validated > labeled > kps > lowest-id collapse. Finally deletes the
+    now-empty duplicate `ImageFile` row (`ImageFile.delete()` already cleans up its own thumbnail
+    files and any remaining faces properly). A contaminated row whose primary can't be found
+    (already separately removed, etc.) is deliberately left alone rather than guessed at. 6 new
+    tests (transfer, collapse-prefers-validated, unresolved-left-alone, dry-run-no-op, person-count
+    recompute on a losing collapse, re-run-finds-nothing), full fast suite still green (311/313,
+    same 2 pre-existing failures). **Dry-run against real production data: 1,197 contaminated rows
+    -- 948 resolvable (a clear primary found), 249 unresolved (no primary found, left alone), 4,202
+    faces would be transferred.** Not yet run for real -- awaiting the user's go-ahead.
 
 **Face-classification outlier-rejection: investigation and ideas (2026-08-27).** Started from a
 real user observation: `face_manager/assign_faces.py`'s `classify_unassigned()` is good at
