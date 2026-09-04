@@ -307,8 +307,10 @@ via the user's own two example faces (1060610/1076848) plus a broader id-delta a
     convention. 12 tests covering the connected-components grouping, each survivor-preference
     criterion individually and their priority ordering, re-run-finds-nothing idempotency, and
     thumbnail-file cleanup. Dry-run against real production data (no upper cap on faces-per-image,
-    unlike the earlier ad hoc investigation script which capped at 8 and undercounted): **8,264
-    duplicate groups, 8,368 Face rows to delete.**
+    unlike the earlier ad hoc investigation script which capped at 8 and undercounted): 8,264
+    duplicate groups, 8,368 Face rows to delete. **Run for real against production 2026-09-04:
+    8,368 duplicate faces deleted, face counts recomputed for 227 affected people, ~1 minute.
+    Confirmed clean afterward -- a second `--dry-run` immediately found 0 groups.**
 - **TODO, NOT STARTED: a separate, unrelated duplicate problem noticed while investigating the
   above -- files being ingested twice, producing two distinct `ImageFile` rows with an IDENTICAL
   MD5 hash.** Confirmed via the user's own example (faces 1060610/1076848, on `ImageFile`s 340565
