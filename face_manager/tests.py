@@ -1227,6 +1227,46 @@ class ReencodeMissingFacesTests(TestCase):
         self.assertIsNone(realignored_face.face_encoding_512)
         self.mock_face_analysis.get.assert_not_called()
 
+    def test_non_detected_sentinel_on_a_real_person_is_selected_for_reencode(self):
+        # Regression test: update_list_of_no_matching_detects() stamps
+        # settings.NON_DETECTED_FACE_ENCODING ([-999]*512) onto a face
+        # whose box wasn't matched to any detection during a full-image
+        # reprocessing pass. Found 2026-09-03 via a clustering
+        # investigation: 1,207 faces database-wide carried this sentinel
+        # while still being declared to a REAL person -- not NULL, so
+        # invisible to the original face_encoding_512__isnull=True filter,
+        # and not .ignore/.realignore, so this isn't a "confirmed-ignore"
+        # case either. Just a real face silently stuck with fake data.
+        person = make_person("Has Sentinel Encoding")
+        face = make_face(
+            self.image, declared_name=person,
+            box_left=100, box_top=100, box_right=140, box_bottom=140,
+        )
+        face.face_encoding_512 = list(settings.NON_DETECTED_FACE_ENCODING)
+        face.save()
+
+        self.mock_face_analysis.get.return_value = [
+            {'bbox': [0, 0, 40, 40], 'kps': np.zeros((5, 2)), 'embedding': np.full(512, 0.4)},
+        ]
+
+        self.extractor.reencode_missing_faces()
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.4] * 512)
+        self.assertTrue(face.reencoded)
+
+    def test_non_detected_sentinel_on_ignore_face_is_still_excluded(self):
+        ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        face = make_face(self.image, declared_name=ignore_person)
+        face.face_encoding_512 = list(settings.NON_DETECTED_FACE_ENCODING)
+        face.save()
+
+        self.extractor.reencode_missing_faces()
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, list(settings.NON_DETECTED_FACE_ENCODING))
+        self.mock_face_analysis.get.assert_not_called()
+
     def test_faces_with_an_existing_encoding_are_left_alone(self):
         person = make_person("Already Encoded")
         face = make_face(self.image, declared_name=person)
