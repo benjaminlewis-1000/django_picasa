@@ -446,9 +446,9 @@ ideas, so a future session doesn't have to redo this from scratch:
       nullable `IntegerField` on `Face` (migration `0008_face_verification_cluster_group`),
       populated by `face_manager/verification_clustering.py`'s `cluster_all_unverified_faces()`
       -- complete-linkage clustering (`sklearn.cluster.AgglomerativeClustering(linkage='complete',
-      metric='euclidean')` on L2-normalized embeddings, cos threshold **0.65 default** (changed
-      from the original 0.7 -- see the dated note below), configurable via a function argument,
-      `dist = sqrt(2 - 2*cos_sim)`) run independently **per real person**
+      metric='euclidean')` on L2-normalized embeddings, cos threshold **0.6 default** (changed
+      from the original 0.7 via 0.65 -- see the dated note below), configurable via a function
+      argument, `dist = sqrt(2 - 2*cos_sim)`) run independently **per real person**
       (never mixing galleries, one `AgglomerativeClustering` call per person) over
       `eligible_faces_queryset()`: **unverified** (`validated=False`), **valid-encoding**
       (excludes NULL and the `NON_DETECTED_FACE_ENCODING` sentinel), **non-ignore**
@@ -499,14 +499,18 @@ ideas, so a future session doesn't have to redo this from scratch:
       already-live DB. The three parked DB generations (`picasa_prerestore_2026_09_04`,
       `picasa_prevacuum_2026_08_31`, `picasa_pre_reset_2026_08_26`) were dropped afterward at the
       user's request, once satisfied with the result -- only `picasa` remains.
-      **Threshold changed 0.7 -> 0.65 (2026-09-04)**: the user asked to see 0.65's real effect
-      compared to 0.7 (the 0.65 vs 0.7 comparison had been tested during the original
-      investigation, but only via cached experiment data, never as a real production run) --
-      re-ran `cluster_all_unverified_faces(cos_threshold=0.65)` against live production: still
-      30 people, but 41,756 of 65,383 eligible faces grouped (up from 37,812 at 0.7, ~4pp more
-      coverage). User's call after comparing both real results: keep 0.65. `DEFAULT_COS_THRESHOLD`
-      in `verification_clustering.py` updated to match, so the nightly 1am task uses it going
-      forward too, not just this one-off run.
+      **Threshold walked down 0.7 -> 0.65 -> 0.6, same day (2026-09-04)**: the user asked to see
+      each looser threshold's real effect in turn (the 0.65/0.7 comparison had been tested during
+      the original investigation, but only via cached experiment data, never as a real production
+      run). Each step re-ran `cluster_all_unverified_faces(cos_threshold=...)` against live
+      production -- same 30 people every time, coverage of the 65,383 eligible faces climbing
+      each step: 37,812 (57.8%) at 0.7, 41,756 (63.9%) at 0.65, 46,236 (70.7%) at 0.6. At 0.6 the
+      user visually spot-checked real groups in the frontend (not just the raw counts) and called
+      it good -- kept. `DEFAULT_COS_THRESHOLD` in `verification_clustering.py` is now `0.6`, so
+      the nightly 1am task uses it going forward too, not just these one-off runs. No contact-sheet
+      audit at 0.6 was done outside the frontend spot-check -- worth remembering if quality
+      complaints ever come in, since the original investigation's own visual-coherence checks
+      (at 0.7, on Erica's gallery) don't automatically extend to a looser threshold.
   - **Looser branch for faces with `.ignore` already in their reject list (2026-08-28).** A face
     whose `rejected_fields` contains `.ignore` means a human previously declined an *auto-
     proposed* soft-ignore for it -- i.e. someone already looked and said "no, this is a real
