@@ -6,12 +6,17 @@
 0	3	*	*	6	run-parts /etc/periodic/weekly
 0	5	1	*	*	run-parts /etc/periodic/monthly
 
-# Weekly low-downtime VACUUM FULL via dump/restore/promote (see
-# weekly_vacuum_swap.py's own docstring). Deliberately 3am, not 2am --
-# the daily backup+prune above (0 2 * * *, which now also runs a restore
-# sanity-check on the day a backup is promoted into the weekly retention
-# tier) needs to be finished well before this starts, since both touch
-# the same DB and this one briefly stops picasa_api. Monday specifically
-# (weekday 1) so it doesn't collide with the stock weekly slot above
-# (Saturday, weekday 6).
-0	3	*	*	1	python3 /etc/periodic/weekly_vacuum_swap.py --promote >> /var/log/weekly_vacuum_swap.log 2>&1
+# Low-downtime VACUUM FULL via dump/restore/promote (weekly_vacuum_
+# swap.py's own docstring has the full mechanism). Changed 2026-09-04
+# from every Monday to the FIRST Monday of each month ("day-of-month
+# 1-7" + "weekday Monday" together only matches once a month): it exists
+# purely to reclaim disk space in the LIVE DB's on-disk footprint
+# (regular autovacuum already keeps the table usable/performant on its
+# own, it just doesn't shrink the file back down) -- separate from
+# backup size, which was never affected by live bloat either way
+# (pg_dump/postgres_bak.sh only ever dumps live row data, not dead
+# tuples/free space, regardless of bloat). Not worth picasa_api downtime
+# every single week for that; monthly is the compromise. Still Monday
+# 3am specifically so it doesn't collide with the daily backup (2am) or
+# the stock weekly slot above (Saturday, weekday 6).
+0	3	1-7	*	1	python3 /etc/periodic/weekly_vacuum_swap.py --promote >> /var/log/weekly_vacuum_swap.log 2>&1

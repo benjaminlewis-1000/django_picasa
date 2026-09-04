@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Weekly low-downtime VACUUM FULL via dump/restore/promote.
+"""Low-downtime VACUUM FULL via dump/restore/promote -- scheduled MONTHLY
+(first Monday, 3am) as of 2026-09-04, downgraded from weekly. It exists
+to reclaim disk space in the LIVE DB's on-disk footprint, which is
+unrelated to backup size (pg_dump/postgres_bak.sh only ever dumps live
+row data, never dead tuples/free space, regardless of how bloated the
+source table is) -- weekly picasa_api downtime wasn't worth it for pure
+disk reclaim, monthly is the compromise (see crontab_root's own note).
+Can still be run by hand (--rehearse first, then --promote) any time in
+between if live disk usage gets tight before the next scheduled run.
 
 VACUUM FULL run in-place would exclusive-lock face_manager_face (the most
 actively-written table) for its entire runtime, blocking all live traffic
@@ -8,14 +16,13 @@ live DB, restore it into a scratch DB (a freshly-restored table has no
 bloat at all -- no separate VACUUM FULL is needed on the copy), verify
 it's sane, then swap it in to replace the live DB.
 
-Runs INSIDE db_picasa itself (bind-mounted, scheduled via that
-container's own crontab -- see the crontab entry this ships with), using
-the local psql/pg_dump/pg_restore/createdb/dropdb tools directly for
-everything DB-related. The one thing it can't do locally is control the
-separate picasa_api container -- that goes through `docker
-stop`/`docker start`/`docker exec` against the host's Docker socket,
-which db_picasa has mounted in for exactly this purpose (see
-docker-compose.yaml's db_django service).
+Runs INSIDE db_picasa itself (bind-mounted), using the local
+psql/pg_dump/pg_restore/createdb/dropdb tools directly for everything
+DB-related. The one thing it can't do locally is control the separate
+picasa_api container -- that goes through `docker stop`/`docker
+start`/`docker exec` against the host's Docker socket, which db_picasa
+has mounted in for exactly this purpose (see docker-compose.yaml's
+db_django service).
 
 Two modes:
   --rehearse (safe, default): dump+restore+verify into a scratch DB while
