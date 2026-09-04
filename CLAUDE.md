@@ -279,12 +279,36 @@ via the user's own two example faces (1060610/1076848) plus a broader id-delta a
     unrelated failures as before -- fixture path availability and float32-precision rounding).
     Merged to `master` and deployed 2026-09-04 (`picasa_api` restarted to load the new code --
     no migration needed, no model/schema changes involved).
-  - **TODO, NOT YET FOUND: root cause #2, the ~1,064 far-apart-id same-image duplicate pairs.**
-    Checked the known "reset isProcessed=False without deleting stale Face rows first" management
-    commands (`cleanDB.py`, both `clearfaces.py` variants, `cleanup_chronically_unmatched_faces.
-    py`) -- all correctly delete before resetting, none is the culprit. Some other trigger,
-    not yet identified, is causing this. Worth a fresh investigation pass (same id-delta/contact-
-    sheet methodology) once time allows.
+  - **RESOLVED (2026-09-04): root cause #2, the ~1,064 far-apart-id same-image duplicate pairs, is
+    NOT a separate bug -- it's the same race condition at bulk-import scale.** The 98 distinct
+    images involved don't scatter randomly across the library; they cluster into a handful of
+    contiguous `ImageFile`-id ranges (sizes 23, 34, 68, 109), each corresponding to one bulk-import
+    event -- e.g. the 109-image cluster is entirely `/photos/Completed/Pictures_finished/2018/
+    Family Pictures/Erica Farewell/*`. That's the signature of a large batch of freshly-ingested
+    photos landing in the DB with `isProcessed=False` all at once, then getting caught by the
+    exact same race as root cause #1: two overlapping `find_and_encode_faces()` runs each
+    independently working through the big unprocessed batch, colliding on many of its images. The
+    larger id deltas simply reflect how many *other*, unrelated faces each run inserted before
+    happening to reach the shared images -- not a different trigger. The advisory-lock fix above
+    already fully covers this case too, regardless of batch size, since it prevents a second
+    concurrent invocation from starting at all. No separate fix was needed.
+  - **DONE (2026-09-04): `dedupe_overlapping_faces` management command, cleans up the duplicate
+    rows already sitting in the database from both flavors above.** Finds groups of mutually-
+    overlapping (IOU > 0.9, single-linkage via connected components) `Face` rows on the same
+    image, collapses each group to one survivor, deletes the rest via real `Face.delete()` (not a
+    bulk queryset delete, so thumbnail files get cleaned up too), and recomputes `Person.num_faces`/
+    `num_possibilities`/`num_unverified_faces` for anyone affected. Survivor preference, in order:
+    already-**validated** (never discard a completed human verification) > **has a real label**
+    (`declared_name` isn't the blank sentinel -- added per the user's specific request, since a
+    common real scenario is a human tagging one copy of a duplicate pair without knowing the other
+    copy existed, leaving it blank forever) > has **kps** populated (lets a later reencode
+    reproduce the exact embedding without re-detecting) > lowest id as a final deterministic
+    tiebreaker. `--dry-run`/`--yes` flags match this repo's established cleanup-command
+    convention. 12 tests covering the connected-components grouping, each survivor-preference
+    criterion individually and their priority ordering, re-run-finds-nothing idempotency, and
+    thumbnail-file cleanup. Dry-run against real production data (no upper cap on faces-per-image,
+    unlike the earlier ad hoc investigation script which capped at 8 and undercounted): **8,264
+    duplicate groups, 8,368 Face rows to delete.**
 - **TODO, NOT STARTED: a separate, unrelated duplicate problem noticed while investigating the
   above -- files being ingested twice, producing two distinct `ImageFile` rows with an IDENTICAL
   MD5 hash.** Confirmed via the user's own example (faces 1060610/1076848, on `ImageFile`s 340565
