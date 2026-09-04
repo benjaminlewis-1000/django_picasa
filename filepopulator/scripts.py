@@ -14,6 +14,7 @@ from PIL import Image
 from PIL.ExifTags import TAGS 
 import csv
 import logging
+import numpy as np
 import os
 import re
 import sys
@@ -121,6 +122,36 @@ def write_duplicates_csv(not_added_file, in_db_file):
             writer = csv.DictWriter(csvfile, fieldnames=titles)
             writer.writeheader()
             writer.writerow({titles[0]: not_added_file, titles[1]: in_db_file})
+
+
+def _pixel_arrays_match(new_photo, candidate_filename):
+    """Verifies that two files' actual decoded pixel content is
+    identical, not just their pixel_hash MD5 digests. pixel_hash is only
+    a 128-bit MD5 of the decoded, flattened pixel array (ImageFile.
+    _generate_md5_hash()) -- collisions between genuinely different
+    photos are astronomically unlikely in practice, but a synthetic one
+    is trivial to construct on purpose (see filepopulator.tests.
+    ImageFileTests.test_same_pixel_hash, which does exactly that to
+    confirm two different images sharing a pixel_hash are NOT treated as
+    duplicates of each other).
+
+    Re-decodes candidate_filename the same way ImageFile._generate_md5_
+    hash() does and compares the actual pixel arrays -- only called on
+    the rare "pixel_hash already matched" path, not on every file, so
+    the extra decode cost here doesn't matter for the common case.
+    """
+    if not os.path.exists(candidate_filename):
+        return False
+    candidate = ImageFile(filename=candidate_filename)
+    try:
+        candidate.process_new_no_md5()
+        candidate._generate_md5_hash()
+    except OSError:
+        return False
+    return (
+        new_photo.pixels.shape == candidate.pixels.shape
+        and bool(np.array_equal(new_photo.pixels, candidate.pixels))
+    )
 
 
 def create_image_file(file_path):
@@ -338,6 +369,7 @@ def create_image_file(file_path):
             # raise NotImplementedError('More than one...')
             print(f"Same hash: {exist_with_same_hash}")
             # logging.error('This is not how I want it -- I want more matching validation. But getting here was right.')
+            moved_into_existing = False
             for each in exist_with_same_hash:
                 if not os.path.exists(each.filename):
                     print(f"Deleting file {each.filename} since it is no longer in the file path.")
@@ -346,14 +378,52 @@ def create_image_file(file_path):
                     each.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
                     delete_old_thumbnails(each)
                     instance_clean_and_save(each)
+                    moved_into_existing = True
+                    break
+            if moved_into_existing:
+                return
+            # None of the existing same-hash rows were missing from disk.
+            # Verify actual pixel content (not just the pixel_hash digest)
+            # against each candidate before trusting it as a real
+            # duplicate -- a bare hash match used to be treated as
+            # sufficient here, which both (a) missed the possibility of a
+            # hash collision between genuinely different photos and (b)
+            # had a real bug: even when correctly identified as a
+            # duplicate, this branch never returned, so the file got
+            # BOTH a DuplicateFile record AND its own redundant
+            # ImageFile row, defeating the whole point of tracking
+            # duplicates.
+            for each in exist_with_same_hash:
+                if _pixel_arrays_match(new_photo, each.filename):
+                    new_dup = DuplicateFile(filename=file_path)
+                    print("File exists (multiple)...", file_path, '. Marking as duplicate.')
+                    new_dup.save()
                     return
+            settings.LOGGER.warning(
+                f"pixel_hash matched {len(exist_with_same_hash)} existing row(s) for "
+                f"{file_path}, but none had matching pixel content -- treating as a "
+                f"distinct photo (hash collision, not a real duplicate)."
+            )
         elif len(exist_with_same_hash) == 1 and os.path.exists(exist_with_same_hash[0].filename):
-            # There is a duplicate already. 
-            # TODO 
-            new_dup = DuplicateFile(filename=file_path)
-            # print("Making a duplicate")
-            print("File exists...", file_path, exist_with_same_hash[0].filename, '. Marking as duplicate.')
-            new_dup.save()
+            # There is a candidate duplicate -- same pixel_hash already
+            # ingested at a different path that's still on disk. Verify
+            # actual pixel content before trusting the hash (see
+            # _pixel_arrays_match's docstring); only if it genuinely
+            # matches do we record it as a DuplicateFile and stop -- do
+            # NOT fall through to create an ImageFile row too (that was a
+            # real bug: this branch never returned, so every duplicate
+            # file got correctly recorded as a DuplicateFile AND
+            # incorrectly given its own full ImageFile row).
+            if _pixel_arrays_match(new_photo, exist_with_same_hash[0].filename):
+                new_dup = DuplicateFile(filename=file_path)
+                print("File exists...", file_path, exist_with_same_hash[0].filename, '. Marking as duplicate.')
+                new_dup.save()
+                return
+            settings.LOGGER.warning(
+                f"pixel_hash matched {exist_with_same_hash[0].filename} for {file_path}, "
+                f"but pixel content differs -- treating as a distinct photo (hash "
+                f"collision, not a real duplicate)."
+            )
 
         elif len(exist_with_same_hash) == 0:
             settings.LOGGER.info("New photo should be created")
