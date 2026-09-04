@@ -260,6 +260,22 @@ def thumbnail_small_path(instance, filename):
 class DuplicateFile(models.Model):
     filename = models.CharField(max_length=1024)
 
+    # The ImageFile this path's content is a duplicate of. Nullable
+    # because existing rows predate this field (backfilled separately --
+    # see the backfill_duplicatefile_original command; some can't be
+    # resolved at all, e.g. the primary was already deleted before this
+    # field existed, and are left null or removed by that same backfill).
+    # on_delete=CASCADE is the actual point of this field: if the
+    # primary ImageFile is later deleted (e.g. the file vanished from
+    # disk and delete_removed_photos() ran), this DuplicateFile record
+    # should go with it -- otherwise it permanently blocks the
+    # now-sole-surviving duplicate file from ever being re-ingested as a
+    # real photo, with nothing left for it to be "a duplicate of."
+    original = models.ForeignKey(
+        'ImageFile', on_delete=models.CASCADE, null=True, blank=True,
+        related_name='duplicates',
+    )
+
 
 class FailedImageFile(models.Model):
     # Tracks a file that has never successfully been ingested into
