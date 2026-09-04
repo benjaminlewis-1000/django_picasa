@@ -23,7 +23,10 @@ from sklearn.cluster import AgglomerativeClustering
 
 from face_manager.models import Face
 
-DEFAULT_COS_THRESHOLD = 0.7
+# Changed from 0.7 to 0.65 on 2026-09-04: a real production comparison run
+# (same 30 people either way) found 0.65 grouped 41,756 of 65,383 eligible
+# faces vs. 37,812 at 0.7 -- kept per the user's call after seeing both.
+DEFAULT_COS_THRESHOLD = 0.65
 
 
 def _cos_to_euclidean_distance(cos_threshold):
