@@ -39,7 +39,7 @@ from face_manager.models import Face, Person, get_default_blank_person, clear_co
 from face_manager.pyramidal_detector import PyramidalDetector
 from face_manager.test_face_cache import cached_detect
 from face_manager.verification_clustering import cluster_all_unverified_faces
-from filepopulator.models import Directory, ImageFile
+from filepopulator.models import Directory, DuplicateFile, ImageFile
 from filepopulator.scripts import create_image_file
 
 
@@ -1713,3 +1713,121 @@ class DedupeOverlappingFacesTests(TestCase):
         call_command('dedupe_overlapping_faces', '--yes')
         call_command('dedupe_overlapping_faces', '--dry-run')
         self.assertEqual(Face.objects.filter(source_image_file=self.img).count(), 1)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class MergeDuplicateImageFilesTests(TestCase):
+    """merge_duplicate_imagefiles management command -- cleans up the
+    duplicate ImageFile rows left behind by the (now-fixed, see
+    filepopulator/scripts.py's create_image_file()) missing-return bug:
+    a genuine duplicate file used to get BOTH a correct DuplicateFile
+    record AND a redundant ImageFile row of its own, which could carry
+    real independent human work (labels, validations). Test data seeds
+    the contaminated state directly via bulk_create, mirroring
+    filepopulator.tests's own approach for the same reason: the normal
+    create_image_file() ingestion path no longer produces this state at
+    all now that it's fixed."""
+
+    def setUp(self):
+        self.person = make_person("Merge Person")
+        self.primary_img = make_image()
+
+    def _make_contaminated_duplicate(self, primary):
+        directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(primary.filename))
+        dup_filename = primary.filename + '.dup.jpg'
+        ImageFile.objects.bulk_create([ImageFile(
+            filename=dup_filename, directory=directory,
+            pixel_hash=primary.pixel_hash, file_hash=primary.file_hash,
+            width=primary.width, height=primary.height, isProcessed=False,
+            thumbnail_big='', thumbnail_medium='', thumbnail_small='',
+        )])
+        dup = ImageFile.objects.get(filename=dup_filename)
+        DuplicateFile.objects.create(filename=dup_filename)
+        return dup
+
+    def test_face_is_transferred_from_duplicate_to_primary(self):
+        dup = self._make_contaminated_duplicate(self.primary_img)
+        face = make_face(dup, declared_name=self.person, validated=True,
+                          box_left=1, box_top=1, box_right=30, box_bottom=30)
+
+        call_command('merge_duplicate_imagefiles', '--yes')
+
+        face.refresh_from_db()
+        self.assertEqual(face.source_image_file_id, self.primary_img.id)
+        self.assertFalse(ImageFile.objects.filter(pk=dup.pk).exists())
+
+    def test_duplicate_face_pairs_after_transfer_collapse_preferring_validated(self):
+        dup = self._make_contaminated_duplicate(self.primary_img)
+        blank = get_default_blank_person()
+        # A face already exists on the primary at this box, unlabeled/unvalidated.
+        make_face(self.primary_img, declared_name=blank,
+                  box_left=1, box_top=1, box_right=30, box_bottom=30)
+        # The duplicate's copy of the SAME face was validated + labeled --
+        # a human tagged it without knowing it was on a duplicate photo.
+        dup_face = make_face(dup, declared_name=self.person, validated=True,
+                              box_left=1, box_top=1, box_right=30, box_bottom=30)
+
+        call_command('merge_duplicate_imagefiles', '--yes')
+
+        remaining = Face.objects.get(source_image_file=self.primary_img)
+        self.assertEqual(remaining.pk, dup_face.pk)
+        self.assertTrue(remaining.validated)
+
+    def test_unresolved_duplicate_is_left_alone_when_no_primary_found(self):
+        # A DuplicateFile record with no OTHER ImageFile sharing its
+        # pixel_hash -- e.g. the primary was itself separately removed.
+        # Must be left alone, not guessed at or deleted.
+        directory, _ = Directory.objects.get_or_create(dir_path='/tmp')
+        ImageFile.objects.bulk_create([ImageFile(
+            filename='/tmp/orphan_dup.jpg', directory=directory,
+            pixel_hash='no_matching_hash_at_all', file_hash='x',
+            width=10, height=10, isProcessed=False,
+            thumbnail_big='', thumbnail_medium='', thumbnail_small='',
+        )])
+        DuplicateFile.objects.create(filename='/tmp/orphan_dup.jpg')
+
+        call_command('merge_duplicate_imagefiles', '--yes')
+
+        self.assertTrue(ImageFile.objects.filter(filename='/tmp/orphan_dup.jpg').exists())
+
+    def test_dry_run_changes_nothing(self):
+        dup = self._make_contaminated_duplicate(self.primary_img)
+        face = make_face(dup, declared_name=self.person, validated=True,
+                          box_left=1, box_top=1, box_right=30, box_bottom=30)
+
+        call_command('merge_duplicate_imagefiles', '--dry-run')
+
+        self.assertTrue(ImageFile.objects.filter(pk=dup.pk).exists())
+        face.refresh_from_db()
+        self.assertEqual(face.source_image_file_id, dup.pk)
+
+    def test_person_face_counts_recomputed_for_collapsed_away_person(self):
+        # A plain transfer with no collision doesn't change any person's
+        # face count (declared_name is untouched by moving source_image_
+        # file) -- recompute only matters when the post-transfer collapse
+        # actually DELETES a face, which is what this exercises: the
+        # losing side's stale cached count should get corrected.
+        dup = self._make_contaminated_duplicate(self.primary_img)
+        losing_person = make_person("Losing Person")
+        make_face(self.primary_img, declared_name=losing_person,
+                  box_left=1, box_top=1, box_right=30, box_bottom=30)
+        make_face(dup, declared_name=self.person, validated=True,
+                  box_left=1, box_top=1, box_right=30, box_bottom=30)
+        losing_person.num_faces = 999
+        losing_person.save()
+
+        call_command('merge_duplicate_imagefiles', '--yes')
+
+        losing_person.refresh_from_db()
+        self.assertEqual(losing_person.num_faces, 0)
+
+    def test_rerunning_after_merge_finds_nothing_more_to_do(self):
+        dup = self._make_contaminated_duplicate(self.primary_img)
+        make_face(dup, declared_name=self.person,
+                  box_left=1, box_top=1, box_right=30, box_bottom=30)
+
+        call_command('merge_duplicate_imagefiles', '--yes')
+        call_command('merge_duplicate_imagefiles', '--dry-run')
+
+        dup_filenames = set(DuplicateFile.objects.values_list('filename', flat=True))
+        self.assertEqual(ImageFile.objects.filter(filename__in=dup_filenames).count(), 0)
