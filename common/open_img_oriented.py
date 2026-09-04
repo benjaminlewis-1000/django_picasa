@@ -61,6 +61,13 @@ def open_img_oriented(filename: str, as_numpy: bool):
     else:
         raise NotImplementedError(f"Type of filename is {type(filename)}")
 
+    # Keep a handle to the ORIGINALLY opened image specifically so its
+    # underlying file can be force-closed in the `finally` below --
+    # convert()/transpose() reassign `image` to independent derived
+    # objects, so closing/loading this original reference afterward can't
+    # affect whatever ends up being returned.
+    original_image = image
+
     # PIL.Image.open() parses the header lazily and succeeds even on a
     # truncated/broken file -- the real decode (and OSError) happens on
     # first actual pixel access, which any of convert()/rotate()/
@@ -91,5 +98,25 @@ def open_img_oriented(filename: str, as_numpy: bool):
     except OSError as e:
         print("EX", e)
         return None
+    finally:
+        # Pillow's own docs: Image.load() "will close the file associated
+        # with the image" once decoded (unless draft() was used, which
+        # nothing here does) -- but reading EXIF via _getexif() doesn't
+        # necessarily trigger that, and neither convert() nor transpose()
+        # guarantee the ORIGINAL file object gets closed just because the
+        # local `image` variable was reassigned to a new object derived
+        # from it. Left as-is, a tight loop calling this function over
+        # many images (e.g. FaceExtractor.reencode_missing_faces()) leaks
+        # one file descriptor per call -- confirmed in production
+        # 2026-09-03: a 1,219-face batch hit "Too many open files" (ulimit
+        # -n 1024) partway through, making 206 perfectly good images fail
+        # with a misleading decode error. Forcing load() here explicitly
+        # guarantees the close, is a harmless no-op if the file was
+        # already fully loaded some other way, and never touches whatever
+        # derived object is actually being returned.
+        try:
+            original_image.load()
+        except Exception:
+            pass
     return image
 

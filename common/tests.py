@@ -15,6 +15,25 @@ class OpenImgOrientedTests(TestCase):
         with self.assertRaises(FileNotFoundError):
             open_img_oriented("/tmp/does_not_exist_at_all.jpg", as_numpy=True)
 
+    def test_does_not_leak_file_descriptors_across_many_calls(self):
+        # Regression test for a real production incident (2026-09-03):
+        # PIL keeps the underlying file open until Image.load() actually
+        # runs, and neither _getexif() nor convert()/transpose() were
+        # guaranteed to trigger that for the ORIGINALLY opened image
+        # object -- a tight loop over many images (FaceExtractor.
+        # reencode_missing_faces()) leaked one fd per call, hit the
+        # process's ulimit -n (1024) partway through a 1,219-face batch,
+        # and made 206 perfectly good images fail with a misleading
+        # decode error. Calling this function many more times than a
+        # typical ulimit allows must not accumulate open fds.
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/naming/good/1.JPG"
+        fd_dir = f"/proc/{os.getpid()}/fd"
+        before = len(os.listdir(fd_dir))
+        for _ in range(200):
+            open_img_oriented(path, as_numpy=True)
+        after = len(os.listdir(fd_dir))
+        self.assertLessEqual(after - before, 5, f"fd count grew from {before} to {after}")
+
     def test_reads_normal_jpeg_as_numpy(self):
         path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/naming/good/1.JPG"
         arr = open_img_oriented(path, as_numpy=True)
