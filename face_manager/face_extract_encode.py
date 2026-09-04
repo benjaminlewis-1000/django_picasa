@@ -1,6 +1,7 @@
 #! /usr/bin/env python
 
 from django.conf import settings
+from django.db.models import Q
 from face_manager.models import Person, Face
 from filepopulator.models import ImageFile
 from insightface.app import FaceAnalysis
@@ -748,15 +749,29 @@ class FaceExtractor(object):
 
     def reencode_missing_faces(self):
         """
-        Re-encode faces that have no face_encoding_512 but are no longer
-        declared .ignore/.realignore -- e.g. a confirmed-ignore face whose
-        embedding was cleared to save storage, then reassigned away from
-        that sentinel because it turned out to be a real person after all.
+        Re-encode faces that have no *usable* face_encoding_512 but are no
+        longer declared .ignore/.realignore -- e.g. a confirmed-ignore face
+        whose embedding was cleared to save storage, then reassigned away
+        from that sentinel because it turned out to be a real person after
+        all.
 
-        Deliberately filters on face_encoding_512 being NULL, not on the
-        `reencoded` flag -- that flag tracks whether a face's *box* came
-        from the modern insightface pipeline, which is orthogonal to
-        whether it currently has a usable embedding.
+        "No usable embedding" means either NULL, or the
+        settings.NON_DETECTED_FACE_ENCODING sentinel ([-999]*512) that
+        update_list_of_no_matching_detects() stamps onto a face whose
+        existing box wasn't matched to any detection during a full-image
+        reprocessing pass -- a real, declared-to-a-real-person face with
+        this sentinel is not "ignored," just stuck with a placeholder that
+        looks like real data to anything that doesn't check for it
+        specifically (found 2026-09-03: 1,207 faces database-wide carried
+        this sentinel, only 1 of which the existing
+        cleanup_chronically_unmatched_faces command's orientation-6/8-only
+        scope happened to also catch -- the other 1,206 were invisible to
+        every existing cleanup path).
+
+        Deliberately filters on face_encoding_512 lacking real data this
+        way, not on the `reencoded` flag -- that flag tracks whether a
+        face's *box* came from the modern insightface pipeline, which is
+        orthogonal to whether it currently has a usable embedding.
 
         Two paths, in order of preference:
           1. If the face has stored `kps` (5 landmark points, in the source
@@ -790,7 +805,7 @@ class FaceExtractor(object):
         every future run.
         """
         faces_to_reencode = Face.objects.filter(
-            face_encoding_512__isnull=True
+            Q(face_encoding_512__isnull=True) | Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
         ).exclude(
             declared_name__person_name__in=[settings.SOFT_IGNORE_NAME, '.realignore']
         ).select_related('source_image_file')
