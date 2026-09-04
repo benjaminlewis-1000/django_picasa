@@ -311,23 +311,32 @@ via the user's own two example faces (1060610/1076848) plus a broader id-delta a
     duplicate groups, 8,368 Face rows to delete. **Run for real against production 2026-09-04:
     8,368 duplicate faces deleted, face counts recomputed for 227 affected people, ~1 minute.
     Confirmed clean afterward -- a second `--dry-run` immediately found 0 groups.**
-- **TODO, NOT STARTED: a separate, unrelated duplicate problem noticed while investigating the
-  above -- files being ingested twice, producing two distinct `ImageFile` rows with an IDENTICAL
-  MD5 hash.** Confirmed via the user's own example (faces 1060610/1076848, on `ImageFile`s 340565
-  and 346648): same `pixel_hash`-equivalent MD5 (`c3e6fce0cc3c8adeb545380d44acc826`), same
-  dimensions, same `dateTaken`, different paths (`/photos/aggregated/20260725_211618.jpg` vs
-  `.../Seattle Family Reunion and Josh Wedding/20260725_211618.jpg`) -- already flagged in
-  `SimilarImagePair` (`hamming_distance=0`) since 2026-08-27, but never merged/pruned, so each row
-  gets its own independent face-detection pass and (since the pixel content is identical) produces
-  identical-box "duplicate" faces downstream -- a *symptom* of this bug, not a cause, and NOT
-  fixed by the race-condition fix above (that fix only stops the SAME `ImageFile` from being
-  double-processed; two separate `ImageFile` rows for the same real photo are a filepopulator/
-  ingestion-side problem, not a face-detection one). Not investigated further this session --
-  explicitly flagged by the user as a real but non-mainline TODO. Needs its own look at
-  `filepopulator/scripts.py`'s duplicate-detection logic (`create_image_file()`'s pixel-hash/
-  file-hash matching, `DuplicateFile`) to understand why a file already known (by MD5) to be
-  identical to an existing row still gets its own new `ImageFile` row instead of being recorded as
-  a `DuplicateFile` and skipped, the way a same-path re-ingest already is.
+- **DONE (2026-09-04): the duplicate-ImageFile bug above, root-caused and fixed.** Confirmed via
+  the user's own example (faces 1060610/1076848, on `ImageFile`s 340565 and 346648): same
+  `pixel_hash` MD5 (`c3e6fce0cc3c8adeb545380d44acc826`), same dimensions, same `dateTaken`,
+  different paths -- already flagged in `SimilarImagePair` (`hamming_distance=0`) since 2026-08-27,
+  and (crucially) already correctly recorded as a `DuplicateFile` too. **Root cause**:
+  `create_image_file()`'s "pixel_hash matches an existing, still-present file" branch
+  (`filepopulator/scripts.py`) correctly created the `DuplicateFile` record but was **missing a
+  `return` statement**, so execution fell through to the bottom of the function and created a full
+  `ImageFile` row for it anyway, every single time -- every real duplicate got BOTH correctly
+  flagged AND incorrectly given its own row. The same gap existed in the sibling `len(exist_with_
+  same_hash) > 1` branch (multiple existing rows already share the hash) when none of them had a
+  missing file to "move into." Fixed by adding the missing `return`s in both branches.
+  **Secondary fix, per the user's explicit choice when asked**: rather than trusting a bare
+  `pixel_hash` MD5 match as sufficient proof of duplicate content, added a real pixel-level
+  verification (`_pixel_arrays_match()`) -- re-decodes the candidate file and compares actual
+  pixel arrays before trusting the hash, so a (deliberately synthetic, essentially impossible for
+  real photos) MD5 collision between two genuinely different images still correctly creates its
+  own row rather than being wrongly discarded as a duplicate. This preserves an existing test
+  (`test_same_pixel_hash`) that constructs exactly such a collision on purpose. Three other
+  existing tests (`test_same_picture_two_paths`, `test_image_path_changes_two_instances`,
+  `test_move_id_stay_same`) had explicitly asserted the OLD (buggy) two-rows-for-one-photo
+  behavior as their documented "expected outcome" -- rewritten to assert the corrected behavior
+  instead, plus `test_bulk_add`'s blanket "every fixture file becomes its own ImageFile row"
+  assertion loosened to "becomes an ImageFile OR a recorded DuplicateFile," since the real
+  validation fixture directory has always contained a deliberate duplicate pair. Full fast suite:
+  305/307 passing (same 2 pre-existing, unrelated failures as always).
 
 **Face-classification outlier-rejection: investigation and ideas (2026-08-27).** Started from a
 real user observation: `face_manager/assign_faces.py`'s `classify_unassigned()` is good at

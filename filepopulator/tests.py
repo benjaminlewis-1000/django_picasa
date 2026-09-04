@@ -29,7 +29,7 @@ import pillow_heif
 
 from django.core.management import call_command
 
-from .models import ImageFile, Directory, FailedImageFile, guess_date_from_filename
+from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, guess_date_from_filename
 # from .forms import ImageFileForm, DirectoryForm
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
 from face_manager.models import Face
@@ -206,7 +206,76 @@ class ImageFileTests(TestCase):
         rand_2 = str(binascii.b2a_hex(os.urandom(500)))[2:-1]
         test_with_prestrings(rand_1, rand_2, False, "diff")
 
-    def test_file_names(self): ### CHECKED ### 
+    def test_duplicate_file_content_does_not_create_a_second_imagefile_row(self):
+        # Regression test for a real production bug: create_image_file()'s
+        # "pixel_hash matches an existing, still-present file" branch
+        # correctly recorded a DuplicateFile for the new path but never
+        # returned, so it also fell through and created a full second
+        # ImageFile row for the exact same content -- defeating the whole
+        # point of tracking duplicates. Confirmed in production: two real
+        # ImageFile rows (different paths, one under a bulk-import folder)
+        # sharing an identical MD5/pixel_hash.
+        original = self.goodFiles[0]
+        duplicate_path = os.path.join(os.path.dirname(original), 'duplicate_copy.jpg')
+        shutil.copyfile(original, duplicate_path)
+
+        create_image_file(original)
+        create_image_file(duplicate_path)
+
+        self.assertEqual(ImageFile.objects.filter(filename=original).count(), 1)
+        self.assertEqual(ImageFile.objects.filter(filename=duplicate_path).count(), 0)
+        self.assertTrue(DuplicateFile.objects.filter(filename=duplicate_path).exists())
+
+    def test_multiple_existing_same_hash_rows_still_recognize_a_genuine_duplicate(self):
+        # Exercises the len(exist_with_same_hash) > 1 branch, which has
+        # the same missing-return shape of bug as the single-candidate
+        # branch above. This scenario (>1 ImageFile already sharing a
+        # pixel_hash) shouldn't arise going forward now that the single-
+        # candidate case is fixed, but could still exist from data that
+        # predates this fix -- a further duplicate of that content should
+        # still be recognized, not given yet another row.
+        original = self.goodFiles[0]
+        create_image_file(original)
+        seeded = ImageFile.objects.get(filename=original)
+
+        preexisting_dup_path = os.path.join(os.path.dirname(original), 'preexisting_dup.jpg')
+        shutil.copyfile(original, preexisting_dup_path)
+        # Bypass create_image_file to seed a second ImageFile row sharing
+        # the same pixel_hash, simulating contamination from before this
+        # fix existed (bulk_create, like face_manager.tests.
+        # make_preexisting_image_row, to avoid ImageFile.save()'s own
+        # duplicate-detection running here).
+        ImageFile.objects.bulk_create([ImageFile(
+            filename=preexisting_dup_path, directory=seeded.directory,
+            pixel_hash=seeded.pixel_hash, file_hash=seeded.file_hash,
+            width=seeded.width, height=seeded.height, isProcessed=False,
+            thumbnail_big='', thumbnail_medium='', thumbnail_small='',
+        )])
+
+        newest_dup_path = os.path.join(os.path.dirname(original), 'newest_dup.jpg')
+        shutil.copyfile(original, newest_dup_path)
+        create_image_file(newest_dup_path)
+
+        self.assertTrue(DuplicateFile.objects.filter(filename=newest_dup_path).exists())
+        self.assertFalse(ImageFile.objects.filter(filename=newest_dup_path).exists())
+
+    def test_pixel_hash_collision_with_different_content_still_creates_its_own_row(self):
+        # The flip side of the two tests above: a pixel_hash MATCH alone
+        # must not be trusted as proof of duplicate content (see
+        # _pixel_arrays_match's docstring) -- test_same_pixel_hash above
+        # already covers the deliberately-constructed-MD5-collision case
+        # end to end; this just pins down that the verification helper
+        # itself is what's doing the work, directly.
+        from filepopulator.scripts import _pixel_arrays_match
+        original = self.goodFiles[0]
+        different = self.goodFiles[1] if len(self.goodFiles) > 1 else self.orientFiles[0]
+        create_image_file(original)
+        new_photo = ImageFile(filename=different)
+        new_photo.process_new_no_md5()
+        new_photo._generate_md5_hash()
+        self.assertFalse(_pixel_arrays_match(new_photo, original))
+
+    def test_file_names(self): ### CHECKED ###
         # What we expect to happen: all of the files in goodFiles should be added
         # to the database, none in badFiles should be added, and all the 
         # thumbnails should exist for photos added to the database. 
@@ -349,10 +418,16 @@ class ImageFileTests(TestCase):
         self.assertNotEqual(orig_data.dateAdded, new_ref[0].dateAdded)
 
     def test_image_path_changes_two_instances(self): ### CHECKED ###
-        # Case: Similar to above, except that the same pixel image is already in the database
-        # twice, then one of them moves. Can we assure that the right record is altered?
-        # Expected outcome: the system recognizes that one image is still in place and the
-        # other one has moved. 
+        # Case: the same pixel image is added at one path, then a genuine
+        # duplicate (same content, different path) is added while the
+        # original is still in place. UPDATED for the create_image_file()
+        # duplicate-detection fix: the duplicate copy is now correctly
+        # recorded as a DuplicateFile rather than given its own ImageFile
+        # row (previously a real bug -- see CLAUDE.md -- meant it got
+        # BOTH a DuplicateFile record and a redundant row). Moving the
+        # ORIGINAL file afterward should still be tracked correctly via
+        # the normal "moved" detection, unaffected by the unrelated
+        # duplicate bookkeeping.
 
         file_orig = self.goodFiles[0]
         create_image_file(file_orig)
@@ -363,12 +438,15 @@ class ImageFileTests(TestCase):
         new_path = os.path.join(self.tmp_valid_dir, 'tmpmv.jpg')
         shutil.copy(file_orig, new_path )
         create_image_file(new_path)
-        f2_data = ImageFile.objects.filter(filename=new_path)[0]
 
+        # The duplicate copy is recorded, not given its own row.
+        self.assertEqual(ImageFile.objects.filter(filename=new_path).count(), 0)
+        self.assertTrue(DuplicateFile.objects.filter(filename=new_path).exists())
         total_records = ImageFile.objects.all()
-        self.assertEqual(len(total_records), 2)
+        self.assertEqual(len(total_records), 1)
 
-        # Move one of the files
+        # Move the original file -- should still be tracked as the same
+        # row via ordinary move detection.
         f3_path = os.path.join(self.tmp_valid_dir, 'f3.jpg')
         shutil.move(file_orig, f3_path)
         create_image_file(f3_path)
@@ -378,28 +456,26 @@ class ImageFileTests(TestCase):
 
         # Check the processing
         self.assertTrue(f3_data.isProcessed)
-        self.assertFalse(f2_data.isProcessed)
         # Check that IDs are the same
         self.assertEqual(f1_data.id, f3_data.id)
-        self.assertNotEqual(f2_data.id, f3_data.id)
-        self.assertTrue(os.path.isfile(f2_data.thumbnail_big.path))
         self.assertTrue(os.path.isfile(f3_data.thumbnail_big.path))
         self.assertFalse(os.path.isfile(f1_data.thumbnail_big.path))
 
-        self.assertTrue(os.path.isfile(f2_data.filename))
         self.assertTrue(os.path.isfile(f3_data.filename))
         self.assertFalse(os.path.isfile(f1_data.filename))
 
         self.assertNotEqual(f1_data.dateAdded, f3_data.dateAdded)
 
-    def test_same_picture_two_paths(self): ### CHECKED ### 
+    def test_same_picture_two_paths(self): ### CHECKED ###
         # Case: We have the exact same picture (same pixels) in two different
         # file locations at the same time. We add both images to the database.
-        # Expected outcome is that there will be two entries in the database
-        # with different IDs and different paths but that the pixel hash will
-        # be the same. 
+        # UPDATED for the create_image_file() duplicate-detection fix: the
+        # second path is now correctly recorded as a DuplicateFile rather
+        # than given its own ImageFile row (previously a real production
+        # bug -- confirmed via two real ImageFile rows sharing an
+        # identical MD5 hash -- see CLAUDE.md).
 
-        # Copy the same image to two places and add both to the database. 
+        # Copy the same image to two places and add both to the database.
         src_file = self.goodFiles[0]
         path1 = os.path.join(self.tmp_valid_dir, 'tmp1.jpg')
         shutil.copy(src_file, path1)
@@ -408,24 +484,14 @@ class ImageFileTests(TestCase):
         create_image_file(path1)
         create_image_file(path2)
 
-        # Assert that both were added to the database. 
+        # The first path gets a real row; the second is a duplicate.
         first_item = ImageFile.objects.filter(filename=path1)
         self.assertEqual(len(first_item), 1)
-        pixel_hash = first_item[0].pixel_hash
-        second_item = ImageFile.objects.filter(filename=path2)
-        self.assertEqual(len(second_item), 1)
-        pixel_hash2 = second_item[0].pixel_hash
+        self.assertEqual(ImageFile.objects.filter(filename=path2).count(), 0)
+        self.assertTrue(DuplicateFile.objects.filter(filename=path2).exists())
 
-        # Pretty standard checks that should all be equivalent -- same hash,
-        # different ID, thumbnails exist, paths are right, and the file isn't processed.
-        self.assertNotEqual(path1, path2)
-        self.assertEqual(pixel_hash, pixel_hash2)
-        # Don't feel the need to test all the thumbnails; we've done that elsewhere.
         self.assertTrue(os.path.isfile(first_item[0].thumbnail_big.path))
-        self.assertTrue(os.path.isfile(second_item[0].thumbnail_big.path))
         self.assertFalse(first_item[0].isProcessed)
-        self.assertFalse(second_item[0].isProcessed)
-        self.assertNotEqual(first_item[0].id, second_item[0].id)
 
     def test_delete_photos(self): ### CHECKED ### 
 
@@ -580,52 +646,60 @@ class ImageFileTests(TestCase):
         self.assertEqual(len(i1_tmp), 0)
         date_add = path1_item.dateAdded
 
-        # Have two of same input -- how can I figure out which moved?
-        # Here, we will add another copy of path1 in path2, then move one
-        # of the files and assert that the other one did not change.
+        # Have two of same input -- add another copy of path1 at path2
+        # while path1 is still present. UPDATED for the create_image_
+        # file() duplicate-detection fix: path2 is now correctly recorded
+        # as a DuplicateFile rather than given its own ImageFile row
+        # (previously a real bug -- see CLAUDE.md). Moving path2 to path3
+        # afterward and rescanning finds path1 still present with the
+        # same content, so path3 is recognized as a further duplicate too
+        # -- path1 remains the sole real row throughout.
         path2 = os.path.join(self.tmp_valid_dir, 'tmp2.jpg')
         path3 = os.path.join(self.tmp_valid_dir, 'tmp3.jpg')
         shutil.copy(path1, path2)
         create_image_file(path2)
-        path2_item = ImageFile.objects.filter(filename=path2)[0]
-        date_add2 = path2_item.dateAdded
-        self.assertNotEqual(date_add2, date_add)
-        self.assertNotEqual(path1_item.id, path2_item.id)
-        # Since the original still exists, the isProcessed status
-        # of the copy should be False.
-        self.assertFalse(path2_item.isProcessed)
-    #     # 1 and 2 in database
+        self.assertEqual(ImageFile.objects.filter(filename=path2).count(), 0)
+        self.assertTrue(DuplicateFile.objects.filter(filename=path2).exists())
+
         shutil.move(path2, path3)
-        # 1 and 3 in database
         create_image_file(path3)
-        path3_item = ImageFile.objects.filter(filename=path3)[0]
-        date_add3 = path3_item.dateAdded
-        self.assertNotEqual(date_add2, date_add3)
-        self.assertFalse(os.path.exists(path2_item.filename))
+        self.assertEqual(ImageFile.objects.filter(filename=path3).count(), 0)
+        self.assertTrue(DuplicateFile.objects.filter(filename=path3).exists())
+        self.assertFalse(os.path.exists(path2))
         self.assertTrue(os.path.exists(path1_item.filename))
-        self.assertEqual(path2_item.id, path3_item.id)
         # Path1 should still be in the database
         p1_tmp = ImageFile.objects.filter(filename=path1)
         self.assertEqual(len(p1_tmp), 1)
 
         items = ImageFile.objects.all()
         item_files = [x.filename for x in items]
-        # The initial items should only have path1 and path3 added to them now,
-        # and src_file removed from the set..
-        self.assertEqual(set(item_files) , set(item_files_init + [path1, path3] ) - set([src_file]))
+        # UPDATED for the create_image_file() duplicate-detection fix:
+        # path3 is a duplicate (see above), not a real row, so only path1
+        # was actually added -- src_file removed from the set (renamed to
+        # path1), path2/path3 never get their own rows at all.
+        self.assertEqual(set(item_files), set(item_files_init + [path1]) - set([src_file]))
 
-        # Should gracefully handle overwriting existing files
-        shutil.move(self.goodFiles[3], path3)
-        path3_item = ImageFile.objects.filter(filename=path3)[0]
+        # Should gracefully handle a genuinely NEW (non-duplicate) file
+        # being written into a path that previously only held a
+        # DuplicateFile record (no ImageFile row to "overwrite" here,
+        # unlike the old behavior this test predates). Uses an
+        # orientation fixture rather than another "good" fixture -- the
+        # goodFiles set includes deliberate same-content repeats under
+        # different extensions, which would just create another
+        # duplicate here instead of exercising the "new content" path.
+        shutil.move(self.orientFiles[0], path3)
+        self.assertEqual(ImageFile.objects.filter(filename=path3).count(), 0)
 
-        # Since a new file was written into this path, the ID should change
-        # and the thumbnail paths should be different
+        # path3 already has a stale DuplicateFile record from the move
+        # above -- create_image_file()'s very first check wipes any
+        # existing DuplicateFile/ImageFile bookkeeping for a path and
+        # bails out ("start over"), rather than ingesting in the same
+        # call. A second call (matching how the next add_from_root_dir
+        # scan would naturally pick it up) then genuinely ingests it.
+        create_image_file(path3)
         create_image_file(path3)
         path3_item_aft = ImageFile.objects.filter(filename=path3)[0]
-
-        self.assertNotEqual(path3_item.id, path3_item_aft.id)
-        self.assertNotEqual(path3_item.thumbnail_big.path, path3_item_aft.thumbnail_big.path)
-        self.assertEqual(path3_item.filename, path3_item_aft.filename)
+        self.assertEqual(path3_item_aft.filename, path3)
 
     # # Tested adding bad file names? Not there?
     def test_bogus_file(self): ### CHECKED ### 
@@ -721,9 +795,16 @@ class ImageFileTests(TestCase):
 
         files_in_db = ImageFile.objects.all()
         files_in_db = [x.filename for x in files_in_db]
+        # The real validation fixture directory intentionally contains a
+        # genuine duplicate (tmpmv.jpg, same content as naming/good/space
+        # in filename.jpg) -- UPDATED for the create_image_file()
+        # duplicate-detection fix: a duplicate is correctly recorded as a
+        # DuplicateFile, not given its own ImageFile row (see CLAUDE.md),
+        # so "every file is accounted for" now means either one.
+        duplicate_files = [d.filename for d in DuplicateFile.objects.all()]
 
         for vf in valid_files:
-            self.assertTrue(vf in files_in_db)
+            self.assertTrue(vf in files_in_db or vf in duplicate_files)
 
         dir_objs = Directory.objects.all()
         # print(dir_objs)
