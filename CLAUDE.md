@@ -474,11 +474,19 @@ ideas, so a future session doesn't have to redo this from scratch:
       reassignment path. Full fast suite run afterward: 279/281 passing, the 2 failures pre-existing
       and unrelated (a corrupted-image fixture path not mounted in that exec context, and an
       already-known float32-precision rounding assertion) -- confirmed neither touches this
-      feature's files. Deployed to production (`picasa_api` restarted to pick up the new task/
-      migration) and run once immediately as a manual backfill rather than waiting for the first
-      1am scheduled run -- see the dated note below for the real backfill numbers. The frontend
-      surface for actually using this (grouped review UI) remains explicitly out of scope for this
-      repo -- the user plans to design that separately once the backend/data side is live.
+      feature's files. Deployed to production (`face_manager.0008` migrated, `picasa_api`
+      restarted -- confirmed `face_manager.cluster_unverified_faces` registered in `celery
+      inspect registered` afterward) and run once immediately as a manual backfill
+      (`cluster_all_unverified_faces()` via `manage.py shell`) rather than waiting for the first
+      1am scheduled run. **Real backfill result (2026-09-04): 30 people clustered, 37,812 of
+      65,383 eligible faces (57.8%) grouped, ~2m36s wall time** -- well under the ~10-minute
+      estimate from the original 65,371-face scoping count (49 people at scoping time vs 30
+      actually producing a real group here; the rest were either singletons or already covered
+      by `MIN_NUM_FACES`-style small-gallery exclusions upstream, not investigated further).
+      Largest galleries grouped: Nathaniel Lewis (6,578 grouped faces), Liam Lewis (5,689),
+      Jessica Lewis (2,955), Gwendolyn Lewis (2,633), Benjamin Lewis (1,850). The frontend surface
+      for actually using this (grouped review UI) remains explicitly out of scope for this repo --
+      the user plans to design that separately once the backend/data side is live.
   - **Looser branch for faces with `.ignore` already in their reject list (2026-08-28).** A face
     whose `rejected_fields` contains `.ignore` means a human previously declined an *auto-
     proposed* soft-ignore for it -- i.e. someone already looked and said "no, this is a real
