@@ -269,8 +269,12 @@ serves, which is exactly what happened -- a pinned package version had since bee
 `backend_upgrade` off the actual `Dockerfile_picasa`, spun up a dedicated container from it
 (separate from `picasa_api_dev_test`), and ran the genuinely complete test suite -- fast and slow,
 including real ML inference -- **326/326 passing**. Deployed by rebuilding the real `picasa_img`
-via `docker compose build` from `master`'s `dockerize/` and recreating `picasa_api`; health check
-passed afterward. Also corrected a stale doc claim in this same section: `dockerize/requirements.txt`
+via `docker compose build` from `master`'s `dockerize/` and recreating `picasa_api`. Verified live
+in production afterward, not just via `manage.py check`: `django.VERSION` confirms `(6, 1, 1, ...)`,
+zero unapplied migrations (`migrate --check` clean, no framework-bump migrations needed), and a
+real smoke test against `/api/images/` and `/api/person_list/` both returned the expected `403`
+for an anonymous request with no errors in the logs. Also corrected a stale doc claim in this same
+section: `dockerize/requirements.txt`
 on `master` was said to still be the original unbounded `>=` file, untouched deliberately -- it
 isn't anymore, both branches have carried the same pinned file for a while now (merged along with
 everything else moving between the branches this session).
