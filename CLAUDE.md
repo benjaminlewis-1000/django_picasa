@@ -6,6 +6,83 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Don't touch `master` or this directory (`/home/benjamin/git_repos/django_picasa`) for exploratory/maintenance work.** This checkout is bind-mounted directly into the live `picasa_api` production container (`dockerize/.env`'s `DJANGO_FILES_ROOT` points here) — editing files here can affect what's actually running. Do this kind of work (tests, dependency upgrades, CI, bug investigation) in the `backend_upgrade` branch/worktree at `/home/benjamin/git_repos/django_picasa_dev` instead (see "Where things stand" below for what's already there). Only touch `master` directly for something the user explicitly asks to land on `master` right now.
 
+## Open TODOs (quick index)
+
+A consolidated, easy-to-find list of everything still outstanding across this file — added
+2026-09-04 after having to re-derive this list from a full-file grep sweep instead of it living
+in one place. **Keep this section current going forward: add new open items here directly, not
+only buried in a session's own narrative further down.** Full detail/context for each item is in
+the dated write-up elsewhere in this file (search for a distinctive word from the bullet).
+
+**Confirmed-live bugs, not yet fixed:**
+- 29 duplicate `ImageFile` rows sharing the same filename (a different bug than the pixel_hash
+  cross-path duplicate issue already fixed) — needs a decision on which row of each pair to keep.
+- `find_and_encode_faces()`'s IOU-matching logic has unhandled edge cases
+  (`NotImplementedError`/`ValueError`/bare asserts) when an image's existing vs. newly-detected
+  face counts diverge — silently aborts the *entire* scheduled `face_extraction` batch via a bare
+  `except:` in `tasks.py`. `ImageFile` ids `99862`, `103837`, `108072` still stuck unprocessed.
+- `faceAssigner.execute()` (`face_manager/assign_faces.py`) never initializes its embedding cache
+  when there are <=100 unassigned faces to classify — classifies nothing, silently, below that
+  threshold.
+- A separate `classify_unassigned()` array-sizing bug — a stale-sized zero-padded array can
+  pollute a max-similarity calculation and raise `IndexError` (rejected candidates +
+  `.another_ignore` combo); compounded by `execute()`'s per-face error handling being commented
+  out, so it can abort the whole scheduled run, not just one face.
+- `Person.num_faces`/`num_possibilities`/`num_unverified_faces` are manually-synced cached
+  columns, not live queries — can silently drift stale if anything mutates faces outside the
+  model's own methods. `PersonSerializer.get_num_possibilities` is also missing entirely (likely
+  crashes `/api/people/` if that endpoint is ever actually hit).
+- HEIC files with a non-1 EXIF orientation currently fail loudly instead of being handled — found
+  via one real user photo, needs a design decision before extending the pipeline to apply it.
+
+**Smaller tech debt:**
+- `set_possible_person()`/`reject_association()` still hardcode `5`/`range(1, 6)` via `eval`/
+  `exec` instead of using `Face.NUM_POSSIBLE_IDENTITIES` — fine until that constant ever changes.
+- `ImageFile.save()` unconditionally re-decodes and rehashes the full image on *every* save, not
+  just creation — flagged repeatedly as real wasted CPU on any hot path that re-saves existing
+  rows, never actually fixed at the source (routed around instead, e.g. by `backfill_phash`).
+- Django 6.1 upgrade is blocked: it made the test suite hang indefinitely partway through
+  `filepopulator`'s duplicate-detection tests (Django vs. scipy 1.18.1 bumped alongside it, root
+  cause never confirmed) — deliberately avoided, pinned at `6.0.8`.
+- A full (non-diagonal) Mahalanobis distance for face-classification outlier rejection was never
+  tried (a diagonal approximation was tried and underperformed `p99` alone).
+
+**Open questions / follow-ups:**
+- No automated "did last night's backup actually run" freshness check exists — the current
+  restore-testing only validates a backup file once it's promoted into weekly retention, which
+  says nothing about a night the backup silently never ran at all (this has already happened
+  once, caught only because the user happened to notice a file hadn't shrunk).
+- Which client project depends on the still-live JWT auth endpoints, and whether it specifically
+  needs `token_blacklist` (logout/revocation), was never pinned down.
+- The `detected_age` birth-year-cutoff idea for face classification is tabled pending a visual
+  sanity-check (real face thumbnails next to their `detected_age`) that was never actually done.
+- A manual override tool for nearest-metro geocoding mismatches is wanted but not scoped (needs
+  both a frontend UI and a backend endpoint/storage design).
+- A looser classification threshold specifically for faces with `.ignore` already in their reject
+  list was brainstormed but never validated or built.
+
+**Bigger, deliberately unscoped features:**
+- Slideshow metadata overlay (photo date + location shown alongside the image).
+- Video support — the whole pipeline currently assumes still images end-to-end; needs a real
+  design pass, explicitly not started.
+
+**Frontend (out of scope for this repo — no visibility into that codebase from here):**
+- "Mark image for deletion" button for the slideshow.
+- "Failed to open" image list surface (backend data — `image_load_failed`/`FailedImageFile` — is
+  ready; frontend work never started).
+- Grouped-review UI for `Face.verification_cluster_group` (backend/data side is live).
+
+**Stale — likely already superseded, worth pruning from this file's own later brainstormed-ideas
+list if confirmed:**
+- "Similar-image search" / "faster image hashing for duplicate detection" — but `backfill_phash`,
+  `backfill_similarity`, and a live `filepopulator.find_similar_images` scheduled task already
+  exist elsewhere in this file's own later notes.
+- "Backend geocoding with a real service, not an offline heuristic" — but Nominatim-based reverse
+  geocoding was fully backfilled and runs on a schedule per this file's own later notes.
+- "Face clustering quality... hasn't been reviewed this round" — likely superseded by the later,
+  much deeper outlier-rejection/gallery-size-adaptive-threshold investigation, though that was
+  specifically about the accept/reject gate, not a full clustering-algorithm review.
+
 ## What this is
 
 A self-hosted Django + DRF photo library and face-tagging system ("django_picasa"). It indexes a photo tree on disk, extracts EXIF/GPS metadata and thumbnails, runs a face-detection/recognition pipeline (insightface/ONNX, formerly dlib/torch) to find and cluster faces across photos, and exposes everything through a REST API consumed by a separate frontend and a slideshow client. Background work (indexing, face extraction, classification) runs as Celery tasks on a schedule via `django-celery-beat`.
