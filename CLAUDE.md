@@ -269,11 +269,21 @@ serves, which is exactly what happened -- a pinned package version had since bee
 `backend_upgrade` off the actual `Dockerfile_picasa`, spun up a dedicated container from it
 (separate from `picasa_api_dev_test`), and ran the genuinely complete test suite -- fast and slow,
 including real ML inference -- **326/326 passing**. Deployed by rebuilding the real `picasa_img`
-via `docker compose build` from `master`'s `dockerize/` and recreating `picasa_api`; health check
-passed afterward. Also corrected a stale doc claim in this same section: `dockerize/requirements.txt`
+via `docker compose build` from `master`'s `dockerize/` and recreating `picasa_api`. Verified live
+in production afterward, not just via `manage.py check`: `django.VERSION` confirms `(6, 1, 1, ...)`,
+zero unapplied migrations (`migrate --check` clean, no framework-bump migrations needed), and a
+real smoke test against `/api/images/` and `/api/person_list/` both returned the expected `403`
+for an anonymous request with no errors in the logs. Also corrected a stale doc claim in this same
+section: `dockerize/requirements.txt`
 on `master` was said to still be the original unbounded `>=` file, untouched deliberately -- it
 isn't anymore, both branches have carried the same pinned file for a while now (merged along with
 everything else moving between the branches this session).
+
+**RE-INVESTIGATED 2026-09-05: could not reproduce the hang at all.** Followed the throwaway-container instructions above properly this time (a genuinely separate container off `picasa_img:latest`, `--cap-add=SYS_PTRACE`, not `picasa_api_dev_test`). Two separate tests, both clean:
+1. **Runtime upgrade** (`pip install --upgrade django scipy` inside the throwaway container, landing 6.1.1/1.18.1): the specific duplicate-detection tests named in the original report passed individually, the *entire* `filepopulator` fast module passed (83/83, ~103s), and the *entire* fast suite passed (318/318, no hang, exit 0).
+2. **A real image build** with `Django==6.1.1`/`scipy==1.18.1` pinned in a scratch copy of `requirements.txt`, using the actual `Dockerfile_picasa` (fresh Ubuntu base, nothing cached from the working image): `pip install -r requirements.txt` — the step that actually installs Django/scipy — completed with zero errors, both times it was run. The build did fail, but at a *later*, unrelated step (`apt install postgresql`, hitting a genuine `404` fetching `libfdisk1` from `security.ubuntu.com` — a stale/out-of-sync Ubuntu package mirror, reproduced identically twice, nothing to do with Django or Python dependencies at all).
+
+**Conclusion: Django 6.1 does not appear to actually be blocked by anything found this session.** Two live explanations for the original report, neither chased further: (a) it was a misdiagnosis of an unrelated environment hiccup (plausibly this same kind of transient apt/mirror issue) at the time, or (b) the actual trigger was specific to the *old* versions of the duplicate-detection tests named in the report -- which were substantially rewritten this session as part of the `DuplicateFile.original` work (see above), so a Django-6.1-specific interaction with that old test code, if real, may simply no longer exist. Not yet decided whether to actually cut over `requirements.txt` to 6.1 -- this only re-opens the option, it doesn't commit to it.
 
 ## Follow-up bug audit (2026-08-24)
 
