@@ -8,6 +8,7 @@ from django.conf import settings
 from django.db import connection
 import psycopg2
 import zlib
+import hashlib
 import os
 import binascii
 from datetime import datetime
@@ -469,10 +470,63 @@ class ImageFileTests(TestCase):
         num_files = ImageFile.objects.all().count()
         self.assertEqual(num_files, 1)
 
-    def test_image_path_changes(self): ### CHECKED ### 
+    def test_save_skips_rehash_when_pixel_hash_already_set(self):
+        # ImageFile.save() used to unconditionally call
+        # _generate_md5_hash() (a real, measured ~15ms-per-call cost:
+        # pixel decode + MD5 + a perceptual hash + a DB query) even when
+        # the caller had already computed and verified a correct
+        # pixel_hash moments earlier -- e.g. create_image_file()'s
+        # "mtime changed but pixel hash confirmed unchanged" path, which
+        # calls _generate_md5_hash() itself and THEN save(), redoing the
+        # exact same work twice for the same file. save() now only
+        # recomputes it when pixel_hash isn't already a real value.
+        goodFile = self.goodFiles[0]
+        img = ImageFile(filename=goodFile)
+        img.process_new_no_md5()
+        img._generate_md5_hash()
+        real_hash = img.pixel_hash
+        self.assertNotIn(real_hash, (None, '', '-1', -1))
+
+        with mock.patch.object(ImageFile, '_generate_md5_hash') as mock_hash:
+            img.save()
+        mock_hash.assert_not_called()
+        self.assertEqual(img.pixel_hash, real_hash)
+
+    def test_save_computes_hash_when_pixel_hash_not_yet_set(self):
+        goodFile = self.goodFiles[0]
+        img = ImageFile(filename=goodFile)
+        img.process_new_no_md5()
+        self.assertEqual(img.pixel_hash, -1)  # field default, never computed
+
+        with mock.patch.object(
+            ImageFile, '_generate_md5_hash', wraps=img._generate_md5_hash
+        ) as mock_hash:
+            img.save()
+        mock_hash.assert_called_once()
+        self.assertNotIn(img.pixel_hash, (None, '', '-1', -1))
+
+    def test_save_refreshes_file_hash_even_when_pixel_hash_reused(self):
+        # file_hash is derived from self.filename, not pixel content --
+        # it must stay correct even on the skip-rehash path, e.g. after a
+        # "file moved to a new path" update reuses an existing pixel_hash.
+        goodFile = self.goodFiles[0]
+        img = ImageFile(filename=goodFile)
+        img.process_new_no_md5()
+        img._generate_md5_hash()
+        img.save()
+
+        new_path = os.path.join(self.tmp_valid_dir, 'moved_for_hash_test.jpg')
+        shutil.move(goodFile, new_path)
+        img.filename = new_path
+        img.save()
+
+        expected = hashlib.md5(new_path.encode('utf-8')).hexdigest()
+        self.assertEqual(img.file_hash, expected)
+
+    def test_image_path_changes(self): ### CHECKED ###
         # Case: we have an image that is already in the database, but it is then
-        # moved somewhere else in the filesystem and the original file is no 
-        # longer in place. 
+        # moved somewhere else in the filesystem and the original file is no
+        # longer in place.
         # Expected outcome: The database detects that the file has been moved 
         # and updates the record to show that it's the same ID. The path to the
         # thumbnail should change, though (mostly for ease of doing business)
