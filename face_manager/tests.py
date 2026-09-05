@@ -1288,13 +1288,40 @@ class LoadEncodingsCachingTests(TestCase):
         mock_sig.assert_not_called()
         self.assertIn(self.person.id, fresh_assigner.embedding_dict)
 
-    def test_next_day_no_changes_keeps_cache(self):
+    def test_within_max_age_reuses_cache_without_requerying(self):
+        # A cache built (CACHE_MAX_AGE_DAYS - 1) days ago is still fully
+        # inside the trusted window -- not even the cheap signature check
+        # should run, let alone a full re-fetch.
         self.assigner.load_encodings()
 
         with open(self.cache_path, "rb") as fh:
             import pickle
             cached = pickle.load(fh)
-        cached["built_date"] = cached["built_date"] - __import__("datetime").timedelta(days=1)
+        cached["built_date"] = cached["built_date"] - __import__("datetime").timedelta(
+            days=self.assigner.CACHE_MAX_AGE_DAYS - 1
+        )
+        with open(self.cache_path, "wb") as fh:
+            pickle.dump(cached, fh)
+
+        fresh_assigner = faceAssigner()
+        fresh_assigner.ENCODINGS_PKL_FILE = self.cache_path
+        fresh_assigner.likely_people_ids = [self.person.id]
+        with patch.object(Face.objects, "filter", wraps=Face.objects.filter) as mock_filter, \
+             patch.object(faceAssigner, "_current_face_data_signature") as mock_sig:
+            fresh_assigner.load_encodings()
+        mock_sig.assert_not_called()
+        self.assertEqual(mock_filter.call_count, 0)
+        self.assertIn(self.person.id, fresh_assigner.embedding_dict)
+
+    def test_past_max_age_no_changes_keeps_cache(self):
+        self.assigner.load_encodings()
+
+        with open(self.cache_path, "rb") as fh:
+            import pickle
+            cached = pickle.load(fh)
+        cached["built_date"] = cached["built_date"] - __import__("datetime").timedelta(
+            days=self.assigner.CACHE_MAX_AGE_DAYS
+        )
         with open(self.cache_path, "wb") as fh:
             pickle.dump(cached, fh)
 
@@ -1308,13 +1335,15 @@ class LoadEncodingsCachingTests(TestCase):
         self.assertEqual(mock_filter.call_count, 1)
         self.assertIn(self.person.id, fresh_assigner.embedding_dict)
 
-    def test_next_day_with_changes_rebuilds_cache(self):
+    def test_past_max_age_with_changes_rebuilds_cache(self):
         self.assigner.load_encodings()
 
         with open(self.cache_path, "rb") as fh:
             import pickle
             cached = pickle.load(fh)
-        cached["built_date"] = cached["built_date"] - __import__("datetime").timedelta(days=1)
+        cached["built_date"] = cached["built_date"] - __import__("datetime").timedelta(
+            days=self.assigner.CACHE_MAX_AGE_DAYS
+        )
         cached["signature"] = -1  # force a mismatch against the real current count
         with open(self.cache_path, "wb") as fh:
             pickle.dump(cached, fh)

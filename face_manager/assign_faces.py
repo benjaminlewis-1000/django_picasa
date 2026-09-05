@@ -37,6 +37,16 @@ class faceAssigner():
 
         self.DEBUG=debug
         self.ENCODINGS_PKL_FILE='/models/face_assign_preload.pkl'
+        # How many days the encoding cache is trusted before load_encodings()
+        # even bothers checking whether anything's changed (see that
+        # method's own docstring for the full lifecycle -- a brand-new
+        # qualifying person is picked up immediately regardless of this,
+        # via the per-call top-up loop). Was 1 day; relaxed to 3 per the
+        # user's request, since reads cost effectively nothing on SSD and
+        # the real cost being traded off is write frequency/disk wear from
+        # rebuilding the ~1GB cache file, not staleness risk for a pipeline
+        # that already tolerates being hours behind on classification.
+        self.CACHE_MAX_AGE_DAYS = 3
         self.USE_MIN_VALUE=True
         if self.USE_MIN_VALUE:
             self.IGN_VALUE = 999
@@ -162,20 +172,30 @@ class faceAssigner():
         hundreds of thousands of Face rows from the DB every time this
         task fires (currently hourly).
 
-        Cache lifecycle: within the same calendar day, the cache is
-        trusted as-is and only topped up with any brand-new likely-people
-        not seen before (people freshly crossing MIN_NUM_FACES). Once a
-        new day has begun since the cache was last built, do one cheap
-        signature check (_current_face_data_signature()) -- if nothing
-        has actually changed (no faces (re)assigned to any likely person
-        since the last build), keep using the existing cache untouched
-        rather than pay for a rebuild nobody needs; if something did
-        change, rebuild the whole cache from scratch (not just top up),
-        since an existing person's gallery may have been added to or
-        corrected, not just brand-new people appearing. This naturally
-        catches "once a day, if there was activity that day" without a
-        separate scheduled invalidation task -- it just piggybacks on
-        whichever run happens first after the day rolls over.
+        Cache lifecycle: for CACHE_MAX_AGE_DAYS days after the cache was
+        last built, it's trusted as-is and only topped up with any
+        brand-new likely-people not seen before (people freshly crossing
+        MIN_NUM_FACES) -- this top-up check runs on every call regardless
+        of cache age, so a newly-qualifying person is never left out
+        waiting for the age gate below, even on day 1 of 3. Once
+        CACHE_MAX_AGE_DAYS days have passed since the cache was last
+        built, do one cheap signature check
+        (_current_face_data_signature()) -- if nothing has actually
+        changed (no faces (re)assigned to any likely person since the
+        last build), keep using the existing cache untouched (and don't
+        rewrite the pickle file -- avoids paying disk-write wear for a
+        rebuild nobody needs); if something did change, rebuild the whole
+        cache from scratch (not just top up), since an existing person's
+        gallery may have been added to or corrected, not just brand-new
+        people appearing. This naturally catches "once every
+        CACHE_MAX_AGE_DAYS days, if there was activity in that window"
+        without a separate scheduled invalidation task -- it just
+        piggybacks on whichever run happens first after the window ends.
+        Reads cost effectively nothing on SSD (wear comes from writes,
+        not reads), so CACHE_MAX_AGE_DAYS is really just trading "how
+        stale can classify_unassigned()'s comparisons get before we
+        force a full DB re-vectorization" against write frequency/disk
+        wear, not read cost.
         """
 
         ss = time.time()
@@ -192,7 +212,7 @@ class faceAssigner():
             cached_date = combo_dict.get('built_date')
             today = datetime.now().date()
 
-            if cached_date == today:
+            if cached_date is not None and (today - cached_date).days < self.CACHE_MAX_AGE_DAYS:
                 cache_is_valid = True
             else:
                 cached_signature = combo_dict.get('signature')

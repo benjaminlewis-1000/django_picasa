@@ -557,6 +557,21 @@ a column). Full fast suite: 317/317 passing.
   dedicated worker process, reasoning about what happens if that worker crashes mid-day). Given
   the disk-reload path now costs well under a second, the user opted for the smaller fix above
   instead of taking this on.
+- **DONE (2026-09-04): relaxed the cache-staleness window from 1 day to 3
+  (`faceAssigner.CACHE_MAX_AGE_DAYS`)**, per the user's follow-up question about SSD wear.
+  Confirmed reads cost essentially nothing on SSD wear-wise (wear comes from program/erase
+  cycles, i.e. writes; reads only cause "read disturb," a well-managed background concern
+  handled transparently by drive firmware) -- so the real tradeoff `CACHE_MAX_AGE_DAYS` controls
+  is write frequency (how often the ~1.1GB cache file gets rewritten), not read cost. A brand-new
+  qualifying person (freshly crossing `MIN_NUM_FACES`) is still picked up immediately regardless
+  of this window -- the per-call top-up loop in `load_encodings()` already ran unconditionally on
+  every call before this change and still does, so this didn't need any new logic, just
+  confirming the existing behavior covered it. 2 existing tests (`test_next_day_no_changes_keeps_
+  cache`/`test_next_day_with_changes_rebuilds_cache`) hardcoded a 1-day offset to simulate
+  staleness and would have silently stopped exercising the stale path at all under the new
+  3-day window -- renamed and parameterized against `CACHE_MAX_AGE_DAYS` instead of a literal
+  `timedelta(days=1)`, plus a new test added for the "still within the (now 3-day) window"
+  case explicitly. Full fast suite: 318/318 passing.
 
 **Face-classification outlier-rejection: investigation and ideas (2026-08-27).** Started from a
 real user observation: `face_manager/assign_faces.py`'s `classify_unassigned()` is good at
