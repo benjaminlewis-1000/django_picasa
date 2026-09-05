@@ -342,8 +342,19 @@ class FaceModelTests(TestCase):
         face.save()
         face.refresh_from_db()
 
-        expected = float(np.float32(double_only_value))
-        self.assertEqual(face.face_encoding_512[0], expected)
+        # Compare via a float32 narrowing on both sides rather than exact
+        # double equality: Postgres's `real` -> text -> Python float round
+        # trip (via psycopg2) doesn't necessarily reproduce the exact same
+        # double bit pattern as `float(np.float32(x))` computed directly in
+        # Python -- e.g. this test observed the DB round trip coming back
+        # as 0.12345679 (fewer significant digits) rather than
+        # 0.12345679104328156. Narrowing both to float32 collapses that
+        # text-precision noise while still genuinely verifying the stored
+        # value lost precision down to float32, which is the actual point
+        # of this test.
+        self.assertEqual(
+            np.float32(face.face_encoding_512[0]), np.float32(double_only_value)
+        )
         self.assertNotEqual(face.face_encoding_512[0], double_only_value)
 
 

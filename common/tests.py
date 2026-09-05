@@ -58,7 +58,17 @@ class OpenImgOrientedTests(TestCase):
         # images gracefully, corrupted files actually raised an unguarded
         # OSError. Now that call is wrapped too, so this genuinely returns
         # None on failure as documented.
-        path = "/photos/corrupted/truncated_a.jpg"
+        #
+        # Picks whatever's actually present in the fixture directory
+        # rather than a hardcoded filename -- the real local fixture set
+        # (5 real corrupted JPEGs pulled from production logs) and CI's
+        # own synthetic ci_fixtures/corrupted/ don't share filenames, and
+        # this test previously hardcoded a name ("truncated_a.jpg") that
+        # matched neither, so it always failed with FileNotFoundError.
+        corrupted_dir = "/photos/corrupted"
+        candidates = sorted(os.listdir(corrupted_dir))
+        self.assertTrue(candidates, f"No fixture files found in {corrupted_dir}")
+        path = os.path.join(corrupted_dir, candidates[0])
         self.assertIsNone(open_img_oriented(path, as_numpy=True))
 
 
