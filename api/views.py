@@ -26,7 +26,6 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.reverse import reverse, reverse_lazy
 from rest_framework.views import APIView
-from rest_framework_simplejwt.views import TokenObtainPairView
 from django.utils.functional import SimpleLazyObject
 from face_manager.tasks import api_bulk_operation
 from time import sleep
@@ -197,10 +196,6 @@ def render_404(request, message):
     response = render(request, '404.html', context = {'error': message})
     response.status_code = 404
     return response
-
-class TokenPairWithUsername(TokenObtainPairView):
-    permission_classes = (AllowAny,)
-    serializer_class = api_ser.TokenPairSerializer
 
 class UserViewSet(viewsets.ModelViewSet):
     """

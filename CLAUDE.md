@@ -98,13 +98,35 @@ user (2026-09-04) has no test exercising it yet. Add real test coverage for the 
 (likely mocking the Nominatim HTTP call, given its rate-limit policy) before considering this
 fully done.
 
-**IN PROGRESS (2026-09-04): stripping out JWT auth.** The user believes the external client
-project that depended on `rest_framework_simplejwt` (`/api/token/obtain/`, `/api/token/refresh/`)
-has since dropped that dependency, so `SIMPLE_JWT` settings, `TokenPairWithUsername`,
-`token_blacklist` (`INSTALLED_APPS`), and `PyJWT` may all now be safely removable. Not yet
-verified from inside this session (no visibility into that other project) — confirm the client
-is really off it before deleting live auth code, then remove the app/settings/dependency and
-check nothing else in this repo references them.
+**DONE (2026-09-04): stripped out the legacy `rest_framework_simplejwt` auth path.** The user
+believed the external client project that depended on it (`/api/token/obtain/`,
+`/api/token/refresh/`) had since dropped that dependency. Checked production logs before touching
+anything: only 3 hits ever (within available log retention) to `/api/token/obtain/`, all on
+2026-08-28 (about a week prior), all `Unauthorized` (failed auth attempts, not successful logins),
+zero hits ever to `/api/token/refresh/`, and nothing at all in the week since — supported removing
+it. **Important distinction preserved**: `PyJWT` itself (the `import jwt` package) is NOT related
+to `rest_framework_simplejwt` and was correctly left alone — it's a separate, actively-live
+dependency used by `api/authentication.py`'s `AutheliaOIDCAuthentication` (validates the
+PhotoVerify mobile app's Authelia OIDC bearer tokens, RS256/JWKS). Removed: `rest_framework_
+simplejwt`/`rest_framework_simplejwt.token_blacklist` from `INSTALLED_APPS`; `JWTAuthentication`
+from `REST_FRAMEWORK['DEFAULT_AUTHENTICATION_CLASSES']`; the whole `SIMPLE_JWT` settings dict;
+`TokenPairSerializer` (`api/serializers.py`) and `TokenPairWithUsername` (`api/views.py`); the
+`token/obtain/`, `token/obtain` (redirect), and `token/refresh/` URL patterns (`api/urls.py`,
+along with the now-unused `RedirectView` import); the 3 tests exercising the old endpoint
+(`AuthenticationTests.test_token_obtain_with_valid_credentials`/
+`test_token_obtain_with_bad_credentials_rejected`/`test_jwt_access_token_authenticates_requests`
+in `api/tests.py`) and 1 in `picasa/tests.py`
+(`test_jwt_signing_key_is_the_django_secret_key`); `djangorestframework-simplejwt==5.5.1` from
+`dockerize/requirements.txt` (`PyJWT==2.13.0` and `cryptography` both kept — still real
+dependencies, unrelated to this removal). Two stale comments in `api/authentication.py` that
+referenced the old path as a "fallback" were also updated. **Deliberately not done**: the
+`token_blacklist` app's DB tables were left in place rather than dropped (removing an app from
+`INSTALLED_APPS` doesn't require dropping its tables, and there's no urgency); the Docker image
+wasn't rebuilt to actually uninstall `djangorestframework-simplejwt` from `site-packages` (harmless
+now that nothing imports it, just present-but-unused — a normal image rebuild whenever one next
+happens will pick up the trimmed `requirements.txt`). Full fast suite: 317 tests total (4 fewer
+than before, as expected from the removed tests), 315/317 passing — same 2 pre-existing,
+unrelated failures as always.
 
 ## What this is
 

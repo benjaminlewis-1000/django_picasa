@@ -5,8 +5,6 @@ from api import views
 from api import mobile_views
 from django.urls import path
 from rest_framework.authtoken.views import obtain_auth_token  # <-- Here
-from rest_framework_simplejwt import views as jwt_views
-from django.views.generic import RedirectView
 
 # app_name = 'api'
 
@@ -27,10 +25,7 @@ router.register(r'server_stats', views.StatsViewSet, basename='stats')
 # Requesting a token: https://simpleisbetterthancomplex.com/tutorial/2018/11/22/how-to-implement-token-authentication-using-django-rest-framework.html#user-requesting-a-token
 # http post https://picasa.exploretheworld.tech/api/request-token/ username=benjamin password=********
 urlpatterns = [
-    # path('request-token/', obtain_auth_token, name='api_token_auth'),  
-    path(r'token/obtain/', views.TokenPairWithUsername.as_view(), name='token_create'),  # override sjwt stock token
-    path(r'token/obtain', RedirectView.as_view(url = '/token/obtain/', permanent=True), name='token_create'),
-    path(r'token/refresh/', jwt_views.TokenRefreshView.as_view(), name='token_refresh'),
+    # path('request-token/', obtain_auth_token, name='api_token_auth'),
     # url(r'^', include(router.urls)),
     path('', include(router.urls)),
     path(r'image_list/', views.filteredImagesView.as_view(), name='image_list'),
