@@ -84,16 +84,27 @@ this session — real failures, not flakes, just never fixed):
   against a float64 literal it expects to round-trip exactly; needs the comparison changed to a
   tolerance-based check (or the expected literal corrected) instead of exact equality.
 
-**Stale — likely already superseded, worth pruning from this file's own later brainstormed-ideas
-list if confirmed:**
-- "Similar-image search" / "faster image hashing for duplicate detection" — but `backfill_phash`,
-  `backfill_similarity`, and a live `filepopulator.find_similar_images` scheduled task already
-  exist elsewhere in this file's own later notes.
-- "Backend geocoding with a real service, not an offline heuristic" — but Nominatim-based reverse
-  geocoding was fully backfilled and runs on a schedule per this file's own later notes.
-- "Face clustering quality... hasn't been reviewed this round" — likely superseded by the later,
-  much deeper outlier-rejection/gallery-size-adaptive-threshold investigation, though that was
-  specifically about the accept/reject gate, not a full clustering-algorithm review.
+**Stale — pruned from this file's later brainstormed-ideas list (2026-09-04):**
+- "Similar-image search" / "faster image hashing for duplicate detection" — superseded:
+  `backfill_phash`, `backfill_similarity`, and a live `filepopulator.find_similar_images`
+  scheduled task already exist and do this.
+- "Face clustering quality... hasn't been reviewed this round" — confirmed good for now by the
+  user (2026-09-04); superseded by the much deeper outlier-rejection/gallery-size-adaptive-
+  threshold investigation elsewhere in this file.
+
+**Backend geocoding — implemented, just needs test coverage.** Nominatim-based reverse geocoding
+was fully backfilled and runs on a schedule (`filepopulator.geocode_new_images`), but per the
+user (2026-09-04) has no test exercising it yet. Add real test coverage for the geocoding path
+(likely mocking the Nominatim HTTP call, given its rate-limit policy) before considering this
+fully done.
+
+**IN PROGRESS (2026-09-04): stripping out JWT auth.** The user believes the external client
+project that depended on `rest_framework_simplejwt` (`/api/token/obtain/`, `/api/token/refresh/`)
+has since dropped that dependency, so `SIMPLE_JWT` settings, `TokenPairWithUsername`,
+`token_blacklist` (`INSTALLED_APPS`), and `PyJWT` may all now be safely removable. Not yet
+verified from inside this session (no visibility into that other project) — confirm the client
+is really off it before deleting live auth code, then remove the app/settings/dependency and
+check nothing else in this repo references them.
 
 ## What this is
 
@@ -1302,9 +1313,5 @@ active production issue, not just cleanup — worth prioritizing the deploy once
   - Thumbnailing and MD5/pixel hashing needed zero changes — both already operate purely on the already-decoded `self.image` (a PIL Image), format-agnostic by construction. (The `cv2.imread()` fallback used for corrupted-JPEG recovery doesn't work for HEIC — OpenCV has no HEIC codec — so a genuinely corrupted HEIC has no fallback decode path, just fails and gets flagged like any other unrecoverable file.)
   - Test coverage: `filepopulator.tests.HeicIngestionTests` (real fixtures locally, CI's single synthetic no-EXIF stub from `ci_fixtures/heic_stub/` otherwise — tests work with "whatever's present," no hardcoded counts/filenames) covers ingestion, `add_from_root_dir()` discovery, GPS conversion (skipped if no fixture has GPS), and both guards.
 - **JWT auth (`rest_framework_simplejwt`) is NOT dead code — confirmed live, do not remove.** Previously flagged here as a candidate "dead code after the Authelia migration" audit item. Checked 2026-08-28: the user found, from another project, that its login workflow actively calls this API's JWT endpoints (`/api/token/obtain/` → `TokenPairWithUsername`, `/api/token/refresh/`). So `SIMPLE_JWT` settings, `TokenPairWithUsername`, `token_blacklist` in `INSTALLED_APPS`, and `PyJWT` all stay. Still open: identify *which* project/client this is and whether it also relies on `token_blacklist` (logout/revocation) specifically, not just obtain/refresh — that determines how much of this could ever be trimmed later if that consumer is migrated to Authelia too. Until then, treat this as a second real parallel auth system, not leftover cruft.
-- **Face clustering quality**: how `face_manager/assign_faces.py`'s `faceAssigner` clusters/matches detected faces against existing `Person`s hasn't been reviewed this round — flagged as a bigger task of its own, separate from the pipeline plumbing bugs already found.
-- **Similar-image search**: find images that are visually similar (not just exact pixel-duplicate) — e.g. near-duplicate bursts, edited/re-exported versions of the same shot.
-- **Faster/better image hashing for duplicate detection**: `filepopulator` currently does a full MD5 over raw decoded pixels (`ImageFile._generate_md5_hash()`) to catch *exact* duplicates. A perceptual hash (pHash/dHash/aHash) would likely be faster and could double as the foundation for the similar-image search above, rather than solving them separately.
-- **Backend geocoding with a real service, not an offline heuristic**: GPS lat/lon is already captured (`gps_lat_decimal`/`gps_lon_decimal` via `gpsphoto`) but never reverse-geocoded to a place name. Wants a precise geocoding service rather than an offline/heuristic library — likely rate-limited (e.g. Nominatim's usage policy), so needs caching/backoff, not a call-per-request. Bonus: fall back to the nearest larger city/landmark/national park when there's no exact precise place (useful for photos taken somewhere remote).
 - **Slideshow metadata overlay**: serve slideshow images with the photo's date (nicely formatted, not a raw timestamp) and location (feeds off the geocoding work above) alongside the image itself.
 - **Video support**: the pipeline currently assumes still images end-to-end — `ImageFile`'s filename validator/extension checks, thumbnailing, EXIF/GPS extraction, and the face-detection pipeline are all image-only. Adding video would need real planning: a distinct model (or a shared base) for video assets, a thumbnailing strategy (extract a representative frame, or several), whether/how face detection runs against video (sample frames vs. skip entirely), metadata extraction differences (video containers carry EXIF-equivalent metadata differently than JPEGs), and slideshow/API changes to serve a different media type. Not started — flagged here as a bigger feature needing a design pass, not a quick add.
