@@ -44,8 +44,6 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 - Django 6.1 upgrade is blocked: it made the test suite hang indefinitely partway through
   `filepopulator`'s duplicate-detection tests (Django vs. scipy 1.18.1 bumped alongside it, root
   cause never confirmed) — deliberately avoided, pinned at `6.0.8`.
-- A full (non-diagonal) Mahalanobis distance for face-classification outlier rejection was never
-  tried (a diagonal approximation was tried and underperformed `p99` alone).
 
 **Open questions / follow-ups:**
 - No automated "did last night's backup actually run" freshness check exists — the current
@@ -652,6 +650,10 @@ ideas, so a future session doesn't have to redo this from scratch:
   people have far fewer faces than the 512 embedding dimensions -- but given the diagonal version
   already underperformed, a full version isn't an obvious next step without a reason to expect
   the *correlations* between dimensions (the part diagonal ignores) to carry the missing signal.
+  **Dropped from the TODO list (2026-09-04) per the user's call**: a full 512x512 covariance
+  would be underspecified for most people's actual gallery sizes anyway (needing shrinkage/PCA
+  just to be estimable at all, per above), and the already-tried diagonal approximation gave no
+  reason to expect the full version would help -- not worth pursuing.
 - **Brainstormed, not yet tried**:
   - **Co-occurrence / social-context prior** -- if other faces in the *same photo* are already
     confidently identified, and those people are frequently photographed together with a given
