@@ -7,22 +7,10 @@ from drf_queryfields import QueryFieldsMixin
 from face_manager.models import Person, Face
 from filepopulator.models import ImageFile, Directory
 from rest_framework import serializers
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 import datetime
 import dateutil.parser
 import json
 from django.db.models import Q
-
-
-class TokenPairSerializer(TokenObtainPairSerializer):
-
-    @classmethod
-    def get_token(cls, user):
-        token = super(TokenPairSerializer, cls).get_token(user)
-
-        # Add custom claims
-        token['username'] = user.username
-        return token
 
 
 class FaceSubsetSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):

@@ -144,29 +144,6 @@ class AuthenticationTests(ApiTestCase):
         resp = self.client.get("/api/images/")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
-    def test_token_obtain_with_valid_credentials(self):
-        resp = self.anon_client.post(
-            "/api/token/obtain/", {"username": "tester", "password": "pw123456"}, format="json"
-        )
-        self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertIn("access", resp.data)
-        self.assertIn("refresh", resp.data)
-
-    def test_token_obtain_with_bad_credentials_rejected(self):
-        resp = self.anon_client.post(
-            "/api/token/obtain/", {"username": "tester", "password": "wrong"}, format="json"
-        )
-        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
-
-    def test_jwt_access_token_authenticates_requests(self):
-        token_resp = self.anon_client.post(
-            "/api/token/obtain/", {"username": "tester", "password": "pw123456"}, format="json"
-        )
-        access = token_resp.data["access"]
-        self.anon_client.credentials(HTTP_AUTHORIZATION=f"JWT {access}")
-        resp = self.anon_client.get("/api/images/")
-        self.assertEqual(resp.status_code, status.HTTP_200_OK)
-
 
 class SlideshowKeyPermissionTests(ApiTestCase):
     """Covers api/permissions.py HasSlideshowKeyOrAuthenticated, used by

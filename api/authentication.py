@@ -18,8 +18,12 @@
 # users: the account must already exist (provisioned by a prior web SSO
 # login), so this stays a pure authentication path with no side effects.
 #
-# The legacy rest_framework_simplejwt path (/api/token/obtain/, header
-# type "JWT ") is left in place and untouched as a fallback.
+# (The legacy rest_framework_simplejwt path -- /api/token/obtain/, header
+# type "JWT " -- that used to sit alongside this as a fallback was
+# removed 2026-09-04: its one known consumer had stopped using it, per
+# production logs showing zero successful auths and no hits at all in
+# the week before removal. This class's own PyJWT-based OIDC validation
+# below is unrelated to that package and is unaffected.)
 
 import logging
 import time
@@ -102,7 +106,7 @@ class AutheliaOIDCAuthentication(authentication.BaseAuthentication):
 
         if not auth or auth[0].lower() != self.keyword.lower().encode():
             # No Bearer token -- let the other authenticators (session,
-            # DRF token, simplejwt "JWT ") have their turn.
+            # DRF token) have their turn.
             return None
 
         if len(auth) == 1:

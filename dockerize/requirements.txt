@@ -10,7 +10,6 @@ django-filter==26.1
 django-webpack-loader==3.2.4
 Django==6.0.8
 djangorestframework-queryfields==1.1.0
-djangorestframework-simplejwt==5.5.1
 djangorestframework==3.18.0
 drf-url-filters==0.5.1
 editdistance==0.8.1
