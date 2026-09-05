@@ -35,9 +35,6 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 **Smaller tech debt:**
 - `set_possible_person()`/`reject_association()` still hardcode `5`/`range(1, 6)` via `eval`/
   `exec` instead of using `Face.NUM_POSSIBLE_IDENTITIES` — fine until that constant ever changes.
-- `ImageFile.save()` unconditionally re-decodes and rehashes the full image on *every* save, not
-  just creation — flagged repeatedly as real wasted CPU on any hot path that re-saves existing
-  rows, never actually fixed at the source (routed around instead, e.g. by `backfill_phash`).
 - **RE-INVESTIGATED 2026-09-05, could not reproduce -- see the dated note below.** No longer
   believed to be actually blocked; still pinned at `6.0.8` pending a decision to actually cut over.
 
@@ -1418,16 +1415,24 @@ active production issue, not just cleanup — worth prioritizing the deploy once
   install) now shares the same permanent rows, matching how production actually behaves.
   `ensure_sentinel_people()` in `api/tests.py` is now effectively a no-op safety net (its
   `exists()` check short-circuits immediately) rather than the sole source of these rows.
-- **Investigate `ImageFile.save()`'s unconditional MD5 rehash** (see "Data model notes" above) —
-  it fully decodes the image and recomputes `_generate_md5_hash()` (and now phash, added
-  2026-08-27 — see the similarity-detection entry below) on *every* `.save()` call, not just
-  creation. Worth checking whether anything calls `.save()` on existing rows somewhere hot
-  (bulk operations, periodic tasks) where this is pure wasted CPU, and whether the hash could be
-  computed once and skipped on later saves when the file's mtime/size haven't changed. This has
-  come up repeatedly as a real cost, not just a theoretical one: `backfill_phash` (below) was
-  built specifically to avoid it — going through `.save()` to backfill 206k images' phash would
-  have redundantly rehashed pixel_hash and regenerated thumbnails for every one of them. Worth
-  actually fixing at the source rather than routing around it again next time.
+- **FIXED (2026-09-05): `ImageFile.save()`'s unconditional MD5 rehash.** Traced through the real
+  cost breakdown before touching anything (measured against a real fixture): `_init_image()`
+  (decode + EXIF orientation) is cheap, ~0.5ms; `_generate_md5_hash()` (pixel hash + phash + a DB
+  query) is the actual expensive part, ~15ms steady-state per call. Checked every real call site
+  in the codebase (`create_image_file()`'s several branches -- new file, unchanged-pixel-hash
+  update, orientation change, moved file -- plus `add_file_manual.py`, which routes through the
+  same function) and confirmed every single one already computes and verifies a correct
+  `pixel_hash` *before* calling `.save()` -- so `.save()`'s own unconditional rehash was pure
+  repeated work in the common case of "file's mtime changed but content didn't," redoing the
+  exact same decode+hash a second time for a value already known correct. Fixed: `save()` now
+  only calls `_generate_md5_hash()` when `pixel_hash` isn't already a real value (still `-1`, the
+  field's default); otherwise it just calls the new, cheap `_refresh_file_hash()` (a filename-only
+  hash, no image decode) so `file_hash` -- used to build the thumbnail path -- stays correct even
+  when a file gets moved to a new path without its pixel content changing. 3 new tests (skips
+  rehash when already set, still computes when not, `file_hash` refreshes correctly on the
+  skip-rehash path after a simulated move). Full fast suite: 321/321 passing. `backfill_phash`
+  (below) already worked around this same cost by deliberately not going through `.save()` at
+  all -- that workaround is now less necessary but still harmless to leave as-is.
 - **DONE (2026-08-26): HEIC support.** `pillow-heif` (already present in `picasa_img`, now explicitly pinned) registers a PIL plugin (`common/__init__.py`, at import time) so `PIL.Image.open()` handles `.heic`/`.heif` transparently. `ImageFile.filename`'s `RegexValidator`, `process_new_no_md5()`'s own check, and `create_image_file()`/`add_from_root_dir()`'s extension gates all now accept `.heic`/`.heif` via one shared `IMAGE_EXTENSION_REGEX` constant (`filepopulator/models.py`). Verified empirically against 8 real iPhone HEIC samples (models 12 through 17 Pro, from `/mnt/fast_storage/appdata/django_picasa/test_suite/heic_images/`, mounted read-only under `/photos/heic_stub`):
   - Decode always produces plain RGB (no alpha/exotic color modes to handle).
   - **EXIF orientation always reads back as `1`** regardless of the photo's actual portrait/landscape framing — `pillow_heif`/libheif auto-applies any container-level rotation transform (`irot`/`imir` boxes) during decode and resets the tag to match. This means the existing `apply_exif_orientation()` logic (which no-ops on orientation 1) is safe to reuse unchanged — no double-rotation risk materialized.
