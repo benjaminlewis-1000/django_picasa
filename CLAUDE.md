@@ -17,14 +17,14 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 **Confirmed-live bugs, not yet fixed:**
 - 29 duplicate `ImageFile` rows sharing the same filename (a different bug than the pixel_hash
   cross-path duplicate issue already fixed) — needs a decision on which row of each pair to keep.
-- `find_and_encode_faces()`'s IOU-matching logic has unhandled edge cases
+- `find_and_encode_faces()`'s IOU-matching logic still has unhandled edge cases
   (`NotImplementedError`/`ValueError`/bare asserts) when an image's existing vs. newly-detected
-  face counts diverge — silently aborts the *entire* scheduled `face_extraction` batch via a bare
-  `except:` in `tasks.py`. `ImageFile` ids `99862`, `103837`, `108072` still stuck unprocessed.
-- A separate `classify_unassigned()` array-sizing bug — a stale-sized zero-padded array can
-  pollute a max-similarity calculation and raise `IndexError` (rejected candidates +
-  `.another_ignore` combo); compounded by `execute()`'s per-face error handling being commented
-  out, so it can abort the whole scheduled run, not just one face.
+  face counts diverge, and root-causing *why* those counts diverge is still open — but per-image
+  **containment** was already fixed (commit `4613c84`, 2026-08-26, on both branches): a failure on
+  one image no longer aborts the whole scheduled batch, just skips that image
+  (`isProcessed=False`, retried later). Confirmed the 3 previously-stuck images (`99862`,
+  `103837`, `108072`) are all `isProcessed=True` now — this entry is scoped down to just "find and
+  fix the actual root cause," not "stops the whole pipeline," which is no longer true.
 - `Person.num_faces`/`num_possibilities`/`num_unverified_faces` are manually-synced cached
   columns, not live queries — can silently drift stale if anything mutates faces outside the
   model's own methods. `PersonSerializer.get_num_possibilities` is also missing entirely (likely
@@ -1183,6 +1183,18 @@ ideas, so a future session doesn't have to redo this from scratch:
   file's own "keep one consolidated TODO index" convention matters: this bug sat marked as open
   for over a week after it was actually fixed, simply because the fix's own commit never touched
   this TODO entry.
+- **FIXED (also landed 2026-08-26, also never marked resolved here until the user asked
+  directly on 2026-09-05): the `classify_unassigned()` array-sizing bug, and `execute()`'s
+  per-face error handling.** Commit `8c93b3c` ("Fix array-sizing bug in classify_unassigned(),
+  restore per-face error handling") -- confirmed present on both branches, and
+  `_classify_one_safely()`'s own comment references the fix directly. Same commit also restored
+  the per-face try/except (`_classify_one_safely`) that wraps every `classify_unassigned()` call
+  in `execute()`'s loop, so one face's exception can't abort the whole scheduled run.
+  **Same day, a related but separate fix** (commit `4613c84`, "Contain IOU-matching failures
+  per-image in find_and_encode_faces()"): wrapped that function's IOU-matching section in its own
+  try/except so one bad image no longer aborts the entire batch -- this is the "confirmed-live
+  bugs" list entry above, now scoped down to just the still-open root cause (why existing/detected
+  face counts diverge in the first place), not the blast-radius containment, which is done.
 
 **Where things stand (2026-08-26, end of session)**: `backend_upgrade` is pushed
 (`9475adf`) with three fixes made *after* HEIC/PR #44 was already merged to `master` and
