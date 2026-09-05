@@ -38,17 +38,14 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 - `ImageFile.save()` unconditionally re-decodes and rehashes the full image on *every* save, not
   just creation — flagged repeatedly as real wasted CPU on any hot path that re-saves existing
   rows, never actually fixed at the source (routed around instead, e.g. by `backfill_phash`).
-- Django 6.1 upgrade is blocked: it made the test suite hang indefinitely partway through
-  `filepopulator`'s duplicate-detection tests (Django vs. scipy 1.18.1 bumped alongside it, root
-  cause never confirmed) — deliberately avoided, pinned at `6.0.8`.
+- **RE-INVESTIGATED 2026-09-05, could not reproduce -- see the dated note below.** No longer
+  believed to be actually blocked; still pinned at `6.0.8` pending a decision to actually cut over.
 
 **Open questions / follow-ups:**
 - No automated "did last night's backup actually run" freshness check exists — the current
   restore-testing only validates a backup file once it's promoted into weekly retention, which
   says nothing about a night the backup silently never ran at all (this has already happened
   once, caught only because the user happened to notice a file hadn't shrunk).
-- The `detected_age` birth-year-cutoff idea for face classification is tabled pending a visual
-  sanity-check (real face thumbnails next to their `detected_age`) that was never actually done.
 - A manual override tool for nearest-metro geocoding mismatches is wanted but not scoped (needs
   both a frontend UI and a backend endpoint/storage design).
 - A looser classification threshold specifically for faces with `.ignore` already in their reject
@@ -253,6 +250,12 @@ bugs the test suite above already found/documented:**
 ## Dependencies
 
 `dockerize/requirements.txt` on `master` is still the original, every entry an unbounded `>=` — untouched there deliberately, per the user's request to keep this work dev-only for now. On `backend_upgrade`, it's been trimmed and pinned: originally 15 packages removed as "zero references anywhere in the codebase" (`coloredlogs`, `dj-database-url`, `django-celery-beat`, `django-celerybeat-status`, `django-rest-framework` [a dead/unrelated stub package — not `djangorestframework`, which stays], `django-timezone-field`, `ExifRead`, `importlib-metadata`, `pgi`, `piexif`, `psycopg2-pool`, `python-dotenv`, `python-xmp-toolkit`, `SCons`, `twilio`), and every remaining package pinned `==` to the exact version that passed all 93 fast tests. **Correction (2026-08-26)**: `ExifRead`/`piexif` were wrongly included in that "zero references" list and had to be added back — that check only looked for direct imports in our own code, missing that `gpsphoto` (which we do use, for GPS EXIF extraction) imports both itself (`import exifread`, `from piexif import load, dump`) without declaring them in its own `setup.py`'s `install_requires` (empty/broken packaging on GPSPhoto's part). Invisible locally because `picasa_img:latest` already had both installed from before the trim — only surfaced once CI actually ran `pip install -r requirements.txt` into a genuinely clean environment, which is exactly the kind of gap a real CI run is for. Actually-zero-reference removals (the other 13) still stand. Deliberately pinned Django to `6.0.8`, not the newer `6.1` that `pip install --upgrade` offered — upgrading to 6.1 (with scipy bumped to 1.18.1 alongside it) made the test suite hang indefinitely partway through `filepopulator`'s duplicate-detection tests; root cause not confirmed (Django vs. scipy), not chased further, just avoided. If picking this back up: reproduce in a throwaway container (not `picasa_api_dev_test`), and getting a real stack trace will need `--cap-add=SYS_PTRACE` on the container so `py-spy dump` can attach (it couldn't, last time).
+
+**RE-INVESTIGATED 2026-09-05: could not reproduce the hang at all.** Followed the throwaway-container instructions above properly this time (a genuinely separate container off `picasa_img:latest`, `--cap-add=SYS_PTRACE`, not `picasa_api_dev_test`). Two separate tests, both clean:
+1. **Runtime upgrade** (`pip install --upgrade django scipy` inside the throwaway container, landing 6.1.1/1.18.1): the specific duplicate-detection tests named in the original report passed individually, the *entire* `filepopulator` fast module passed (83/83, ~103s), and the *entire* fast suite passed (318/318, no hang, exit 0).
+2. **A real image build** with `Django==6.1.1`/`scipy==1.18.1` pinned in a scratch copy of `requirements.txt`, using the actual `Dockerfile_picasa` (fresh Ubuntu base, nothing cached from the working image): `pip install -r requirements.txt` — the step that actually installs Django/scipy — completed with zero errors, both times it was run. The build did fail, but at a *later*, unrelated step (`apt install postgresql`, hitting a genuine `404` fetching `libfdisk1` from `security.ubuntu.com` — a stale/out-of-sync Ubuntu package mirror, reproduced identically twice, nothing to do with Django or Python dependencies at all).
+
+**Conclusion: Django 6.1 does not appear to actually be blocked by anything found this session.** Two live explanations for the original report, neither chased further: (a) it was a misdiagnosis of an unrelated environment hiccup (plausibly this same kind of transient apt/mirror issue) at the time, or (b) the actual trigger was specific to the *old* versions of the duplicate-detection tests named in the report -- which were substantially rewritten this session as part of the `DuplicateFile.original` work (see above), so a Django-6.1-specific interaction with that old test code, if real, may simply no longer exist. Not yet decided whether to actually cut over `requirements.txt` to 6.1 -- this only re-opens the option, it doesn't commit to it.
 
 ## Follow-up bug audit (2026-08-24)
 
