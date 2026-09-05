@@ -72,6 +72,18 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   ready; frontend work never started).
 - Grouped-review UI for `Face.verification_cluster_group` (backend/data side is live).
 
+**Failing tests to fix** (both pre-existing, seen repeatedly across many unrelated fast-suite runs
+this session — real failures, not flakes, just never fixed):
+- `common.tests.OpenImgOrientedTests.test_corrupted_image_returns_none` — `FileNotFoundError: File
+  /photos/corrupted/truncated_a.jpg not found` in the exec context this session ran tests in
+  (`picasa_api_dev_test`). Looks like an environment/fixture-availability gap (the real corrupted-
+  image fixture set isn't mounted there, or that specific file is missing from it) rather than a
+  code bug — needs confirming which, then either fixing the fixture mount or the test.
+- `face_manager.tests.FaceModelTests.test_face_encoding_512_stores_at_float32_precision` —
+  `AssertionError: 0.12345679 != 0.12345679104328156`. A float32-storage precision test comparing
+  against a float64 literal it expects to round-trip exactly; needs the comparison changed to a
+  tolerance-based check (or the expected literal corrected) instead of exact equality.
+
 **Stale — likely already superseded, worth pruning from this file's own later brainstormed-ideas
 list if confirmed:**
 - "Similar-image search" / "faster image hashing for duplicate detection" — but `backfill_phash`,
