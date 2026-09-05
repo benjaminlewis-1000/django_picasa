@@ -36,6 +36,15 @@ RUN cp /usr/bin/python3 /usr/bin/python
 # RUN pip3 install PyJWT==1.7.1
 
 # RUN apt install -y postgresql
+# Fresh `apt update` immediately before this install, not just relying on
+# the one at the top of the file: Docker layer caching can reuse that
+# early layer's package index long after the mirror has actually moved on
+# (pruned an old package version), causing a 404 on a package that was
+# resolvable when the early layer was last built. Hit this for real
+# 2026-09-05 (libfdisk1's pinned version 404ing from security.ubuntu.com,
+# unrelated to any Python dependency change) -- reproduced identically
+# across multiple build attempts until this was added.
+RUN apt update
 RUN DEBIAN_FRONTEND=noninteractive apt install -y postgresql # postgresql-contrib
 RUN rm -r /var/lib/apt/lists
 
