@@ -70,17 +70,23 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   ready; frontend work never started).
 - Grouped-review UI for `Face.verification_cluster_group` (backend/data side is live).
 
-**Failing tests to fix** (both pre-existing, seen repeatedly across many unrelated fast-suite runs
-this session — real failures, not flakes, just never fixed):
-- `common.tests.OpenImgOrientedTests.test_corrupted_image_returns_none` — `FileNotFoundError: File
-  /photos/corrupted/truncated_a.jpg not found` in the exec context this session ran tests in
-  (`picasa_api_dev_test`). Looks like an environment/fixture-availability gap (the real corrupted-
-  image fixture set isn't mounted there, or that specific file is missing from it) rather than a
-  code bug — needs confirming which, then either fixing the fixture mount or the test.
-- `face_manager.tests.FaceModelTests.test_face_encoding_512_stores_at_float32_precision` —
-  `AssertionError: 0.12345679 != 0.12345679104328156`. A float32-storage precision test comparing
-  against a float64 literal it expects to round-trip exactly; needs the comparison changed to a
-  tolerance-based check (or the expected literal corrected) instead of exact equality.
+**DONE (2026-09-04): the two persistently-failing tests, fixed.** Both were real test bugs, not
+code bugs:
+- `common.tests.OpenImgOrientedTests.test_corrupted_image_returns_none` hardcoded a filename
+  (`truncated_a.jpg`) that matched neither the real local fixture set (5 real corrupted JPEGs
+  pulled from production logs) nor CI's own synthetic `ci_fixtures/corrupted/` — always a
+  `FileNotFoundError`. Fixed by picking whatever's actually present in `/photos/corrupted/`
+  dynamically (`sorted(os.listdir(...))[0]`), matching the established convention other tests in
+  this file already use for exactly this reason.
+- `face_manager.tests.FaceModelTests.test_face_encoding_512_stores_at_float32_precision` compared
+  the DB-round-tripped value against `float(np.float32(x))` for exact double equality --
+  Postgres's `real` -> text -> Python float round trip (via psycopg2) doesn't necessarily
+  reproduce the exact same double bit pattern as computing the float32 narrowing directly in
+  Python (observed: `0.12345679` back from the DB vs `0.12345679104328156` computed directly).
+  Fixed by narrowing both sides to `np.float32` before comparing, which collapses that harmless
+  text-precision noise while still genuinely verifying the stored value lost precision down to
+  float32 (the actual point of the test).
+Full fast suite: **317/317 passing**, first fully-clean run this session.
 
 **Stale — pruned from this file's later brainstormed-ideas list (2026-09-04):**
 - "Similar-image search" / "faster image hashing for duplicate detection" — superseded:
