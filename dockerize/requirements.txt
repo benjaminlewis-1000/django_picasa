@@ -8,7 +8,7 @@ django-admin-thumbnails==1.0.0
 django-cors-headers==4.9.0
 django-filter==26.1
 django-webpack-loader==3.2.4
-Django==6.0.8
+Django==6.1.1
 djangorestframework-queryfields==1.1.0
 djangorestframework==3.18.0
 drf-url-filters==0.5.1
@@ -48,11 +48,10 @@ redis==8.1.0
 regex==2026.7.19
 requests==2.34.2
 scikit-learn==1.9.0
-# Pinned to 1.18.0 deliberately, not the newer 1.18.1 -- see CLAUDE.md:
-# upgrading alongside Django 6.1 caused the test suite to hang (root cause
-# not confirmed to be scipy vs Django), so both are pinned to the last
-# combination that passed all 93 tests.
-scipy==1.18.0
+# Bumped to 1.18.1 alongside Django 6.1 (see CLAUDE.md) -- an earlier
+# session couldn't reproduce a real test-suite hang on this combination
+# from scratch, so the upgrade was unblocked.
+scipy==1.18.1
 torch==2.13.0
 torchvision==0.28.0
 xmltodict==1.0.4
