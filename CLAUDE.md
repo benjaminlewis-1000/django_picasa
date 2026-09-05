@@ -35,8 +35,6 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 **Smaller tech debt:**
 - `set_possible_person()`/`reject_association()` still hardcode `5`/`range(1, 6)` via `eval`/
   `exec` instead of using `Face.NUM_POSSIBLE_IDENTITIES` — fine until that constant ever changes.
-- **RE-INVESTIGATED 2026-09-05, could not reproduce -- see the dated note below.** No longer
-  believed to be actually blocked; still pinned at `6.0.8` pending a decision to actually cut over.
 
 **Open questions / follow-ups:**
 - No automated "did last night's backup actually run" freshness check exists — the current
@@ -59,31 +57,9 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   ready; frontend work never started).
 - Grouped-review UI for `Face.verification_cluster_group` (backend/data side is live).
 
-**DONE (2026-09-04): the two persistently-failing tests, fixed.** Both were real test bugs, not
-code bugs:
-- `common.tests.OpenImgOrientedTests.test_corrupted_image_returns_none` hardcoded a filename
-  (`truncated_a.jpg`) that matched neither the real local fixture set (5 real corrupted JPEGs
-  pulled from production logs) nor CI's own synthetic `ci_fixtures/corrupted/` — always a
-  `FileNotFoundError`. Fixed by picking whatever's actually present in `/photos/corrupted/`
-  dynamically (`sorted(os.listdir(...))[0]`), matching the established convention other tests in
-  this file already use for exactly this reason.
-- `face_manager.tests.FaceModelTests.test_face_encoding_512_stores_at_float32_precision` compared
-  the DB-round-tripped value against `float(np.float32(x))` for exact double equality --
-  Postgres's `real` -> text -> Python float round trip (via psycopg2) doesn't necessarily
-  reproduce the exact same double bit pattern as computing the float32 narrowing directly in
-  Python (observed: `0.12345679` back from the DB vs `0.12345679104328156` computed directly).
-  Fixed by narrowing both sides to `np.float32` before comparing, which collapses that harmless
-  text-precision noise while still genuinely verifying the stored value lost precision down to
-  float32 (the actual point of the test).
-Full fast suite: **317/317 passing**, first fully-clean run this session.
-
-**Stale — pruned from this file's later brainstormed-ideas list (2026-09-04):**
-- "Similar-image search" / "faster image hashing for duplicate detection" — superseded:
-  `backfill_phash`, `backfill_similarity`, and a live `filepopulator.find_similar_images`
-  scheduled task already exist and do this.
-- "Face clustering quality... hasn't been reviewed this round" — confirmed good for now by the
-  user (2026-09-04); superseded by the much deeper outlier-rejection/gallery-size-adaptive-
-  threshold investigation elsewhere in this file.
+(Resolved items -- fixed tests, the Django 6.1 upgrade, pruned-stale brainstormed ideas, etc. --
+have been cleared from this index once actually done; their full write-ups remain in the dated
+narrative below, findable by searching a distinctive word.)
 
 **Backend geocoding — implemented, just needs test coverage.** Nominatim-based reverse geocoding
 was fully backfilled and runs on a schedule (`filepopulator.geocode_new_images`), but per the
