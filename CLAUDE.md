@@ -21,9 +21,6 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   (`NotImplementedError`/`ValueError`/bare asserts) when an image's existing vs. newly-detected
   face counts diverge — silently aborts the *entire* scheduled `face_extraction` batch via a bare
   `except:` in `tasks.py`. `ImageFile` ids `99862`, `103837`, `108072` still stuck unprocessed.
-- `faceAssigner.execute()` (`face_manager/assign_faces.py`) never initializes its embedding cache
-  when there are <=100 unassigned faces to classify — classifies nothing, silently, below that
-  threshold.
 - A separate `classify_unassigned()` array-sizing bug — a stale-sized zero-padded array can
   pollute a max-similarity calculation and raise `IndexError` (rejected candidates +
   `.another_ignore` combo); compounded by `execute()`'s per-face error handling being commented
@@ -520,6 +517,46 @@ via the user's own two example faces (1060610/1076848) plus a broader id-delta a
     CASCADE-on-primary-delete, and the backfill's four outcomes -- resolved / file-gone-deleted /
     no-primary-deleted / corrupted-left-alone -- plus dry-run and re-run idempotency). Full fast
     suite: 319/321 passing (same 2 pre-existing, unrelated failures).
+
+**DONE (2026-09-04): cut `faceAssigner`'s daily encoding cache from 7.08GB to 2.80GB resident
+memory and 13.7s to 0.84s load time (both measured against the real production cache).** Started
+from the user asking whether the day-scoped encoding cache (`load_encodings()`,
+`/models/face_assign_preload.pkl`) could be made to persist in memory across runs, and how much
+RAM that would take -- "just a couple gigs?" Investigated empirically rather than guessing:
+production's actual cache file was 2.4GB on disk; loading it took 13.71s and left the process
+holding **7.08GB resident RAM** (`VmRSS`, confirmed real and not reclaimable transient overhead
+via `gc.collect()`/`malloc_trim` -- neither changed it). That's well more than "a couple gigs,"
+and the gap turned out to be a genuine bug, not requirements: `candidate_dict` (built inside
+`load_encodings()`) stored every face's 512-d embedding a *second* time -- as a Python `list` of
+512 individually-boxed floats inside a pandas object-dtype DataFrame column -- duplicating the
+exact same data already held compactly in `embedding_dict` (a packed numpy array). A full-codebase
+grep confirmed `candidate_dict`'s own embedding column is never read by anything except the very
+next few lines of `load_encodings()` itself, which builds `embedding_dict`/`norm_dict` from it and
+then never touches it again -- pure redundant storage, just in a ~8x-more-expensive form (a Python
+list of boxed floats vs. a packed array). Verified this was the actual cause, not a red herring,
+before touching code: dropping that one column from the loaded pickle and re-measuring showed
+current `VmRSS` fall from 7.08GB to 2.80GB immediately. Fixed by never storing that column in the
+first place -- `load_encodings()` now drops it from each person's cached DataFrame right after
+using it to build `embedding_dict` (`face_manager/assign_faces.py`). Re-measured against a
+from-scratch save/load of the corrected structure: pickle file 2.4GB -> 1.19GB, load time 13.7s ->
+**0.84s (a real ~16x speedup)**, resident memory 7.08GB -> 2.80GB -- matching the user's original
+"couple gigs" estimate once the redundant copy was gone. No functional change: the one existing
+test asserting `len(candidate_dict[person_id])` still passes (row count is unaffected by dropping
+a column). Full fast suite: 317/317 passing.
+- **Separately, also fixed while investigating the batch-size question that prompted this**:
+  `faceAssigner.execute()`'s old <=100-unassigned-faces bug turned out to already be fixed (see
+  the corrected TODO entry above) -- confirmed no batch-size gate remains anywhere in the file.
+- **Genuine in-memory persistence across Celery task runs (not just a faster per-run disk
+  reload) was discussed but not built.** `picasa_api`'s Celery workers run with
+  `--max-tasks-per-child 3` -- each worker process is killed and replaced after 3 tasks, so a
+  plain module-level Python cache would only survive ~3 task runs regardless, not reliably "until
+  tomorrow." Real persistence across many runs would need a dedicated worker/queue for
+  `face_manager.assign_faces` with `--max-tasks-per-child` effectively unlimited, holding the
+  cache as a module-level global (checked against the same day/signature invalidation
+  `load_encodings()` already uses) -- a bigger, deliberately-deferred change (new queue routing, a
+  dedicated worker process, reasoning about what happens if that worker crashes mid-day). Given
+  the disk-reload path now costs well under a second, the user opted for the smaller fix above
+  instead of taking this on.
 
 **Face-classification outlier-rejection: investigation and ideas (2026-08-27).** Started from a
 real user observation: `face_manager/assign_faces.py`'s `classify_unassigned()` is good at
@@ -1120,16 +1157,17 @@ ideas, so a future session doesn't have to redo this from scratch:
   `management/commands/deprecated/` all still read/write `face_encoding` and will error if run —
   none are part of the scheduled Celery pipeline, so this was a deliberate scope decision rather
   than an oversight.
-- **TODO: `faceAssigner.execute()` (`face_manager/assign_faces.py`) never initializes
-  `self.embedding_dict`/`self.norm_dict`/`self.candidate_dict` when there are <= 100 unassigned
-  faces to classify** — `load_encodings()` (the only thing that sets them) is only called when
-  `num_unassigned > 100`. Any run with a small batch crashes `classify_unassigned()` for every
-  face in it with `AttributeError: 'faceAssigner' object has no attribute 'embedding_dict'`.
-  Confirmed live in production (2026-08-26, post-DB-restore) — contained by the per-face
-  try/except added earlier this session (logs a warning, skips the face, doesn't abort the run),
-  but the practical effect is that **small classification batches currently classify nothing at
-  all**, silently, every time this threshold isn't crossed. Fix: call `load_encodings()`
-  unconditionally regardless of batch size. Not fixed yet.
+- **FIXED (landed 2026-08-27, during the p99-gate work below, but never marked resolved here
+  until noticed again on 2026-09-04): `faceAssigner.execute()` used to never initialize
+  `self.embedding_dict`/`self.norm_dict`/`self.candidate_dict` when there were <= 100 unassigned
+  faces to classify** — `load_encodings()` (the only thing that sets them) used to only be called
+  when `num_unassigned > 100`, crashing `classify_unassigned()` for every face in a small batch
+  with `AttributeError: 'faceAssigner' object has no attribute 'embedding_dict'`. `execute()` now
+  calls `load_encodings()` unconditionally regardless of batch size (confirmed in the current
+  code, no batch-size gate remains anywhere in the file) — this exact scenario is exactly why this
+  file's own "keep one consolidated TODO index" convention matters: this bug sat marked as open
+  for over a week after it was actually fixed, simply because the fix's own commit never touched
+  this TODO entry.
 
 **Where things stand (2026-08-26, end of session)**: `backend_upgrade` is pushed
 (`9475adf`) with three fixes made *after* HEIC/PR #44 was already merged to `master` and
