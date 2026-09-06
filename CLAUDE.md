@@ -55,7 +55,6 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 - "Mark image for deletion" button for the slideshow.
 - "Failed to open" image list surface (backend data — `image_load_failed`/`FailedImageFile` — is
   ready; frontend work never started).
-- Grouped-review UI for `Face.verification_cluster_group` (backend/data side is live).
 
 (Resolved items -- fixed tests, the Django 6.1 upgrade, pruned-stale brainstormed ideas, etc. --
 have been cleared from this index once actually done; their full write-ups remain in the dated
@@ -850,8 +849,8 @@ ideas, so a future session doesn't have to redo this from scratch:
       by `MIN_NUM_FACES`-style small-gallery exclusions upstream, not investigated further).
       Largest galleries grouped: Nathaniel Lewis (6,578 grouped faces), Liam Lewis (5,689),
       Jessica Lewis (2,955), Gwendolyn Lewis (2,633), Benjamin Lewis (1,850). The frontend surface
-      for actually using this (grouped review UI) remains explicitly out of scope for this repo --
-      the user plans to design that separately once the backend/data side is live.
+      for actually using this (grouped review UI) was out of scope for this repo -- confirmed by
+      the user (2026-09-05) that it's since been built on the frontend side.
       **Real backup-restore rehearsal, same day (2026-09-04)**: at the user's request, restored
       that morning's `picasa_db_2026-09-04.tar.zst` (02:03am backup, predating both the migration
       and the backfill above) into a scratch DB, verified row counts matched exactly
