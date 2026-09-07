@@ -227,9 +227,66 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
   whenever revisited.
 - **Phase 2 (not started)**: thumbnailing via one extracted `ffmpeg` frame, reusing the existing
   thumbnail-generation code unchanged once a PIL Image exists; handle the rotation matrix here.
-- **Phase 3 (not started, holding at the user's request)**: sparse-sampled face detection through
-  the existing `PyramidalDetector`, `Face.source_video_file`/`video_timestamp_seconds` fields +
-  migration, own scheduled task with the same per-item containment pattern the photo pipeline uses.
+- **Phase 3 (design/investigation started 2026-09-07, no code yet, holding on implementation at
+  the user's request): sparse-sampled video face detection.** Original plan (superseded) was to
+  reuse the existing `PyramidalDetector` as-is; the user instead wants a real single-pass
+  detector for video (no multi-scale pyramid -- video's own frame-to-frame redundancy already
+  covers what the pyramid buys for stills) combined with clustering (same complete-linkage
+  approach as `verification_clustering.py`) plus IOU-based track-stitching (the same
+  `linear_sum_assignment` primitive the image reconciliation rewrite already uses) to merge
+  broken same-person tracks across a clip, then drop tiny/transient clusters (someone in frame
+  for only a couple sampled hits) via a group-size floor. Clustering/tracking design itself not
+  yet finalized -- what's below is real benchmarking to size the problem before designing it
+  further.
+
+  **Real per-frame benchmark, against 2 real 1080p phone-video fixtures** (`IMG_0760.MOV` 229
+  frames/30fps, `VID_20190608_170520884.mp4` 304 frames/29.9fps, both from the real video-samples
+  fixture dir), run serially (concurrent runs were tried first and rejected -- ONNXRuntime's own
+  CPU intra-op threading already spans many cores per single call, confirmed via `ps aux` showing
+  700-1200% CPU for one process alone, so two concurrent benchmark runs just contended for the
+  same cores and produced inflated, unusable numbers for both):
+  - Baseline (`FaceAnalysis(name='buffalo_l')`, default `.prepare()`): **832-1039ms/frame**.
+  - Forcing a real single detector scale (`det_size=(640,640)` explicitly -- default
+    `.prepare()` silently runs `DEFAULT_DET_SIZES = [(128,128),(640,640)]`, a built-in
+    double-scale pass, not a true single pass, confirmed via `insightface.model_zoo.scrfd`
+    source): only **764-974ms/frame**, a small win -- the extra (128,128) pass is cheap since
+    it's tiny, so this wasn't where the real cost was.
+  - **Real dominant cost, found by inspecting `FaceAnalysis.get()`'s source directly**: it runs
+    every loaded non-detection model against every detected face unconditionally --
+    `landmark_3d_68` (`1k3d68.onnx`, 143MB) and `landmark_2d_106` (`2d106det.onnx`, 5MB) included.
+    A full-codebase grep confirmed **neither landmark output is read anywhere in this repo, on
+    the image side either** -- pure wasted compute inherited from `FaceAnalysis(name='buffalo_l')`
+    being constructed with no `allowed_modules` filter. Left alone on the image side (stable,
+    not touched per the user's explicit instruction) but no reason to carry into new video code.
+  - **Lightweight combo, real per-frame timing: 263-344ms/frame (~3x the baseline)** --
+    `allowed_modules=['detection','recognition','genderage']` (drops both landmark models) AND
+    swaps the detector for `buffalo_s`'s `det_500m.onnx` (2.5MB SCRFD-500MF, downloaded and
+    verified working) in place of `buffalo_l`'s `det_10g.onnx` (16.9MB SCRFD-10GF) -- same
+    `Face` object interface (bbox/kps/det_score) so it drops straight into the same recognition
+    call unmodified. **Recognition stays `w600k_r50.onnx` (buffalo_l's), never swapped** --
+    verified the resulting embedding is still real 512-d output (`shape=(512,), norm=18.33`),
+    numerically the same model as the image pipeline's own encodings, so video faces will be
+    directly comparable to existing `Person` galleries with no separate embedding space. The
+    lighter detector does find fewer faces per frame than `det_10g` (expected, lower-capacity
+    model) -- an explicit, accepted tradeoff per the user ("we want the encodings to be
+    consistent... but the detector can be less capable").
+  - **No native batch-inference path exists** in this installed insightface version (1.0.1) --
+    `SCRFD.detect()` is single-image only, no multi-frame tensor dimension. Not pursued: CPU
+    inference already spans many cores per single call (same reasoning behind this session's own
+    earlier multi-threading revert for image classification -- numpy/ONNX matmul already
+    multi-threads internally, so Python-level parallelism just oversubscribes the same cores).
+  - **Full-library scope, at the lightweight per-frame cost, against the real backfilled library**
+    (237.5 hours total footage, 6,946 videos, ~2min average): sampling every frame is not viable
+    (~213 days single-threaded); every 10th frame ~21 days; every 20th frame ~11 days; every 30th
+    frame ~7 days. This is a one-time-backfill sizing problem, not an ongoing-cost one -- a new
+    video going forward costs only ~55s at a stride-20 sample rate for an average ~2-minute clip,
+    same "backlog vs. steady-state" shape as the original image face-extraction backfill.
+  - **Not yet decided**: final sample stride, the clustering distance threshold and group-size
+    floor for dropping transient faces, and how IOU-based track-stitching combines with the
+    clustering pass (stitch first then cluster stitched tracks, or cluster raw detections then
+    use IOU only to heal adjacent-frame gaps within an already-formed cluster). `Face.source_
+    video_file`/`video_timestamp_seconds` fields + migration, and the actual scheduled task, are
+    still not built -- this is investigation only, no schema or pipeline code written yet.
 - **Phase 4 (not started)**: `VideoFileSerializer`/viewset, a `media_type` discriminator for the
   slideshow/frontend to branch `<video>` vs `<img>` (frontend side out of scope for this repo).
 - **Phase 5, newly identified (2026-09-07), not started -- transcode pipeline, likely required
