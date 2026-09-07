@@ -1036,6 +1036,11 @@ class VideoFile(models.Model):
     height = models.IntegerField(validators=[MinValueValidator(1)])
     codec = models.CharField(max_length=32, null=True, blank=True)
 
+    # Raw file size on disk (os.path.getsize()), unlike ImageFile which has
+    # no equivalent field -- added specifically to help size the Phase 5
+    # transcode pipeline's disk footprint (see CLAUDE.md).
+    file_size_bytes = models.BigIntegerField(null=True, blank=True)
+
     # Recovered via exiftool where available (confirmed present for some
     # real camcorder-sourced files even when ffprobe finds nothing at
     # all) -- absent for many older/converted sources, same as ImageFile's
