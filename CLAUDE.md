@@ -232,6 +232,20 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
   migration, own scheduled task with the same per-item containment pattern the photo pipeline uses.
 - **Phase 4 (not started)**: `VideoFileSerializer`/viewset, a `media_type` discriminator for the
   slideshow/frontend to branch `<video>` vs `<img>` (frontend side out of scope for this repo).
+- **Phase 5, newly identified (2026-09-07), not started -- transcode pipeline, likely required
+  before Phase 4 is actually usable.** Prompted by the user asking about progressive-playback
+  slideshow integration. HTML5 `<video>` already supports progressive playback for free via HTTP
+  byte-range requests (the browser buffers the first chunk and starts playing before the rest
+  streams in) -- but that only works if (a) the codec is browser-playable at all, which most of
+  this library's real source codecs are NOT (`.wmv`, `.avi`, `.mts`, `.mpg` all need transcoding
+  to H.264/mp4 first -- `.mp4`/`.mov`/`.m4v` from phones may already qualify, not yet checked),
+  and (b) the mp4's `moov` atom (metadata) is at the front of the file (`ffmpeg -movflags
+  +faststart`), or the browser must download the whole file first just to find it. So Phase 4
+  likely can't just be a thin serializer/viewset over the original files -- it probably needs a
+  real transcode step (new output files, own disk footprint, own processing time/queue) ahead of
+  it. **Deliberately waiting on the full backfill (in progress, see above) to finish before
+  scoping this** -- want real numbers (total footage/duration, codec breakdown across the actual
+  library) to estimate transcode disk space and processing time before designing this phase.
 
 **Backend geocoding — implemented, just needs test coverage.** Nominatim-based reverse geocoding
 was fully backfilled and runs on a schedule (`filepopulator.geocode_new_images`), but per the
