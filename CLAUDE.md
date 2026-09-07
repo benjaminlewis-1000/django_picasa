@@ -24,10 +24,6 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   `103837`, `108072`) are all `isProcessed=True` now — this entry is scoped down to just "find and
   fix the actual root cause," not "stops the whole pipeline," which is no longer true.
 
-**Smaller tech debt:**
-- `set_possible_person()`/`reject_association()` still hardcode `5`/`range(1, 6)` via `eval`/
-  `exec` instead of using `Face.NUM_POSSIBLE_IDENTITIES` — fine until that constant ever changes.
-
 **Open questions / follow-ups:**
 - No automated "did last night's backup actually run" freshness check exists — the current
   restore-testing only validates a backup file once it's promoted into weekly retention, which
@@ -1433,6 +1429,16 @@ active production issue, not just cleanup — worth prioritizing the deploy once
   fix: 320/320 passing (net zero test-count change: one test rewritten, not added/removed).
   Deployed the same way as the first stage (code change only this time, no new migration --
   `picasa_api` restart alone was sufficient).
+- **DONE (2026-09-07): `set_possible_person()`/`reject_association()` no longer hardcode `5`/
+  `range(1, 6)` via `eval`/`exec`.** Both now use `self.NUM_POSSIBLE_IDENTITIES` for every bound
+  (the `poss_idx` range assert, the candidate-scan loop, the compaction loop, the final-clear
+  loop) and plain `setattr()`/`getattr()` instead of building and `eval`/`exec`-ing an f-string --
+  same pattern `remove_poss_ident()` already used since its own earlier fix. Logic unchanged, pure
+  mechanical swap; `Face.NUM_POSSIBLE_IDENTITIES` is already the single source of truth checked
+  against the model's actual `poss_identN`/`weight_N` field pairs by a Django system check
+  (`face_manager.E001`), so this closes the last gap where changing that constant wouldn't have
+  been enough on its own. Full fast suite: 320/320 passing (no test changes needed -- existing
+  coverage already exercises both methods' behavior, which is unchanged).
 - **Fixed (2026-08-25): the non-daemon background thread in `api/views.py`** (`work_thread` /
   `background_bulk_processor`) — turned out not to be just a local testing annoyance ("looks
   hung, isn't"). In CI, with no `--keepdb` and no one around to manually `kill` the leftover
