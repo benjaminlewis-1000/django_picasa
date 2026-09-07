@@ -180,25 +180,16 @@ class FaceSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
 
 
 
-class PersonSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
-
-    # num_faces/num_possibilities are computed live -- see
-    # face_manager/live_counts.py's annotate_live_face_counts(), which
-    # PersonViewSet.get_queryset() applies. Plain (not SerializerMethodField)
-    # so DRF just reads the annotated queryset attribute directly; no
-    # per-object query here. (This used to be a SerializerMethodField
-    # with get_num_faces() doing a live per-object count and a commented-out,
-    # never-implemented get_num_possibilities() -- the latter meant any
-    # request that actually serialized a Person here raised AttributeError.)
-    num_faces = serializers.IntegerField(read_only=True)
-    num_possibilities = serializers.IntegerField(read_only=True)
-    face_declared = FaceSubsetSerializer(read_only = True, many=True)
-
-    class Meta:
-
-        model = Person
-        fields = ['url', 'person_name', 'highlight_img', 'num_faces', \
-        'num_possibilities', 'id', 'further_images_unlikely', 'face_declared']
+# PersonSerializer removed -- it exposed face_declared as a fully nested
+# list of hyperlinked Face URLs, which for a large-gallery person (the
+# blank sentinel, ~99k faces; .ignore, ~131k faces) meant building
+# six-figure numbers of URLs in pure Python on a single request. This was
+# always latent but never reachable in practice: get_num_possibilities
+# was commented out while still declared as a SerializerMethodField, so
+# every request 500'd before ever reaching face_declared. See
+# PersonViewSet (api/views.py) -- now a bare GenericViewSet exposing only
+# its two real actions (rename, toggle_further_unlikely), neither of
+# which used this serializer.
 
 # Source : https://medium.com/django-rest-framework/django-rest-framework-viewset-when-you-don-t-have-a-model-335a0490ba6f
 class ParameterSerializer(serializers.Serializer):

@@ -240,30 +240,33 @@ class PersonViewSetTests(ApiTestCase):
         person.refresh_from_db()
         self.assertTrue(person.further_images_unlikely)
 
-    def test_list_returns_live_num_faces_and_num_possibilities(self):
-        # Regression test: PersonSerializer.get_num_possibilities used to
-        # be commented out entirely while still declared as a
-        # SerializerMethodField, so GET /api/people/ raised AttributeError
-        # on every single request that actually serialized a Person --
-        # never caught because nothing exercised this endpoint directly.
-        # num_faces/num_possibilities are now computed live via
-        # PersonViewSet.get_queryset()'s annotate_live_face_counts().
+    def test_list_and_retrieve_are_not_exposed(self):
+        # PersonViewSet is deliberately a bare GenericViewSet, not a
+        # ModelViewSet -- GET /api/people/ and GET /api/people/<id>/ used
+        # to 500 on every request (PersonSerializer.get_num_possibilities
+        # was commented out while still declared as a
+        # SerializerMethodField). Fixing that crash would have exposed a
+        # real, much worse landmine underneath: PersonSerializer's
+        # face_declared nested-serialized every one of a person's Face
+        # rows as its own hyperlinked URL -- for the blank sentinel
+        # (~99k faces) or .ignore (~131k faces), that's building
+        # six-figure numbers of URLs in pure Python on one request
+        # (confirmed hanging 85+ seconds, 7GB+ RSS, no DB query even
+        # involved). Removed rather than fixed -- nothing exercised list/
+        # retrieve/create/update/destroy before this, only the two real
+        # actions below.
         person = Person.objects.create(person_name="Listed Person")
         person.highlight_img.save("p.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
-        image = self.make_image()
-        self.make_face(image, declared_name=person)
-        other = Person.objects.create(person_name="Candidate Person")
-        other.highlight_img.save("p2.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
-        face2 = self.make_face(image)
-        face2.set_possible_person(other.id, 1, 0.8)
 
-        resp = self.client.get("/api/people/")
-        self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        results = resp.data["results"]
-        person_row = next(r for r in results if r["id"] == person.id)
-        other_row = next(r for r in results if r["id"] == other.id)
-        self.assertEqual(person_row["num_faces"], 1)
-        self.assertEqual(other_row["num_possibilities"], 1)
+        # A router only wires up a URL for an action that actually
+        # exists on the viewset -- with no list/retrieve action
+        # registered, these URLs don't resolve at all (plain 404), not
+        # a DRF 405 on an existing-but-disallowed route.
+        list_resp = self.client.get("/api/people/")
+        self.assertEqual(list_resp.status_code, status.HTTP_404_NOT_FOUND)
+
+        retrieve_resp = self.client.get(f"/api/people/{person.id}/")
+        self.assertEqual(retrieve_resp.status_code, status.HTTP_404_NOT_FOUND)
 
 
 class FaceViewSetTests(ApiTestCase):
