@@ -23,6 +23,7 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   (`isProcessed=False`, retried later). Confirmed the 3 previously-stuck images (`99862`,
   `103837`, `108072`) are all `isProcessed=True` now — this entry is scoped down to just "find and
   fix the actual root cause," not "stops the whole pipeline," which is no longer true.
+
 **Smaller tech debt:**
 - `set_possible_person()`/`reject_association()` still hardcode `5`/`range(1, 6)` via `eval`/
   `exec` instead of using `Face.NUM_POSSIBLE_IDENTITIES` — fine until that constant ever changes.
