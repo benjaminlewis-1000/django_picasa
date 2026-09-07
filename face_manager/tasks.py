@@ -175,12 +175,3 @@ def cluster_unverified_faces_task():
         )
     except:
         settings.LOGGER.debug("Ending cluster_unverified_faces task")
-
-@shared_task(ignore_result=True, name='face_manager.set_face_counts')
-def reset_task():
-    people = Person.objects.all()
-    for p in people:
-        p.num_faces = p.face_declared.count()
-        p.num_possibilities = p.face_poss1.count() # + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
-        p.num_unverified_faces = p.face_declared.filter(validated=False).count()
-        p.save()

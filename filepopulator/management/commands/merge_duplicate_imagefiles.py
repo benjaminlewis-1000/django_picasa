@@ -28,7 +28,7 @@ from django.core.management.base import BaseCommand
 from face_manager.management.commands.dedupe_overlapping_faces import (
     _connected_groups, _pick_survivor,
 )
-from face_manager.models import Face, Person
+from face_manager.models import Face
 from filepopulator.models import DuplicateFile, ImageFile
 
 
@@ -137,12 +137,6 @@ class Command(BaseCommand):
             dup.delete()
             total_deleted_dupes += 1
 
-        for person in Person.objects.filter(id__in=affected_person_ids):
-            person.num_faces = person.face_declared.count()
-            person.num_possibilities = person.face_poss1.count()
-            person.num_unverified_faces = person.face_declared.filter(validated=False).count()
-            person.save()
-
         self.stdout.write(self.style.SUCCESS(
             f"Merged and deleted {total_deleted_dupes} duplicate ImageFile row(s)."
         ))
@@ -150,5 +144,5 @@ class Command(BaseCommand):
             f"Collapsed {total_collapsed_faces} resulting duplicate face(s)."
         ))
         self.stdout.write(self.style.SUCCESS(
-            f"Recomputed face counts for {len(affected_person_ids)} affected person(s)."
+            f"Affected {len(affected_person_ids)} person(s) (face counts are computed live, no recompute needed)."
         ))

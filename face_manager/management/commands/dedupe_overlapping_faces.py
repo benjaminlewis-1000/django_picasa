@@ -37,7 +37,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db.models import Count
 
-from face_manager.models import Face, Person
+from face_manager.models import Face
 
 
 def _iou(a, b):
@@ -169,13 +169,7 @@ class Command(BaseCommand):
             except Face.DoesNotExist:
                 pass
 
-        for person in Person.objects.filter(id__in=affected_person_ids):
-            person.num_faces = person.face_declared.count()
-            person.num_possibilities = person.face_poss1.count()
-            person.num_unverified_faces = person.face_declared.filter(validated=False).count()
-            person.save()
-
         self.stdout.write(self.style.SUCCESS(f"Deleted {deleted} duplicate face(s)."))
         self.stdout.write(self.style.SUCCESS(
-            f"Recomputed face counts for {len(affected_person_ids)} affected person(s)."
+            f"Affected {len(affected_person_ids)} person(s) (face counts are computed live, no recompute needed)."
         ))
