@@ -490,7 +490,76 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       tracklet-level representative embeddings, enforcing the cannot-link constraint by forcing
       temporally-overlapping tracklet pairs to an infinite/disallowed distance before clustering,
       rather than continuing to force this into an end-to-start bipartite matching formulation.
-      Not yet tried as of this write-up.
+
+  - **Clustering tried (2026-09-07): confirms the problem is NOT the matching algorithm --
+    every method tried, bipartite or clustering, fails to consolidate this video's known-hard
+    case, pointing at embedding variability itself as the real limiter, not algorithm choice.**
+    Built `AgglomerativeClustering(linkage='complete', metric='precomputed')` over EVERY
+    individual face embedding across all 26 tracklets (not track-level representatives), with
+    cannot-link enforced by forcing temporally-overlapping cross-track pairs to a disallowed
+    (1e6) distance in the precomputed matrix. **First run found a new bug before ever reaching
+    the real question**: 15 of 26 tracks got split across multiple cluster labels internally,
+    despite every face within one track being same-person by construction (that's what the IOU
+    tracker guarantees) -- complete linkage's strict worst-pair-must-clear-threshold rule was
+    rejecting even a track's own natural pose/lighting variation, since intra-track pairs had
+    been left at raw computed distance instead of being forced together. **Fixed with a
+    must-link constraint** (force `dist=0` for same-track pairs, alongside the existing
+    cannot-link forcing for overlapping cross-track pairs) -- re-run confirmed 0 internally-split
+    tracks, so the must-link fix is necessary and sufficient for internal consistency.
+    - **But the corrected result still didn't consolidate the known case**: 26 tracks -> 21
+      groups at the project's own default `cos_threshold=0.6`, and a full sweep down to a very
+      loose 0.35 (`AgglomerativeClustering` distance threshold up to 1.14, well past any value
+      this project has used elsewhere) **never merged the four scattered appearances of one
+      real person (a glasses-wearing woman) together** -- they stayed as separate groups at
+      every single threshold tested, while OTHER unrelated tracks increasingly blobbed together
+      as the threshold loosened (a 6-track group appeared by cos=0.55) -- the classic
+      single-criterion tradeoff (loosen enough to catch the real merge you want, and you catch
+      wrong merges elsewhere first). Root cause: complete linkage requires the WORST pairwise
+      distance across every frame in both tracks to clear threshold; with all-frames-per-track
+      (not just start/end reps), one bad frame (motion blur, extreme angle, partial occlusion) in
+      either track is enough to permanently block the merge, no matter how good every other frame
+      pair looks. This is the same "worst-case sensitivity to outlier frames" problem the earlier
+      max-vs-mean/median m×n investigation already flagged, just showing up from the opposite
+      direction here (too conservative for genuine merges, instead of too lenient for disputed
+      ones).
+    - **Tried average linkage instead (same must-link/cannot-link-constrained precomputed
+      matrix)**, since averaging dilutes a single bad-frame outlier rather than being blocked by
+      it outright. Recovered more of the target merges as the threshold loosened (2 of 4 by
+      cos=0.55, one further one folded into a same-labeled 6-track group by cos=0.45) -- but
+      **visual verification via a contact sheet (representative middle-frame crop per track,
+      grouped by final cluster label) showed the same person was STILL split across 3 separate
+      groups at cos=0.5** (groups of tracks `(0,120)+(880,880)+(1000,1080)+(2040,2280)+(3200,3320)`
+      vs. `(160,280)+(640,960)+(1120,1120)+(1400,1440)+(2840,2840)` vs. the lone `(3080,3160)` --
+      all three visually confirmed as the identical woman, same glasses, same setting) -- despite
+      average linkage's known risk of over-merging *different* people once loosened far enough to
+      catch this (partially already visible: cos<=0.45 started folding unrelated tracks into a
+      shared 6-track group). Per this project's own established discipline (numerically-clean
+      groupings have been visually wrong before, and the reverse -- numerically-plausible
+      non-merges hiding a real same-person split -- is just as much a trap), this was checked by
+      eye, not assumed from group counts alone.
+    - **Conclusion: this is not a linkage-criterion or threshold-tuning problem at all.** Every
+      approach tried across this entire investigation -- one-shot bipartite matching, dummy-padded
+      optional assignment, iterative re-solving, pure greedy, gap-restricted variants, complete-
+      linkage clustering, and average-linkage clustering, at every threshold from strict to very
+      loose -- fails to fully consolidate this one real, hard case (a person whose appearances are
+      scattered non-adjacently through a clip with long gaps and highly variable pose/lighting
+      between them). The common thread is that ALL of these methods reduce a track's identity down
+      to a single aggregate similarity number (max, mean, a worst-case, an average) compared
+      against a single global threshold -- and for a person with this much real per-frame
+      variability, no single number/threshold combination cleanly separates "same person, just a
+      bad frame" from "different person, coincidentally similar." Fixing this for real would need
+      either better/more consistent per-frame embeddings (not a stitching-algorithm change at all)
+      or genuinely new signal beyond raw embedding similarity (e.g. the co-occurrence/temporal-
+      context priors already brainstormed-but-unscoped for the image pipeline's own outlier-
+      rejection work, or a two-stage human-assisted merge suggestion rather than a fully automatic
+      one). **This validates, rather than overturns, the project's original Phase 3 MVP decision**
+      (see this section's own opening paragraph): accept near-duplicate/split-identity entries per
+      person per clip as a known limitation for the first shippable version, leaning on the
+      existing `verification_cluster_group` review tooling for human cleanup, rather than blocking
+      Phase 3 on solving fully-automatic cross-gap stitching -- which this investigation now shows
+      is a substantially harder, open-ended problem than originally scoped, not a matter of
+      picking the right algorithm or threshold. Real cross-frame tracking beyond simple IOU+gap-
+      tolerance remains explicitly Phase 3.5, not Phase 3, per the project's existing phasing.
 
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
