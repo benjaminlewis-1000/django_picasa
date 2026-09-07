@@ -304,6 +304,21 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
   scoping this** -- want real numbers (total footage/duration, codec breakdown across the actual
   library) to estimate transcode disk space and processing time before designing this phase.
 
+  **Real numbers now in (2026-09-07), backfill and `VideoFile.file_size_bytes` both done.**
+  Added `file_size_bytes` (`BigIntegerField`, migration `filepopulator.0008`, populated via
+  `os.path.getsize()` in `create_video_file()`) plus a one-time `backfill_video_file_size`
+  management command for rows ingested before the field existed -- deployed (migrate-then-restart,
+  additive column, safe) and run for real: **6,946/6,946 rows backfilled, 0 files missing from
+  disk**. Real library footprint: **647.6 GB total, 95.5 MB average file size**. Codec x size
+  breakdown: h264 366.7GB (4,456 files) + vp9 0.3GB (38 files) = **~367GB already browser-native,
+  no transcode needed**; the remaining **~281GB would need transcoding** for universal playback --
+  mpeg4 130.5GB (only 96 files -- old high-bitrate camcorder footage, huge per-file average),
+  hevc 68.7GB (821 files, Safari-native but not universal), mjpeg 34.4GB (849 files), mpeg2video
+  38.0GB (89 files), mpeg1video 8.2GB (411 files), h263/wmv1-3 ~0.9GB combined (186 files). So
+  **roughly 57% of the library is already web-playable as-is** -- Phase 5's transcode pipeline
+  mainly needs to cover the other ~281GB, not the whole library. Still not designed/started --
+  this closes out the scoping-data gap, not the phase itself.
+
 **Backend geocoding — implemented, just needs test coverage.** Nominatim-based reverse geocoding
 was fully backfilled and runs on a schedule (`filepopulator.geocode_new_images`), but per the
 user (2026-09-04) has no test exercising it yet. Add real test coverage for the geocoding path
