@@ -15,7 +15,7 @@ from django.shortcuts import render
 from django.shortcuts import render
 from django_filters.rest_framework import DjangoFilterBackend
 from face_manager.models import Person, Face
-from face_manager.live_counts import annotate_live_face_counts, compute_live_face_counts
+from face_manager.live_counts import compute_live_face_counts
 from filepopulator.models import ImageFile, Directory
 from io import BytesIO
 from PIL import Image, ExifTags, ImageDraw
@@ -259,21 +259,25 @@ class DirectoryViewSet(FiltersMixin, viewsets.ModelViewSet):
         'time': 'mean_datesec',
     }
         
-class PersonViewSet(viewsets.ModelViewSet):
+class PersonViewSet(viewsets.GenericViewSet):
+    # Deliberately NOT a ModelViewSet -- no list/create/retrieve/update/
+    # destroy. PersonSerializer (removed) used to expose face_declared as
+    # a fully nested list of hyperlinked Face URLs, which for a
+    # large-gallery person (the blank sentinel, ~99k faces; .ignore,
+    # ~131k faces) meant building six-figure numbers of URLs in pure
+    # Python on a single request -- no DB query involved, just CPU/RAM,
+    # confirmed hanging 85+ seconds and using 7GB+ RSS on a real request
+    # before being killed. This was always latent but never actually
+    # reachable: PersonSerializer.get_num_possibilities was commented out
+    # while still declared as a SerializerMethodField, so every list/
+    # retrieve request 500'd on AttributeError before ever reaching
+    # face_declared. Fixing that crash (see live_counts.py) would have
+    # made this landmine reachable, so the generic CRUD actions are
+    # removed instead -- GenericViewSet keeps get_object()/get_queryset()
+    # (used by the two real actions below) without auto-registering any
+    # of them.
     permission_classes = (IsAuthenticated,)
-
-    # num_faces/num_possibilities are computed live via correlated
-    # subqueries, not stored columns -- see face_manager/live_counts.py.
-    queryset = annotate_live_face_counts(Person.objects.all())
-
-    serializer_class = api_ser.PersonSerializer
-
-
-    def get_serializer_context(self):
-        context = super(PersonViewSet, self).get_serializer_context()
-        context.update({"request": self.request})
-        return context
-
+    queryset = Person.objects.all()
 
     @action(detail=True, methods=['put'])
     def toggle_further_unlikely(self, request, pk=None):

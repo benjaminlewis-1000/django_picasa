@@ -1391,11 +1391,47 @@ active production issue, not just cleanup — worth prioritizing the deploy once
   "trueing up" recompute pass (and the `ExecuteTrueingUpTests` regression test that existed only to
   cover a since-reverted threading bug in that pass), and the recompute blocks in
   `dedupe_overlapping_faces`/`merge_duplicate_imagefiles` (both now report "computed live, no
-  recompute needed" instead). `PersonSerializer.num_faces`/`num_possibilities` are now plain
-  `IntegerField`s reading the annotated queryset attribute directly (no `SerializerMethodField`, no
-  per-object query). Full fast suite: 320/320 passing (net change from the prior 322 baseline
-  matches exactly: -2 removed counter-bookkeeping tests +1 replacement, -1 trueing-up test, -1
-  removed dedupe-recompute test, +1 new `/api/people/` regression test).
+  recompute needed" instead). Full fast suite (this stage): 320/320 passing (net change from the
+  prior 322 baseline matches exactly: -2 removed counter-bookkeeping tests +1 replacement, -1
+  trueing-up test, -1 removed dedupe-recompute test, +1 new `/api/people/` regression test).
+
+  **Deployed same day, and a real second bug found during production smoke-testing.** Sequenced
+  as: restart `picasa_api` first (new code, still-old DB schema -- safe, since the new code no
+  longer references the 3 columns at all), *then* `manage.py migrate` (drops the columns +
+  no-ops the already-existing covering indexes) -- deliberately the opposite order of the naive
+  "migrate then restart," which would have left the *old*, still-running code erroring on every
+  query the instant the columns vanished. Verified via `manage.py migrate --check` (clean) and a
+  direct query confirming the columns were gone.
+
+  Smoke-testing the two real endpoints after deploy surfaced a second, more serious bug that
+  fixing the `get_num_possibilities` crash had been *masking*: `PersonSerializer.face_declared`
+  (a `FaceSubsetSerializer(many=True)`) nested-serializes every one of a person's `Face` rows as
+  its own hyperlinked URL. For a huge-gallery person -- the blank sentinel (`_NO_FACE_ASSIGNED_`,
+  ~99k faces) or `.ignore` (~131k faces), both of which land on `/api/people/`'s default
+  (unordered) first page -- that means building six-figure numbers of URLs in pure Python on a
+  single request. Confirmed via a real request: no DB query even running (checked
+  `pg_stat_activity` -- empty), 85+ seconds elapsed, 7GB+ RSS, had to be `kill -9`'d. This was
+  always latent in `PersonSerializer` but never actually reachable before this session's fix,
+  since every prior request 500'd on the `get_num_possibilities` crash before ever reaching
+  `face_declared` -- fixing the crash without also addressing this would have traded "instant
+  500" for "worker hangs 85+ seconds and OOMs," a regression in production stability, not an
+  improvement. **Fixed by removing the dangerous surface instead of trying to paginate/limit
+  it**, per the user's explicit call once this was explained: `PersonViewSet` is now a bare
+  `GenericViewSet` (not `ModelViewSet`) -- no `list`/`create`/`retrieve`/`update`/`destroy` at
+  all, so there's nothing left that can trigger `face_declared`'s nested serialization. Its two
+  real, actually-used actions (`rename`, `toggle_further_unlikely`, both hand-rolled plain-dict
+  responses that never touched `PersonSerializer` or `face_declared` in the first place) are
+  unaffected -- `GenericViewSet` still provides `get_object()`/`get_queryset()`, which both rely
+  on. `PersonSerializer` itself was deleted entirely (nothing else referenced it once the
+  viewset stopped using it) -- `FaceSubsetSerializer` (its nested field's type) is kept, since a
+  *different*, safe usage of it still exists (`ImageFileSerializer.face_set`, bounded by "faces
+  per photo," a completely different scale than "faces per person"). Regression test
+  (`test_list_and_retrieve_are_not_exposed`) confirms `GET /api/people/` and `GET
+  /api/people/<id>/` now 404 (a router only wires up a URL for an action that actually exists --
+  not DRF's 405, since the route itself doesn't exist at all). Full fast suite after this second
+  fix: 320/320 passing (net zero test-count change: one test rewritten, not added/removed).
+  Deployed the same way as the first stage (code change only this time, no new migration --
+  `picasa_api` restart alone was sufficient).
 - **Fixed (2026-08-25): the non-daemon background thread in `api/views.py`** (`work_thread` /
   `background_bulk_processor`) — turned out not to be just a local testing annoyance ("looks
   hung, isn't"). In CI, with no `--keepdb` and no one around to manually `kill` the leftover
