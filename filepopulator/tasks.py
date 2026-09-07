@@ -27,24 +27,17 @@ if not settings.configured:
 @shared_task(ignore_result=True, name='filepopulator.populate_files_from_root')
 def load_images_into_db():
 
-    
-    i = celery_app.control.inspect()
-    active_tasks = i.active()
-    task_running = False
-    num_this_task_running = 0
-    for k in active_tasks.keys():
-        tasks = active_tasks[k]
-        if len(tasks) != 0:
-            for tt in tasks:
-                if tt['name'] == 'face_manager.populate_files_from_root':
-                    num_this_task_running += 1
-
-    if num_this_task_running > 1:
-        # This task will be one, so looking for other tasks.
-        settings.LOGGER.debug("Already running a task to load images, exiting.")
-        return
-
-        
+    # This used to have its own celery_app.control.inspect().active()
+    # check-then-act guard here, checking for a task named
+    # 'face_manager.populate_files_from_root' -- a name that never
+    # existed (this task is actually registered as
+    # 'filepopulator.populate_files_from_root', see the decorator
+    # above), so the check could never trigger. It's also redundant
+    # now regardless: add_from_root_dir() below holds its own real
+    # Postgres advisory lock (common/advisory_lock.py), which is
+    # atomic and covers every entry point, not just concurrent Celery
+    # tasks of this same name -- the same reasoning that removed the
+    # equivalent racy check from face_manager.tasks.process_faces().
     base_directory = settings.FILEPOPULATOR_SERVER_IMG_DIR
     # fname = os.path.join(os.environ['HOME'], 'filepopulate.txt')
     # logger.info("Write time")

@@ -35,6 +35,7 @@ services:
       - ${DJANGO_FILES_ROOT}:/code
       - ${PHOTO_ROOT}:/photos:ro
       - ${PHOTO_ROOT}:/photos_rw
+      - ${VIDEO_ROOT}:/videos:ro
       - ${TEST_PHOTOS_FILEPOPULATE}:/test_imgs_filepopulate
       - ${MEDIA_FILES_LOCATION}:/media
       - ${LOG_LOCATION}:/var/log/picasa

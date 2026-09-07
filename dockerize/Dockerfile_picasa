@@ -46,6 +46,11 @@ RUN cp /usr/bin/python3 /usr/bin/python
 # across multiple build attempts until this was added.
 RUN apt update
 RUN DEBIAN_FRONTEND=noninteractive apt install -y postgresql # postgresql-contrib
+# Video support: ffmpeg for frame extraction/thumbnailing, exiftool
+# (package libimage-exiftool-perl) for metadata (GPS, creation date,
+# camera info, rotation matrix) -- ffprobe alone is weaker at reliably
+# surfacing manufacturer/QuickTime metadata atoms across camera brands.
+RUN DEBIAN_FRONTEND=noninteractive apt install -y ffmpeg libimage-exiftool-perl
 RUN rm -r /var/lib/apt/lists
 
 # startup.sh is no longer baked into the image here -- it's part of the

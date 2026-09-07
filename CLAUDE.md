@@ -26,8 +26,9 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 
 **Bigger, deliberately unscoped features:**
 - Slideshow metadata overlay (photo date + location shown alongside the image).
-- Video support — the whole pipeline currently assumes still images end-to-end; needs a real
-  design pass, explicitly not started.
+- Video support — design pass done 2026-09-07, Phase 0 (infra) landed, Phases 1-4 (ingestion,
+  thumbnailing, face detection, API) not started. See the dated write-up below for the full
+  design and phased build plan.
 
 **Frontend (out of scope for this repo — no visibility into that codebase from here):**
 - "Mark image for deletion" button for the slideshow.
@@ -45,6 +46,87 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 (Resolved items -- fixed tests, the Django 6.1 upgrade, pruned-stale brainstormed ideas, etc. --
 have been cleared from this index once actually done; their full write-ups remain in the dated
 narrative below, findable by searching a distinctive word.)
+
+**Video support — design pass + Phase 0 (2026-09-07).** Full design discussed with the user before
+any code: a separate `VideoFile` model (not a shared base with `ImageFile` -- too many
+photo-specific EXIF fields to drag along, and it'd force a risky refactor of every existing
+`ImageFile` call site) mirroring `ImageFile`'s field *names* deliberately (`thumbnail_big`,
+`filename`, `dateTaken`, etc.) so code can duck-type across both via a `Face.source_media` property
+later. `Face` gets a second nullable FK (`source_video_file`, alongside the existing
+`source_image_file`), not a `GenericForeignKey` -- two plain FKs keep `select_related`, the
+covering indexes added earlier this session, and referential integrity intact; a `CheckConstraint`
+(`Q(source_image_file__isnull=False) ^ Q(source_video_file__isnull=False)`) enforces exactly one
+source per face. Crucially, **no primary-key harmonization is actually needed** --
+`ImageFile.pk`/`VideoFile.pk` are separate sequences in separate tables, so there's no collision to
+resolve, and everything identity-related (`Person`, `declared_name`, `poss_identN`, the whole
+`assign_faces.py` classification pipeline, verification clustering) is already orthogonal to
+"photo vs. video frame" and needs zero changes -- it just counts `Face` rows regardless of source.
+
+**Metadata reality check, done before committing to any tooling**: exposure/aperture/ISO/focal-
+length/flash/light-source have no standard video equivalent at all (a per-exposure photo concept;
+video is a continuous stream, consumer devices essentially never embed per-clip camera settings) --
+a real, structural loss, not a tooling gap. Orientation is recoverable but via a rotation matrix in
+the container's track header, not an EXIF enum -- needs its own parsing, can't reuse
+`apply_exif_orientation()`. GPS and creation-date are generally recoverable. Tooling split
+deliberately two ways rather than one: `ffmpeg`/`ffprobe` for frame extraction and stream info (the
+right tool for that), `exiftool` for the metadata specifically (GPS and camera-make/model in
+particular are meaningfully more reliable out of exiftool's tag database than ffprobe's, across the
+range of real camera/phone manufacturers) -- same shape as this project already uses PIL for
+image decode and a separate GPS-conversion helper for EXIF GPS math. Real per-file verification via
+`ffprobe`/`exiftool` against actual library samples is planned for Phase 1, before any parsing logic
+is written (same discipline HEIC support used -- 8 real samples before committing to an assumption
+-- skipping it is exactly how the original IOU-matching bug happened).
+
+**Face detection phasing, deliberately NOT started yet (holding at the user's explicit request)**:
+Phase 3 in the plan below is sparse frame-sampling through the *existing*, unchanged
+`PyramidalDetector`, accepting near-duplicate faces per person per clip as a known MVP limitation
+(the existing `verification_cluster_group` review tooling already helps here) rather than building
+new cross-frame tracking machinery up front. Real tracking (collapsing same-face-across-frames
+before it reaches classification, via the same `linear_sum_assignment` primitive this session's
+IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
+
+**Phased build plan**:
+- **Phase 0 (infra, no app code) -- DONE, landed this session.** Real host directories confirmed to
+  exist and be readable (`/mnt/data/samba_share/Video/{Our_Home_Videos,Lewis_family_videos}`) --
+  the shared parent also has unrelated sibling folders (`Marco Polos`, `Movies`, `TV`, a loose
+  `t.mp4`) the user does NOT want scanned, and doesn't want to reshape the directory layout right
+  now to avoid them. Resolved as: **one bind mount of the shared parent**
+  (`VIDEO_ROOT=/mnt/data/samba_share/Video` in `.env`, `${VIDEO_ROOT}:/videos:ro` in
+  `docker-compose.yaml`) plus an explicit **`VIDEO_ROOTS` allowlist in settings**
+  (`picasa/settings.py`) naming only the two wanted subfolders -- simpler than two separate mounts,
+  and the unwanted siblings are just never walked since nothing outside the list is ever
+  `os.walk()`'d. `FILEPOPULATOR_SERVER_VIDEO_DIRS = VIDEO_ROOTS + [PHOTO_ROOT]` also covers videos
+  interspersed in the existing photo tree (confirmed some are). `ffmpeg` and `exiftool` (package
+  `libimage-exiftool-perl`) added to `Dockerfile_picasa`, built and verified in a throwaway image
+  (`ffmpeg`/`ffprobe`/`exiftool` all run correctly) before touching the real image. Real `.env` on
+  the host updated with the new `VIDEO_ROOT` line (additive, harmless until the container is
+  actually recreated with the new compose file -- not yet done, see below). Full fast suite:
+  320/320 passing.
+  - **Small unrelated bug fixed along the way**: `filepopulator/tasks.py`'s `load_images_into_db()`
+    had its own `celery_app.control.inspect().active()` guard checking for a task named
+    `'face_manager.populate_files_from_root'` -- a name that never existed (the task is actually
+    registered as `'filepopulator.populate_files_from_root'`), so the check could never trigger.
+    Removed entirely rather than just fixing the string, since it's also redundant:
+    `add_from_root_dir()` already holds its own real Postgres advisory lock covering every entry
+    point, the same reasoning that already removed an equivalent racy check from
+    `face_manager.tasks.process_faces()`.
+  - **Not yet done**: rebuilding the real `picasa_img` and recreating the live `picasa_api`
+    container to actually pick up the new mount/binaries -- deliberately held, since it's a real
+    production change and the code above hasn't been merged to `master`/deployed yet at time of
+    writing.
+- **Phase 1 (not started)**: `VideoFile` model + migration, `filepopulator/video_scripts.py`
+  (`create_video_file()`, `add_videos_from_root_dir(root_dirs: list)` -- own advisory lock name,
+  loops `FILEPOPULATOR_SERVER_VIDEO_DIRS` under one lock acquisition), new
+  `filepopulator.populate_videos_from_root` Celery task (own schedule, matching the existing
+  one-task-per-concern pattern). Verify real metadata via `ffprobe`/`exiftool` against real samples
+  first.
+- **Phase 2 (not started)**: thumbnailing via one extracted `ffmpeg` frame, reusing the existing
+  thumbnail-generation code unchanged once a PIL Image exists; handle the rotation matrix here.
+- **Phase 3 (not started, holding at the user's request)**: sparse-sampled face detection through
+  the existing `PyramidalDetector`, `Face.source_video_file`/`video_timestamp_seconds` fields +
+  migration, own scheduled task with the same per-item containment pattern the photo pipeline uses.
+- **Phase 4 (not started)**: `VideoFileSerializer`/viewset, a `media_type` discriminator for the
+  slideshow/frontend to branch `<video>` vs `<img>` (frontend side out of scope for this repo).
 
 **Backend geocoding — implemented, just needs test coverage.** Nominatim-based reverse geocoding
 was fully backfilled and runs on a schedule (`filepopulator.geocode_new_images`), but per the
