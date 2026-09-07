@@ -511,6 +511,13 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': crontab(hour='*', minute='*/10'),
         # 'schedule': crontab(minute='*'),
     },
+    'video_populate_root': {
+        'task': 'filepopulator.populate_videos_from_root',
+        # Less frequent than the photo scan -- videos are added in bulk
+        # historical batches, not a continuous trickle, per the real
+        # library.
+        'schedule': crontab(hour='*', minute='30'),
+    },
     'dirs_datetimes': {
         'task': 'filepopulator.update_dir_dates',
         'schedule': crontab(minute=0, hour='*/12')

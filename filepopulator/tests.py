@@ -30,9 +30,10 @@ import pillow_heif
 
 from django.core.management import call_command
 
-from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, guess_date_from_filename
+from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, guess_date_from_filename, VideoFile, FailedVideoFile
 # from .forms import ImageFileForm, DirectoryForm
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
+from .video_scripts import create_video_file, add_videos_from_root_dir, _parse_exif_date
 from face_manager.models import Face
 from common.open_img_oriented import apply_exif_orientation
 
@@ -2087,3 +2088,137 @@ class BackfillDatesFromFilenameTests(TestCase):
 
         obj.refresh_from_db()
         self.assertEqual(obj.dateTaken, original_date)
+
+
+@override_settings(MEDIA_ROOT="/tmp/filepopulator_test_media")
+class VideoIngestionTests(TestCase):
+    """VIDEO_DIR mirrors real fixture data locally: 8 real video samples
+    (one per real format found in the actual video library -- mp4, mov,
+    mpg, avi, m2ts, mts, wmv, 3gp) at
+    /mnt/fast_storage/appdata/django_picasa/test_suite/sample_photos/
+    video_samples/, mounted read-only under /photos/video_samples. CI
+    only has the single synthetic no-metadata stub from
+    ci_fixtures/video_stub/ (see generate_fixtures.py) -- tests here work
+    with "whatever's present" rather than assuming a specific count or
+    specific metadata, so they hold in both environments.
+
+    Metadata handling verified empirically against all 8 real samples
+    (see CLAUDE.md): ffprobe alone misses creation date/camera info that
+    exiftool recovers for some real camcorder-sourced files; a global
+    exiftool -n flag was tried and rejected (it also breaks Make/Model
+    decoding for at least one real file); dateutil.parser was tried and
+    rejected as a date-parsing fallback (silently defaults the date
+    portion to today() for exiftool's colon-separated date format,
+    confirmed against a real file, no exception raised)."""
+
+    VIDEO_DIR = '/photos/video_samples'
+
+    def tearDown(self):
+        VideoFile.objects.all().delete()
+        FailedVideoFile.objects.all().delete()
+
+    def _video_files(self):
+        return sorted(os.listdir(self.VIDEO_DIR))
+
+    def test_ingests_every_video_fixture_successfully(self):
+        video_files = self._video_files()
+        self.assertGreaterEqual(len(video_files), 1)
+        for filename in video_files:
+            path = os.path.join(self.VIDEO_DIR, filename)
+            create_video_file(path)
+            v = VideoFile.objects.filter(filename=path).first()
+            self.assertIsNotNone(v, f"{filename} was not ingested")
+            self.assertGreater(v.width, 0)
+            self.assertGreater(v.height, 0)
+            self.assertFalse(FailedVideoFile.objects.filter(filename=path).exists())
+
+    def test_add_videos_from_root_dir_discovers_video_files(self):
+        add_videos_from_root_dir([self.VIDEO_DIR])
+        self.assertEqual(VideoFile.objects.count(), len(self._video_files()))
+
+    def test_rerunning_finds_nothing_new(self):
+        # Regression-shaped test: a second run over the same root
+        # shouldn't create duplicate rows or re-process already-known
+        # files.
+        add_videos_from_root_dir([self.VIDEO_DIR])
+        first_count = VideoFile.objects.count()
+        add_videos_from_root_dir([self.VIDEO_DIR])
+        self.assertEqual(VideoFile.objects.count(), first_count)
+
+    def test_multiple_roots_are_all_walked(self):
+        # add_videos_from_root_dir() takes a LIST of roots (VIDEO_ROOTS is
+        # an explicit allowlist of subfolders under one shared bind mount,
+        # plus PHOTO_ROOT for interspersed videos) -- confirm passing two
+        # roots actually walks both, not just the first.
+        other_dir = '/tmp/video_other_root'
+        os.makedirs(other_dir, exist_ok=True)
+        self.addCleanup(shutil.rmtree, other_dir, ignore_errors=True)
+        video_files = self._video_files()
+        first_file = os.path.join(self.VIDEO_DIR, video_files[0])
+        other_copy = os.path.join(other_dir, video_files[0])
+        shutil.copy(first_file, other_copy)
+
+        add_videos_from_root_dir([self.VIDEO_DIR, other_dir])
+
+        self.assertTrue(VideoFile.objects.filter(filename=other_copy).exists())
+        self.assertEqual(VideoFile.objects.count(), len(video_files) + 1)
+
+    def test_nonexistent_file_is_recorded_as_failed(self):
+        create_video_file('/photos/video_samples/does_not_exist.mp4')
+        self.assertFalse(VideoFile.objects.filter(filename='/photos/video_samples/does_not_exist.mp4').exists())
+        self.assertTrue(FailedVideoFile.objects.filter(filename='/photos/video_samples/does_not_exist.mp4').exists())
+
+    def test_gps_and_camera_info_recovered_when_present(self):
+        # Not every fixture (or CI's synthetic stub) has GPS/camera
+        # metadata -- only assert against ones that actually do.
+        found_gps = False
+        found_camera = False
+        for filename in self._video_files():
+            path = os.path.join(self.VIDEO_DIR, filename)
+            create_video_file(path)
+            v = VideoFile.objects.get(filename=path)
+            if v.gps_lat_decimal != -999 or v.gps_lon_decimal != -999:
+                found_gps = True
+                self.assertGreaterEqual(v.gps_lat_decimal, -90)
+                self.assertLessEqual(v.gps_lat_decimal, 90)
+                self.assertGreaterEqual(v.gps_lon_decimal, -180)
+                self.assertLessEqual(v.gps_lon_decimal, 180)
+            if v.camera_make:
+                found_camera = True
+        if not found_gps and not found_camera:
+            self.skipTest("no fixture in VIDEO_DIR has GPS or camera metadata (expected for CI's synthetic stub)")
+
+
+class ParseExifVideoDateTests(unittest.TestCase):
+    """Unit tests for video_scripts._parse_exif_date() -- no DB/file
+    access needed. Covers the real parsing bug found against a real Sony
+    camcorder file: dateutil.parser silently defaulted the date portion
+    to today() for exiftool's 'YYYY:MM:DD ...' format instead of raising,
+    which explicit strptime formats don't do."""
+
+    def test_no_timezone_offset(self):
+        date = _parse_exif_date('2025:11:27 01:31:30')
+        self.assertEqual((date.year, date.month, date.day), (2025, 11, 27))
+        self.assertEqual((date.hour, date.minute, date.second), (1, 31, 30))
+
+    def test_with_timezone_offset(self):
+        date = _parse_exif_date('2018:12:14 20:15:14-04:00')
+        self.assertEqual((date.year, date.month, date.day), (2018, 12, 14))
+        self.assertEqual(date.hour, 20)
+
+    def test_with_timezone_offset_and_zone_name(self):
+        # The exact real-world shape that broke dateutil.parser: a
+        # numeric offset followed by a zone-name word ("DST").
+        date = _parse_exif_date('2018:12:14 20:15:14-04:00 DST')
+        self.assertEqual((date.year, date.month, date.day), (2018, 12, 14))
+        self.assertEqual(date.hour, 20)
+
+    def test_empty_or_none_returns_none(self):
+        self.assertIsNone(_parse_exif_date(None))
+        self.assertIsNone(_parse_exif_date(''))
+
+    def test_garbage_string_returns_none_not_todays_date(self):
+        # The actual regression: this used to silently return today's
+        # date via dateutil.parser instead of None.
+        result = _parse_exif_date('not a real date at all')
+        self.assertIsNone(result)

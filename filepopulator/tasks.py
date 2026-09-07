@@ -10,6 +10,7 @@ import time
 import os
 # import scripts
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
+from .video_scripts import add_videos_from_root_dir
 
 if not settings.configured:
     settings.configure()
@@ -51,6 +52,19 @@ def load_images_into_db():
     # update_dirs_datetime()
 
     # TODO: Check duplicates
+
+@shared_task(ignore_result=True, name='filepopulator.populate_videos_from_root')
+def load_videos_into_db():
+    # Own advisory lock (see add_videos_from_root_dir()), own task, own
+    # schedule -- matches the existing one-task-per-concern pattern
+    # rather than folding this into load_images_into_db() above. No
+    # delete_removed_videos() equivalent yet -- a stale VideoFile row
+    # for a file that's since vanished from disk isn't cleaned up
+    # automatically. Deliberate Phase 1 scope cut, not an oversight; see
+    # CLAUDE.md's Video support write-up.
+    print("Loading videos into database...")
+    add_videos_from_root_dir(settings.FILEPOPULATOR_SERVER_VIDEO_DIRS)
+    print("Finished adding videos")
 
 @shared_task(ignore_result=True, name='filepopulator.check_mod_dates')
 def check_mod_dates():

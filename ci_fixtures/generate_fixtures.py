@@ -12,13 +12,20 @@ Produces, relative to this file's directory:
                                 settings.FILEPOPULATOR_VAL_DIRECTORY
   corrupted/                -- synthetic truncated/broken JPEGs
   heic_stub/                -- one synthetic .heic file
+  video_stub/               -- one synthetic tiny .mp4 (requires ffmpeg
+                                on PATH; real-video-format coverage
+                                lives in local-only fixtures under
+                                /mnt/fast_storage/appdata/django_picasa/
+                                test_suite/sample_photos/video_samples,
+                                not committed here)
 
-None of these contain real photo content -- every image is procedurally
-generated (solid colors / simple gradients), not sourced from a personal
-photo library.
+None of these contain real photo content -- every image/video is
+procedurally generated (solid colors / simple gradients), not sourced
+from a personal photo library.
 """
 import io
 import os
+import subprocess
 
 import numpy as np
 import piexif
@@ -136,8 +143,27 @@ def build_heic():
     heif_file.save(os.path.join(root, "synthetic.heic"), quality=80)
 
 
+def build_video():
+    root = os.path.join(HERE, "video_stub")
+    os.makedirs(root, exist_ok=True)
+    out_path = os.path.join(root, "synthetic.mp4")
+    # A 1-second solid-color test pattern -- no real video content, no
+    # metadata (no creation date/GPS/camera info), so this exercises the
+    # "nothing recoverable" path VideoIngestionTests checks for, not the
+    # real-metadata path (that's what the local-only real samples are
+    # for -- see the module docstring).
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=blue:s=64x64:d=1",
+            "-pix_fmt", "yuv420p", out_path,
+        ],
+        check=True, capture_output=True,
+    )
+
+
 if __name__ == "__main__":
     build_test_imgs_filepopulate()
     build_corrupted()
     build_heic()
+    build_video()
     print(f"Fixtures written under {HERE}")
