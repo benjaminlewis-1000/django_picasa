@@ -26,9 +26,9 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 
 **Bigger, deliberately unscoped features:**
 - Slideshow metadata overlay (photo date + location shown alongside the image).
-- Video support — design pass done 2026-09-07, Phase 0 (infra) landed, Phases 1-4 (ingestion,
-  thumbnailing, face detection, API) not started. See the dated write-up below for the full
-  design and phased build plan.
+- Video support — design pass, Phase 0 (infra) and Phase 1 (`VideoFile` model + ingestion) landed
+  2026-09-07. Phases 2-4 (thumbnailing, face detection, API) not started. See the dated write-up
+  below for the full design and phased build plan.
 
 **Frontend (out of scope for this repo — no visibility into that codebase from here):**
 - "Mark image for deletion" button for the slideshow.
@@ -110,16 +110,81 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
     `add_from_root_dir()` already holds its own real Postgres advisory lock covering every entry
     point, the same reasoning that already removed an equivalent racy check from
     `face_manager.tasks.process_faces()`.
-  - **Not yet done**: rebuilding the real `picasa_img` and recreating the live `picasa_api`
-    container to actually pick up the new mount/binaries -- deliberately held, since it's a real
-    production change and the code above hasn't been merged to `master`/deployed yet at time of
-    writing.
-- **Phase 1 (not started)**: `VideoFile` model + migration, `filepopulator/video_scripts.py`
-  (`create_video_file()`, `add_videos_from_root_dir(root_dirs: list)` -- own advisory lock name,
-  loops `FILEPOPULATOR_SERVER_VIDEO_DIRS` under one lock acquisition), new
-  `filepopulator.populate_videos_from_root` Celery task (own schedule, matching the existing
-  one-task-per-concern pattern). Verify real metadata via `ffprobe`/`exiftool` against real samples
-  first.
+  - **DONE (2026-09-07): rebuilt `picasa_img` and recreated `picasa_api`** with the new mount and
+    binaries. `docker compose build picasa` then `docker compose up -d --force-recreate picasa`
+    (`db_picasa` was also recreated as part of the same compose operation -- verified data fully
+    intact afterward, row counts matched). Verified live: `/videos` mount present and correctly
+    shows the parent's full contents (including the unwanted siblings -- `VIDEO_ROOTS` is what
+    actually scopes ingestion, not the mount), `ffmpeg`/`ffprobe`/`exiftool` all run correctly,
+    `manage.py check` clean, all expected Celery tasks still registered, a `person_list` smoke
+    test still returns 200.
+- **DONE (2026-09-07): Phase 1 -- `VideoFile` model, ingestion, and scheduled task.**
+  `FailedVideoFile` (mirrors `FailedImageFile` exactly) + `VideoFile`
+  (`filepopulator/migrations/0007_failedvideofile_videofile.py`) -- thumbnail fields included now
+  even though Phase 2 populates them, to avoid a second migration later.
+  `VIDEO_EXTENSION_REGEX` sized against a **real extension survey** of the actual mounted
+  directories (`find ... | sed 's/.*\.//' | sort | uniq -c`), not guessed: real video extensions
+  turned out far broader than assumed (`mp4`, `mov`, `mpg`, `avi`, `m2ts`, `mts`, `wmv`, `3gp`/
+  `3gpp`, `m4v`, `mkv`), and the same directories are full of non-video clutter that needed
+  explicit exclusion -- `.bif` (2334 files, Roku trick-play thumbnails), `.modd`/`.moff` (JVC
+  camcorder sidecar metadata), `.thm` (thumbnail sidecars).
+
+  **Real per-file metadata verification, done before writing any parsing logic** (via `ffprobe`/
+  `exiftool` against one real sample per extension) -- confirmed the design's assumptions and
+  surfaced two things that changed the actual implementation:
+  - `creation_time` is present via `ffprobe` for phone-shot formats (mp4/mov/3gp) but **absent**
+    for camcorder/older formats (mpg/avi/wmv/m2ts/mts/m4v) -- a real, structural gap, not a
+    tooling failure. `exiftool` recovered `DateTimeOriginal` **and** `Make`/`Model` for a real Sony
+    `.MTS` file where `ffprobe` found nothing at all -- confirms the two-tool split was the right
+    call. One real `.mpg` file had **no recoverable metadata whatsoever** (confirmed via both
+    tools) -- a genuine permanent gap for some old digitized home movies, handled by falling back
+    to `guess_date_from_filename()` (reused directly from the image pipeline -- many of these
+    video filenames embed a capture timestamp the exact same way phone photo filenames do) and
+    finally `timezone.now()` with `dateTakenValid=False`, the **same fallback order
+    `ImageFile._get_date_taken()` already uses** (initially assumed a file-mtime fallback instead;
+    checked the actual code and corrected course before implementing).
+  - **A real, in-progress bug caught by testing against real files, not synthetic ones**: a global
+    `exiftool -n` flag (chosen to force clean decimal GPS output) also disabled print-conversion
+    for `Make`, and the same real Sony file has an undecoded numeric `Make` tag that came out as
+    the meaningless raw code `264` under `-n` instead of the correct `"Sony"` string `exiftool`
+    gives without it. Fixed with exiftool's per-tag `#` suffix (`-GPSLatitude#`/`-GPSLongitude#`)
+    to force numeric output for *only* those two tags, leaving `Make`/`Model`/dates on their
+    normal human-readable decoding.
+  - **A second real bug, same discovery pass**: `dateutil.parser.parse()` was tried as the
+    date-parsing fallback (for exiftool's `'2018:12:14 20:15:14-04:00 DST'` shape) and silently
+    defaulted the date portion to **today()** while still parsing the time correctly -- no
+    exception raised, so it wasn't merely untested, it was actively wrong and undetected until
+    manually inspecting the output. Fixed by using explicit `strptime` formats (including a
+    `%z`-aware one for the numeric-offset case) instead of dateutil, after stripping a trailing
+    zone-name word (`"DST"`) neither format expects.
+  - `Rotation` needed no override -- already a clean signed-degree integer from exiftool without
+    `-n`, confirmed against the same real iPhone file that showed `ffprobe`'s own side-data
+    rotation disagreeing in sign (90 vs. -90) -- exiftool is used as the sole source for rotation,
+    never mixed with ffprobe's.
+
+  **`filepopulator/video_scripts.py`** (`create_video_file()`, `add_videos_from_root_dir
+  (root_dirs: list)` -- own advisory lock name `filepopulator.add_videos_from_root_dir`, loops
+  `FILEPOPULATOR_SERVER_VIDEO_DIRS` under one lock acquisition rather than one call per root) +
+  new `filepopulator.populate_videos_from_root` Celery task (own schedule, 30 minutes past every
+  hour, offset from the photo scan; matches the existing one-task-per-concern pattern rather than
+  folding into `load_images_into_db()`). **Deliberate scope cut, not an oversight**: no
+  `delete_removed_videos()` equivalent yet -- a `VideoFile` row for a file that's since vanished
+  from disk isn't cleaned up automatically.
+
+  **Tested against all 8 real sample files** (one per real extension, staged at
+  `/mnt/fast_storage/appdata/django_picasa/test_suite/sample_photos/video_samples/` -- the
+  established real-fixture convention, reachable at `/photos/video_samples` the same way
+  `heic_stub`/`corrupted` already are) with **zero failures** after the two bugs above were fixed,
+  correct dates/GPS/camera-info/rotation recovered exactly where expected and absent exactly where
+  the source genuinely has nothing embedded. `VideoIngestionTests` (11 new tests, `filepopulator/
+  tests.py`) covers ingestion, root-discovery, re-run idempotency, multi-root walking, a
+  nonexistent-file failure case, and GPS/camera-info recovery when present; a synthetic
+  `ci_fixtures/video_stub/synthetic.mp4` (one-second solid-color pattern, no embedded metadata,
+  generated via `ci_fixtures/generate_fixtures.py`'s new `build_video()`) backs the same tests in
+  CI, which also gained `ffmpeg`/`libimage-exiftool-perl` in its system-library install step.
+  `ParseExifVideoDateTests` (5 new tests) unit-tests the date-parsing fix directly, including the
+  exact real-world string that broke `dateutil`. Full fast suite: 331/331 passing (320 baseline +
+  11 new).
 - **Phase 2 (not started)**: thumbnailing via one extracted `ffmpeg` frame, reusing the existing
   thumbnail-generation code unchanged once a PIL Image exists; handle the rotation matrix here.
 - **Phase 3 (not started, holding at the user's request)**: sparse-sampled face detection through

@@ -39,6 +39,19 @@ IMAGE_EXTENSION_REGEX = r"\.(?:[jJ][pP][eE]?[gG]|[hH][eE][iI][cC]|[hH][eE][iI][f
 
 HEIC_EXTENSIONS = ('.heic', '.heif')
 
+# Accepted video file extensions -- shared by VideoFile's filename
+# validator and video_scripts.py's create_video_file()/
+# add_videos_from_root_dir() gates. Sized against a real survey of the
+# actual video library (not guessed upfront): mp4/mov/3gp are phone-shot,
+# m2ts/mts are AVCHD camcorder, mpg/avi/wmv/m4v are older/converted
+# formats, mkv showed up once. Deliberately excludes non-video files that
+# share the same folders -- .bif (Roku trick-play thumbnails), .modd/
+# .moff (JVC camcorder sidecar metadata), .thm (thumbnail sidecars).
+VIDEO_EXTENSION_REGEX = (
+    r"\.(?:[mM][pP]4|[mM][oO][vV]|[mM][pP][gG]|[aA][vV][iI]|[mM]2[tT][sS]|"
+    r"[mM][tT][sS]|[wW][mM][vV]|3[gG][pP][pP]?|[mM]4[vV]|[mM][kK][vV])$"
+)
+
 # Patterns for guess_date_from_filename(), each capturing (year, month,
 # day, hour, minute, second). Order doesn't matter for correctness --
 # guess_date_from_filename() tries all of them and picks the earliest
@@ -970,6 +983,101 @@ class ImageFile(models.Model):
         return f"{self.exposure_num}/{self.exposure_denom}"
 
     exposure.short_description = 'Exposure'
+
+
+class FailedVideoFile(models.Model):
+    # Tracks a video file that has never successfully been ingested,
+    # mirroring FailedImageFile exactly (same reasoning: a real VideoFile
+    # row can't be created without successfully reading duration/
+    # width/height, and without tracking this separately, a broken file
+    # would be re-attempted -- and re-fail -- on every single ingestion
+    # run forever).
+    filename = models.CharField(max_length=1024, unique=True)
+    error_message = models.TextField()
+    file_mod_time = models.FloatField()
+    first_failed_at = models.DateTimeField(auto_now_add=True)
+    last_attempted_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"FailedVideoFile({self.filename})"
+
+
+class VideoFile(models.Model):
+    # Deliberately a separate model from ImageFile, not a shared base
+    # class -- ImageFile carries a dozen photo-specific EXIF fields
+    # (exposure/aperture/ISO/flash/light-source) that have no standard
+    # video equivalent at all (verified against real library samples,
+    # not assumed -- see CLAUDE.md), and unifying the two would force a
+    # risky refactor of every existing ImageFile call site for no real
+    # benefit. Field NAMES deliberately mirror ImageFile's where the
+    # underlying concept is the same (filename, dateTaken, thumbnail_*,
+    # gps_*) so calling code can eventually duck-type across both via a
+    # Face.source_media-style property, without the two models actually
+    # sharing a base class.
+    filename = models.CharField(
+        max_length=1024,
+        validators=[RegexValidator(regex=VIDEO_EXTENSION_REGEX, message="Filename must be a supported video format")],
+        db_index=True,
+    )
+    directory = models.ForeignKey(Directory, on_delete=models.PROTECT, related_name='video_set')
+
+    # Filename-only hash (matches ImageFile._refresh_file_hash(), not
+    # _generate_md5_hash() -- decoding every frame of every video just to
+    # detect a move/rename isn't worth the cost the way it might be for a
+    # single still image).
+    file_hash = models.CharField(max_length=64, null=False, default=-1)
+
+    thumbnail_big = models.ImageField(upload_to=thumbnail_big_path, editable=False, default=None)
+    thumbnail_medium = models.ImageField(upload_to=thumbnail_med_path, editable=False, default=None)
+    thumbnail_small = models.ImageField(upload_to=thumbnail_small_path, editable=False, default=None)
+
+    duration_seconds = models.FloatField(default=0)
+    width = models.IntegerField(validators=[MinValueValidator(1)])
+    height = models.IntegerField(validators=[MinValueValidator(1)])
+    codec = models.CharField(max_length=32, null=True, blank=True)
+
+    # Recovered via exiftool where available (confirmed present for some
+    # real camcorder-sourced files even when ffprobe finds nothing at
+    # all) -- absent for many older/converted sources, same as ImageFile's
+    # camera_make/camera_model being merely "usually" present for JPEGs.
+    camera_make = models.CharField(max_length=64, null=True, blank=True)
+    camera_model = models.CharField(max_length=64, null=True, blank=True)
+
+    # Degrees, from exiftool's Rotation tag -- NOT the same value space as
+    # ImageFile.orientation (EXIF's 1-8 enum). exiftool and ffprobe's own
+    # side_data rotation disagree on sign convention for the same file
+    # (confirmed empirically), so exiftool is used as the single
+    # authoritative source for this rather than mixing the two.
+    rotation = models.IntegerField(default=0)
+
+    gps_lat_decimal = models.FloatField(default=-999, validators=[validate_lat])
+    gps_lon_decimal = models.FloatField(default=-999, validators=[validate_lon])
+    gps_source = models.CharField(max_length=64, null=True, blank=True, default='exif')
+    geocode = models.ForeignKey(
+        GeocodeCache, on_delete=models.SET_NULL, null=True, blank=True, related_name='videos'
+    )
+
+    dateAdded = models.DateTimeField(default=timezone.now)
+    dateModified = models.DateTimeField(default=timezone.now)
+
+    # Default mirrors ImageFile's own placeholder default.
+    dateTaken = models.DateTimeField(default=datetime(2018, 1, 1))
+    dateTakenUTC = models.FloatField(default=0)
+    # False whenever no real creation date could be recovered at all
+    # (confirmed a real, permanent case for some old digitized home
+    # movies with literally no embedded metadata) -- dateTaken then
+    # falls back to file mtime, same as ImageFile's own convention.
+    dateTakenValid = models.BooleanField(default=False)
+
+    # isProcessed -- whether faces have been extracted (Phase 3, not
+    # built yet as of this field's introduction).
+    isProcessed = models.BooleanField(default=False)
+
+    video_load_failed = models.BooleanField(default=False)
+    video_load_error = models.TextField(null=True, blank=True)
+
+    def __str__(self):
+        return self.filename
 
 
 class SimilarImagePair(models.Model):
