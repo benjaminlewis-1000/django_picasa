@@ -175,6 +175,21 @@ def create_video_file(file_path):
     except (TypeError, ValueError):
         duration = 0
 
+    if duration < settings.MIN_VIDEO_DURATION_SECONDS:
+        # Not a real failure -- a deliberate exclusion by design (Live
+        # Photos/motion clips, accidental taps). Recorded via
+        # FailedVideoFile anyway so a re-scan doesn't re-run ffprobe
+        # against the same never-changing short file every time (same
+        # mtime-check mechanism add_videos_from_root_dir() already uses
+        # for real failures) -- checked before the exiftool call, so
+        # excluding a file also skips that cost entirely.
+        _record_video_failure(
+            file_path,
+            f"Excluded: duration {duration:.1f}s is below the "
+            f"{settings.MIN_VIDEO_DURATION_SECONDS}s minimum",
+        )
+        return
+
     codec = video_stream.get('codec_name')
 
     exif = _run_exiftool(file_path)

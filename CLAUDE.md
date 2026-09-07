@@ -185,6 +185,29 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
   `ParseExifVideoDateTests` (5 new tests) unit-tests the date-parsing fix directly, including the
   exact real-world string that broke `dateutil`. Full fast suite: 331/331 passing (320 baseline +
   11 new).
+  - **DONE, same day: deployed to production and validated against real data end-to-end.**
+    Sequenced migrate-then-restart (safe here since it's purely additive -- new tables never break
+    currently-running old code, unlike the earlier column-drop case that needed the opposite
+    order). Verified live: `manage.py check`/`migrate --check` clean, new task registered
+    (`celery inspect registered`), and a real, non-synthetic smoke test -- ran
+    `add_videos_from_root_dir()` against one real folder
+    (`/videos/Our_Home_Videos/Phone/2025/thanksgiving`) rather than just the 8-sample set: **42
+    real videos ingested with zero failures**, all `Apple iPhone 12 mini`, all correct dates
+    (Nov 26-29 2025, ~19.7 minutes total), 41 of 42 with GPS. Left these as real, permanent data
+    (not test artifacts to clean up) -- this is genuine partial backfill, not a throwaway check.
+  - **DONE, same day: `MIN_VIDEO_DURATION_SECONDS` (default 3s) excludes short clips** (Live
+    Photos/motion clips, accidental taps), per the user's request, added *before* running the full
+    library backfill so short junk wouldn't need cleanup afterward. Checked via `ffprobe`'s
+    duration before the more expensive `exiftool` call (cheaper to rule out a short file than a
+    normal one), recorded via `FailedVideoFile` with an "Excluded: duration Xs is below the Ys
+    minimum" message rather than silently skipped -- reuses the same mtime-check mechanism that
+    already stops a real failure from being retried every scan, and keeps the exclusion visible/
+    trackable rather than silently invisible. Not a hypothetical: one real fixture
+    (`PICT0335.AVI`, an old digitized home-movie snippet, genuinely 2.1s) and the CI synthetic
+    stub (1s) both already exercise this path, so `VideoIngestionTests` was rewritten to partition
+    fixtures by actual measured duration rather than assume every fixture clears the bar -- real
+    regression coverage, not fixtures chosen to avoid the new behavior. Full fast suite: 332/332
+    (331 + 1 new exclusion-specific test).
 - **Phase 2 (not started)**: thumbnailing via one extracted `ffmpeg` frame, reusing the existing
   thumbnail-generation code unchanged once a PIL Image exists; handle the rotation matrix here.
 - **Phase 3 (not started, holding at the user's request)**: sparse-sampled face detection through

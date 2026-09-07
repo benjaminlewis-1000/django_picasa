@@ -615,6 +615,13 @@ VIDEO_ROOTS = [
 # above).
 FILEPOPULATOR_SERVER_VIDEO_DIRS = VIDEO_ROOTS + [PHOTO_ROOT]
 
+# Videos shorter than this are excluded rather than ingested -- Live
+# Photos/motion-photo clips and accidental taps tend to land well under
+# this, and aren't worth a VideoFile row. Checked via ffprobe's duration
+# before the more expensive exiftool call, so a short clip is also
+# cheaper to (repeatedly, harmlessly) rule out than a normal one.
+MIN_VIDEO_DURATION_SECONDS = 3
+
 FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code.
 FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory that will have validation images when testing the app.
 FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL = 150 # Maximum size of the short edge for thumbnails.
