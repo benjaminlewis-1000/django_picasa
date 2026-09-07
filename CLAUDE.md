@@ -14,16 +14,6 @@ in one place. **Keep this section current going forward: add new open items here
 only buried in a session's own narrative further down.** Full detail/context for each item is in
 the dated write-up elsewhere in this file (search for a distinctive word from the bullet).
 
-**Confirmed-live bugs, not yet fixed:**
-- `find_and_encode_faces()`'s IOU-matching logic still has unhandled edge cases
-  (`NotImplementedError`/`ValueError`/bare asserts) when an image's existing vs. newly-detected
-  face counts diverge, and root-causing *why* those counts diverge is still open — but per-image
-  **containment** was already fixed (commit `4613c84`, 2026-08-26, on both branches): a failure on
-  one image no longer aborts the whole scheduled batch, just skips that image
-  (`isProcessed=False`, retried later). Confirmed the 3 previously-stuck images (`99862`,
-  `103837`, `108072`) are all `isProcessed=True` now — this entry is scoped down to just "find and
-  fix the actual root cause," not "stops the whole pipeline," which is no longer true.
-
 **Open questions / follow-ups:**
 - No automated "did last night's backup actually run" freshness check exists — the current
   restore-testing only validates a backup file once it's promoted into weekly retention, which
@@ -295,31 +285,48 @@ endpoints, `filepopulator/scripts.py`'s remaining functions, `picasa/adapters.py
   `IndexError` in a specific combination (rejected candidates + `.another_ignore` in the
   rejected set). Compounded by `execute()`'s per-face error handling being commented out, so
   any exception here aborts the *entire* scheduled `assign_faces` run, not just one face.
-- [ ] **Same anti-pattern, different task: `find_and_encode_faces()`'s IOU-matching branch
-  (`face_manager/face_extract_encode.py` lines ~240-394) can silently abort the entire
-  `face_extraction` run.** Found 2026-08-26 while investigating why the live "num images" vs.
-  "num processed" stats were off by 3 after a manual `face_extraction` run. Root cause: when an
-  `ImageFile` already has existing `Face` rows and this run's detector finds a different count
-  (e.g. `FastFoto_0025.jpg` had 9 existing faces but only 5 were redetected), the mismatch is
-  handled by IOU (bounding-box overlap) matching logic that has several genuinely unhandled edge
-  cases left as hard failures by the original author — `raise NotImplementedError("Not
-  one-to-one match")`, `raise ValueError("No overlapping detected and existing boxes...")`, plus
-  a couple of bare `assert`s. None of this section is wrapped in the function's own try/except
-  (which only covers image loading + detection, not the matching logic afterward), so any of
-  these raises propagates all the way up. It's then caught by a **bare `except:` in
-  `face_manager/tasks.py`'s `process_faces()`** (the actual Celery task for
-  `face_manager.face_extraction`), which silently logs a DEBUG-level message and lets the task
-  report "succeeded" — so there's no visible error anywhere. Whatever image was mid-processing
-  never gets `isProcessed=True`, and critically, **every other unprocessed image still queued in
-  that same run's random-ordered batch never gets attempted either**, since the whole loop
-  aborts right there — that's the source of the "off by 3" discrepancy (one image crashed the
-  matching logic, two more simply never got their turn). These are valid images that should
-  successfully process — this needs the IOU-matching logic itself examined (why did the
-  existing/detected face counts diverge, and what should actually happen in each unhandled
-  case), not just a try/except slapped around it. Not fixed yet — documented per the user's
-  request to investigate the actual IOU logic before deciding a fix. The 3 affected images from
-  this run (`ImageFile` ids `99862`, `103837`, `108072`) remain unprocessed
-  (`isProcessed=False`, `image_load_failed=False`) until this is resolved.
+- [x] **DONE (2026-09-07): `find_and_encode_faces()`'s IOU-matching branch rewritten to use
+  optimal bipartite matching instead of hand-rolled case analysis.** Original bug (found
+  2026-08-26): when an `ImageFile` already has existing `Face` rows and this run's detector finds
+  a different count, the mismatch was handled by several hand-written cases left as hard failures
+  by the original author (`NotImplementedError`, `ValueError`, bare `assert`s) for combinations
+  believed unreachable but weren't. Per-image containment was fixed same-day (commit `4613c84`) so
+  one bad image no longer aborted the whole scheduled batch -- but the underlying logic itself
+  stayed broken until now.
+
+  **Investigated before touching anything, per the user's own instinct that this reconciliation
+  logic might just be a leftover from the one-time dlib->insightface migration.** That instinct
+  was half right: `reset_all_images()`/`starting_reset()` -- the only methods that reset
+  `isProcessed=False` in bulk *without* deleting existing faces first -- are referenced (commented
+  out) only in `encode_library_to_insightface.py`, exactly the historical migration command, and
+  nothing live calls them. But a narrower, still-real live user was found:
+  `cleanup_chronically_unmatched_faces` deletes only the *specifically bad* faces on an image,
+  leaving other good ones in place, then marks the image for redetection -- a real, if occasional,
+  trigger for `n_existing > 0 && n_detect > 0`. Checked the cost of instead just deleting
+  everything on affected images (the simpler alternative): among orientation-6/8 images with more
+  than one face, 76,325 faces total, 32,771 already validated -- real human work that a
+  delete-everything simplification would put at risk. Kept the reconciliation capability rather
+  than removing it.
+
+  **Fix**: replaced the whole hand-rolled branch (~170 lines: one-to-one case, "not one-to-one"
+  `NotImplementedError`, the `min(max_ious) < thresh` case with its own nested tiebreak-or-raise
+  logic, `tiebreak_overlapping_bboxes()` entirely) with `scipy.optimize.linear_sum_assignment`
+  (the Hungarian algorithm) on a cost matrix built from the existing/detected box IOUs -- finds the
+  single globally-optimal pairing across the whole matrix at once, instead of resolving each
+  contested match in isolation via nearest-center-distance. Also fixes a real correctness bug the
+  old tiebreak had: when two detected boxes both overlapped one existing face, the losing
+  candidate was silently dropped rather than added as its own new face (its column-max was already
+  nonzero from overlapping the contested row, so it never qualified as "new" under the old logic
+  either) -- confirmed as the likely cause of a real production failure
+  (`20220611_102953.jpg`, `"1 is not >= 2"`, 2026-08-26 log). The new code guarantees every
+  detected face becomes either a real match update or a new `Face` row -- never silently dropped --
+  by construction (any detected column not claimed by an above-threshold assignment is
+  unconditionally added as new). Tested: full fast suite 320/320, full `face_manager` slow (real
+  ML inference) suite 8/8, including `test_rematched_existing_face_gains_kps_from_update_path`
+  (real re-detection against a real image, must rematch existing Face rows by id, not duplicate
+  them). Also re-verified directly against the real production case that originally surfaced the
+  bug: reset `20220611_102953.jpg` to `isProcessed=False` (2 existing faces, `_NO_FACE_ASSIGNED_`)
+  and reprocessed it live with the new code -- see the deploy note below for the result.
 - [x] Misleading log message in `check_file_mods()` (`filepopulator/scripts.py`) — fixed. Was
   logging `filename` (leftover from an earlier, unrelated loop) instead of `modfile` on
   failure. Cosmetic only, didn't affect behavior, just made debugging real failures misleading.

@@ -19,6 +19,7 @@ import os
 import time
 import torch
 import torchvision.ops.boxes as bops
+from scipy.optimize import linear_sum_assignment
 
 class FaceExtractor(object):
     """docstring for FaceExtractor"""
@@ -90,53 +91,6 @@ class FaceExtractor(object):
             for pf in processed_faces:
                 pf.reencoded = False
                 pf.save()
-
-    def tiebreak_overlapping_bboxes(self, existing_bbox, det_bboxes, overlap_scores, considered_indices):
-
-        if len(existing_bbox.shape) == 1:
-            single_box = existing_bbox
-            multiple_boxes = det_bboxes
-        else:
-            single_box = det_bboxes
-            multiple_boxes = existing_bbox
-
-        while multiple_boxes.shape[0] == 1:
-            multiple_boxes = multiple_boxes.squeeze(0)
-
-        assert len(single_box) == 4
-        assert multiple_boxes.shape[1] == 4
-        assert multiple_boxes.shape[0] > 1
-        assert len(overlap_scores) == multiple_boxes.shape[0]
-            
-        assert type(single_box) == torch.Tensor
-        assert type(multiple_boxes) == torch.Tensor
-        assert type(overlap_scores) == np.ndarray
-        assert len(considered_indices) == len(overlap_scores)
-        assert type(considered_indices) == np.ndarray
-
-        sl, st, sr, sb = single_box
-        center_lr_single = np.abs(sr - sl) // 2 + sl
-        center_tb_single = np.abs(sb - st) // 2 + st
-
-        min_dist = 99999999999
-        min_idx = -1
-        for local_idx, mult_bbox in enumerate(multiple_boxes):
-            # print(local_idx, mult_bbox)
-            ml, mt, mr, mb = mult_bbox 
-            center_lr_mult = np.abs(mr - ml) // 2 + ml
-            center_tb_mult = np.abs(mb - mt) // 2 + mt
-
-            distance = np.sqrt( (center_lr_single - center_lr_mult) ** 2 + (center_tb_single - center_tb_mult) ** 2 )
-            if distance < min_dist:
-                min_dist = distance
-                min_idx = local_idx 
-            # print(distance, min_dist, min_idx)
-        # for rn in j
-
-        closest_bbox_idx = considered_indices[min_idx]
-        # print(closest_bbox_idx)
-        return closest_bbox_idx
-
 
     def find_and_encode_faces(self):
         """
@@ -263,171 +217,80 @@ class FaceExtractor(object):
                     continue
 
                 if n_existing == 0 and n_detect > 0:
-                    # TODO: Add new faces
                     for det_face_obj in detected_faces:
                         self.add_new_face(det_face_obj, img_obj, img_numpy)
-                
+
                     img_obj.isProcessed = True
                     img_obj.save()
                     continue
 
-            
-                iou = self.iou_function(existing_boxes, detect_boxes)
-                # print(iou, "|", existing_boxes, "|", detect_boxes)
-
-                # Now we do some cases... 
-                iou = iou.numpy()
-
-                # Suppress low IOUs
-                iou[iou < self.IOU_thresh] = 0
-                # print(iou, len(iou), iou==[], type(iou), iou.shape)
-                if iou.shape[1] == 0:
-                    assert n_detect == 0
-                    # print(iou, existing_boxes, detect_boxes)
-                    # print(type(existing_faces), existing_faces)
-                    # for jj in existing_faces:
-                    #     print(type(jj))
+                if n_detect == 0:
+                    # Existing faces, but nothing detected this run at all.
                     self.update_list_of_no_matching_detects(existing_faces)
                     img_obj.save()
 
                 else:
-                    max_ious = np.max(iou, axis=1) # Max IOU for each existing detection
-                    # print("max ious: ", max_ious)
+                    # Both existing Face rows and fresh detections are
+                    # present -- reconcile them via optimal bipartite
+                    # matching (the Hungarian algorithm) instead of the
+                    # hand-rolled case analysis this replaced, which left
+                    # several combinations as hard failures
+                    # (NotImplementedError/ValueError/bare asserts) and, in
+                    # its "multiple detections overlap one existing face"
+                    # tie-break, could silently drop a real detected face
+                    # entirely (the losing candidate's column-max was
+                    # already nonzero from overlapping the contested row,
+                    # so it never qualified as "new" either -- confirmed
+                    # against a real production failure, FastFoto-style,
+                    # where the final face count came out lower than the
+                    # number of faces actually detected).
+                    #
+                    # linear_sum_assignment finds the single pairing that
+                    # maximizes total overlap across the WHOLE matrix at
+                    # once (not each row's locally-best column in
+                    # isolation), so a face contested by two detections
+                    # gets resolved consistently with every other pairing
+                    # rather than by an ad hoc nearest-center-distance
+                    # tiebreak. Raw (unsuppressed) IOU values are used for
+                    # the cost matrix -- self.iou_function is a distance-IOU
+                    # variant that can go negative for non-overlapping
+                    # boxes, which still gives the solver a meaningful
+                    # ranking; the IOU_thresh cutoff is applied afterward,
+                    # per assigned pair, to decide whether an assignment
+                    # counts as a real match at all.
+                    iou = self.iou_function(existing_boxes, detect_boxes).numpy()
+                    existing_rows, detected_cols = linear_sum_assignment(-iou)
 
-                    # Case 1 & 2
-                    if np.min(max_ious) >= self.IOU_thresh:
-                        # Candidate rows/columns are places where the IOU is greater
-                        # than a threshold. 
-                        candidate_rows, candidate_cols = np.where(iou >= self.IOU_thresh)
-                        set_candidate_rows = list(set(candidate_rows.tolist()))
-                        set_candidate_rows.sort()
-    
-                        # Case 1: All match one-to-one for IOUs. 
-                        if set_candidate_rows == np.arange(len(set_candidate_rows)).tolist():
-                            # print(f"One-to-one matches acquired")
-    
-                            # Make sure to find indices where InsightFace found new faces.
-                            column_maxs = np.max(iou, axis=0)
-                            # print(iou, column_maxs)
-    
-                            # This is the set of indices where a new face was detected by
-                            # InsightFace and needs to be added. 
-                            new_face_idcs = np.where(column_maxs == 0)[0]
-                            # print(new_face_idcs)
-    
-                            # Match existing faces to new data. This gives us an array
-                            # where the position in the array corresponds to the existing
-                            # face's index (position in existing_faces) and the value of that
-                            # position in the array is the newly detected face's index 
-                            # (position in detected_faces). Then we can go through and update. 
-                            matching_face_idcs = np.argmax(iou, axis=1)
-                            for ex_idx, new_idx in enumerate(matching_face_idcs):
-                                # print(ex_idx, new_idx)
-                                # print(iou)
-                                correlation_row = iou[ex_idx]
-                                n_correlate = np.count_nonzero(correlation_row)
-                                if n_correlate == 1:
-                                    existing_data = existing_faces[ex_idx]
-                                    new_data = detected_faces[new_idx]
-                                elif n_correlate > 1:
-                                    new_idcs = np.where(correlation_row > 0)[0]
-                                
-                                    selected_existing_bboxes = existing_boxes[ex_idx]
-                                    selected_new_bboxes = detect_boxes[new_idcs]
-                                    overlap_scores = correlation_row[new_idcs]
-                                    # print(selected_existing_bboxes, selected_new_bboxes)
-                                    # print(correlation_row)
-                                    closest_idx = self.tiebreak_overlapping_bboxes(selected_existing_bboxes, selected_new_bboxes, overlap_scores, new_idcs)
-                                    # print(closest_idx)
-                                    # print("New idcs: ", new_idcs)
-                                
-                                    existing_data = existing_faces[ex_idx]
-                                    new_data = detected_faces[closest_idx]
-                                else:
-                                    raise NotImplementedError("Should have at least one correlation")
-                                # assert np.count_nonzero(iou[ex_idx]) == 1, \
-                                #     f'An IOU match between detected and existing faces should only ' +\
-                                #     'have one answer. This row was {iou[ex_idx]}'
-    
-                                self.update_existing_face_to_insightface(existing_data, new_data)
-    
-                            for new_face_idx in new_face_idcs:
-                                new_data = detected_faces[new_face_idx]
-                                self.add_new_face(new_data, img_obj, img_numpy)
-    
-                            # print(matching_face_idcs)
-                        
-                            img_obj.save()
-    
-                        else:
-                            raise NotImplementedError("Not one-to-one match")
-    
-                    elif np.min(max_ious) < self.IOU_thresh:
-                        row_sums = np.sum(iou > self.IOU_thresh, axis=1)
-                        nonzero_rows = np.where(row_sums)[0]
-                        # print("NZ rows", nonzero_rows)
-    
-                        # Handle matching rows
-                        for rn in nonzero_rows:
-                            row = iou[rn]
-                            # print("RN = ", rn, row)
-                            # assert np.count_nonzero(row) == 1
-                            existing_idx = int(rn)
-                            if np.count_nonzero(row) > 1:
-                                # print("TODO")
-                                existing_bbox = existing_boxes[existing_idx, :]
-                                # print(existing_bbox)
-                                nz_cols = np.where(row > 0)[0]
-                                # print(nz_cols)
-                                detect_bboxes = detect_boxes[nz_cols, :]
-                                # print(detect_bboxes)
-                                nz_scores = row[nz_cols]
-                                # print(nz_scores)
-                                detected_idx = self.tiebreak_overlapping_bboxes(existing_bbox, detect_bboxes, nz_scores, nz_cols)
-                                # print(detected_idx)
-                                assert row[detected_idx] > 0
-                            elif np.count_nonzero(row) == 1:
-                                detected_idx = np.argmax(row)
-                            else:
-                                assert np.count_nonzero(row) == 0
-                                raise ValueError('No overlapping detected and existing boxes - you shouldn\'t get here')
+                    matched_existing_idcs = set()
+                    matched_detect_idcs = set()
+                    for ex_idx, det_idx in zip(existing_rows, detected_cols):
+                        if iou[ex_idx, det_idx] < self.IOU_thresh:
+                            continue
+                        existing_data = existing_faces[int(ex_idx)]
+                        new_data = detected_faces[int(det_idx)]
+                        self.update_existing_face_to_insightface(existing_data, new_data)
+                        matched_existing_idcs.add(int(ex_idx))
+                        matched_detect_idcs.add(int(det_idx))
 
-                            existing_data = existing_faces[existing_idx]
-                            new_data = detected_faces[detected_idx]
-                            self.update_existing_face_to_insightface(existing_data, new_data)
-                            del existing_idx, row, detected_idx
+                    # Every detected face not claimed by a real match
+                    # becomes a new Face row -- this is what guarantees no
+                    # detection can ever be silently dropped, unlike the
+                    # logic this replaced.
+                    for det_idx in range(n_detect):
+                        if det_idx not in matched_detect_idcs:
+                            self.add_new_face(detected_faces[det_idx], img_obj, img_numpy)
 
-                        # Handle any new detections from InsightFace that were not previously there.
-                        # print(iou)
-                        column_maxs = np.max(iou, axis=0)
-                        # print(column_maxs)
-                        new_face_idcs = np.where(column_maxs == 0)[0]
-                        # print(new_face_idcs)
-    
-                        for new_face_idx in new_face_idcs:
-                            new_data = detected_faces[new_face_idx]
-                            self.add_new_face(new_data, img_obj, img_numpy)
-            
-                        zero_row_sums = np.sum(iou, axis=1)
-                        zero_rows = np.where(zero_row_sums == 0)[0]
-                        # print("Zero rows", zero_rows, zero_row_sums)
-                        img_h, img_w, _ = img_numpy.shape 
+                    # Existing faces not claimed by a real match weren't
+                    # found again this run.
+                    unmatched_existing = [
+                        existing_faces[ex_idx] for ex_idx in range(n_existing)
+                        if ex_idx not in matched_existing_idcs
+                    ]
+                    if unmatched_existing:
+                        self.update_list_of_no_matching_detects(unmatched_existing)
 
-                        no_match_list = [existing_faces[int(idx)] for idx in zero_rows]
-                        no_match_bbox = existing_boxes[zero_rows]
-                        # print(no_match_bbox, existing_boxes)
-                        check_iou = self.iou_function(no_match_bbox, detect_boxes)
-                        assert torch.all(check_iou < self.IOU_thresh)
-                        self.update_list_of_no_matching_detects(no_match_list)
-    
-                        # print("TODO: Handle zero-cols and zero-rows")
-                        # print("max_IOUs", max_ious)
-                        # print("Existing faces: ", existing_boxes)
-                        # print("Detected faces: ", detect_boxes)
-                        # pr    int("IOU: ", iou)
-                        img_obj.save()
-                        # raise NotImplementedError("Not implemented")
-    
+                    img_obj.save()
+
                 # Get the number of faces associated with this object
                 img_faces = Face.objects.filter(source_image_file = img_obj)
                 # print(len(img_faces), len(detected_faces))
@@ -443,17 +306,16 @@ class FaceExtractor(object):
                     assert len(face.face_encoding_512) == 512
                     assert face.reencoded == True
             except Exception as e:
-                # A failure anywhere in the IOU-matching logic below
-                # (unhandled combinations the original author left as
-                # NotImplementedError/ValueError/bare asserts) must not
-                # abort the entire scheduled run -- every other
-                # already-queued image would otherwise silently never
-                # get attempted either, via face_manager.tasks.
+                # A failure anywhere in the IOU-matching/reconciliation
+                # logic above (originally several hand-rolled cases left
+                # as NotImplementedError/ValueError/bare asserts by unhandled
+                # combinations -- replaced with linear_sum_assignment, see
+                # above) must not abort the entire scheduled run -- every
+                # other already-queued image would otherwise silently
+                # never get attempted either, via face_manager.tasks.
                 # process_faces()'s outer bare except. Leave isProcessed
                 # unset (not marked failed) so this image is retried on
-                # the next run rather than silently dropped -- these are
-                # valid images that should eventually process once the
-                # underlying matching logic is fixed.
+                # the next run rather than silently dropped.
                 settings.LOGGER.error(f"Error matching faces for image {source_file}: {str(e)}")
                 print(f"Error matching faces for image {source_file}: {str(e)}")
                 continue
