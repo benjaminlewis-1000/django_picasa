@@ -2149,6 +2149,7 @@ class VideoIngestionTests(TestCase):
                 self.assertIsNotNone(v, f"{filename} was not ingested")
                 self.assertGreater(v.width, 0)
                 self.assertGreater(v.height, 0)
+                self.assertEqual(v.file_size_bytes, os.path.getsize(path))
                 self.assertFalse(FailedVideoFile.objects.filter(filename=path).exists())
             else:
                 self.assertFalse(VideoFile.objects.filter(filename=path).exists())
@@ -2224,6 +2225,36 @@ class VideoIngestionTests(TestCase):
                 found_camera = True
         if not found_gps and not found_camera:
             self.skipTest("no fixture in VIDEO_DIR has GPS or camera metadata (expected for CI's synthetic stub)")
+
+    def test_backfill_command_populates_missing_file_size(self):
+        from django.core.management import call_command
+
+        long_enough = self._long_enough_files()
+        if not long_enough:
+            self.skipTest("no fixture in VIDEO_DIR clears MIN_VIDEO_DURATION_SECONDS")
+        path = os.path.join(self.VIDEO_DIR, long_enough[0])
+        create_video_file(path)
+        VideoFile.objects.filter(filename=path).update(file_size_bytes=None)
+
+        call_command('backfill_video_file_size')
+
+        v = VideoFile.objects.get(filename=path)
+        self.assertEqual(v.file_size_bytes, os.path.getsize(path))
+
+    def test_backfill_command_dry_run_makes_no_changes(self):
+        long_enough = self._long_enough_files()
+        if not long_enough:
+            self.skipTest("no fixture in VIDEO_DIR clears MIN_VIDEO_DURATION_SECONDS")
+        from django.core.management import call_command
+
+        path = os.path.join(self.VIDEO_DIR, long_enough[0])
+        create_video_file(path)
+        VideoFile.objects.filter(filename=path).update(file_size_bytes=None)
+
+        call_command('backfill_video_file_size', '--dry-run')
+
+        v = VideoFile.objects.get(filename=path)
+        self.assertIsNone(v.file_size_bytes)
 
 
 class ParseExifVideoDateTests(unittest.TestCase):

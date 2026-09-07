@@ -226,6 +226,11 @@ def create_video_file(file_path):
     hash_file.update(file_path.encode('utf-8'))
     video.file_hash = hash_file.hexdigest()
 
+    try:
+        video.file_size_bytes = os.path.getsize(file_path)
+    except OSError:
+        video.file_size_bytes = None
+
     video.save()
 
     # Clear a stale failure record now that this file has actually
