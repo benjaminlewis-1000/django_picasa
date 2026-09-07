@@ -2120,21 +2120,57 @@ class VideoIngestionTests(TestCase):
     def _video_files(self):
         return sorted(os.listdir(self.VIDEO_DIR))
 
-    def test_ingests_every_video_fixture_successfully(self):
+    def _duration_seconds(self, path):
+        from .video_scripts import _run_ffprobe
+        probe = _run_ffprobe(path)
+        return float(probe.get('format', {}).get('duration', 0) or 0)
+
+    def _long_enough_files(self):
+        # Real fixtures include at least one real clip under
+        # settings.MIN_VIDEO_DURATION_SECONDS (a real ~2s digitized home
+        # movie snippet), and the CI synthetic stub is 1s -- tests here
+        # partition by actual measured duration rather than assuming
+        # every fixture clears the bar.
+        from django.conf import settings
+        return [
+            f for f in self._video_files()
+            if self._duration_seconds(os.path.join(self.VIDEO_DIR, f)) >= settings.MIN_VIDEO_DURATION_SECONDS
+        ]
+
+    def test_ingests_fixtures_at_or_above_minimum_duration(self):
         video_files = self._video_files()
         self.assertGreaterEqual(len(video_files), 1)
+        long_enough = set(self._long_enough_files())
         for filename in video_files:
             path = os.path.join(self.VIDEO_DIR, filename)
             create_video_file(path)
-            v = VideoFile.objects.filter(filename=path).first()
-            self.assertIsNotNone(v, f"{filename} was not ingested")
-            self.assertGreater(v.width, 0)
-            self.assertGreater(v.height, 0)
-            self.assertFalse(FailedVideoFile.objects.filter(filename=path).exists())
+            if filename in long_enough:
+                v = VideoFile.objects.filter(filename=path).first()
+                self.assertIsNotNone(v, f"{filename} was not ingested")
+                self.assertGreater(v.width, 0)
+                self.assertGreater(v.height, 0)
+                self.assertFalse(FailedVideoFile.objects.filter(filename=path).exists())
+            else:
+                self.assertFalse(VideoFile.objects.filter(filename=path).exists())
+                failed = FailedVideoFile.objects.filter(filename=path).first()
+                self.assertIsNotNone(failed, f"{filename} should have been excluded as too short")
+                self.assertIn("Excluded", failed.error_message)
+
+    def test_videos_shorter_than_minimum_are_excluded_not_ingested(self):
+        # Explicit regression test for the exclusion itself, not just
+        # incidental coverage from the fixture loop above.
+        long_enough = set(self._long_enough_files())
+        short_files = [f for f in self._video_files() if f not in long_enough]
+        if not short_files:
+            self.skipTest("no fixture in VIDEO_DIR is shorter than MIN_VIDEO_DURATION_SECONDS")
+        path = os.path.join(self.VIDEO_DIR, short_files[0])
+        create_video_file(path)
+        self.assertFalse(VideoFile.objects.filter(filename=path).exists())
+        self.assertTrue(FailedVideoFile.objects.filter(filename=path, error_message__icontains="Excluded").exists())
 
     def test_add_videos_from_root_dir_discovers_video_files(self):
         add_videos_from_root_dir([self.VIDEO_DIR])
-        self.assertEqual(VideoFile.objects.count(), len(self._video_files()))
+        self.assertEqual(VideoFile.objects.count(), len(self._long_enough_files()))
 
     def test_rerunning_finds_nothing_new(self):
         # Regression-shaped test: a second run over the same root
@@ -2153,15 +2189,16 @@ class VideoIngestionTests(TestCase):
         other_dir = '/tmp/video_other_root'
         os.makedirs(other_dir, exist_ok=True)
         self.addCleanup(shutil.rmtree, other_dir, ignore_errors=True)
-        video_files = self._video_files()
-        first_file = os.path.join(self.VIDEO_DIR, video_files[0])
-        other_copy = os.path.join(other_dir, video_files[0])
+        long_enough = self._long_enough_files()
+        self.assertGreaterEqual(len(long_enough), 1)
+        first_file = os.path.join(self.VIDEO_DIR, long_enough[0])
+        other_copy = os.path.join(other_dir, long_enough[0])
         shutil.copy(first_file, other_copy)
 
         add_videos_from_root_dir([self.VIDEO_DIR, other_dir])
 
         self.assertTrue(VideoFile.objects.filter(filename=other_copy).exists())
-        self.assertEqual(VideoFile.objects.count(), len(video_files) + 1)
+        self.assertEqual(VideoFile.objects.count(), len(long_enough) + 1)
 
     def test_nonexistent_file_is_recorded_as_failed(self):
         create_video_file('/photos/video_samples/does_not_exist.mp4')
@@ -2173,7 +2210,7 @@ class VideoIngestionTests(TestCase):
         # metadata -- only assert against ones that actually do.
         found_gps = False
         found_camera = False
-        for filename in self._video_files():
+        for filename in self._long_enough_files():
             path = os.path.join(self.VIDEO_DIR, filename)
             create_video_file(path)
             v = VideoFile.objects.get(filename=path)
