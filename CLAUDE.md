@@ -15,8 +15,6 @@ only buried in a session's own narrative further down.** Full detail/context for
 the dated write-up elsewhere in this file (search for a distinctive word from the bullet).
 
 **Confirmed-live bugs, not yet fixed:**
-- 29 duplicate `ImageFile` rows sharing the same filename (a different bug than the pixel_hash
-  cross-path duplicate issue already fixed) — needs a decision on which row of each pair to keep.
 - `find_and_encode_faces()`'s IOU-matching logic still has unhandled edge cases
   (`NotImplementedError`/`ValueError`/bare asserts) when an image's existing vs. newly-detected
   face counts diverge, and root-causing *why* those counts diverge is still open — but per-image
@@ -1300,11 +1298,17 @@ active production issue, not just cleanup — worth prioritizing the deploy once
      duplicates from being created — the 29 existing ones are a separate data-cleanup question,
      not yet addressed (need a decision on which of each duplicate pair to keep). Covered by
      `filepopulator.tests.OrientationChangeReprocessTests`.
-- **TODO: clean up the 29 known duplicate `ImageFile` rows in production** (see the fix above —
-  this is the pre-existing data left over from before the fix, not something the fix itself
-  resolves). Query: `ImageFile.objects.values('filename').annotate(n=Count('id')).filter(n__gt=1)`.
-  Needs a decision on which row of each pair to keep (and what happens to `Face` rows/thumbnails
-  attached to the one being dropped) before doing anything destructive.
+- **DONE (2026-09-06): the 29 known duplicate `ImageFile` rows cleaned up in production.** All 29
+  were in one folder (`/photos/Pictures_In_Progress/2025/Debbie visit/`), each pair with identical
+  `pixel_hash`, `dateModified` (to the microsecond), orientation, and face counts — confirming the
+  documented root cause (one batch reprocessing run through that folder hit the now-fixed INSERT-
+  instead-of-UPDATE bug for every file). Before deleting, checked every pair for human-entered
+  face data unique to the higher-id row (`declared_name` excluding the ignore sentinels) — found
+  real validated names on most drop-side rows, but in every single case the identical set of names
+  was *also* already present on the keep-side row (a person had independently tagged both visible
+  copies the same way), so nothing was at risk of being lost. Kept the lower id in each pair,
+  deleted the higher-id row via `ImageFile.delete()` per-instance (not a bulk queryset delete) so
+  `Face` cleanup and thumbnail-file removal ran correctly. Verified 0 duplicate filenames remain.
 - **TODO: frontend slideshow — add a "mark image for deletion" button.** Requested 2026-08-26;
   not scoped yet (this project doesn't have visibility into the slideshow frontend's codebase in
   this session — noted here so it isn't lost, needs its own design pass covering both the
