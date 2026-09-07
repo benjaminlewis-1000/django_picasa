@@ -344,18 +344,19 @@ class Face(models.Model):
         trip on every one of these calls across a large reprocess) pass
         it straight through."""
 
-        assert poss_idx > 0, 'The index correlateed to poss_ident must be a value between 1 and 5.'
-        assert poss_idx <= 5, 'The index correlateed to poss_ident must be a value between 1 and 5.'
+        assert poss_idx > 0, \
+            f'The index correlated to poss_ident must be a value between 1 and {self.NUM_POSSIBLE_IDENTITIES}.'
+        assert poss_idx <= self.NUM_POSSIBLE_IDENTITIES, \
+            f'The index correlated to poss_ident must be a value between 1 and {self.NUM_POSSIBLE_IDENTITIES}.'
         assert isinstance(person_id, (int, np.int32, np.int64, Person)), \
             f"Person ID should be an int or Person but is {type(person_id)}"
         assert type(weight) in [int, float, np.float64], f"Weight should be an int or float; is {type(weight)}"
         assert weight >= 0
         assert weight <= 1.000001, f"weight was {weight}"
         new_poss_id = person_id if isinstance(person_id, Person) else Person.objects.get(id=person_id)
-        # self.__dict__[f'weight_{poss_idx}'] = weight
 
-        exec(f"self.poss_ident{poss_idx} = new_poss_id")
-        exec(f"self.weight_{poss_idx} = weight")
+        setattr(self, f'poss_ident{poss_idx}', new_poss_id)
+        setattr(self, f'weight_{poss_idx}', weight)
 
         if save:
             self.save()
@@ -373,21 +374,17 @@ class Face(models.Model):
         disown_person = Person.objects.get(id=person_unassociate_id)
 
         possible_ids = []
-        for ID_num in range(1, 6):
-            try:
-                get_id = eval(f"self.poss_ident{ID_num}.id")
-            except AttributeError:
-                get_id = None
-            possible_ids.append(get_id)
+        for ID_num in range(1, self.NUM_POSSIBLE_IDENTITIES + 1):
+            candidate = getattr(self, f'poss_ident{ID_num}')
+            possible_ids.append(candidate.id if candidate is not None else None)
 
         assert person_unassociate_id in possible_ids
 
-        # Use eval statements to effect a change in the possible ID list.
         # Find if the removal ID is in the possible IDs, then bump everything
-        # up higher in the possible IDs list, accounting for any "None" values. 
+        # up higher in the possible IDs list, accounting for any "None" values.
         if person_unassociate_id in possible_ids:
             remove_idx = possible_ids.index(person_unassociate_id)
-            source_idcs = [x for x in range(5) if x != remove_idx and possible_ids[x] is not None]
+            source_idcs = [x for x in range(self.NUM_POSSIBLE_IDENTITIES) if x != remove_idx and possible_ids[x] is not None]
             dest_idcs = list(range(len(source_idcs)))
 
 
@@ -396,22 +393,17 @@ class Face(models.Model):
                 dest_offset = dest_idcs[offset]
                 if source_offset == dest_offset:
                     continue
-                exec(f"self.poss_ident{dest_offset + 1} = self.poss_ident{source_offset + 1}")
-                exec(f"self.weight_{dest_offset + 1} = self.weight_{source_offset + 1}")
+                setattr(self, f'poss_ident{dest_offset + 1}', getattr(self, f'poss_ident{source_offset + 1}'))
+                setattr(self, f'weight_{dest_offset + 1}', getattr(self, f'weight_{source_offset + 1}'))
 
             if len(dest_idcs) > 0:
                 offset_start = max(dest_idcs) + 2
             else:
                 offset_start = 1
-                
-            for offset in range(offset_start, 6):
-                exec(f"self.poss_ident{offset} = None")
-                exec(f"self.weight_{offset} = 0.0")
 
-            # print("Removing", remove_idx)
-            # if remove_idx == 0:
-            #     assert source_idcs[0] == 1
-            #     assert dest_idcs[0] == 0
+            for offset in range(offset_start, self.NUM_POSSIBLE_IDENTITIES + 1):
+                setattr(self, f'poss_ident{offset}', None)
+                setattr(self, f'weight_{offset}', 0.0)
 
         self.add_to_rejected_fields(person_unassociate_id)
         self.save()
