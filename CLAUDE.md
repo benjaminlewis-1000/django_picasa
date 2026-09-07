@@ -208,6 +208,23 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
     fixtures by actual measured duration rather than assume every fixture clears the bar -- real
     regression coverage, not fixtures chosen to avoid the new behavior. Full fast suite: 332/332
     (331 + 1 new exclusion-specific test).
+- **IN PROGRESS right now (started 2026-09-07, ~15:04 America/New_York): full production video
+  backfill running.** Kicked off manually (not waiting for the hourly schedule) via
+  `docker exec picasa_api python manage.py shell -c "from filepopulator.video_scripts import
+  add_videos_from_root_dir; from django.conf import settings;
+  add_videos_from_root_dir(settings.FILEPOPULATOR_SERVER_VIDEO_DIRS)"`, running detached
+  (`docker exec -d`, so no captured stdout log -- monitor via `VideoFile`/`FailedVideoFile` row
+  counts and `docker exec picasa_api ps aux | grep manage.py` instead). Covers all three
+  `FILEPOPULATOR_SERVER_VIDEO_DIRS` roots (`Our_Home_Videos`, `Lewis_family_videos`, and
+  `PHOTO_ROOT` for interspersed videos) against the real library (~6,300+ real video files by
+  extension count, thousands more `.bif`/`.modd`/`.moff`/`.thm` correctly excluded by extension).
+  Progress snapshot at last check: 769 `VideoFile` + 168 `FailedVideoFile` (most likely the new
+  duration-exclusion, not real failures -- not yet broken down). **When this finishes**: report
+  final counts/stats to the user (duration exclusions vs. real failures, date range, camera
+  makes/models seen, GPS coverage, total footage) -- this was explicitly why the user wanted the
+  backfill run now instead of waiting on the schedule ("so we can get more info on the library").
+  Nothing else is blocked on this finishing -- Phase 2 (thumbnailing) can start independently
+  whenever revisited.
 - **Phase 2 (not started)**: thumbnailing via one extracted `ffmpeg` frame, reusing the existing
   thumbnail-generation code unchanged once a PIL Image exists; handle the rotation matrix here.
 - **Phase 3 (not started, holding at the user's request)**: sparse-sampled face detection through
