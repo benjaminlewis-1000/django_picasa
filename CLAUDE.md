@@ -281,12 +281,132 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
     frame ~7 days. This is a one-time-backfill sizing problem, not an ongoing-cost one -- a new
     video going forward costs only ~55s at a stride-20 sample rate for an average ~2-minute clip,
     same "backlog vs. steady-state" shape as the original image face-extraction backfill.
-  - **Not yet decided**: final sample stride, the clustering distance threshold and group-size
-    floor for dropping transient faces, and how IOU-based track-stitching combines with the
-    clustering pass (stitch first then cluster stitched tracks, or cluster raw detections then
-    use IOU only to heal adjacent-frame gaps within an already-formed cluster). `Face.source_
-    video_file`/`video_timestamp_seconds` fields + migration, and the actual scheduled task, are
-    still not built -- this is investigation only, no schema or pipeline code written yet.
+  - **Resolved: the sequential design.** Rather than "stitch vs. cluster" as alternatives, they're
+    sequential stages, resolving a real chicken-and-egg problem raised mid-investigation (bbox+kps-
+    only candidates have no embeddings, so pure embedding clustering can't be the first pass):
+    **Stage 1** IOU tracking (geometry only, no embeddings) chains raw detections into tracklets
+    across consecutive sampled frames -- zero recognition cost spent. **Stage 2** drops
+    short/transient tracklets by a length floor before ever paying for recognition -- cheaper than
+    filtering after clustering. **Stage 3** encodes only survivors, sparsely (a couple
+    representative frames per tracklet, not every frame). **Stage 4** embedding-based stitching
+    (with a hard cannot-link constraint) merges tracklets IOU couldn't bridge (occlusion, a cut,
+    re-entering frame) and classifies the merged result against the existing `Person` gallery.
+
+  - **DB storage: bbox+kps candidates cost ~15-20x less per row than a full `Face` row.** Measured
+    directly against production `face_manager_face` (not estimated): a full row averages **2,125
+    bytes** (2,067 of that is `face_encoding_512` alone; `kps`: 61 bytes; box columns: 16 bytes
+    combined). A lean candidate table (video FK + frame index + box + kps, no embedding) lands
+    around **~100-150 bytes/row**. At stride-20 across the full library (~1.28M sampled frames,
+    ~1-1.4 faces/sampled-frame in the real fixtures) that's **~1-2M candidate detections costing
+    ~150-300MB temporarily**, vs. 2-4GB if every raw detection stored a full embedding.
+
+  - **Compute: no real "recompute penalty" from the two-pass design.** Pure detection-only
+    (`det_500m`, bbox+kps, no recognition/genderage): **37-46ms/frame**. Recognition-only
+    re-encode via kps-replay (`rec_model.get(img, Face(kps=...))`, the same trick
+    `reencode_missing_faces()` already uses): **~142-144ms/face**. Full detect+recognize+genderage
+    together: **279-369ms/frame** -- backing that out, **genderage alone costs ~90-120ms/face**,
+    roughly as expensive as recognition itself. **Genderage is dropped entirely for video**:
+    `Face.detected_age`/`detected_gender` both have real defaults (`-1`/`"unknown"`), not required
+    fields, and this project's own earlier birth-year-cutoff investigation already found real
+    doubt about whether `detected_age`'s output is usable at all (a known preschooler's median
+    came back 46) -- little is given up by skipping it here that wasn't already questionable for
+    images. Net: detect-only (37-46ms/frame, paid once regardless of face count) -> cluster/filter
+    -> recognition-only re-encode survivors (142-144ms/face, paid only for faces that matter)
+    costs about the same or less total compute than committing to full detect+recognize+genderage
+    for every raw detection up front, since the two expensive parts are deferred until you know
+    which detections survive.
+
+  - **Two real, confirmed extraction-pipeline bugs found via testing against real fixtures, not
+    assumed** (both while re-benchmarking with real formats beyond the two phone videos):
+    1. **`cv2.VideoCapture` silently corrupts frames on `.mpg`/`.mts`/`.m2ts` content** -- produces
+       all-black frames with no error raised (confirmed: a frame `cv2` returned had `mean=0.0`;
+       the identical timestamp extracted via `ffmpeg` gave `mean=121.0` and a real detected face).
+       This is exactly why every earlier per-frame timing number in this write-up came from
+       `cv2.VideoCapture` and needed correcting -- **confirmed against real production data: ~624
+       files (500 `.mpg` + 124 `.mts`/`.m2ts`, ~9% of the library) are at risk.** Fixed by
+       switching frame extraction to a single `ffmpeg` subprocess per video, piping raw frames
+       (`-f rawvideo -pix_fmt bgr24 pipe:1`) rather than using `cv2.VideoCapture` at all.
+    2. **`ffmpeg`'s raw pipe auto-applies the container's rotation side-data**, so a ±90°/270°-
+       rotated video's actual output frame dimensions are swapped from `ffprobe`'s raw stream
+       width/height. Assuming the un-rotated dimensions when reshaping the raw byte buffer
+       produces severely garbled frames (confirmed visually -- a diagonal-shear artifact, not
+       recognizable content) and silently zero detections, not an error. Fixed by checking
+       `ffprobe`'s `stream_side_data` rotation and swapping width/height before reshaping whenever
+       rotation is ±90/270. Re-verified against the real `IMG_0760.MOV` fixture (rotation=-90):
+       correctly recovers a normal, upright real photo and all 10 real faces once fixed.
+    3. **Black-frame sanity check, built and validated**: probe the first ~10 sampled frames per
+       video, flag the video if >=50% come back near-zero mean pixel value (`< 1.0`). All 6 real
+       fixtures passed clean after the two fixes above -- this is the guard that would have caught
+       the original `cv2` corruption immediately (as "video flagged, needs investigation") instead
+       of silently reporting "no faces found." Not yet wired into the real ingestion pipeline --
+       validated only in the investigation scripts so far.
+    4. **Corrected detection-only cost, post-fix, across 6 real diverse videos** (phone MOV/MP4,
+       AVCHD MTS/M2TS, old MPG, WMV): **38-82ms/frame** -- consistent with, not wildly different
+       from, the earlier (bugged) `cv2` numbers, but now trustworthy.
+
+  - **Track fragmentation is real and substantial with plain IOU tracking alone** (0.67s between
+    samples, boxes grown 25% before computing IOU, `iou_thresh=0.3`) -- most tracks are singletons;
+    only a minority survive length>=2. Real per-video breakdown (tracks / % surviving >=2 frames):
+    `IMG_0760.MOV` 3 tracks/33%, `VID_2019...mp4` 14/14%, `00023.MTS` 32/56%, `20191005...m2ts`
+    12/33%, `20120309...mpg` 14/29%, `Bear Hands.wmv` 9/67% -- directly motivating Stage 4 as
+    necessary, not optional.
+
+  - **Levers tried, in order of actual value per unit cost (parameter sweep + two follow-up
+    experiments, all against real fixtures):**
+    - *Lowering the IOU threshold* (0.3->0.2->0.1) and *growing boxes more before matching*
+      (25%->50%) each help a little, unevenly by content, with diminishing/overlapping returns
+      when combined (e.g. on `00023.MTS`, `iou>=0.3,grow=50%` ~= `iou>=0.2,grow=25%`; at
+      `iou>=0.1` further growing boxes made zero additional difference). Neither is a big lever on
+      its own.
+    - *Sampling twice as often* (0.67s -> 0.33s between samples) gives a real but more modest
+      continuity win than raw sample-count numbers suggest -- **track length in sample-count
+      trivially doubles with 2x the sample rate regardless of any real improvement** (a units
+      artifact, correctly caught mid-investigation), so the honest metric is real TIME SPAN of the
+      longest track: `00023.MTS` 4.67s->8.68s (1.86x), `VID_2019mp4` 1.34s->1.68s (1.25x) -- real,
+      but content-dependent and smaller than it first looked. Cost: detection-only time scales
+      close to the expected ~2x (confirmed by isolating decode-only vs. detect-only wall time:
+      decode is a large FIXED cost since the current extraction decodes every frame in the video
+      regardless of stride, e.g. `00023.MTS` decode-only stayed ~24-26s at both sample rates while
+      detect-only genuinely went 4.41s->10.56s) -- an earlier claim that "total cost barely
+      increased" was an artifact of decode dominating this specific unoptimized implementation,
+      not a real property of sampling rate; a version that skips decoding unsampled frames
+      entirely (e.g. `ffmpeg`'s own `-vf select=...` frame-selection filter) would scale total
+      cost close to 2x with 2x the sample rate, same as detection does here. Not yet built.
+    - **Gap tolerance -- the best lever found, and free.** Allowing a track to survive up to K
+      consecutive missed sampled frames before closing (matching resumes against the last known
+      box) improves real continuity at ZERO extra detection cost (same samples, smarter linking
+      only). `00023.MTS` max real span: 4.67s (K=0) -> **9.34s (K=1)** -> 8.01s (K=2) -- note this
+      is **not monotonic**: more tolerance doesn't always help further, since the optimal
+      bipartite matching can resolve a different pairing as tolerance loosens, shifting which
+      segments link rather than only ever adding more. `VID_2019mp4`: length in *samples* stayed
+      flat at 3 across K=0/1/2 while real span still climbed 1.34s->2.01s->3.35s, confirming gap
+      tolerance bridges real time between existing detections rather than manufacturing new ones.
+      Recommended as the first lever to reach for, ahead of sampling rate or IOU/box-growth
+      tuning.
+
+  - **Stage 4 (embedding stitching) prototyped and visually validated against a real fixture.**
+    Design: for each surviving tracklet, encode a representative embedding at its start and end
+    (recognition-only kps-replay); build a cost matrix of end-to-start cosine similarity between
+    every ordered pair of tracklets, with a **hard cannot-link constraint** -- any pair that
+    overlaps in time (or isn't in the right order) gets an disallowed cost, never eligible to
+    merge, regardless of embedding similarity (ground truth: the same person can't be in two
+    places at once) -- then a single `linear_sum_assignment` call resolves the optimal set of
+    stitches at once, thresholded at cosine similarity `>=0.4`. Union-find merges chains of
+    pairwise stitches into final groups. **Real result against `00023.MTS`'s gap=1 tracks: 26 raw
+    tracks -> 19 groups.** The biggest merge chained 5 separate tracks across gaps up to 9.34s
+    into one continuous **21.35-second span** (more than 2x the best result gap-tolerant IOU
+    tracking alone achieved). **Visually confirmed correct**, not just numerically plausible --
+    pulled and inspected face crops from all 5 segments (same glasses, same hair, same reclined
+    profile pose throughout) -- this project's own established discipline (the `.ignore`-bucket
+    clustering investigation found numerically-clean clusters that were visually incoherent) made
+    this check necessary, not a formality, and here it held up.
+
+  - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
+    group-size floor threshold for dropping transient tracklets, and whether to also pursue the
+    ffmpeg-side frame-selection optimization (skip decoding unsampled frames) before or after
+    landing a first real version. `Face.source_video_file`/`video_timestamp_seconds` fields +
+    migration, the black-frame check, and the actual scheduled task are all still not built --
+    this remains investigation only, no schema or pipeline code written yet.
 - **Phase 4 (not started)**: `VideoFileSerializer`/viewset, a `media_type` discriminator for the
   slideshow/frontend to branch `<video>` vs `<img>` (frontend side out of scope for this repo).
 - **Phase 5, newly identified (2026-09-07), not started -- transcode pipeline, likely required
