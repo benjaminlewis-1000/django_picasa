@@ -401,12 +401,105 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
     clustering investigation found numerically-clean clusters that were visually incoherent) made
     this check necessary, not a formality, and here it held up.
 
+  - **Full-track (m*n) matching instead of start/end-only representatives -- investigated
+    2026-09-07, real improvement confirmed, but surfaced a deeper structural problem with
+    bipartite matching itself (see below).** Motivated by a direct question: rather than encoding
+    only each tracklet's first/last face, encode EVERY face in a tracklet and compare all m*n
+    face pairs between two tracklets, using an aggregate (max/mean/median/percentile) as the
+    tracklet-to-tracklet score. This is the same question this project already answered for
+    `classify_unassigned()` (max/1-NN found "maximally vulnerable to any single noisy face,"
+    percentile-gating held up better) -- worth re-testing here since track sizes (2-8 faces) are
+    much smaller than a `Person` gallery (hundreds+), where that logic was established.
+    - **Real result**: all four aggregates (max/mean/median/p75) agreed on one clearly valuable
+      stitch the start/end-only baseline missed entirely -- confirms full m*n comparison is a
+      real improvement, not just start/end-only being "good enough."
+    - **But max-similarity specifically pulled in 2 more borderline stitches that mean/median
+      rejected** -- visually checked via saved face crops (this project's own established
+      discipline: numerically-clean-looking merges have been visually wrong before, e.g. the
+      `.ignore`-bucket clustering investigation). Both disputed pairs were infant faces --
+      plausibly the same baby, genuinely hard to call even by eye, exactly the low-information
+      case this project's outlier-vulnerability concern was originally about.
+    - **p90 did NOT behave as an intermediate safety margin between mean and max, as hoped** --
+      it produced an IDENTICAL result to pure max (same 16 groups, accepted both disputed
+      pairs). Root cause: with only 2-8 faces per track, the 90th percentile of a small m*n
+      matrix often collapses to (or very near) the actual max value -- there simply aren't enough
+      data points to spread a percentile meaningfully away from the extreme. The "percentile
+      protects against outliers" logic that worked for `classify_unassigned()` assumed
+      hundreds-to-thousands of gallery faces; it doesn't transfer cleanly to comparing two small
+      tracks. A genuinely intermediate option (e.g. top-k average with a small fixed k, or
+      requiring >=2 pairs above threshold) was identified but not yet tried.
+
+  - **Bipartite (Hungarian) matching for stitching is the wrong tool structurally, not just
+    mistuned -- root-caused via a real diagnostic, not assumed.** Started from a concrete
+    observation: the same visually-identical person (glasses, reclined pose) appeared split
+    across 4 separate final groups in the contact-sheet review (real crops pulled and inspected,
+    not just counts) that should have chained into one identity. Dumped the actual similarity
+    values for the specific missed boundary pairs: **0.759 and 0.658 -- both comfortably above
+    the 0.40 threshold**, so this was never a threshold problem. `linear_sum_assignment` forces a
+    COMPLETE permutation across all n tracks (every row assigned to some column); with mostly-
+    disallowed (1e6-cost) entries and only a sparse few real candidates, the solver can be forced
+    to sacrifice a genuinely good pair to avoid an even-worse forced pairing elsewhere in the
+    matrix -- a real, structural failure mode of naive Hungarian matching on a mostly-sparse cost
+    matrix, not a parameter to tune away.
+    - **Tried: dummy "stay unmatched" padding** (standard optional-assignment trick -- pad the
+      cost matrix with a same-cost "remain unmatched" option per track, at exactly the
+      similarity threshold, so the solver is never forced to accept worse-than-threshold). First
+      attempt had a real bug (only zeroed the DIAGONAL of the dummy-to-dummy block instead of the
+      whole block, which incorrectly re-introduced the same forced-sacrifice problem via a
+      different path -- caught by testing, produced 0 stitches at all, obviously wrong). Once
+      fixed, it recovered more real matches, but surfaced a NEW, different problem:
+    - **Leapfrogging**: with "stay unmatched" available, the solver is free to pick the
+      objectively-highest-raw-similarity pair ANYWHERE in the video, with zero preference for
+      temporal proximity -- produced nonsensical long-distance stitches (e.g. a track near the
+      very start matched to one near the very end, skipping right over a much closer, more
+      sensible candidate in between). Confirmed this isn't an assignment-strategy artifact:
+      **iterative re-solving** (repeatedly solve, accept threshold-passing stitches, remove those
+      tracks, repeat) reproduced the exact same 16-group result as one-shot matching and still
+      missed the known-good 0.759 link -- traced to a real bug of its own (conflating a track's
+      sender-role and receiver-role as a single "matched, remove entirely" state, when a mid-chain
+      track legitimately needs both an incoming AND an outgoing link simultaneously; fixed by
+      tracking sender/receiver availability separately) -- and even fixed, round 2 still suffers
+      the SAME forced-full-permutation problem on whatever's left, just on a smaller pool, so
+      iterating doesn't structurally fix anything. **Pure greedy** (repeatedly take the single
+      best remaining candidate pair, no assignment-forcing at all) was tried as the simplest
+      alternative and made leapfrogging WORSE, not better (a track at the very start of the clip
+      matched to one at the very end, sim=0.866) -- confirming the missing ingredient across
+      every variant tried is the same: none of them have any notion of temporal proximity.
+    - **Tried: restricting candidates to a maximum real-time gap, plus a threshold sweep**
+      (10s/15s/unlimited cutoffs x 0.40/0.35/0.30 thresholds, 9 combos on the plain one-shot
+      solver). Gap cutoff had ZERO effect in any combo (the real max useful gap in this fixture
+      is 9.34s, safely under every cutoff tested, so nothing was ever actually excluded) --
+      confirming the missing 0.759 link is NOT explained by gap size at all. Lowering the
+      threshold only added one new, unrelated low-confidence link; the known-good link stayed
+      missing across all 9 combos, confirming (again) the failure is the forced-permutation
+      stealing problem, not a threshold or gap issue.
+    - **Tried: gap-restriction combined with dummy-padding together** (the two independently-
+      diagnosed fixes, combined). Did not converge to a clean result either -- produced MORE
+      groups than the plain one-shot baseline (21 and 20 vs. 16), and the leapfrogging problem
+      reappeared at the 15s cutoff (a start-of-clip track matched to one 14.68s later). Diminishing
+      returns from continuing to patch the bipartite-assignment formulation with more constraints.
+    - **Conclusion, and the actual next step**: the real mismatch is structural, not a tuning gap
+      -- bipartite assignment limits every track to at most ONE link in and ONE link out, but the
+      real problem (one person reappearing 3+ separate times across a video, with OTHER people's
+      tracks interleaved between appearances) is inherently a **many-to-one grouping problem**,
+      which no combination of gap cutoffs, dummy padding, iteration, or greedy selection can fix
+      by construction. The project already has the right tool for this shape of problem:
+      `verification_clustering.py`'s complete-linkage clustering (used for `Face.
+      verification_cluster_group`), which naturally handles "one identity, many separate
+      appearances" without any one-in/one-out limitation. Plan: apply that directly to
+      tracklet-level representative embeddings, enforcing the cannot-link constraint by forcing
+      temporally-overlapping tracklet pairs to an infinite/disallowed distance before clustering,
+      rather than continuing to force this into an end-to-start bipartite matching formulation.
+      Not yet tried as of this write-up.
+
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
-    group-size floor threshold for dropping transient tracklets, and whether to also pursue the
-    ffmpeg-side frame-selection optimization (skip decoding unsampled frames) before or after
-    landing a first real version. `Face.source_video_file`/`video_timestamp_seconds` fields +
-    migration, the black-frame check, and the actual scheduled task are all still not built --
-    this remains investigation only, no schema or pipeline code written yet.
+    group-size floor threshold for dropping transient tracklets, the full-track aggregation
+    metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
+    but not finalized), and whether to also pursue the ffmpeg-side frame-selection optimization
+    (skip decoding unsampled frames) before or after landing a first real version. `Face.
+    source_video_file`/`video_timestamp_seconds` fields + migration, the black-frame check, and
+    the actual scheduled task are all still not built -- this remains investigation only, no
+    schema or pipeline code written yet.
 - **Phase 4 (not started)**: `VideoFileSerializer`/viewset, a `media_type` discriminator for the
   slideshow/frontend to branch `<video>` vs `<img>` (frontend side out of scope for this repo).
 - **Phase 5, newly identified (2026-09-07), not started -- transcode pipeline, likely required
