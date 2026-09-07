@@ -182,34 +182,23 @@ class FaceSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
 
 class PersonSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
 
-    num_faces = serializers.SerializerMethodField()
-    num_possibilities = serializers.SerializerMethodField()
-    face_declared = FaceSubsetSerializer(read_only = True, many=True) 
+    # num_faces/num_possibilities are computed live -- see
+    # face_manager/live_counts.py's annotate_live_face_counts(), which
+    # PersonViewSet.get_queryset() applies. Plain (not SerializerMethodField)
+    # so DRF just reads the annotated queryset attribute directly; no
+    # per-object query here. (This used to be a SerializerMethodField
+    # with get_num_faces() doing a live per-object count and a commented-out,
+    # never-implemented get_num_possibilities() -- the latter meant any
+    # request that actually serialized a Person here raised AttributeError.)
+    num_faces = serializers.IntegerField(read_only=True)
+    num_possibilities = serializers.IntegerField(read_only=True)
+    face_declared = FaceSubsetSerializer(read_only = True, many=True)
 
     class Meta:
 
         model = Person
         fields = ['url', 'person_name', 'highlight_img', 'num_faces', \
         'num_possibilities', 'id', 'further_images_unlikely', 'face_declared']
-        # fields = ['url', 'person_name', 'highlight_img', 'num_faces', 'id']
-
-    def get_num_faces(self, obj):
-        # face_declared is the related field of the ForeignKey.
-        return obj.face_declared.count()
-
-    # def get_num_possibilities(self, obj):
-    #     # face_declared is the related field of the ForeignKey.
-    #     f1 = obj.face_poss1.count()
-    #     f2 = obj.face_poss2.count()
-    #     f3 = obj.face_poss3.count()
-    #     f4 = obj.face_poss4.count()
-    #     f5 = obj.face_poss5.count()
-
-    #     return  f1 + f2 + f3 + f4 + f5
-
-    
-    # def update(self, instance, validated_data):
-    #     print("Seri update")
 
 # Source : https://medium.com/django-rest-framework/django-rest-framework-viewset-when-you-don-t-have-a-model-335a0490ba6f
 class ParameterSerializer(serializers.Serializer):

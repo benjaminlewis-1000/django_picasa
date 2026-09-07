@@ -111,14 +111,6 @@ class faceAssigner():
         ########################################################
         # self.known_persons_to_dates()
 
-    # def reset_task(self):
-    #     people = Person.objects.all()
-    #     for p in people:
-    #         p.num_faces = p.face_declared.count()
-    #         p.num_possibilities = p.face_poss1.count() # + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
-    #         p.num_unverified_faces = p.face_declared.filter(validated=False).count()
-    #         p.save()
-
     def _cached_person(self, person_id):
         """Person instance if person_cache has it (the normal case after
         load_encodings()), else the raw id -- Face.set_possible_person()
@@ -152,7 +144,6 @@ class faceAssigner():
         ).count()
 
     def reset_possible_assignments(self):
-        Person.objects.all().update(num_possibilities = 0)
         Face.objects.filter(~Q(poss_ident1=None)).update(poss_ident1 = None)
         Face.objects.filter(~Q(poss_ident2=None)).update(poss_ident2 = None)
         Face.objects.filter(~Q(poss_ident3=None)).update(poss_ident3 = None)
@@ -375,23 +366,6 @@ class faceAssigner():
 
         for u_img in tqdm(unassigned.iterator()):
             self._classify_one_safely(u_img.id, u_img)
-
-        # Finish up by "trueing up" the num_assigned for each person. Runs
-        # once, here, after the classification loop fully completes --
-        # NOT per face. (Regression note: this briefly ended up inside
-        # _classify_one_safely() below during a since-reverted threading
-        # experiment, running once per face instead of once per
-        # execute() call -- 140k redundant 912-row Person iterations
-        # instead of one, caught by a real reprocess run's ETA jumping
-        # from ~10 hours to ~92. The regression test added for that,
-        # ExecuteThreadingTests.test_trueing_up_pass_runs_exactly_once_
-        # not_per_face, is worth keeping even post-revert.)
-        print("Verifying face counts...")
-        for p in tqdm(Person.objects.all()):
-            p.num_faces = p.face_declared.count()
-            p.num_possibilities = p.face_poss1.count() # + p.face_poss2.count() + p.face_poss3.count()+ p.face_poss4.count()+ p.face_poss5.count()
-            p.num_unverified_faces = p.face_declared.filter(validated=False).count()
-            p.save()
 
     def _classify_one_safely(self, face_id, face):
         try:

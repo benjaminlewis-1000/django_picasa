@@ -240,6 +240,31 @@ class PersonViewSetTests(ApiTestCase):
         person.refresh_from_db()
         self.assertTrue(person.further_images_unlikely)
 
+    def test_list_returns_live_num_faces_and_num_possibilities(self):
+        # Regression test: PersonSerializer.get_num_possibilities used to
+        # be commented out entirely while still declared as a
+        # SerializerMethodField, so GET /api/people/ raised AttributeError
+        # on every single request that actually serialized a Person --
+        # never caught because nothing exercised this endpoint directly.
+        # num_faces/num_possibilities are now computed live via
+        # PersonViewSet.get_queryset()'s annotate_live_face_counts().
+        person = Person.objects.create(person_name="Listed Person")
+        person.highlight_img.save("p.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
+        image = self.make_image()
+        self.make_face(image, declared_name=person)
+        other = Person.objects.create(person_name="Candidate Person")
+        other.highlight_img.save("p2.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
+        face2 = self.make_face(image)
+        face2.set_possible_person(other.id, 1, 0.8)
+
+        resp = self.client.get("/api/people/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        results = resp.data["results"]
+        person_row = next(r for r in results if r["id"] == person.id)
+        other_row = next(r for r in results if r["id"] == other.id)
+        self.assertEqual(person_row["num_faces"], 1)
+        self.assertEqual(other_row["num_possibilities"], 1)
+
 
 class FaceViewSetTests(ApiTestCase):
     def setUp(self):
@@ -722,11 +747,10 @@ class IgnoreReviewFlaggedPartitionTests(ApiTestCase):
         # Explicit invariant, not just implied by the two tests above:
         # every face with poss_ident1=.ignore appears in exactly one of
         # the two queries, and their union is the whole set with no
-        # overlap - queried straight against the DB (not the stored
-        # Person.num_possibilities counter, which is separate
-        # bookkeeping - see IgnoreReviewFlaggedCountTests below) so this
-        # would catch the query itself regressing back to overlapping or
-        # dropping rows, independent of that counter ever being right.
+        # overlap - queried straight against the DB (num_possibilities is
+        # itself a live query too now - see IgnoreReviewFlaggedCountTests
+        # below - but this test independently confirms the partition
+        # itself, regardless of how that count is computed).
         main_ids = set(json.loads(
             self.client.get(f"/api/paginate_obj_ids/{self.ignore.id}/face_poss").content
         )["id_list"])
@@ -748,9 +772,9 @@ class IgnoreReviewFlaggedPartitionTests(ApiTestCase):
         # "Flagged for review" view the way .ignore does, so excluding
         # mobile_review_hidden=True faces from their face_poss query made
         # a skipped candidate disappear from the gallery entirely (while
-        # still counting toward the sidebar's num_possibilities, a
-        # separate stored field) - reported by the user 2026-09-02 as "a
-        # person shows one unlabeled face but the gallery is empty."
+        # still counting toward the sidebar's num_possibilities) -
+        # reported by the user 2026-09-02 as "a person shows one
+        # unlabeled face but the gallery is empty."
         real_person = Person.objects.create(person_name="Garrett Egan Test")
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
         skipped_face = self.make_face(
@@ -788,12 +812,21 @@ class IgnoreReviewFlaggedCountTests(FaceFixtureMixin, TransactionTestCase):
         )
 
     def test_person_list_num_possibilities_excludes_flagged_for_ignore(self):
-        # .ignore's stored num_possibilities counter (Person model field)
-        # counts every poss_ident1 candidate regardless of the flag - the
-        # sidebar's main-screen count needs the same exclusion the query
-        # above applies, or it would overcount relative to what the main
-        # screen actually shows.
-        Person.objects.filter(pk=self.ignore.pk).update(num_possibilities=3)
+        # .ignore's live num_possibilities count includes every
+        # poss_ident1 candidate regardless of the flag - the sidebar's
+        # main-screen count needs the same exclusion the query above
+        # applies, or it would overcount relative to what the main
+        # screen actually shows. setUp already created 1 flagged
+        # candidate; add 2 more unflagged ones so the live total is 3.
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        self.make_face(
+            self.image, declared_name=blank, poss_ident1=self.ignore,
+            weight_1=0.5, mobile_review_hidden=False,
+        )
+        self.make_face(
+            self.image, declared_name=blank, poss_ident1=self.ignore,
+            weight_1=0.4, mobile_review_hidden=False,
+        )
         resp = self.client.get("/api/person_list/")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         results = json.loads(resp.content)["results"]

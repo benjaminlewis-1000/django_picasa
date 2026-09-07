@@ -544,10 +544,6 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'face_manager.clear_ignored_encodings',
         'schedule': crontab(minute='35', hour='*'),
     },
-   'set_face_counts': {
-       'task': 'face_manager.set_face_counts',
-       'schedule': crontab( minute = '55', hour='*/4'),
-   },
    'cluster_unverified_faces': {
         'task': 'face_manager.cluster_unverified_faces',
         # 1am -- clear of db_picasa's daily backup (2am) and weekly

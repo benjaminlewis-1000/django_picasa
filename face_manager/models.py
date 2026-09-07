@@ -67,20 +67,16 @@ class Person(models.Model):
 
     further_images_unlikely = models.BooleanField(default=False)
 
-    num_faces = models.IntegerField(default=0)
-    num_possibilities = models.IntegerField(default=0)
-    num_unverified_faces = models.IntegerField(default=0)
-
     gender = models.CharField(max_length=15, default="unknown")
 
     # id field has a primary key
     def delete(self):
         # Protect the no face assigned person from
-        # ever being deleted. 
+        # ever being deleted.
         if self.person_name == settings.BLANK_FACE_NAME:
             return
-        # Else, remove the saved image and 
-        # then delete the person object. 
+        # Else, remove the saved image and
+        # then delete the person object.
         try:
             os.remove(self.highlight_img.path)
 
@@ -95,47 +91,6 @@ class Person(models.Model):
 
     def __str__(self):
         return self.person_name
-
-    def increment_assigned(self):
-        self.num_faces += 1
-        self.save()
-
-    def increment_unverified(self):
-        self.num_unverified_faces += 1
-        self.save()
-
-    def increment_possible_num(self):
-        # Atomic DB-side increment, not a Python-level read-modify-write:
-        # faceAssigner caches Person instances across many
-        # classify_unassigned() calls (see person_cache in
-        # assign_faces.py) to avoid a Person.objects.get() round trip
-        # per call, and a multi-threaded reprocess can genuinely call
-        # this concurrently on the SAME cached instance for a popular
-        # person -- a plain self.num_possibilities += 1; self.save()
-        # would lose increments under that race. F() makes the increment
-        # itself race-free; refresh_from_db() then syncs this in-memory
-        # instance (shared across threads) back to the true DB value
-        # rather than leaving it holding a stale local count.
-        Person.objects.filter(pk=self.pk).update(num_possibilities=models.F('num_possibilities') + 1)
-        self.refresh_from_db(fields=['num_possibilities'])
-
-    def decrement_assigned(self):
-        self.num_faces -= 1
-        if self.num_faces < 0:
-            self.num_faces = 0
-        self.save()
-
-    def decrement_unverified(self):
-        self.num_unverified_faces -= 1
-        if self.num_unverified_faces < 0:
-            self.num_unverified_faces = 0
-        self.save()
-
-    def decrement_possible_num(self):
-        self.num_possibilities -= 1
-        if self.num_possibilities < 0:
-            self.num_possibilities = 0
-        self.save()
 
 class SingleFloatField(models.FloatField):
     """Django has no built-in single-precision float field -- FloatField
@@ -315,9 +270,6 @@ class Face(models.Model):
                 f"1 and {self.NUM_POSSIBLE_IDENTITIES} (NUM_POSSIBLE_IDENTITIES)."
             )
         if getattr(self, field_name) is not None:
-            person = getattr(self, field_name)
-            if poss_idx == 1:
-                person.decrement_possible_num()
             # Real attribute assignment (not a raw __dict__/attname poke) so
             # Model.save() doesn't reconcile the still-cached related object
             # back over this on write.
@@ -327,23 +279,13 @@ class Face(models.Model):
     def associate_person(self, person_id):
         # A one-stop-shop function to assign a Face to a given
         # Person. Unassociates the face with the old Person, if
-        # any, and decrements the counts of assigned faces. 
-        # Also removes values for possible identities. Increments
-        # counts for the new person appropriately.
+        # any. Also removes values for possible identities.
 
         assert type(person_id) is int, f"person_id must be an int corresponding to a database ID for a Person object."
         assert Person.objects.filter(id=person_id).exists(), f"Person with ID {person_id} does not exist in the database"
 
-        # Change the numbers for assigned to the old and new person objects
-        if self.declared_name.id != person_id:
-            self.declared_name.decrement_assigned()
-            if not self.validated: 
-                self.declared_name.decrement_unverified()
-
         new_id = Person.objects.get(id=person_id)
         self.declared_name = new_id
-        new_id.increment_assigned()
-        new_id.increment_unverified()
         self.validated = False
         self.written_to_photo_metadata = False
         self.verification_cluster_group = None
@@ -354,8 +296,6 @@ class Face(models.Model):
         self.save()
 
     def verify_person_in_image(self):
-        self.declared_name.decrement_unverified()
-
         self.validated = True
         self.verification_cluster_group = None
         self.save()
@@ -380,20 +320,12 @@ class Face(models.Model):
 
         self.verification_cluster_group = None
 
-        prev = self.declared_name
-        if prev is not None and prev.person_name != settings.BLANK_FACE_NAME:
-            prev.decrement_assigned()
-            if not self.validated:
-                prev.decrement_unverified()
-
         self.set_possibles_zero()  # clears poss_identN + weights, saves
 
         if self.declared_name_id != blank.id:
             self.declared_name = blank
             self.validated = False
             self.written_to_photo_metadata = False
-            blank.increment_assigned()
-            blank.increment_unverified()
             self.save()
 
     def set_possible_person(self, person_id, poss_idx, weight, save=True):
@@ -420,8 +352,6 @@ class Face(models.Model):
         assert weight >= 0
         assert weight <= 1.000001, f"weight was {weight}"
         new_poss_id = person_id if isinstance(person_id, Person) else Person.objects.get(id=person_id)
-        if poss_idx == 1:
-            new_poss_id.increment_possible_num()
         # self.__dict__[f'weight_{poss_idx}'] = weight
 
         exec(f"self.poss_ident{poss_idx} = new_poss_id")
@@ -455,9 +385,8 @@ class Face(models.Model):
         # Use eval statements to effect a change in the possible ID list.
         # Find if the removal ID is in the possible IDs, then bump everything
         # up higher in the possible IDs list, accounting for any "None" values. 
-        if person_unassociate_id in possible_ids: 
+        if person_unassociate_id in possible_ids:
             remove_idx = possible_ids.index(person_unassociate_id)
-            exec(f"self.poss_ident{remove_idx + 1}.decrement_possible_num()")
             source_idcs = [x for x in range(5) if x != remove_idx and possible_ids[x] is not None]
             dest_idcs = list(range(len(source_idcs)))
 
@@ -469,9 +398,6 @@ class Face(models.Model):
                     continue
                 exec(f"self.poss_ident{dest_offset + 1} = self.poss_ident{source_offset + 1}")
                 exec(f"self.weight_{dest_offset + 1} = self.weight_{source_offset + 1}")
-                if dest_offset == 0:
-                    # print("Dest offset", self.poss_ident1.person_name, self.poss_ident1.id)
-                    self.poss_ident1.increment_possible_num()
 
             if len(dest_idcs) > 0:
                 offset_start = max(dest_idcs) + 2

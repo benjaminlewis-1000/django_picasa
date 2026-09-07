@@ -23,10 +23,6 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   (`isProcessed=False`, retried later). Confirmed the 3 previously-stuck images (`99862`,
   `103837`, `108072`) are all `isProcessed=True` now — this entry is scoped down to just "find and
   fix the actual root cause," not "stops the whole pipeline," which is no longer true.
-- `Person.num_faces`/`num_possibilities`/`num_unverified_faces` are manually-synced cached
-  columns, not live queries — can silently drift stale if anything mutates faces outside the
-  model's own methods. `PersonSerializer.get_num_possibilities` is also missing entirely (likely
-  crashes `/api/people/` if that endpoint is ever actually hit).
 **Smaller tech debt:**
 - `set_possible_person()`/`reject_association()` still hardcode `5`/`range(1, 6)` via `eval`/
   `exec` instead of using `Face.NUM_POSSIBLE_IDENTITIES` — fine until that constant ever changes.
@@ -1346,34 +1342,60 @@ active production issue, not just cleanup — worth prioritizing the deploy once
   `SOFT_IGNORE_NAME` now equals `.ignore` in production's live `settings.py`, so `assign_faces`
   no longer recreates `.another_ignore` on its next scheduled run, and `close_ignored` correctly
   recognizes classifier-suggested candidates. Fully resolved.
-- **TODO: stop relying on manually-synced cached face-count columns on `Person`.**
-  `Person.num_faces`/`num_possibilities`/`num_unverified_faces` are plain `IntegerField`s only
-  kept in sync by `increment_assigned()`/`decrement_assigned()`/etc (called from `Face` model
-  methods like `associate_person()`), or recomputed wholesale by the scheduled
-  `face_manager.set_face_counts` task (`face_manager/tasks.py`'s `reset_task`) — never by a live
-  query, so any code path that mutates `Face.declared_name`/`poss_identN` without going through
-  those model methods (e.g. a bulk `.update()`) silently leaves the cached numbers wrong until
-  someone happens to notice or the scheduled task next runs. This bit us directly: right after
-  the `.another_ignore` → `.ignore` merge (2026-08-25), the underlying `Face` rows were correct
-  but `.ignore`'s cached counters were stale (`10,467`/`0` instead of the real
-  `103,317`/`115,335`), which is what `PersonListView` (`api/views.py`) actually serves to the
-  frontend for non-blank-sentinel people. Worked around in the moment by manually queuing
-  `set_face_counts` (`reset_task.delay()`) rather than looping and saving every `Person` by
-  hand — but that's a hack, not a fix; the real problem is that these numbers require a separate
-  sync step *at all*. Also folds in a second bug found while investigating this: `PersonSerializer`
-  (`api/serializers.py`) declares `num_possibilities = serializers.SerializerMethodField()` but
-  `get_num_possibilities` is commented out — any code path that actually serializes a `Person`
-  through this serializer (confirmed via direct test: `PersonSerializer(p).data` raises
-  `AttributeError: 'PersonSerializer' object has no attribute 'get_num_possibilities'`) crashes;
-  `PersonViewSet` (the `/api/people/` DRF router endpoint) uses this serializer, so it's likely
-  broken for any request that hits it, while `PersonListView` (`/api/person_list/`, hand-rolled,
-  no serializer) is presumably what the frontend actually relies on instead. Real fix needs to
-  address both symptoms of the same root cause together: either make `num_faces`/
-  `num_possibilities`/`num_unverified_faces` genuinely live (a `SerializerMethodField`/annotated
-  queryset computed on read, like `get_num_faces` already correctly does, no cached column at
-  all), or keep the cached-column approach but make every mutation path — `associate_person()`,
-  `remove_poss_ident()`, any future bulk operation — update it as a mandatory part of the same
-  transaction, with `get_num_possibilities` implemented to match instead of missing. Not started.
+- **DONE (2026-09-07): stopped relying on manually-synced cached face-count columns on
+  `Person` -- replaced with live queries.** `Person.num_faces`/`num_possibilities`/
+  `num_unverified_faces` used to be plain `IntegerField`s kept in sync by
+  `increment_assigned()`/`decrement_assigned()`/etc, or recomputed wholesale by the scheduled
+  `face_manager.set_face_counts` task -- never a live query, so any code path that mutated
+  `Face.declared_name`/`poss_identN` without going through those model methods (e.g. a bulk
+  `.update()`) silently left the cached numbers wrong. This bit us directly after the
+  `.another_ignore` → `.ignore` merge (2026-08-25) -- `.ignore`'s cached counters went stale until
+  manually re-synced. Also folded in a second, related bug: `PersonSerializer.get_num_possibilities`
+  was commented out entirely while still declared as a `SerializerMethodField`, so `GET
+  /api/people/` (`PersonViewSet`) crashed with `AttributeError` on every request that actually
+  serialized a `Person` -- never caught because nothing exercised that endpoint directly until this
+  work added a regression test for it.
+
+  **Investigated and benchmarked empirically before implementing** (see the session's own
+  benchmarking, not repeated in full here): a naive per-person query loop across all 915 people
+  took ~4.5s; a naive multi-`Count(distinct=True)` joined annotation (the "obvious" single-query
+  fix) instead produced a Cartesian-product join per person and *hung for 10+ minutes* on real
+  data -- confirmed via `pg_stat_activity`, not assumed. Switching to correlated subqueries
+  (`Subquery`/`OuterRef`, one per counted relation, no join) avoided that entirely and got the
+  single-query version to ~1s. Two new covering indexes,
+  `face_manager_face_declared_name_id_covering` (`declared_name_id`) `INCLUDE (id, validated)` and
+  `face_manager_face_poss_ident1_id_covering` (`poss_ident1_id`) `INCLUDE (id)`, let Postgres
+  answer the counts via index-only scans (`Heap Fetches: 0`, confirmed via `EXPLAIN ANALYZE`)
+  instead of bitmap-heap-scanning the wide `face_manager_face` rows (512-d embeddings, keypoints,
+  etc.) just to count 3 small columns -- cut it to ~0.2-0.4s single-threaded. Splitting the person
+  set across a few threads, each its own DB connection (genuine multi-core parallelism, since each
+  Postgres connection is its own backend process -- not fighting Python's GIL), got the full
+  915-person roster to ~0.2s at 4 threads. Net: **~4.5s naive loop → ~0.2s live, indexed, and
+  parallel** -- fast enough to serve directly from the API with no caching needed.
+
+  **Implementation**: new `face_manager/live_counts.py` -- `annotate_live_face_counts()` (single
+  correlated-subquery-annotated queryset, used by `PersonViewSet.get_queryset()`) and
+  `compute_live_face_counts()` (the 4-thread chunked version, used by `PersonListView`, which
+  computes counts for its full, unpaginated person list up front rather than reading cached
+  fields). The two covering indexes ship as a real migration
+  (`face_manager/migrations/0010_face_count_covering_indexes.py`, `atomic = False` +
+  `CREATE/DROP INDEX CONCURRENTLY IF NOT EXISTS`, since they were already created directly against
+  production via `CREATE INDEX CONCURRENTLY` during the investigation -- the migration is a
+  documented, idempotent no-op there and a real create for any fresh/CI/dev database).
+  `Person.num_faces`/`num_possibilities`/`num_unverified_faces` model fields removed
+  (`0009_remove_person_face_counts.py`), along with the six `increment_*`/`decrement_*` bookkeeping
+  methods on `Person` and every call site (`Face.associate_person()`/`verify_person_in_image()`/
+  `reset_to_pool()`/`remove_poss_ident()`/`set_possible_person()`/`reject_association()` all
+  simplified, logic otherwise unchanged), the now-redundant `face_manager.set_face_counts` Celery
+  task and its `reset_face_counts` management command, `assign_faces.py`'s post-`execute()`
+  "trueing up" recompute pass (and the `ExecuteTrueingUpTests` regression test that existed only to
+  cover a since-reverted threading bug in that pass), and the recompute blocks in
+  `dedupe_overlapping_faces`/`merge_duplicate_imagefiles` (both now report "computed live, no
+  recompute needed" instead). `PersonSerializer.num_faces`/`num_possibilities` are now plain
+  `IntegerField`s reading the annotated queryset attribute directly (no `SerializerMethodField`, no
+  per-object query). Full fast suite: 320/320 passing (net change from the prior 322 baseline
+  matches exactly: -2 removed counter-bookkeeping tests +1 replacement, -1 trueing-up test, -1
+  removed dedupe-recompute test, +1 new `/api/people/` regression test).
 - **Fixed (2026-08-25): the non-daemon background thread in `api/views.py`** (`work_thread` /
   `background_bulk_processor`) — turned out not to be just a local testing annoyance ("looks
   hung, isn't"). In CI, with no `--keepdb` and no one around to manually `kill` the leftover

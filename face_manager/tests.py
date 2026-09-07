@@ -35,6 +35,7 @@ from unittest.mock import patch, MagicMock
 
 from face_manager.assign_faces import faceAssigner
 from face_manager.face_extract_encode import FaceExtractor
+from face_manager.live_counts import compute_live_face_counts
 from face_manager.models import Face, Person, get_default_blank_person, clear_confirmed_ignore_face_encodings
 from face_manager.pyramidal_detector import PyramidalDetector
 from face_manager.test_face_cache import cached_detect
@@ -145,33 +146,29 @@ class PersonModelTests(TestCase):
         blank = get_default_blank_person()
         self.assertEqual(blank.person_name, settings.BLANK_FACE_NAME)
 
-    def test_increment_decrement_counters(self):
+    def test_live_face_counts_reflect_real_assignments(self):
+        # Person.num_faces/num_possibilities/num_unverified_faces used to
+        # be cached IntegerFields, manually kept in sync by
+        # increment_*/decrement_* methods called from Face's assignment
+        # methods -- removed because that bookkeeping could silently
+        # drift stale (e.g. a bulk .update() bypassing it entirely). Now
+        # computed live -- see face_manager/live_counts.py.
         person = make_person("Counted")
-        person.increment_assigned()
-        person.increment_unverified()
-        person.increment_possible_num()
-        person.refresh_from_db()
-        self.assertEqual(person.num_faces, 1)
-        self.assertEqual(person.num_unverified_faces, 1)
-        self.assertEqual(person.num_possibilities, 1)
+        image = make_image()
+        face = make_face(image, declared_name=person)
+        counts = compute_live_face_counts([person.id])[person.id]
+        self.assertEqual(counts['num_faces'], 1)
+        self.assertEqual(counts['num_unverified_faces'], 1)
 
-        person.decrement_assigned()
-        person.decrement_unverified()
-        person.decrement_possible_num()
-        person.refresh_from_db()
-        self.assertEqual(person.num_faces, 0)
-        self.assertEqual(person.num_unverified_faces, 0)
-        self.assertEqual(person.num_possibilities, 0)
+        face.verify_person_in_image()
+        counts = compute_live_face_counts([person.id])[person.id]
+        self.assertEqual(counts['num_faces'], 1)
+        self.assertEqual(counts['num_unverified_faces'], 0)
 
-    def test_decrement_below_zero_clamps_to_zero(self):
-        person = make_person("Clamped")
-        person.decrement_assigned()
-        person.decrement_unverified()
-        person.decrement_possible_num()
-        person.refresh_from_db()
-        self.assertEqual(person.num_faces, 0)
-        self.assertEqual(person.num_unverified_faces, 0)
-        self.assertEqual(person.num_possibilities, 0)
+        other = make_person("Other")
+        face.set_possible_person(other.id, 1, 0.9)
+        counts = compute_live_face_counts([other.id])[other.id]
+        self.assertEqual(counts['num_possibilities'], 1)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
@@ -274,7 +271,6 @@ class FaceModelTests(TestCase):
 
     def test_verify_person_in_image(self):
         person = make_person("Verifiable")
-        person.increment_unverified()
         face = make_face(self.image, declared_name=person)
         face.verify_person_in_image()
         face.refresh_from_db()
@@ -287,20 +283,18 @@ class FaceModelTests(TestCase):
         # filter declared_name__person_name == settings.BLANK_FACE_NAME.
         blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
         owner = make_person("PrevOwner")
-        owner.increment_assigned()
         guesser = make_person("Guesser")
         face = make_face(self.image, declared_name=owner)
         face.set_possible_person(guesser.id, 1, 0.8)
 
         face.reset_to_pool()
         face.refresh_from_db()
-        owner.refresh_from_db()
 
         self.assertEqual(face.declared_name_id, blank.id)
         self.assertIsNotNone(face.declared_name)
         self.assertFalse(face.validated)
         self.assertIsNone(face.poss_ident1)
-        self.assertEqual(owner.num_faces, 0)
+        self.assertEqual(owner.face_declared.count(), 0)
 
     def test_reject_association_removes_from_possibles(self):
         person = make_person("Rejectable")
@@ -1363,45 +1357,6 @@ class LoadEncodingsCachingTests(TestCase):
         self.assertEqual(len(fresh_assigner.candidate_dict[self.person.id]), 2)
 
 
-@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
-class ExecuteTrueingUpTests(TestCase):
-    """Regression coverage for execute()'s "Verifying face counts"
-    trueing-up pass (Person.objects.all(), recomputing num_faces/
-    num_possibilities/num_unverified_faces from scratch): during a
-    since-reverted multi-threading experiment, this briefly ended up
-    inside the per-face helper instead of execute() itself, so it ran
-    once PER FACE instead of once per execute() call -- a real
-    production incident where a 140k-face reprocess's ETA jumped from
-    ~10 hours to ~92 (140k redundant full-Person-table passes). Worth
-    keeping this test even though the threading experiment itself was
-    reverted (threading didn't actually speed things up here -- likely
-    BLAS thread oversubscription from numpy already parallelizing the
-    matmul internally -- and wasn't worth the added complexity)."""
-
-    def test_trueing_up_pass_runs_exactly_once_not_per_face(self):
-        img = make_image()
-        prolific = make_person("Trueing Up Person")
-        base = np.zeros(512)
-        base[0] = 1.0
-        for _ in range(12):
-            f = make_face(img, declared_name=prolific)
-            f.face_encoding_512 = base.tolist()
-            f.save()
-
-        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
-        for _ in range(4):
-            f = make_face(img, declared_name=blank_person)
-            f.face_encoding_512 = base.tolist()
-            f.save()
-
-        assigner = faceAssigner()
-        assigner.ENCODINGS_PKL_FILE = "/tmp/face_manager_test_media/exec_trueing_up_cache.pkl"
-
-        with patch.object(Person.objects, 'all', wraps=Person.objects.all) as mock_all:
-            assigner.execute(redo_all=True)
-        self.assertEqual(mock_all.call_count, 1)
-
-
 class FlattenKpsTests(unittest.TestCase):
     """Unit tests for FaceExtractor._flatten_kps(), the helper that turns
     InsightFace's (5, 2) landmark array into the flat 10-float list stored
@@ -1740,14 +1695,6 @@ class DedupeOverlappingFacesTests(TestCase):
         call_command('dedupe_overlapping_faces', '--yes')
         self.assertEqual(Face.objects.filter(pk__in=[a.pk, b.pk]).count(), 2)
 
-    def test_person_face_counts_are_recomputed_after_dedupe(self):
-        a, b = self._duplicate_pair()
-        self.person.num_faces = 999  # deliberately stale
-        self.person.save()
-        call_command('dedupe_overlapping_faces', '--yes')
-        self.person.refresh_from_db()
-        self.assertEqual(self.person.num_faces, 1)
-
     def test_rerunning_after_cleanup_finds_nothing(self):
         self._duplicate_pair()
         call_command('dedupe_overlapping_faces', '--yes')
@@ -1841,25 +1788,21 @@ class MergeDuplicateImageFilesTests(TestCase):
         face.refresh_from_db()
         self.assertEqual(face.source_image_file_id, dup.pk)
 
-    def test_person_face_counts_recomputed_for_collapsed_away_person(self):
+    def test_collapsed_away_persons_face_is_actually_gone(self):
         # A plain transfer with no collision doesn't change any person's
         # face count (declared_name is untouched by moving source_image_
-        # file) -- recompute only matters when the post-transfer collapse
-        # actually DELETES a face, which is what this exercises: the
-        # losing side's stale cached count should get corrected.
+        # file) -- this exercises the case where the post-transfer
+        # collapse actually DELETES a face (the losing side's only face).
         dup = self._make_contaminated_duplicate(self.primary_img)
         losing_person = make_person("Losing Person")
         make_face(self.primary_img, declared_name=losing_person,
                   box_left=1, box_top=1, box_right=30, box_bottom=30)
         make_face(dup, declared_name=self.person, validated=True,
                   box_left=1, box_top=1, box_right=30, box_bottom=30)
-        losing_person.num_faces = 999
-        losing_person.save()
 
         call_command('merge_duplicate_imagefiles', '--yes')
 
-        losing_person.refresh_from_db()
-        self.assertEqual(losing_person.num_faces, 0)
+        self.assertEqual(losing_person.face_declared.count(), 0)
 
     def test_rerunning_after_merge_finds_nothing_more_to_do(self):
         dup = self._make_contaminated_duplicate(self.primary_img)
