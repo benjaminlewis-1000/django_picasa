@@ -58,6 +58,7 @@ if in_docker:
         
     PHOTO_ROOT = '/photos'
     PHOTO_ROOT_RW = '/photos_rw'
+    VIDEO_ROOT = '/videos'
     TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
     ALLOWED_HOSTS = ['localhost',
         '127.0.0.1', 
@@ -86,6 +87,7 @@ else:
     SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
     ALLOWED_HOSTS = ['localhost', '127.0.0.1']
     PHOTO_ROOT = '/home/benjamin/git_repos/picasa_files/actual_imgs'
+    VIDEO_ROOT = '/home/benjamin/git_repos/picasa_files/actual_videos'
     TEST_IMG_DIR_FILEPOPULATE = '/home/benjamin/git_repos/picasa_files/test_imgs'
 
     STATIC_URL = 'http://localhost/static/'
@@ -589,7 +591,24 @@ FILEPOPULATOR_THUMBNAIL_SIZE_BIG = (500, 500)
 FILEPOPULATOR_THUMBNAIL_SIZE_MEDIUM = (250, 250)
 FILEPOPULATOR_THUMBNAIL_SIZE_SMALL = (100, 100)
 FILEPOPULATOR_SERVER_IMG_DIR = PHOTO_ROOT # root location of images you want to index into. (This maybe will change)
-FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code. 
+
+# VIDEO_ROOT is a single bind mount (host: /mnt/data/samba_share/Video)
+# covering several sibling folders, not all of which are meant to be
+# scanned yet -- rather than mounting each wanted folder separately (or
+# adding exclude-list logic to the video ingestion walk), VIDEO_ROOTS
+# explicitly lists only the subfolders to actually walk. Adding another
+# folder later, or excluding one, is a one-line change here, no new
+# mount or code change needed.
+VIDEO_ROOTS = [
+    os.path.join(VIDEO_ROOT, 'Our_Home_Videos'),
+    os.path.join(VIDEO_ROOT, 'Lewis_family_videos'),
+]
+# Also scan PHOTO_ROOT for videos interspersed in the existing photo
+# tree (some are, per the user, alongside the two dedicated folders
+# above).
+FILEPOPULATOR_SERVER_VIDEO_DIRS = VIDEO_ROOTS + [PHOTO_ROOT]
+
+FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code.
 FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory that will have validation images when testing the app.
 FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL = 150 # Maximum size of the short edge for thumbnails.
 SLIDESHOW_API_KEY = os.environ['PICASA_API_KEY']
