@@ -653,31 +653,20 @@ class ImageFile(models.Model):
                 self.orientation = 1
 
         if is_heic:
-            # Empirically, pillow_heif/libheif auto-applies any
+            # Empirically, pillow_heif/libheif usually auto-applies any
             # container-level rotation transform (irot/imir boxes) during
             # decode and resets the EXIF Orientation tag to 1 to match --
-            # verified against 8 real-world iPhone HEIC samples (models 12
-            # through 17 Pro), all of which came back as orientation 1
-            # regardless of the photo's actual portrait/landscape framing.
-            # A different value means either an encoder that behaves
-            # differently than what's been tested, or something else
-            # unexpected -- rather than guess at a second rotation on top
-            # of whatever the decoder already did (risking a silently
-            # wrong image), fail loudly. Raising a plain OSError here
-            # routes through the same corrupted-image handling as
-            # everything else (FailedImageFile / image_load_failed,
-            # logged, not retried forever) via process_new_no_md5()'s
-            # callers in scripts.py.
-            if self.orientation != 1:
-                msg = (
-                    f"HEIC file {self.filename} has unexpected EXIF "
-                    f"orientation {self.orientation} (expected 1) -- needs "
-                    f"manual review before this can be trusted."
-                )
-                print(msg)
-                settings.LOGGER.error(msg)
-                raise OSError(msg)
-
+            # true for all 8 real-world iPhone HEIC samples (models 12
+            # through 17 Pro) this was originally verified against. A real
+            # production file (IMG_9370.HEIC) later showed that doesn't
+            # always hold: it was rotated by an external tool that only
+            # flipped the orientation tag (to 8) without re-encoding the
+            # pixels, so libheif had nothing to auto-apply. Confirmed
+            # visually that applying the tag via the same
+            # apply_exif_orientation() JPEG already uses (below, shared
+            # rather than duplicated) produces the correct upright image
+            # in that case -- so a non-1 orientation is now just handled
+            # like any other image instead of being rejected.
             n_frames = getattr(self.image, 'n_frames', 1)
             if n_frames > 1:
                 msg = (
