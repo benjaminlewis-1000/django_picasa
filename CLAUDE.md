@@ -33,6 +33,14 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 - "Mark image for deletion" button for the slideshow.
 - "Failed to open" image list surface (backend data — `image_load_failed`/`FailedImageFile` — is
   ready; frontend work never started).
+- A way to upload new files from the frontend, including zip archives (would need server-side
+  unpacking before the normal ingestion path could pick them up) — requested 2026-09-07, not
+  scoped (no existing upload endpoint on this backend at all yet — would need a new one designed
+  alongside the frontend work).
+- A status page — requested 2026-09-07, not scoped. `/api/server_stats/` (`StatsViewSet` /
+  `ServerStatsSerializer`) already exists and surfaces some of this (image/face counts, percent
+  processed, estimated time remaining) but was built for a different purpose; worth checking
+  whether it's sufficient as-is or needs new backend fields once the frontend design is known.
 
 (Resolved items -- fixed tests, the Django 6.1 upgrade, pruned-stale brainstormed ideas, etc. --
 have been cleared from this index once actually done; their full write-ups remain in the dated
