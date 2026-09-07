@@ -34,6 +34,7 @@ from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, guess_
 # from .forms import ImageFileForm, DirectoryForm
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
 from face_manager.models import Face
+from common.open_img_oriented import apply_exif_orientation
 
 
 def _tiny_jpeg_bytes(size=(30, 30)):
@@ -1371,14 +1372,16 @@ class HeicIngestionTests(TestCase):
     hold in both environments.
 
     Verified empirically (see CLAUDE.md) against all 8 real samples:
-    pillow_heif/libheif always decodes to plain RGB, and always reports
+    pillow_heif/libheif always decodes to plain RGB, and usually reports
     EXIF orientation 1 regardless of the photo's actual portrait/
-    landscape framing -- meaning it auto-applies any container-level
-    rotation transform during decode and resets the tag to match. The
-    guards below assume that continues to hold for any real-world HEIC
-    this pipeline ever sees, and fail loudly (recorded via
-    FailedImageFile/image_load_failed, not silently) rather than risk a
-    silently wrong rotation if it ever doesn't.
+    landscape framing -- meaning it usually auto-applies any container-
+    level rotation transform during decode and resets the tag to match.
+    A real production file (IMG_9370.HEIC, orientation 8) showed that
+    doesn't always hold, so a non-1 orientation is now rotated via the
+    same apply_exif_orientation() JPEG uses rather than rejected. The
+    multi-frame (Live Photo/burst) guard below still fails loudly
+    (recorded via FailedImageFile/image_load_failed, not silently) since
+    that case is still genuinely unsupported.
     """
 
     HEIC_DIR = '/photos/heic_stub'
@@ -1434,20 +1437,80 @@ class HeicIngestionTests(TestCase):
         if not found_any:
             self.skipTest("no fixture in HEIC_DIR has GPS data (expected for CI's synthetic stub)")
 
-    def test_orientation_guard_fails_loudly_on_non_one_orientation(self):
+    def test_non_one_orientation_is_rotated_and_ingests_successfully(self):
+        # Regression test for a fixed bug: a non-1 HEIC orientation used
+        # to raise OSError and be recorded as a FailedImageFile instead
+        # of being ingested, on the (usually true, but not always, see
+        # IMG_9370.HEIC in CLAUDE.md) assumption that libheif always
+        # normalizes this itself. Now it's rotated via
+        # apply_exif_orientation(), same as JPEG.
         path = os.path.join(self.HEIC_DIR, self._heic_files()[0])
+        raw_width, raw_height = Image.open(path).size
 
         class FakeExif(dict):
             def get_ifd(self, tag):
                 return {}
 
-        fake_exif = FakeExif({274: 6})  # Orientation tag id = 274
+        fake_exif = FakeExif({274: 6})  # Orientation tag id = 274; 6 = 90deg CW
         with mock.patch("PIL.Image.Image.getexif", return_value=fake_exif):
             create_image_file(path)
 
-        self.assertFalse(ImageFile.objects.filter(filename=path).exists())
-        failed = FailedImageFile.objects.get(filename=path)
-        self.assertIn("orientation", failed.error_message.lower())
+        self.assertFalse(FailedImageFile.objects.filter(filename=path).exists())
+        img = ImageFile.objects.get(filename=path)
+        self.assertEqual(img.orientation, 6)
+        # Orientation 6 is a 90-degree rotation, so width/height swap
+        # relative to the raw (unrotated) decode.
+        self.assertEqual(img.width, raw_height)
+        self.assertEqual(img.height, raw_width)
+        self.assertTrue(os.path.isfile(img.thumbnail_big.path))
+
+    def test_all_orientation_codes_round_trip_correctly_on_real_photos(self):
+        # Broader validation for the same fix as
+        # test_non_one_orientation_is_rotated_and_ingests_successfully,
+        # using real photo pixel data instead of a single synthetic
+        # rotation and a single orientation code: for every real HEIC
+        # fixture (all naturally orientation 1 -- already upright) and
+        # every non-identity EXIF orientation code, simulate what that
+        # code's "as captured" raw pixels would look like (the exact
+        # mathematical inverse of apply_exif_orientation()'s own
+        # transform for that code), then confirm apply_exif_orientation()
+        # restores the original upright pixels exactly. This is the same
+        # helper JPEG has always used -- this test exists to give HEIC's
+        # newly-relaxed guard (see CLAUDE.md, IMG_9370.HEIC) the same
+        # confidence for every orientation value, not just the one
+        # production actually hit.
+        def simulate_raw(image, orientation):
+            if orientation == 2:
+                return image.transpose(Image.FLIP_LEFT_RIGHT)
+            if orientation == 3:
+                return image.transpose(Image.ROTATE_180)
+            if orientation == 4:
+                return image.transpose(Image.FLIP_TOP_BOTTOM)
+            if orientation == 5:
+                return image.transpose(Image.ROTATE_270).transpose(Image.FLIP_LEFT_RIGHT)
+            if orientation == 6:
+                return image.transpose(Image.ROTATE_90)
+            if orientation == 7:
+                return image.transpose(Image.ROTATE_270).transpose(Image.FLIP_TOP_BOTTOM)
+            if orientation == 8:
+                return image.transpose(Image.ROTATE_270)
+
+        for filename in self._heic_files():
+            path = os.path.join(self.HEIC_DIR, filename)
+            original = Image.open(path).convert('RGB')
+            orig_arr = np.array(original)
+            for code in range(2, 9):
+                raw = simulate_raw(original, code)
+                restored = apply_exif_orientation(raw, code)
+                restored_arr = np.array(restored)
+                self.assertEqual(
+                    restored_arr.shape, orig_arr.shape,
+                    f"{filename} orientation={code}: shape mismatch after round-trip",
+                )
+                self.assertTrue(
+                    np.array_equal(restored_arr, orig_arr),
+                    f"{filename} orientation={code}: pixels did not round-trip exactly",
+                )
 
     def test_multi_frame_guard_fails_loudly(self):
         path = os.path.join(self.HEIC_DIR, self._heic_files()[0])

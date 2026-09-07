@@ -27,9 +27,6 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   columns, not live queries — can silently drift stale if anything mutates faces outside the
   model's own methods. `PersonSerializer.get_num_possibilities` is also missing entirely (likely
   crashes `/api/people/` if that endpoint is ever actually hit).
-- HEIC files with a non-1 EXIF orientation currently fail loudly instead of being handled — found
-  via one real user photo, needs a design decision before extending the pipeline to apply it.
-
 **Smaller tech debt:**
 - `set_possible_person()`/`reject_association()` still hardcode `5`/`range(1, 6)` via `eval`/
   `exec` instead of using `Face.NUM_POSSIBLE_IDENTITIES` — fine until that constant ever changes.
@@ -956,19 +953,34 @@ ideas, so a future session doesn't have to redo this from scratch:
     `filepopulator/data/major_places.csv` (or a broader gazetteer if that's too narrow for
     arbitrary manual entries) as the source of truth for what counts as valid.
   Not started.
-- **TODO: HEIC files with a non-1 EXIF orientation currently fail loudly instead of being
-  handled.** Found 2026-08-26: a user rotated a real HEIC (`IMG_9370.HEIC`) via an external tool
-  that only flipped the orientation tag (now 8) without re-encoding pixels (raw dimensions
-  unchanged) -- unlike every real HEIC sample tested when this guard was built, where libheif
-  always baked the rotation into the pixels at decode and reset the tag to 1. `_init_image()`'s
-  HEIC-specific guard (`filepopulator/models.py`) deliberately raises `OSError` on any non-1
-  orientation rather than guessing, so this file will get flagged `image_load_failed=True`
-  instead of reprocessing with the new rotation. Possible fix: extend HEIC handling to actually
-  apply non-1 orientations via `apply_exif_orientation()` (the same function JPEG already uses)
-  instead of rejecting them outright -- a real behavior change, not done yet, needs discussion
-  first. Not a JPEG problem: JPEG's orientation-changed case is already correctly handled by
-  `create_image_file()`'s "same pixel hash, different orientation" branch (stale faces cleared,
-  row updated in place, redetection triggered).
+- **DONE (2026-09-07): HEIC files with a non-1 EXIF orientation are now handled instead of
+  failing loudly.** Found 2026-08-26: a user rotated a real HEIC (`IMG_9370.HEIC`) via an external
+  tool that only flipped the orientation tag (to 8) without re-encoding pixels (raw dimensions
+  unchanged) -- unlike every real HEIC sample tested when this guard was originally built, where
+  libheif always baked the rotation into the pixels at decode and reset the tag to 1.
+  `_init_image()`'s HEIC-specific guard (`filepopulator/models.py`) used to deliberately raise
+  `OSError` on any non-1 orientation rather than guessing, flagging the file
+  `image_load_failed=True` instead of processing it. Before changing anything, visually confirmed
+  applying the tag-8 rotation to `IMG_9370.HEIC`'s actual pixels via `apply_exif_orientation()`
+  (the same shared helper JPEG already uses) produces the correct upright image -- sent both the
+  raw (sideways) and rotated decodes to the user for a direct visual check, confirmed correct.
+  Fixed by simply removing the guard's `raise OSError` -- `_init_image()` already calls
+  `apply_exif_orientation()` unconditionally further down for every image regardless of format, so
+  a non-1 HEIC orientation now just gets rotated like any other image, no HEIC-specific rotation
+  logic needed. The separate multi-frame (Live Photo/burst) guard is untouched -- still genuinely
+  unsupported, still fails loudly. **Broader validation beyond the one production file**, per the
+  user's request: wrote a round-trip test (`test_all_orientation_codes_round_trip_correctly_on_
+  real_photos`) that takes each of the 8 real HEIC fixtures (all naturally orientation 1),
+  simulates what each of the 7 non-identity EXIF orientation codes' "as-captured" raw pixels would
+  look like (the exact mathematical inverse of `apply_exif_orientation()`'s own transform for that
+  code), and confirms `apply_exif_orientation()` restores the original upright pixels exactly --
+  56 combinations (8 photos x 7 codes), all pixel-exact matches, not just dimension/shape checks.
+  Replaced the old `test_orientation_guard_fails_loudly_on_non_one_orientation` test with
+  `test_non_one_orientation_is_rotated_and_ingests_successfully` (confirms a non-1-orientation HEIC
+  now ingests successfully with correctly swapped width/height, no `FailedImageFile` record).
+  Full fast suite: 322/322 passing. Not a JPEG problem: JPEG's orientation-changed case was already
+  correctly handled by `create_image_file()`'s "same pixel hash, different orientation" branch
+  (stale faces cleared, row updated in place, redetection triggered).
 - **Gotcha: single-file Docker bind mounts go stale on any edit that replaces the file (rename over
   original) rather than editing in place** — found 2026-08-26 while iterating on
   `dockerize/postgres_bak.sh` (bind-mounted into `db_picasa` at `/etc/periodic/daily/postgres_bak_sh`,
