@@ -957,6 +957,38 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       cases -- not treat `00023.MTS`'s specific baby-sibling-ambiguity problem as the only thing
       to solve for.
 
+  - **Tried a genuinely different embedding CNN alongside insightface (2026-09-08), per the
+    user's question ("what if we used another CNN?")** -- `facenet-pytorch`'s
+    `InceptionResnetV1(pretrained='vggface2')`, a different architecture trained on a different
+    dataset, installed with `pip install facenet-pytorch --no-deps` (plain `pip install` would
+    have pulled ~2-3GB of redundant CUDA wheels since `torch`/`torchvision` were already present
+    for other reasons in this environment). Both models were fed the IDENTICAL aligned crop per
+    face (`insightface.utils.face_align.norm_crop` at the real 5-point kps, 112px -- the
+    resolution insightface's own template requires -- then resized to 160px for facenet's input)
+    so the embedding model was the only variable, run against the same `00023.MTS` tracks used
+    throughout this investigation.
+    - **The core finding replicates under a second, independent model: the glasses-woman still
+      splits into 2 stable groups under facenet too** (a 6-track and a 13-track group, at every
+      threshold tested 0.6 down to 0.3) -- real, convergent evidence that this specific split is
+      a genuine embedding-variability property of her actual appearances in this video, not an
+      artifact of insightface's particular training data or architecture.
+    - **But the two models don't agree on everything -- their clustering compositions genuinely
+      differ**, especially for the smaller, harder-to-place tracks. Most notably: the specific
+      false merge found in the combined-pipeline test (insightface's group mixing her face into
+      spans `220,940,1260,2340,2740,3200`) does NOT reproduce identically under facenet -- `(940,
+      940)` lands as its own clean singleton instead of joining that group, and `(220,240)`
+      separates out cleanly with no contamination visible in either. This doesn't prove facenet
+      is more accurate in general (not independently verified against ground truth beyond visual
+      inspection, and it has its own different small-group placements that weren't individually
+      checked), but it demonstrates the two models are not making identical mistakes.
+    - **This points at a real, promising direction not yet built: agreement-gated merging** --
+      only trust a track-to-track (or track-to-gallery) merge when independently-trained models
+      concur, rather than relying on any single embedding space's judgment call alone. Given the
+      two models here already disagreed on exactly the case that was shown to be a real false
+      merge, requiring agreement is a plausible, concrete way to catch at least some of the
+      contamination risk this investigation's clustering approach keeps running into -- worth a
+      real, systematic test (not just this one spot-check) before being treated as validated.
+
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
     metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
