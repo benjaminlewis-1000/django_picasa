@@ -561,6 +561,55 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       picking the right algorithm or threshold. Real cross-frame tracking beyond simple IOU+gap-
       tolerance remains explicitly Phase 3.5, not Phase 3, per the project's existing phasing.
 
+  - **Real, confirmed bug found and root-caused (2026-09-07): raw-pipe frame extraction never
+    deinterlaces, producing visible combing/blocking artifacts on any moving subject in an
+    interlaced source video -- this, not a transition, is what the user actually spotted as
+    "encoding artifacts" on a contact sheet.** Started from the user's own correction ("It's not
+    a transition, just some faces on the contact sheet had some encoding artifacts, some
+    interleaving I think") after an initial hypothesis (a same-location-neighbor-frame check to
+    catch spurious detections from editing transitions) came back clean against two real
+    fixtures with no editing cuts, so didn't actually test the real concern. Checked
+    `ffprobe`'s `field_order` directly against all 8 real fixtures: **`00023.MTS`,
+    `20120309182349.mpg`, and `20191005094939.m2ts` are all `field_order=tt`** (top-field-first
+    interlaced) -- exactly the same three formats already flagged elsewhere in this file as
+    needing the `ffmpeg` raw-pipe fix for `cv2`'s frame-corruption bug (mpg/mts/m2ts, ~624 real
+    files, ~9% of the library). The other 5 sample formats (wmv/mov/avi/3gp/mp4) came back
+    `unknown` or `progressive`. **Visually confirmed via a real face crop**: extracted the same
+    frame from `00023.MTS` twice, once via the current raw-pipe command
+    (`ffmpeg -i ... -f rawvideo -pix_fmt bgr24 pipe:1`, no deinterlace) and once with
+    `-vf yadif=0` inserted -- the raw version shows clear blocky/combed distortion on a moving
+    subject at the frame's edge (a baby's face, genuinely in motion at that instant), while the
+    deinterlaced version is visibly clean at the same crop. The neighbor-frame consistency check
+    originally built to investigate transitions is a real but separate, complementary safeguard
+    (it would catch severely corrupted per-detection embeddings after the fact); it does not fix
+    the actual root cause here, which is upstream in extraction itself.
+    - **Fix, not yet applied to any real pipeline code** (this remains investigation-only, same
+      as the rest of Phase 3): insert `-vf yadif=0` (or `bwdif=0`, generally regarded as
+      somewhat higher quality, at the same call-site cost) into the `ffmpeg` raw-pipe command
+      whenever the source's `ffprobe`-reported `field_order` isn't `progressive`/absent --
+      gate on that check rather than deinterlacing unconditionally, since running a deinterlace
+      filter on already-progressive content can still alter/blend frames unnecessarily. `yadif`'s
+      default mode (`mode=0`, `send_frame`) outputs one deinterlaced frame per input frame
+      (not one per field), so frame indices/strides/timestamps used elsewhere in this pipeline
+      (IOU tracking, sample stride math) stay unaffected by turning this on.
+    - **Checked: deinterlacing also recovers real missed detections, not just cleaner embeddings
+      on already-found faces -- confirmed on the fixture with the most motion/faces.** Ran the
+      lightweight `det_500m` detector across every sampled frame of all 3 confirmed-interlaced
+      fixtures, once raw and once with `-vf yadif=0`. `00023.MTS` (by far the busiest fixture,
+      the same one used throughout this whole tracking/stitching investigation): **85 -> 94 total
+      detections across the same 84 sampled frames (+9, +10.6%)** with deinterlacing -- a real,
+      meaningful recall gain, consistent with the visual finding above (a combed/corrupted frame
+      can plausibly hide a face from the detector entirely, not just degrade its embedding once
+      found). The other two fixtures (`20120309182349.mpg`: 19->18; `20191005094939.m2ts`:
+      17->18) showed only noise-level ±1 differences -- not a meaningful signal either way, but
+      also both have far fewer sampled frames (6 and 42) than `00023.MTS`'s 84, so this may just
+      be too small a sample to show the same effect, not evidence the effect is absent there.
+      **Not yet done**: visually spot-checking the 9 newly-recovered `00023.MTS` detections to
+      confirm they're genuine faces and not false positives introduced by whatever `yadif` does
+      to frame content in some other way -- worth doing before treating this recall number as
+      final, though the combing-artifact mechanism already visually confirmed above makes a real
+      recall gain the more likely explanation than new false positives.
+
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
     metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
