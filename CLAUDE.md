@@ -989,6 +989,35 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       contamination risk this investigation's clustering approach keeps running into -- worth a
       real, systematic test (not just this one spot-check) before being treated as validated.
 
+  - **Tried the opposite of agreement-gating too (2026-09-08), per the user's explicit
+    preference for this use case ("I'm OK with a few wrong merges, I'd rather have few
+    faces")**: union-merge instead of intersection -- two tracks merge into the same final group
+    if EITHER model's own clustering (insightface OR facenet, same must-link/cannot-link
+    constraints, same cos=0.5 threshold) placed them together, combined via union-find over all
+    50 tracks. **Real, large win for this specific goal**: 15 groups (insightface alone) and 11
+    groups (facenet alone) collapsed to just **5 final groups** -- and critically, **all 19 of
+      the glasses-woman's track spans across the whole video merged into one single, completely
+      clean group** (visually confirmed via contact sheet -- no baby contamination in any of the
+      10 sampled crops), finally achieving the full single-identity consolidation that eluded
+      every method tried earlier in this investigation (bipartite matching, complete/average
+      linkage at any threshold on either model alone, deinterlacing, 2x sampling, reinit-tracking
+      bridging).
+    - **The known cost showed up exactly where predicted, and only there**: one of the other 4
+      groups (13 tracks, otherwise all baby crops) shows her glasses at the edge of 2 of the 10
+      sampled crops -- the same specific false merge already found in the insightface-alone
+      combined-pipeline test, which survived here because union-merge can only ADD merges beyond
+      what either model does alone, never remove a mistake either one makes independently. The
+      other 3 groups (6, 11, and 1 track) showed no contamination in their sampled crops.
+    - **Conclusion: union-merge is a real, working technique for exactly the tradeoff the user
+      asked for** -- large group-count reduction, with contamination risk concentrated (not
+      spread evenly) since it only ever inherits mistakes that already existed in at least one
+      single-model result, rather than inventing new ones. For a use case that explicitly
+      prioritizes fewer final identities over avoiding all false merges, this is the best result
+      of the whole investigation on that specific axis -- the opposite finding from the
+      agreement-gating idea above, and both are legitimate choices depending on which failure
+      mode (missed consolidation vs. occasional wrong merge) is more costly for the actual
+      product use case.
+
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
     metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
