@@ -767,11 +767,28 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       region at higher effective resolution** -- the information a face detector needs (a
       forward-facing face) simply isn't present in that frame, at that location, for that
       reason.
-    - **Conclusion: this closes out the "can better detection/tracking recover the baby"
-      question for this investigation.** Hardening the detector or the local-recrop idea further
-      has real diminishing returns for a subject that moves and turns away this much within a
-      clip -- reinforces (rather than reopens) the standing conclusion above: leaning on gallery
-      classification per surviving track, rather than continuing to invest in keeping a
+    - **Follow-up (same day): tested the user's homography idea too -- a real, but ultimately
+      misleading, improvement that a closer visual check corrected.** If the camera itself
+      panned/shook (common in handheld home video), the subject could still be genuinely in
+      frame, just spatially shifted -- a fixed-location search would miss it even if perfectly
+      detectable. Estimated a global frame-to-frame homography (ORB features + RANSAC, typically
+      100-800 inlier matches) between each track's last real frame and its gap frame, warped the
+      last known box through it to get a motion-corrected predicted location, and searched there
+      instead. **Raw result looked like a real win: 3/20 recovered vs. the static crop's 1/20 --
+      a 3x improvement.** But visually inspecting all 3 "recoveries" (drawing the detected box on
+      the actual crop) told a different story: **all three are the WOMAN's face, not the baby's**
+      -- in every one, the baby's own head is visible in the same crop, genuinely turned away
+      from the camera, still completely undetected. The apparent improvement was an artifact of
+      the search region (whether static or motion-shifted) happening to also cover a different,
+      easier-to-detect adult face nearby -- not a real baby recovery at all.
+      **Corrected conclusion: the true baby-specific recovery rate is 0/20, under BOTH static and
+      homography-corrected search.** This is more decisive than the raw numbers first suggested,
+      and closes out the "can smarter spatial search recover the baby" question for this
+      investigation -- no amount of relocating WHERE to search fixes a frame where the actual
+      problem is that no forward-facing baby face exists at all. Hardening detection/tracking
+      further has real diminishing returns for a subject that turns away and moves this much
+      within a clip -- reinforces (rather than reopens) the standing conclusion above: leaning on
+      gallery classification per surviving track, rather than continuing to invest in keeping a
       fast-moving/frequently-turned-away subject continuously tracked, is the more promising
       direction for Phase 3.
 
