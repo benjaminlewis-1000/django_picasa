@@ -792,6 +792,52 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       fast-moving/frequently-turned-away subject continuously tracked, is the more promising
       direction for Phase 3.
 
+  - **Follow-up (same day): tested the user's optical-flow/tracker idea too -- a genuine visual
+    tracker (not just re-detection) that follows the object itself frame-by-frame, independent
+    of whether a face is oriented toward the camera. This produced the THIRD consecutive
+    "apparent recovery, actually the wrong person" result, now a clear pattern worth stating as
+    its own conclusion.** `cv2`'s CSRT/KCF/MedianFlow trackers need opencv-contrib, not present
+    in this environment's build (only `TrackerMIL`, plus three deep-learning trackers needing
+    external model files not downloaded) -- used `TrackerMIL`, seeded on each track's last known
+    box, updated through EVERY raw (undecimated) frame across the gap (not just the sparse
+    stride samples), checked against the real next detection's box via IOU at the far end.
+    - **First pass (pure open-loop tracking, no mid-gap correction) got 2/14 gaps bridged
+      (IOU>0.3)** -- a real, nontrivial-looking result. The user's own follow-up question caught
+      a real gap in the test before it was over-interpreted: **"did we reinitiate when we lost
+      the track then found a face again?"** -- correctly identifying that the test as originally
+      built never checked for or used a fresh detection mid-gap to correct drift; it was pure
+      open-loop tracking from one endpoint to the other with no correction opportunity, which
+      would especially hurt the longest gaps (up to 160 raw frames, ~2.7s, with zero real anchor
+      point in between).
+    - **Visually checking the 2 "successes" first, before building the more complex
+      reinitialize-on-reacquire version, immediately explained why they succeeded: both are
+      the WOMAN's face, not the baby's** -- one crop shows the baby's head clearly present but
+      turned away, completely untracked; the other shows only the baby's arm, no head visible at
+      all. The tracker had drifted onto (or was tracking, from the start, a box that actually
+      included/favored) the adjacent, larger, more consistently front-facing adult, not the
+      harder subject the gap was nominally about. **True baby-specific bridging success: 0
+      (of however many of the 14 gaps genuinely belong to the baby, which is fewer than 14 once
+      the woman's own easier gaps are excluded).**
+    - **This is now the THIRD independent method (static re-detection, homography-corrected
+      re-detection, and continuous appearance tracking) where an apparent "recovery" turned out,
+      on visual inspection, to be the wrong person entirely** -- not three separate weak
+      results, but one consistent pattern: whenever a search region is widened, relocated, or
+      tracked forward in time near where the baby was last seen, it reliably catches the nearby
+      easier adult face instead, because she is more often correctly-oriented and more visually
+      stable than the baby is at exactly the moments the baby's own detection fails. **This
+      strongly reinforces (with three-for-three consistency, not once) that the baby's detection
+      gaps are not a search-strategy problem at all** -- no combination of WHERE to look (static,
+      motion-compensated, or continuously tracked) recovers her specifically, because the
+      recoverable signal in these frames belongs to a different person. The reinitialize-on-
+      reacquire refinement was not built, since the premise it would test (mid-gap correction
+      improving on open-loop tracking) is moot if the tracker's target was never reliably the
+      baby to begin with in the cases that "worked."
+    - **This closes out the detection/tracking-hardening line of investigation on firmer
+      footing than either of the two prior attempts alone** -- gallery classification per
+      surviving track remains the clear, validated direction for Phase 3, and further engineering
+      effort on video-side detection/tracking robustness for a subject this mobile is not
+      expected to pay off, based on three independently-designed, independently-failed attempts.
+
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
     metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
