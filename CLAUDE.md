@@ -916,6 +916,47 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       a cheap pre-filter (to avoid re-classifying every single frame) rather than trusted as the
       source of a final, low group count on its own.
 
+  - **Generalization check across other real videos of comparable length (2026-09-08), per the
+    user's question ("this video is difficult, what about others?").** Every result in this
+    investigation up to this point came from a single fixture (`00023.MTS`, 112s) -- worth
+    checking whether its specific difficulty (a person who turns away/moves constantly,
+    fragmenting badly, plus 3 similarly-aged siblings making even gallery classification
+    genuinely ambiguous for one of them) is typical or unusual. Ran the same combined pipeline
+    (deinterlace-if-needed, 2x density, IOU tracking, det_10g re-detect on best-2 frames,
+    clustering sweep, gallery cross-check) against the two other real fixtures closest in length:
+    - **`20191005094939.m2ts` (56s, interlaced, HD)**: only 18 raw tracks (vs. `00023.MTS`'s 50)
+      -> 9 groups at average/cos=0.5. **Gallery cross-check was dramatically cleaner**: 15 of 18
+      tracks (83%) confidently and unambiguously matched a single real child, "Nathaniel Lewis,"
+      with the one remaining track (a brief adult cameo) correctly and separately matching
+      "Jessica Lewis" -- the same woman from `00023.MTS`, appearing in a different family video,
+      which is exactly what a real family library should produce. No 3-way sibling ambiguity
+      here at all -- confirms `00023.MTS`'s baby-classification difficulty is a real property of
+      that specific case (multiple similarly-aged siblings), not a general weakness of the
+      gallery-classification approach itself.
+    - **`Bear Hands.wmv` (245s, low-resolution 576x432, older/degraded wmv1 footage with real
+      decode corruption -- `ffmpeg` logged genuine macroblock errors during extraction, not just
+      warnings)**: only 10 raw tracks despite being by far the longest video tested -> 6 groups.
+      Contact-sheet crops were visibly blurry, small, and color-shifted, making visual
+      verification alone much harder than on the other two videos. **Gallery cross-check
+      surfaced a different, genuinely new failure mode: 0 of 10 tracks matched anyone at all**,
+      and not narrowly-missed -- similarities were uniformly very low (0.15-0.24, well under the
+      0.394 threshold, not close). This is NOT the same problem as the baby's ambiguity (multiple
+      close candidates); it's either genuine strangers not covered by this family's gallery, or
+      (more likely, given the visibly degraded source and the real decode corruption) embeddings
+      too noisy from poor input quality to match confidently even if the person is in the
+      gallery. **Real, newly-surfaced caveat for Phase 3: gallery classification's reliability is
+      itself conditional on decent embedding quality** -- it isn't a magic fix that works
+      regardless of source video quality, and old/degraded/low-resolution footage may need to be
+      flagged as lower-confidence or handled differently rather than assumed to benefit the same
+      way clean HD footage did in the other two tests.
+    - **Overall conclusion**: `00023.MTS`'s difficulty was real but not universal -- one other
+      video (the m2ts clip) validated the whole approach cleanly and even more convincingly than
+      the hard case did, while the third (the degraded wmv) surfaced a genuinely different,
+      independent limitation (source quality, not identity ambiguity) worth tracking separately.
+      Phase 3's eventual design should account for both failure modes as distinct, expected
+      cases -- not treat `00023.MTS`'s specific baby-sibling-ambiguity problem as the only thing
+      to solve for.
+
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
     metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
