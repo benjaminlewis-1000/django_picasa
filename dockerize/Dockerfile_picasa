@@ -23,7 +23,27 @@ RUN pip3 install opencv-python-headless>=4.4.0.44
 
 
 ADD requirements.txt /code/requirements.txt
-RUN pip3 install -r /code/requirements.txt 
+RUN pip3 install -r /code/requirements.txt
+
+# facenet-pytorch (InceptionResnetV1/VGGFace2) -- a second, independently-
+# trained face embedding model used alongside insightface for video face
+# clustering (see CLAUDE.md's Phase 3 design). Installed with --no-deps,
+# not added to requirements.txt: its own package metadata pins
+# torch<2.3/torchvision<0.18/Pillow<10.3, which directly conflict with
+# the versions already pinned above (torch==2.13.0/torchvision==0.28.0/
+# Pillow==12.3.0) -- a plain `pip install -r requirements.txt` entry
+# would fail to resolve or downgrade those. Verified empirically that the
+# installed model runs correctly against the newer already-pinned
+# versions despite the stale metadata bounds.
+RUN pip3 install --no-deps facenet-pytorch==2.6.0
+# Pre-fetch the pretrained weights at build time (~107MB) rather than
+# relying on a runtime download on first real use -- same reasoning as
+# insightface's own models being baked in, not downloaded live. Caches to
+# /root/.cache/torch/checkpoints/ -- the container runs as root at
+# runtime (confirmed: the `user`/`usergrp` created below is unused, no
+# USER directive switches to it), so this cache location is the one that
+# actually gets hit later, not a mismatched path.
+RUN python3 -c "from facenet_pytorch import InceptionResnetV1; InceptionResnetV1(pretrained='vggface2')"
 
 RUN apt remove cmake -y
 
