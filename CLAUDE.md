@@ -824,19 +824,41 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       results, but one consistent pattern: whenever a search region is widened, relocated, or
       tracked forward in time near where the baby was last seen, it reliably catches the nearby
       easier adult face instead, because she is more often correctly-oriented and more visually
-      stable than the baby is at exactly the moments the baby's own detection fails. **This
-      strongly reinforces (with three-for-three consistency, not once) that the baby's detection
-      gaps are not a search-strategy problem at all** -- no combination of WHERE to look (static,
-      motion-compensated, or continuously tracked) recovers her specifically, because the
-      recoverable signal in these frames belongs to a different person. The reinitialize-on-
-      reacquire refinement was not built, since the premise it would test (mid-gap correction
-      improving on open-loop tracking) is moot if the tracker's target was never reliably the
-      baby to begin with in the cases that "worked."
-    - **This closes out the detection/tracking-hardening line of investigation on firmer
-      footing than either of the two prior attempts alone** -- gallery classification per
-      surviving track remains the clear, validated direction for Phase 3, and further engineering
-      effort on video-side detection/tracking robustness for a subject this mobile is not
-      expected to pay off, based on three independently-designed, independently-failed attempts.
+      stable than the baby is at exactly the moments the baby's own detection fails.
+    - **Built the reinitialize-on-reacquire version anyway, per the user's explicit request,
+      rather than treating it as moot** -- and it surfaced two more real, useful findings rather
+      than just reconfirming the negative. First, a real bug: `cv2.TrackerMIL.init()` crashes
+      (`assertion failed: !posSamples.empty()`) when reinitialized on a degenerate box (out of
+      frame bounds or too small after clamping) -- fixed by clamping the reacquired box to frame
+      bounds and requiring a minimum 10px size before reinitializing. Second, and more
+      important: **re-ran detection on every raw frame within each gap (not just the sparse
+      stride samples) and reinitialized the tracker whenever a fresh detection appeared near its
+      current position** -- this also exposed exactly how contaminated the earlier "14 gaps"
+      figure was: only 4 of the 14 are genuine baby-to-baby (same-identity) transitions at all,
+      using the already-known gallery-classification labels by span; the other 10 are secretly
+      a handoff between the woman and the baby (or, in 2 cases, woman-to-woman) -- gaps that can
+      never be a valid "bridge" since they're different physical people, confirming exactly why
+      the prior two "successful bridges" (both later shown to be her) were never going to be
+      baby recoveries in the first place.
+    - **Real result on the 4 genuine baby-to-baby gaps: 1/4 bridged successfully (IOU=0.523),
+      visually confirmed correct this time** -- red (tracked) and green (real next detection)
+      boxes both land on the baby's own face, held up in the air against a plain background,
+      clearly separated from the woman's face below. **This is the first genuinely-confirmed
+      baby-specific recovery in this entire investigation**, softening the otherwise consistent
+      "search strategy never helps" pattern from the three prior methods -- under the right
+      circumstances (the baby isolated against a simple background, not immediately adjacent to
+      the woman's own face), continuous tracking with periodic re-detection-based correction
+      really can carry a track through a real multi-frame detection gap.
+    - **But this remains a narrow, not general, result: 3 of 4 genuine gaps still failed even
+      with reinitialization** (two ended at IOU=0.000, one very low at 0.074) -- the technique
+      works when conditions are favorable, not as a general fix for the baby's fragmentation.
+      Combined with the still-real underlying causes established earlier (genuine absence from
+      the region, face turned fully away, frequent close adjacency to the more dominant adult),
+      this qualifies rather than overturns the standing conclusion: detection/tracking hardening
+      has a real but limited ceiling for a subject this mobile, and gallery classification per
+      surviving track remains the more broadly reliable direction for Phase 3 -- but a future
+      real implementation may still be worth including a lightweight reacquire-tracking pass as
+      a cheap, occasionally-effective supplement, not a replacement, for it.
 
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
