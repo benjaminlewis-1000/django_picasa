@@ -609,6 +609,34 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       to frame content in some other way -- worth doing before treating this recall number as
       final, though the combing-artifact mechanism already visually confirmed above makes a real
       recall gain the more likely explanation than new false positives.
+    - **Re-ran the full clustering association (both linkage types, same threshold sweep, same
+      must-link/cannot-link-constrained matrix) on `00023.MTS` with `-vf yadif=0` applied, to see
+      whether cleaner embeddings fix the earlier consolidation failure -- real improvement, but
+      NOT a full fix.** 31 tracks now (up from 26 pre-deinterlace, consistent with the +9
+      recovered detections). **Complete linkage at the project's own default `cos_threshold=0.6`
+      now produces a real 6-track merged group**
+      (`(0,120)+(880,880)+(1000,1080)+(1960,1960)+(2040,2240)+(3200,3320)`) where before
+      deinterlacing the same threshold left these as isolated singletons/small pairs -- a
+      genuine, meaningful consolidation gain from the cleaner embeddings alone, with zero
+      threshold changes. **But it's still not the full answer**: a contact-sheet visual check
+      (same discipline as before) showed the SAME real person (a glasses-wearing woman) still
+      split across **3 separate groups** even at the more lenient average-linkage/cos=0.5 pass --
+      the 6-track group above, a second 5-track group
+      (`(160,360)+(640,960)+(1960,1960)+(2480,2480)+(2840,2880)`) that's visually identical to
+      the first, and a lone singleton (`(3080,3160)`), also visually her. Complete linkage at
+      cos=0.6 only ever recovered the first cluster -- the second cluster's tracks stayed
+      unmerged singletons at that threshold, not merged with the main group or each other.
+      **Conclusion: deinterlacing is a real, worth-doing fix in its own right (recovers missed
+      detections, produces cleaner embeddings, measurably improves consolidation at the
+      project's own default threshold with zero other changes) -- but it does not resolve the
+      deeper track-stitching problem already concluded above.** The same person can still
+      fragment across multiple visually-identical groups even with clean, deinterlaced input,
+      confirming the earlier conclusion (this is a real per-appearance embedding-variability
+      limit -- pose, expression, lighting across genuinely different moments in the clip -- not
+      an artifact of any single upstream data-quality bug). Both fixes belong in the eventual
+      real pipeline (deinterlacing for its own clear, independent benefit; the MVP acceptance of
+      split-identity entries for the deeper problem it doesn't solve) -- neither supersedes the
+      other.
 
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
