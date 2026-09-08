@@ -737,6 +737,44 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       (per the earlier stride-cost analysis in this file) -- worth weighing against the real
       consolidation gain when finalizing Phase 3's shipped stride, not treated as a free win.
 
+  - **Follow-up (2026-09-07): root-caused the baby's specific fragmentation directly, and tested
+    (and rejected) a targeted local-recrop recovery idea.** Prompted by the user's own question
+    ("was it just that it wasn't detected sometimes?"). Reconstructed the full per-sampled-frame
+    detection log (not just track spans) at 2x stride and checked every track-to-track boundary
+    directly against it. Confirmed a real mix of causes, correcting an oversimplification from
+    the prior answer: some apparent "baby gaps" are actually just a DIFFERENT concurrent person
+    (the woman) being detected in between, not a missed baby link at all (e.g. the single-frame
+    track at sample 40, a small 31,803px box, is followed by 4 frames of a much larger,
+    differently-positioned box that matches the woman's own track almost exactly) -- track spans
+    alone conflate this, real per-frame detection logs don't. But genuine multi-frame detector
+    dropouts are also real and common: 20 sampled frames across the video have ZERO detections
+    at all (not a linking failure, an outright miss), including 4-in-a-row (samples 1320-1380,
+    ~1.3 real seconds) and 3-in-a-row (samples 2260-2300) stretches.
+    - **Tested the user's proposed fix: re-run detection on just a ~3x-larger crop (100% padding
+      each side, "200% bigger") centered on the track's last known box, for every one of those 20
+      zero-detection frames** -- testing whether the misses were a resolution/scale problem
+      (a face too small relative to the full 1920x1080 frame for `det_500m` to find, but
+      recoverable once effectively zoomed in, since the crop still gets resized up to the
+      detector's own 640x640 input). **Result: only 1 of 20 recovered a face.** Not a resolution
+      problem for the other 19.
+    - **Visually confirmed why, via 4 representative crops**: a genuine, complete absence (the
+      baby had moved entirely out of that spatial region -- one crop shows only a crib mobile and
+      blinds, another only blinds, no face anywhere in frame); a real face turned fully away from
+      camera (the back of the head, visible hair only -- no 2D detector, at any resolution, finds
+      a face with zero facial features presented); and one edge case that was actually a
+      different real crop-boundary issue (the WOMAN partially cut off at the crop's edge, not a
+      baby miss at all). **None of these are fixable by searching harder in the same spatial
+      region at higher effective resolution** -- the information a face detector needs (a
+      forward-facing face) simply isn't present in that frame, at that location, for that
+      reason.
+    - **Conclusion: this closes out the "can better detection/tracking recover the baby"
+      question for this investigation.** Hardening the detector or the local-recrop idea further
+      has real diminishing returns for a subject that moves and turns away this much within a
+      clip -- reinforces (rather than reopens) the standing conclusion above: leaning on gallery
+      classification per surviving track, rather than continuing to invest in keeping a
+      fast-moving/frequently-turned-away subject continuously tracked, is the more promising
+      direction for Phase 3.
+
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
     metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
