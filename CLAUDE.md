@@ -706,6 +706,37 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
     the same track's every single frame) rather than as the mechanism relied on for full
     identity consolidation.
 
+  - **Re-ran the same ideas-1-3 pipeline at 2x sample density (2026-09-07), per the user's own
+    request -- the best in-video consolidation result of the entire investigation.** Halved the
+    stride (`fps * 20/30 / 2`, giving 50 tracks instead of 31) with everything else unchanged
+    (deinterlaced, det_10g re-detect on best-2-frame reps, same threshold sweep). At
+    `face+clothing`/average-linkage/cos=0.5, **a single 17-track group now consolidates nearly
+    all of the glasses-woman's appearances** (`0-120, 140-200, 280-420, 640-820, 1060, 1120,
+    1540, 1700, 1960, 2480, 2540, 2820-2900, 2980, 3080-3160, 3200-3340`) -- visually confirmed
+    clean via a contact sheet, no contamination in the sampled crops. This is a real step
+    change from every earlier attempt this session (which topped out at 2-3 separate groups for
+    her, even combining every other idea tried) -- denser sampling gives IOU tracking more
+    continuity to work with, directly reducing the frame-to-frame gaps that were the root cause
+    of fragmentation. (One baby-track group's crops showed a possible partial contamination --
+    one crop in a 6-track baby group had what looked like a stray glasses edge -- not fully
+    confirmed, worth a closer look if this stride is adopted.)
+    - **Gallery cross-check reconfirmed the same result independently**: re-ran the read-only
+      production classification (same method as before) against all 50 of the new tracks --
+      virtually every track in the new 17-track group matches "Jessica Lewis" with strong
+      confidence (0.5-0.63 similarity), the same person identified before, now with even more
+      redundant confirmation across more, denser track samples. **Also surfaced a new, distinct
+      detail the lower sample density had missed**: one track (span `2340,2340`) confidently
+      matches a THIRD real person, "Emma" (sim99=0.576 vs. threshold=0.558, a small 19-face
+      gallery) -- a genuinely different person appearing briefly in this clip that hadn't been
+      flagged in the 1x-density run at all. This is itself a point in favor of gallery
+      cross-checking over pure in-video stitching: a person who appears only once, briefly, and
+      isn't visually similar to anyone else in the clip has no chance of being "stitched" to
+      anything internally, but is still directly and correctly identifiable against the existing
+      gallery from a single track alone.
+    - **Practical cost note**: 2x sampling means 2x the detection cost for the same video length
+      (per the earlier stride-cost analysis in this file) -- worth weighing against the real
+      consolidation gain when finalizing Phase 3's shipped stride, not treated as a free win.
+
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
     metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
