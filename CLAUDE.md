@@ -1018,7 +1018,51 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       mode (missed consolidation vs. occasional wrong merge) is more costly for the actual
       product use case.
 
-  - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
+  - **Batch-ran the union-merge pipeline across 12 more real videos (2026-09-08), per the user's
+    request to check beyond the one video this whole investigation was built on.** Selected from
+    the real production library (`Our_Home_Videos/2019`, read-only -- `ffprobe`'d a random sample
+    of 40 real files down to 12 with duration roughly comparable to `00023.MTS`, 50-280s each),
+    copied into the dev/test container via a direct `docker exec cat | docker exec tee` pipe
+    (never touching a host path, since `docker cp` writes through a filesystem view this
+    session's sandboxed shell can't see -- the same workaround noted earlier in this file). All
+    12 processed successfully in one batch (~25 minutes total, models loaded once): confirmed
+    **production stayed completely unaffected throughout** (checked directly after the user
+    asked mid-run -- `picasa_api` uptime, CPU/memory, and a live `/api/images/` request all
+    normal; every operation involved was a plain read `cat`, nothing that touches or restarts
+    the container).
+    - **A striking, consistent numeric pattern held across all 12 videos**: facenet produced
+      FAR fewer groups than insightface at the identical cos=0.5 threshold, every single time
+      (e.g. 49 vs 16, 36 vs 9, 30 vs 12, 25 vs 15) -- never once the other way around. This is
+      too consistent to be per-video noise; it means the two models' raw cosine-similarity
+      distributions aren't naturally comparable at the same threshold value (facenet's same-
+      person similarities apparently cluster tighter/higher at this crop size and normalization
+      than insightface's do) -- worth remembering before assuming facenet is simply "the more
+      accurate" model based on group count alone; the difference is at least partly a
+      threshold-calibration artifact, not necessarily better identity discrimination.
+    - **Union-merge group counts across all 12** (tracks -> insightface-alone / facenet-alone /
+      union): 92->49/16/**8**, 60->25/15/**8**, 42->22/10/**6**, 50->30/12/**8**, 22->5/4/**3**,
+      41->16/8/**8**, 28->8/4/**3**, 21->7/3/**2**, 116->36/9/**5**, 22->7/4/**3**,
+      29->16/5/**4**, 28->11/5/**3** -- union always at or below the smaller individual model's
+      count (mathematically guaranteed, confirmed empirically: video 3 hit union=fn exactly,
+      meaning insightface's own clustering added nothing beyond what facenet already merged on
+      its own that time), with real additional consolidation beyond either single model in most
+      of the other 11.
+    - **Visually spot-checked 2 of the 12** (not an exhaustive per-video audit -- time-boxed
+      given 12 already-heavy pipeline runs): one video dominated by a single child across nearly
+      the whole clip (97 of 116 tracks landed in one union group, visually consistent throughout,
+      one ambiguous-looking crop in a separate 10-track group flagged but not conclusively
+      resolved) and one showing 3 genuinely distinct real people (a child plus two different-
+      haired adults) cleanly separated with no visible cross-contamination in any of the 3 final
+      groups -- a clean, correct multi-person case, not just a single-dominant-subject one.
+    - **Conclusion: the union-merge approach's group-count reduction generalizes well beyond the
+      one hard video this session was built around**, and the two spot-checks (a single-dominant-
+      subject case and a genuine multi-person case) both looked visually sound. **Caveat, stated
+      plainly rather than glossed over**: only 2 of 12 were actually visually verified end to
+      end -- the other 10 are trusted on the numeric pattern and the two spot-checks' consistency
+      alone, not individually confirmed. Given this session's own repeated lesson (a false merge
+      was found in a "spot-checked clean" result earlier by not checking every group), the
+      remaining 10 videos' union results should be treated as provisionally promising, not fully
+      validated, if this work is picked up again.
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
     metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
     but not finalized), and whether to also pursue the ffmpeg-side frame-selection optimization
