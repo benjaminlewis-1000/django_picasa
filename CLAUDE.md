@@ -860,6 +860,62 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       real implementation may still be worth including a lightweight reacquire-tracking pass as
       a cheap, occasionally-effective supplement, not a replacement, for it.
 
+  - **Final combined-pipeline test (2026-09-08), per the user's request to "test everything, try
+    to get the groups low": every validated win from this session run together, plus a real
+    lesson about trusting group-count numbers without exhaustively re-verifying every group.**
+    Combined: deinterlacing, 2x sample density, plain IOU tracking, a properly-verified
+    reinitialize-on-reacquire bridging pass (this time gated on BOTH spatial IOU AND a real
+    embedding-similarity check via det_10g re-detect+encode on both sides of the candidate merge
+    -- not hardcoded gallery labels, which don't exist for a fresh video in real use), best-2-
+    frame det_10g re-detection for representative embeddings, and the same must-link/cannot-link
+    complete/average-linkage clustering sweep. Clothing histogram (idea 3) excluded, already
+    shown to hurt.
+    - **Bridging step: 0/4 spatial candidates survived the embedding check this run** -- all 4
+      failed at the det_10g redetect stage itself (couldn't even re-find a face in the padded
+      crop), even though the live det_500m-based reacquire loop had found something there with
+      decent IOU. This is a real, informative result, not a bug: it shows these specific
+      borderline cases are sensitive enough to flip between "found" and "not found" depending on
+      which detector model looks at them, and the stricter verification correctly refused to
+      merge on that shaky a basis -- appropriately conservative behavior, even though it means
+      the earlier session's 1/4 narrow win didn't reproduce under this run's specific frames.
+      Track count stayed at 50 (no bridging merges applied).
+    - **Clustering alone reached the lowest group counts of the whole investigation as the
+      threshold loosened: 13 groups (cos=0.45) -> 10 (0.40) -> 8 (0.35) -> 6 (0.30), average
+      linkage.** The woman's own two groups (4-track and 15-track) stayed completely stable
+      across this entire sweep -- never merging with each other at any threshold tested, all the
+      way down to 0.30 -- confirming (again) that her own split is a real, threshold-independent
+      limit, not something a looser cutoff fixes. All of the *additional* merging as the
+      threshold loosened happened among the smaller baby-labeled groups instead.
+    - **Real, corrected finding from visually re-checking every group at every threshold, not
+      just the largest ones: a genuine false merge exists, and it was there earlier than first
+      caught.** At cos=0.30, one group (spans `220,940,1260,2340,2740,3200`) clearly shows the
+      woman's face (glasses, unmistakable) mixed into what should be an all-baby group. Checking
+      backward through looser-to-tighter settings, this exact group (same span membership) is
+      present unchanged all the way from cos=0.30 up through cos=0.45 -- meaning it was NOT a
+      new failure introduced by pushing the threshold lower; it was already there in the very
+      first (13-group, cos=0.45) contact sheet checked this run. On the first pass, one crop in
+      that group had been called "possibly just blur/background, hard to tell" rather than
+      correctly flagged -- a real miss in the visual-verification discipline this project
+      otherwise follows carefully, not a new bug in the pipeline. Given this same group's
+      membership is also identical to what the standalone (pre-combined) 2x-stride run reported
+      as its own 6-track group at cos=0.5, this same contamination was almost certainly *already*
+      present in that earlier "15 groups, spot-checked clean" result too -- the spot-check that
+      run only closely inspected the largest, most obviously-interesting group (the 17-track
+      glasses-woman cluster), not every single smaller group.
+    - **Conclusion: mechanically minimizing the group count is not a viable path to a lower,
+      genuinely correct answer -- it trades real correctness for a smaller-looking number, and
+      the trade can be invisible unless every single group is re-verified, not just the largest
+      or most interesting ones.** This reinforces, more sharply than any single result so far,
+      the project's own established discipline (visual verification before trusting a cluster
+      count) -- and specifically that "verify the big groups" is not sufficient; small groups
+      need the same scrutiny, since a false merge can hide there just as easily and be easy to
+      miss at a glance. **The gallery-classification approach (idea 4) remains the only method
+      in this entire investigation that achieves both a low count (all of one person's scattered
+      tracks collapsing to a single real identity) and zero observed contamination risk** --
+      confirming it as the right primary mechanism for Phase 3, with in-video clustering kept as
+      a cheap pre-filter (to avoid re-classifying every single frame) rather than trusted as the
+      source of a final, low group count on its own.
+
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
     metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
