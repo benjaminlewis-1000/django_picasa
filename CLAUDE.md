@@ -638,6 +638,74 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       split-identity entries for the deeper problem it doesn't solve) -- neither supersedes the
       other.
 
+  - **Ideas 1-3 tried together (2026-09-07), plus a 4th (the user's own suggestion) that
+    reframes the whole problem -- real, meaningful progress on the first three, and the 4th is
+    a genuinely different, more promising angle than continuing to chase track-to-track
+    stitching.** All four tested together against the same deinterlaced `00023.MTS`:
+    1. **Re-detect/re-encode each track's representative frame(s) with the full `buffalo_l`
+       `det_10g` detector** (already loaded anyway, as part of the recognition `FaceAnalysis`
+       app) instead of only ever using the lightweight `det_500m` detections from the bulk
+       per-frame sampling pass -- cheap, since only ~2 frames per track (not every sampled
+       frame) need the heavier pass.
+    2. **Pick each track's best 2 frames by a cheap quality score** (`det_score * box_area`)
+       instead of feeding every frame (which is what fed complete linkage's worst-pair
+       sensitivity) or an arbitrary middle frame into the distance matrix.
+    3. **Added a clothing/torso color-histogram (HSV) as an auxiliary signal**, combined with
+       the face-embedding distance.
+    4. **The user's own idea**: classify each track's representative embedding against the REAL
+       production `Person` gallery (the actual `classify_unassigned()` machinery, not a
+       reimplementation) to see whether tracks that don't merge with each other inside the video
+       independently converge on the same already-confirmed real person.
+
+    **Ideas 1+2 together gave real, measurable progress**: at complete-linkage cos=0.5, the
+    previously-unmergeable `(3080,3160)` singleton (isolated across every method tried all
+    session, including after deinterlacing alone) now merges into a real 7-track group. A
+    contact-sheet visual check confirmed the glasses-woman is now split across only **2** groups
+    (down from 3-4 before) -- real progress, though still not full consolidation. Crop quality
+    is visibly sharper than every earlier contact sheet in this investigation, consistent with
+    `det_10g` producing better boxes/kps than `det_500m` on these specific frames.
+
+    **Idea 3 (clothing histogram) did not help, and made things measurably worse**: at the same
+    thresholds, adding the naive HSV-histogram distance term produced MORE groups, not fewer
+    (17 vs. 11 at average-linkage/cos=0.5) -- the crude implementation (a fixed-height crop
+    below the face box) likely picks up inconsistent background/blanket/lighting per frame
+    rather than a stable clothing signal, adding noise rather than a genuine second independent
+    signal. Not pursued further in this form; a real implementation would need a proper
+    person/torso detector, not a fixed offset below the face box.
+
+    **Idea 4 is the standout result of this whole investigation, and reframes the problem
+    rather than incrementally improving on it.** Saved each of the 31 tracks' representative
+    embeddings (averaged over their best-2-frame reps, computed with `det_10g`) and classified
+    them, read-only, against the REAL live production gallery (440 likely people, 281,971 real
+    gallery faces) using the exact same `sim_99th`-vs-gallery-size-bucket-threshold gate
+    `classify_unassigned()` already uses (called only `faceAssigner.__init__()`/
+    `load_encodings()`/`_build_concatenated_gallery()` directly -- never `classify_unassigned()`
+    itself or any `.save()`, so this stayed strictly read-only against production; embeddings
+    were transferred between the dev/test container and the live `picasa_api` container via
+    base64 over `docker exec`, since `docker cp` writes through a filesystem view this session's
+    sandboxed shell can't see -- see the workaround noted where first hit). **Every one of the
+    13 tracks visually confirmed as the glasses-wearing woman -- spread across the entire
+    clip, never fully consolidated by any clustering method tried all session -- independently
+    classified to the SAME real person, "Jessica Lewis," with strong, unambiguous confidence
+    (similarity 0.5-0.63, comfortably clear of the 0.394 threshold, zero competing
+    candidates)**. The baby's tracks, by contrast, were genuinely ambiguous -- bouncing between
+    3 close candidates ("Gwendolyn Lewis"/"Nathaniel Lewis"/"Liam Lewis," scores within
+    0.02-0.03 of each other) and even pulling a different family's children as the closest
+    match on a couple of tracks -- consistent with this project's already-known difficulty
+    classifying young children (siblings look alike as infants), not a new video-specific gap.
+    **Conclusion: rather than continuing to invest in fully solving in-video track-to-track
+    stitching, classifying each track directly against the existing real-person galleries
+    (built from years of real photos, with far more appearance-variability coverage than one
+    video clip alone could ever provide) already solves the consolidation problem outright for
+    anyone well-represented in the gallery -- sidestepping the track-stitching problem entirely
+    rather than solving it.** The remaining difficulty (the baby's ambiguous 3-way split) is the
+    SAME already-known gallery-classification limitation the image pipeline already has for
+    young children, not a new problem introduced by video. This suggests Phase 3's real design
+    should lean on gallery classification as the primary consolidation mechanism, with
+    in-video track/cluster stitching kept only as a cheap first pass (to avoid re-classifying
+    the same track's every single frame) rather than as the mechanism relied on for full
+    identity consolidation.
+
   - **Not yet decided**: final sample stride and gap-tolerance value to actually ship with, the
     group-size floor threshold for dropping transient tracklets, the full-track aggregation
     metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
