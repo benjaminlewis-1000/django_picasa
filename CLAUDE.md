@@ -26,9 +26,12 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 
 **Bigger, deliberately unscoped features:**
 - Slideshow metadata overlay (photo date + location shown alongside the image).
-- Video support — design pass, Phase 0 (infra) and Phase 1 (`VideoFile` model + ingestion) landed
-  2026-09-07. Phases 2-4 (thumbnailing, face detection, API) not started. See the dated write-up
-  below for the full design and phased build plan.
+- Video support — Phase 0 (infra) and Phase 1 (`VideoFile` model + ingestion) landed 2026-09-07.
+  Phase 3 (face detection/clustering) has a full agreed design as of 2026-09-08 (one `Face` row
+  per union-merge group, insightface+facenet dual clustering, gallery-classification-first
+  assignment) plus its runtime dependency (`facenet-pytorch`) already added and deployed to
+  production -- schema/migration/pipeline code itself not yet written. Phases 2/4/5
+  (thumbnailing, API, transcode) not started. See the dated write-ups below for the full design.
 
 **Frontend (out of scope for this repo — no visibility into that codebase from here):**
 - "Mark image for deletion" button for the slideshow.
@@ -1063,13 +1066,76 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
       was found in a "spot-checked clean" result earlier by not checking every group), the
       remaining 10 videos' union results should be treated as provisionally promising, not fully
       validated, if this work is picked up again.
-    group-size floor threshold for dropping transient tracklets, the full-track aggregation
-    metric (leaning toward mean/median over max, given the outlier-vulnerability findings above,
-    but not finalized), and whether to also pursue the ffmpeg-side frame-selection optimization
-    (skip decoding unsampled frames) before or after landing a first real version. `Face.
-    source_video_file`/`video_timestamp_seconds` fields + migration, the black-frame check, and
-    the actual scheduled task are all still not built -- this remains investigation only, no
-    schema or pipeline code written yet.
+
+  - **Still open, deliberately deferred**: the ffmpeg-side frame-selection optimization (skip
+    decoding unsampled frames) -- worth revisiting once real Phase 3 usage shows decode cost
+    actually matters at scale. Everything else from the investigation above (stride, gap
+    tolerance, aggregation, schema shape) has now been folded into a settled design below.
+
+- **Phase 3 design, agreed (2026-09-08), following the whole investigation above.** Reuses the
+  existing `Face` model rather than a parallel `VideoFace` model -- a video-derived face plugs
+  directly into the same classification/tagging/gallery pipeline every image-derived face
+  already uses (`poss_identN`, `declared_name`, `validated`, `rejected_fields`, thumbnails, bulk
+  review), rather than needing its own parallel machinery.
+  - **Granularity: one `Face` row per final union-merge group, not per track.** The user's own
+    framing: "I'm not aiming for complete accuracy, just an idea of who's likely in videos" --
+    given that, the per-track granularity originally proposed (for later un-merging a wrong
+    union-merge decision) isn't worth the extra complexity.
+  - **New schema fields**: `source_video_file` (FK to `VideoFile`, nullable, sibling to the
+    existing `source_image_file`, with the existing planned `CheckConstraint` extended to a
+    two-way XOR); `video_first_timestamp_seconds` / `video_last_timestamp_seconds` (nullable
+    `FloatField`s -- just first/last appearance, no full segment list, per the user's call that
+    completeness isn't the goal here). Everything else on `Face` (`face_encoding_512`, `kps`,
+    box fields, thumbnails, `poss_identN`/`weight_N`, `declared_name`, `validated`,
+    `rejected_fields`, `verification_cluster_group`) is reused unchanged.
+  - **Ingest pipeline** (per `VideoFile`, run once at ingestion, not a live/on-demand
+    computation): (1) deinterlace-if-needed (gate on `ffprobe`'s `field_order`), sample at 2x
+    the original stride, detect with `det_500m`; (2) IOU-track (grow 25%/IOU 0.3/gap-tolerance
+    1 sample); (3) per track, best-2-frames-by-`det_score*area`, re-detect each with `det_10g`,
+    encode with insightface; (4) cluster under insightface embeddings (average linkage, cos=0.5,
+    must-link same-track/cannot-link temporally-overlapping tracks) and separately under facenet
+    embeddings (same constraints) -- facenet computed transiently, never stored, matching the
+    user's call that it isn't worth persisting; (5) union-find over both clusterings ->
+    `video_track_group`; (6) pool every member track's representative-frame embeddings, take the
+    mean, **trim any frame whose cosine similarity to that mean falls below a threshold** (in the
+    neighborhood of the existing classification thresholds, e.g. ~0.3-0.4 -- exact value not yet
+    pinned), recompute the mean from survivors -- this becomes the group's stored
+    `face_encoding_512`; (7) classify that centroid against the real gallery via the existing
+    `classify_unassigned()` bucketed-threshold gate, unchanged -- a confident match populates
+    `poss_ident1`/`weight_1` only (never `declared_name` directly), since **auto-matched groups
+    still go through the same human confirmation pass**, per the user's explicit call; (8)
+    thumbnail selection: if confidently matched, compute each pooled candidate frame's own
+    `sim_99th` against that specific matched person's gallery and pick the highest-scoring frame;
+    if unmatched, **just pick the largest-box frame** (no quality-score formula needed, per the
+    user's simplification); (9) materialize the `Face` row -- box/kps from the selected
+    thumbnail frame, thumbnails generated via the existing image-thumbnail code path,
+    `face_encoding_512` set to the trimmed centroid, `video_first_timestamp_seconds`/
+    `video_last_timestamp_seconds` from the group's overall min/max, `source_video_file` set,
+    `declared_name` left at the blank sentinel.
+  - **New scheduled task**: a `face_manager`-side Celery task analogous to `face_extraction`,
+    processing unprocessed `VideoFile` rows, same advisory-lock/`isProcessed` convention used
+    elsewhere in this codebase.
+  - **Explicitly out of scope for the backend**: the bulk-review UI is a frontend
+    responsibility (confirmed with the user), no backend endpoint changes anticipated beyond
+    what already exists for `Face` bulk operations.
+  - **Dependency landed and deployed the same day**: `facenet-pytorch==2.6.0` added to
+    `Dockerfile_picasa` (both branches) via `pip3 install --no-deps` -- its own package metadata
+    pins `torch<2.3`/`torchvision<0.18`/`Pillow<10.3`, directly conflicting with what's already
+    pinned in this image (`torch==2.13.0`/`torchvision==0.28.0`/`Pillow==12.3.0`); a plain
+    `requirements.txt` entry would have failed to resolve or downgraded those. Verified in a
+    throwaway build first (imports cleanly, produces correct 512-d output, doesn't disturb the
+    already-pinned versions) and via the real fast test suite (334/334 passing) before touching
+    the live image. Pretrained weights (`20180402-114759-vggface2.pt`, ~107MB) pre-fetched at
+    build time into `/root/.cache/torch/checkpoints/` rather than left to download at runtime --
+    confirmed the container actually runs as root (the `user`/`usergrp` created in the
+    Dockerfile is unused, no `USER` directive ever switches to it), so this cache path is the one
+    that's actually hit later. Real `picasa_img` rebuilt and `picasa_api` recreated; verified
+    live afterward: `facenet_pytorch` imports and loads from cache with no download,
+    `manage.py check`/`migrate --check` clean, a real `/api/images/` request still returns the
+    expected `403`, and all Celery tasks (including the not-yet-video-specific ones) still
+    registered. No schema/migration/pipeline code has been written yet -- this lands the runtime
+    dependency only, ahead of the actual feature code described above.
+
 - **Phase 4 (not started)**: `VideoFileSerializer`/viewset, a `media_type` discriminator for the
   slideshow/frontend to branch `<video>` vs `<img>` (frontend side out of scope for this repo).
 - **Phase 5, newly identified (2026-09-07), not started -- transcode pipeline, likely required
