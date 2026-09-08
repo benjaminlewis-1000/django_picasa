@@ -127,6 +127,21 @@ class Face(models.Model):
         on_delete=models.SET(get_default_blank_person), related_name='face_declared', \
         blank=True, null=True)
     source_image_file = models.ForeignKey('filepopulator.ImageFile', on_delete=models.CASCADE, blank=True, null=True)
+    # Video-derived faces (Phase 3, face_manager/video_face_pipeline.py):
+    # one row per final union-merge track-group, not one per detected
+    # frame -- see CLAUDE.md's Phase 3 design for the full rationale.
+    # CASCADE for the same reason as source_image_file: deleting the
+    # source video should delete the faces derived from it. Exactly one
+    # of source_image_file/source_video_file must be set (see the
+    # CheckConstraint in Meta below).
+    source_video_file = models.ForeignKey('filepopulator.VideoFile', on_delete=models.CASCADE, blank=True, null=True)
+    # First/last real appearance of this track-group within the video, in
+    # seconds. Deliberately not a full per-segment list even though a
+    # union-merge group is frequently discontiguous (stitching together
+    # separate appearances) -- this pipeline is aimed at "who's likely in
+    # this video," not complete per-appearance metadata.
+    video_first_timestamp_seconds = models.FloatField(blank=True, null=True)
+    video_last_timestamp_seconds = models.FloatField(blank=True, null=True)
     # ArrayField supported in PostGres
     dateTakenUTC = models.FloatField(default=0)
 
@@ -224,6 +239,17 @@ class Face(models.Model):
     detected_age_group = models.IntegerField(default=-1)
     detected_age_prob = models.FloatField(default=-1)
 
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(source_image_file__isnull=False, source_video_file__isnull=True) |
+                    models.Q(source_image_file__isnull=True, source_video_file__isnull=False)
+                ),
+                name='face_exactly_one_source',
+            ),
+        ]
+
     def __str__(self):
         return "Face instance of {}".format(self.declared_name)
 
@@ -244,9 +270,14 @@ class Face(models.Model):
             raise ValidationError(f'Box bottom ({self.box_bottom}) must be larger value than box top ({self.box_top}) ')
         if self.box_right <= self.box_left:
             raise ValidationError(f'Box right ({self.box_right}) must be larger value than box left ({self.box_left})')
-        # Get the image height and width
-        img_h = self.source_image_file.height
-        img_w = self.source_image_file.width
+        # Get the source media's height and width -- exactly one of
+        # source_image_file/source_video_file is set (see Meta.constraints).
+        if self.source_video_file_id is not None:
+            img_h = self.source_video_file.height
+            img_w = self.source_video_file.width
+        else:
+            img_h = self.source_image_file.height
+            img_w = self.source_image_file.width
 
         if self.box_top < 0:
             raise ValidationError(f"Box top {self.box_top} is < 0")

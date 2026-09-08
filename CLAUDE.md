@@ -1136,6 +1136,64 @@ IOU-matching rewrite already uses) is an explicit Phase-3.5, not Phase 1.
     registered. No schema/migration/pipeline code has been written yet -- this lands the runtime
     dependency only, ahead of the actual feature code described above.
 
+  - **DONE (2026-09-08): Phase 3 schema + pipeline built and tested on `backend_upgrade`, not
+    yet deployed to production.** `face_manager/migrations/0011_face_source_video_file_and_more.py`
+    adds `Face.source_video_file` (nullable FK to `VideoFile`, CASCADE),
+    `video_first_timestamp_seconds`/`video_last_timestamp_seconds` (nullable `FloatField`s), and
+    a `CheckConstraint` enforcing exactly one of `source_image_file`/`source_video_file` --
+    `Face.save()`'s box-dimension check updated to read height/width from whichever source is
+    actually set (previously hardcoded to `source_image_file`, which would have crashed on any
+    video-sourced row). Migration applied cleanly against the real dev DB (confirms every
+    existing row already satisfies the new constraint) and against a fresh test DB.
+    - **`face_manager/video_face_pipeline.py`** implements the full agreed design: deinterlace-
+      if-needed + 2x-density sampling + `det_500m` detection, IOU tracking, per-track best-2-
+      frame `det_10g` re-detection + insightface encoding, dual clustering (insightface and
+      facenet, transient/never stored) with the same must-link/cannot-link constraints validated
+      throughout this investigation, union-merge, one-pass trimmed-mean centroid (drop pooled
+      frames below a 0.35 cosine-similarity floor to the plain mean, recompute from survivors),
+      and gallery classification -- reusing `classify_unassigned()` completely unmodified rather
+      than re-deriving its branch logic. Thumbnail selection is two-phase to resolve the real
+      chicken-and-egg dependency (classification needs an already-saved Face row; the row's
+      thumbnail choice depends on the classification result): create+save with a provisional
+      largest-box thumbnail first, run the real `classify_unassigned()`, and only if it produces
+      a confident match (`poss_ident1` not one of the ignore sentinels) re-pick the thumbnail as
+      whichever pooled frame has the highest `sim_99th` against that *specific* matched person's
+      own gallery slice and re-save.
+    - **Deliberately structured as pure functions (`_iou_track`, `_cluster_track_faces`,
+      `_union_merge_groups`, `_trimmed_centroid`) separate from the Django/ONNX orchestration
+      layer (`VideoFaceExtractor`)** -- the pure functions take plain lists/arrays, have no video-
+      decode or DB dependency, and are unit-tested directly with synthetic embeddings (the same
+      `_embedding()` near-orthogonal-base-direction helper `VerificationClusterGroupTests`
+      already uses), while the orchestration layer is exercised only by a real-inference
+      integration test.
+    - **New task**: `face_manager.video_face_extraction` (`face_manager/tasks.py`), same
+      Postgres-advisory-lock convention as `face_extraction` -- processes every
+      `VideoFile.objects.filter(isProcessed=False)` row, marks `isProcessed=True` regardless of
+      success/failure (same "don't retry a failure forever" reasoning as the image pipeline's
+      corrupted-file handling; a real per-video failure is logged, not yet surfaced anywhere an
+      operator would see it without checking logs -- no `FailedVideoFile`-style tracking added
+      for face-extraction-specific failures, a deliberate scope cut). **Deliberately NOT added to
+      `CELERY_BEAT_SCHEDULE` yet** -- building and testing the pipeline is a smaller, safer step
+      than turning it loose on the real, multi-thousand-file production video library
+      automatically; scheduling (and the real backfill this implies) is left as a separate,
+      explicit decision for whenever the user is ready.
+    - **Testing**: 19 new tests in `face_manager/tests.py` -- 15 fast, pure-function unit tests
+      (`VideoFaceIOUTrackingTests`, `VideoFaceClusterTests`, `VideoFaceUnionMergeTests`,
+      `VideoFaceTrimmedCentroidTests`) covering track linking/gap-tolerance, must-link/cannot-
+      link clustering, union-vs-intersection merging, and outlier-trimmed centroids; plus 2
+      slow-tagged real-inference tests (`VideoFaceExtractorRealInferenceTests`) against the real
+      `IMG_0760.MOV` fixture (7.6s, already used elsewhere in this investigation), following the
+      same `ENCODINGS_PKL_FILE`-override convention `LoadEncodingsCachingTests` already
+      established for a test environment where `/models/` doesn't exist. Full fast suite:
+      349/349 passing (334 baseline + 15 new). Real-inference run confirmed correct, sane
+      behavior end to end against a genuine video: 1 face group produced (this clip is
+      essentially one person throughout, so a single clean union-merge group is the CORRECT
+      outcome, not a bug), falling back correctly to the `.ignore` sentinel with weight 1.0 since
+      the dev DB's tiny synthetic gallery has no real match for this person -- exercising the
+      "no confident match, keep the provisional largest-box thumbnail" branch exactly as
+      designed. Not yet deployed/merged to `master` -- this lands on `backend_upgrade` only,
+      pending the user's decision on when to actually turn it on against the real library.
+
 - **Phase 4 (not started)**: `VideoFileSerializer`/viewset, a `media_type` discriminator for the
   slideshow/frontend to branch `<video>` vs `<img>` (frontend side out of scope for this repo).
 - **Phase 5, newly identified (2026-09-07), not started -- transcode pipeline, likely required

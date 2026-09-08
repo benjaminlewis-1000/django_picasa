@@ -10,7 +10,8 @@ from django.contrib.auth.models import User
 from django.db.models import Q
 from django.utils.crypto import get_random_string
 from face_extract_encode import FaceExtractor
-from filepopulator.models import ImageFile
+from filepopulator.models import ImageFile, VideoFile
+from common.advisory_lock import advisory_lock
 from picasa import celery_app
 import os
 import queue
@@ -65,6 +66,49 @@ def process_faces():
 
         settings.LOGGER.debug("Ending face adding task")
         
+@shared_task(ignore_result=True, name='face_manager.video_face_extraction')
+def process_video_faces():
+    """Phase 3: one Face row per union-merge track-group, per unprocessed
+    VideoFile -- see face_manager/video_face_pipeline.py and CLAUDE.md's
+    Phase 3 design. Same advisory-lock convention as face_extraction
+    (find_and_encode_faces): the lock covers the whole run, atomic across
+    every entry point (scheduled task, manage.py shell, management
+    command), and is released automatically if the holding connection
+    ever drops -- no stale-lock cleanup needed."""
+    with advisory_lock('face_manager.video_face_extraction') as acquired:
+        if not acquired:
+            settings.LOGGER.debug("Video face extraction is locked, exiting.")
+            return
+
+        unprocessed = VideoFile.objects.filter(isProcessed=False)
+        if not unprocessed.exists():
+            settings.LOGGER.debug("No videos to extract faces from! Exiting.")
+            return
+
+        from video_face_pipeline import VideoFaceExtractor
+        extractor = VideoFaceExtractor()
+        for video in unprocessed:
+            try:
+                faces = extractor.process_video(video)
+                settings.LOGGER.debug(
+                    f"Video face extraction: {video.filename} -> {len(faces)} face group(s)."
+                )
+            except Exception:
+                settings.LOGGER.error(
+                    f"Video face extraction failed for {video.filename}", exc_info=True
+                )
+            finally:
+                # Mark processed regardless of success/failure, same as
+                # find_and_encode_faces()'s corrupted-image handling --
+                # a video that fails once shouldn't be retried forever on
+                # every scheduled run. No separate failure-tracking field
+                # for this (unlike FailedVideoFile, which is about
+                # ingestion, not face extraction) -- the error is logged,
+                # not silently dropped, but not yet surfaced anywhere an
+                # operator would see it without checking logs.
+                video.isProcessed = True
+                video.save()
+
 @shared_task(ignore_result=True, name='face_manager.reencode')
 def reencode_missing_faces():
     i = celery_app.control.inspect()

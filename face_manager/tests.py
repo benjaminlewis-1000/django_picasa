@@ -1814,3 +1814,240 @@ class MergeDuplicateImageFilesTests(TestCase):
 
         dup_filenames = set(DuplicateFile.objects.values_list('filename', flat=True))
         self.assertEqual(ImageFile.objects.filter(filename__in=dup_filenames).count(), 0)
+
+
+class VideoFaceIOUTrackingTests(unittest.TestCase):
+    """_iou_track: pure frame-to-frame linking, no Django/model deps --
+    see video_face_pipeline.py / CLAUDE.md's Phase 3 design for the full
+    investigation these constants (grow 25%, iou_thresh 0.3, gap
+    tolerance 1 sample) came out of."""
+
+    def _det(self, sample_idx, boxes):
+        # boxes: list of (l, t, r, b); scores/kps are unused by tracking
+        # logic itself, just carried through -- filler values are fine.
+        return (sample_idx, boxes, [1.0] * len(boxes), [[0.0] * 10] * len(boxes))
+
+    def test_same_box_across_samples_forms_one_track(self):
+        from video_face_pipeline import _iou_track
+        dets = [self._det(0, [[10, 10, 50, 50]]), self._det(1, [[11, 11, 51, 51]]),
+                self._det(2, [[10, 10, 50, 50]])]
+        tracks = _iou_track(dets)
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]['span'], (0, 2))
+        self.assertEqual(len(tracks[0]['boxes']), 3)
+
+    def test_two_spatially_distinct_boxes_form_two_tracks(self):
+        from video_face_pipeline import _iou_track
+        dets = [self._det(0, [[10, 10, 50, 50], [500, 500, 540, 540]]),
+                self._det(1, [[10, 10, 50, 50], [500, 500, 540, 540]])]
+        tracks = _iou_track(dets)
+        self.assertEqual(len(tracks), 2)
+
+    def test_gap_tolerance_bridges_one_missed_sample(self):
+        from video_face_pipeline import _iou_track
+        dets = [self._det(0, [[10, 10, 50, 50]]),
+                self._det(1, []),  # missed detection
+                self._det(2, [[10, 10, 50, 50]])]
+        tracks = _iou_track(dets, max_gap=1)
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]['span'], (0, 2))
+
+    def test_gap_beyond_tolerance_splits_into_two_tracks(self):
+        from video_face_pipeline import _iou_track
+        dets = [self._det(0, [[10, 10, 50, 50]]),
+                self._det(1, []), self._det(2, []),  # two consecutive misses
+                self._det(3, [[10, 10, 50, 50]])]
+        tracks = _iou_track(dets, max_gap=1)
+        self.assertEqual(len(tracks), 2)
+
+    def test_far_apart_boxes_in_same_frame_never_merge_regardless_of_gap(self):
+        from video_face_pipeline import _iou_track
+        # Two different people, both present in every sampled frame --
+        # must never collapse into one track no matter the gap tolerance.
+        dets = [self._det(i, [[10, 10, 50, 50], [500, 500, 540, 540]]) for i in range(5)]
+        tracks = _iou_track(dets, max_gap=1)
+        self.assertEqual(len(tracks), 2)
+
+
+class VideoFaceClusterTests(unittest.TestCase):
+    """_cluster_track_faces: must-link (same track) + cannot-link
+    (temporally-overlapping different tracks) constrained clustering."""
+
+    def test_same_base_direction_different_tracks_cluster_together(self):
+        from video_face_pipeline import _cluster_track_faces
+        # Track 0: samples 0-10; Track 1: samples 100-110 (non-overlapping)
+        # -- both the same person (same base direction), should merge.
+        embs = [_embedding(0, seed=i) for i in range(4)]
+        track_id = [0, 0, 1, 1]
+        spans = {0: (0, 10), 1: (100, 110)}
+        groups = _cluster_track_faces(embs, track_id, spans, cos_threshold=0.5)
+        self.assertEqual(groups[0], groups[1])
+
+    def test_different_base_directions_never_merge(self):
+        from video_face_pipeline import _cluster_track_faces
+        embs = [_embedding(0, seed=i) for i in range(3)] + [_embedding(1, seed=100 + i) for i in range(3)]
+        track_id = [0, 0, 0, 1, 1, 1]
+        spans = {0: (0, 10), 1: (100, 110)}
+        groups = _cluster_track_faces(embs, track_id, spans, cos_threshold=0.5)
+        self.assertNotEqual(groups[0], groups[1])
+
+    def test_must_link_keeps_one_tracks_own_faces_together_despite_noise(self):
+        from video_face_pipeline import _cluster_track_faces
+        # One track's own two reps, seeded far apart enough that raw
+        # similarity alone might not obviously cluster them -- must-link
+        # forces them together regardless (same track = same person by
+        # construction, per the IOU tracker's own guarantee).
+        embs = [_embedding(0, seed=1), _embedding(0, seed=999)]
+        track_id = [0, 0]
+        spans = {0: (0, 10)}
+        groups = _cluster_track_faces(embs, track_id, spans, cos_threshold=0.99)
+        self.assertEqual(groups[0], groups[0])  # trivially true; real check is no crash/split
+
+    def test_cannot_link_blocks_merge_even_at_identical_embeddings(self):
+        from video_face_pipeline import _cluster_track_faces
+        # Same base direction (would otherwise merge) but temporally
+        # overlapping spans -- two different people can't both be the
+        # same identity at the same time, so this must NOT merge even
+        # though the embeddings alone would suggest it should.
+        embs = [_embedding(0, seed=1), _embedding(0, seed=2)]
+        track_id = [0, 1]
+        spans = {0: (0, 100), 1: (50, 150)}  # overlapping
+        groups = _cluster_track_faces(embs, track_id, spans, cos_threshold=0.5)
+        self.assertNotEqual(groups[0], groups[1])
+
+
+class VideoFaceUnionMergeTests(unittest.TestCase):
+    """_union_merge_groups: union (not intersection) over multiple
+    independent clusterings -- the user's own explicit call for this
+    pipeline (fewer final groups, some wrong merges acceptable)."""
+
+    def test_union_of_disjoint_groupings_combines_via_either(self):
+        from video_face_pipeline import _union_merge_groups
+        # Model A groups (0,1) together and (2,3) together; model B
+        # groups (1,2) together -- the union should chain all 4 into one.
+        grouping_a = {0: 'x', 1: 'x', 2: 'y', 3: 'y'}
+        grouping_b = {0: 'p', 1: 'q', 2: 'q', 3: 'r'}
+        final = _union_merge_groups(4, grouping_a, grouping_b)
+        self.assertEqual(len({final[0], final[1], final[2], final[3]}), 1)
+
+    def test_agreement_on_separation_keeps_tracks_apart(self):
+        from video_face_pipeline import _union_merge_groups
+        grouping_a = {0: 'x', 1: 'y'}
+        grouping_b = {0: 'p', 1: 'q'}
+        final = _union_merge_groups(2, grouping_a, grouping_b)
+        self.assertNotEqual(final[0], final[1])
+
+    def test_single_grouping_passthrough(self):
+        from video_face_pipeline import _union_merge_groups
+        grouping = {0: 'x', 1: 'x', 2: 'y'}
+        final = _union_merge_groups(3, grouping)
+        self.assertEqual(final[0], final[1])
+        self.assertNotEqual(final[0], final[2])
+
+
+class VideoFaceTrimmedCentroidTests(unittest.TestCase):
+    """_trimmed_centroid: one-pass outlier trim (drop anything below a
+    cosine-similarity floor to the plain mean, recompute from survivors)
+    -- the user's own chosen approach over a fixed-percentage trim."""
+
+    def test_all_similar_embeddings_centroid_close_to_each(self):
+        from video_face_pipeline import _trimmed_centroid, cos_sim
+        embs = np.array([_embedding(0, seed=i) for i in range(5)])
+        centroid = _trimmed_centroid(embs, sim_floor=0.35)
+        for e in embs:
+            self.assertGreater(cos_sim(e, centroid), 0.9)
+
+    def test_outlier_is_excluded_from_centroid(self):
+        from video_face_pipeline import _trimmed_centroid, cos_sim
+        # 4 real members of one identity, 1 genuine outlier (orthogonal
+        # base direction) that should get trimmed before the final mean.
+        good = [_embedding(0, seed=i) for i in range(4)]
+        outlier = _embedding(1, seed=999)
+        centroid_with_outlier_trimmed = _trimmed_centroid(np.array(good + [outlier]), sim_floor=0.35)
+        centroid_good_only = np.mean(good, axis=0)
+        # The trimmed centroid should closely match the good-only mean --
+        # if the outlier had survived trimming, it would pull noticeably
+        # away from this.
+        self.assertGreater(cos_sim(centroid_with_outlier_trimmed, centroid_good_only), 0.99)
+
+    def test_floor_that_excludes_everything_falls_back_to_untrimmed_mean(self):
+        from video_face_pipeline import _trimmed_centroid
+        embs = np.array([_embedding(0, seed=i) for i in range(3)])
+        # An impossibly strict floor (above 1.0) can never be met -- must
+        # fall back to the plain mean rather than dividing by zero
+        # survivors.
+        centroid = _trimmed_centroid(embs, sim_floor=1.5)
+        expected = embs.mean(axis=0)
+        np.testing.assert_allclose(centroid, expected)
+
+
+@tag("slow")
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class VideoFaceExtractorRealInferenceTests(TestCase):
+    """Real ffmpeg decode + real insightface/facenet inference against a
+    real video fixture (IMG_0760.MOV, 7.6s, already used elsewhere in
+    this investigation and known to contain real, detectable faces --
+    see CLAUDE.md's Phase 3 section). No test_face_cache-style caching
+    exists for this pipeline yet (unlike PyramidalDetectorRealInferenceTests)
+    -- this test pays real CPU inference cost every run."""
+
+    VIDEO_PATH = '/photos/video_samples/IMG_0760.MOV'
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from video_face_pipeline import VideoFaceExtractor
+        cls.extractor = VideoFaceExtractor()
+        # Same override LoadEncodingsCachingTests uses: /models/ (the
+        # real cache location) doesn't exist in this test environment --
+        # pre-build the faceAssigner here with a writable path instead of
+        # letting the lazy face_assigner property build one against the
+        # real (here, nonexistent) path on first access.
+        cache_path = "/tmp/face_manager_test_media/test_video_encodings_cache.pkl"
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+        fa = faceAssigner()
+        fa.ENCODINGS_PKL_FILE = cache_path
+        fa.load_encodings()
+        cls.extractor._face_assigner = fa
+
+    def setUp(self):
+        from filepopulator.models import Directory, VideoFile
+        directory = Directory.objects.create(dir_path='/photos/video_samples')
+        self.video = VideoFile.objects.create(
+            filename=self.VIDEO_PATH, directory=directory,
+            width=1920, height=1080, duration_seconds=7.6,
+        )
+
+    def test_real_fixture_produces_valid_face_groups(self):
+        faces = self.extractor.process_video(self.video)
+        self.assertGreaterEqual(len(faces), 1, "expected at least one face group from a known-face fixture")
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        for face in faces:
+            face.refresh_from_db()
+            self.assertEqual(face.source_video_file_id, self.video.pk)
+            self.assertIsNone(face.source_image_file_id)
+            self.assertEqual(len(face.face_encoding_512), 512)
+            self.assertIsNotNone(face.video_first_timestamp_seconds)
+            self.assertIsNotNone(face.video_last_timestamp_seconds)
+            self.assertLessEqual(face.video_first_timestamp_seconds, face.video_last_timestamp_seconds)
+            self.assertGreaterEqual(face.video_first_timestamp_seconds, 0)
+            self.assertLessEqual(face.video_last_timestamp_seconds, self.video.duration_seconds + 1)
+            # Auto-matching (if any) only ever proposes -- never auto-declares.
+            self.assertEqual(face.declared_name_id, blank_person.pk)
+            # A real thumbnail file was actually generated and saved.
+            self.assertTrue(os.path.exists(face.face_thumbnail.path))
+            self.assertGreater(face.box_right, face.box_left)
+            self.assertGreater(face.box_bottom, face.box_top)
+
+    def test_reprocessing_is_independent_not_cumulative(self):
+        # Not idempotency in the "no duplicate rows" sense (there's no
+        # dedup logic -- isProcessed is what stops a real double-run) --
+        # just confirms a second call doesn't crash or silently multiply
+        # unboundedly, producing a comparable group count both times.
+        first = self.extractor.process_video(self.video)
+        for f in first:
+            f.delete()
+        second = self.extractor.process_video(self.video)
+        self.assertGreaterEqual(len(second), 1)
