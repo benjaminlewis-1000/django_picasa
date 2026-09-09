@@ -236,15 +236,31 @@ def _trimmed_centroid(embeddings, sim_floor=CENTROID_OUTLIER_SIM_FLOOR):
 def ffprobe_info(path):
     out = subprocess.run(
         ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-         '-show_entries', 'stream=width,height,r_frame_rate,field_order',
+         '-show_entries', 'stream=width,height,r_frame_rate,avg_frame_rate,field_order',
          '-show_entries', 'stream_side_data=rotation', '-of', 'json', path],
         capture_output=True, text=True,
     )
     data = json.loads(out.stdout)
     stream = data['streams'][0]
     width, height = stream['width'], stream['height']
+    # avg_frame_rate (real nb_frames/duration) rather than r_frame_rate
+    # (the container's declared NOMINAL rate) -- confirmed via a real
+    # 2026-09-09 survey these can differ substantially and in ways that
+    # silently corrupt every frame_idx-based timestamp downstream:
+    # interlaced PAL content reports r_frame_rate as the FIELD rate (50)
+    # while avg_frame_rate correctly reports the real FRAME rate (25) --
+    # since this pipeline already deinterlaces (one output frame per
+    # input frame), using r_frame_rate there computed every timestamp at
+    # exactly half the true elapsed time. Some phone videos also declare
+    # a high nominal rate (e.g. 120, a slow-mo capability) while actually
+    # delivering ~30fps content. Falls back to r_frame_rate only if
+    # avg_frame_rate is missing/zero (not observed in a 482-video survey,
+    # but a real container could omit it).
     num, den = stream['r_frame_rate'].split('/')
-    fps = float(num) / float(den)
+    r_fps = float(num) / float(den) if float(den) else 0
+    avg_num, avg_den = stream.get('avg_frame_rate', '0/1').split('/')
+    avg_fps = float(avg_num) / float(avg_den) if float(avg_den) else 0
+    fps = avg_fps if avg_fps > 0 else r_fps
     field_order = stream.get('field_order', 'unknown')
     rotation = 0
     for sd in stream.get('side_data_list', []):
