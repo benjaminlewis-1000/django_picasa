@@ -70,6 +70,16 @@ _FILENAME_DATETIME_PATTERNS = [
 # below regardless of which pattern found it.
 _FILENAME_EPOCH_MS_PATTERN = re.compile(r'(?<!\d)(1[5-8]\d{11})(?!\d)')
 
+# Date-only (no time component) M-D-YY convention -- real, common in this
+# library's older "Pre_camcorder" digitized home-movie collection (e.g.
+# "4-27-08 575.mpg", "9-16-08 029.avi"): confirmed against real data
+# 2026-09-09, matching 272 of 977 (28%) videos that otherwise fell all
+# the way through to isValidDate=False. Captures (month, day, 2-digit
+# year); time is unknown so guess_date_from_filename() defaults it to
+# noon UTC rather than midnight, to avoid a date-only guess landing on
+# the wrong calendar day after any later local-timezone conversion.
+_FILENAME_DATE_ONLY_PATTERN = re.compile(r'(?<!\d)(\d{1,2})-(\d{1,2})-(\d{2})(?!\d)')
+
 _FILENAME_DATE_MIN = pytz.utc.localize(datetime(1990, 1, 1))
 
 
@@ -112,6 +122,18 @@ def guess_date_from_filename(filename):
             dt = datetime.fromtimestamp(ms / 1000.0, tz=pytz.utc)
         except (ValueError, OSError, OverflowError):
             continue
+        if _FILENAME_DATE_MIN <= dt <= now:
+            candidates.append(dt)
+
+    for m in _FILENAME_DATE_ONLY_PATTERN.finditer(base):
+        mo, d, yy = (int(g) for g in m.groups())
+        # Same 2-digit-year windowing as Python's own %y strptime
+        # directive: 00-68 -> 2000-2068, 69-99 -> 1969-1999.
+        y = 2000 + yy if yy <= 68 else 1900 + yy
+        try:
+            dt = pytz.utc.localize(datetime(y, mo, d, 12, 0, 0))
+        except ValueError:
+            continue  # e.g. month 13, day 32 -- not a real date, just digits
         if _FILENAME_DATE_MIN <= dt <= now:
             candidates.append(dt)
 
