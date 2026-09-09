@@ -25,16 +25,27 @@ def _mean_abs_diff(a, b):
     return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16))))
 
 
-def _extract_frame_fast(path, timestamp, field_order):
-    """Same fast-seek approach as api/views.py's _extract_video_face_frame
-    -- -ss placed before -i, approximate but not scaling with video
-    length. Returns a raw BGR frame array, or None on failure."""
-    cmd = ['ffmpeg', '-v', 'error', '-ss', str(timestamp), '-i', path]
+def _extract_frame(path, timestamp, field_order, accurate=False):
+    """accurate=False: -ss placed before -i, fast/approximate (can land a
+    few frames off the true target -- fine for a "roughly this moment"
+    viewer, NOT precise enough on its own to decide whether to delete
+    real data). accurate=True: -ss placed after -i, frame-exact but
+    decodes the whole video from the start to reach the target -- only
+    used as a slower confirmation check on faces the fast pass already
+    flagged, not on all of them, to keep the sweep's overall cost down.
+    Returns a raw BGR frame array, or None on failure."""
+    if accurate:
+        cmd = ['ffmpeg', '-v', 'error', '-i', path, '-ss', str(timestamp)]
+    else:
+        cmd = ['ffmpeg', '-v', 'error', '-ss', str(timestamp), '-i', path]
     if field_order not in ('progressive', 'unknown'):
         cmd += ['-vf', 'yadif=0']
     cmd += ['-frames:v', '1', '-f', 'image2', '-q:v', '2', 'pipe:1']
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=300 if accurate else 30,
+        )
     except subprocess.TimeoutExpired:
         return None
     if result.returncode != 0 or not result.stdout:
@@ -89,22 +100,36 @@ class Command(BaseCommand):
                 except Exception:
                     field_order = 'unknown'
 
-            frame = _extract_frame_fast(video.filename, f.video_thumbnail_frame_seconds, field_order)
-            if frame is None:
-                flagged += 1
-                bad_video_ids.add(video.id)
-                self.stdout.write(f'  face {f.id} ({video.filename}): re-extract failed')
-                continue
-
             box = (f.box_left, f.box_top, f.box_right, f.box_bottom)
-            candidate = VideoFaceExtractor._square_thumbnail(frame, box)
             stored = _decode_stored_thumbnail(f)
-            diff = _mean_abs_diff(candidate, stored)
 
-            if diff is None or diff > threshold:
+            frame = _extract_frame(video.filename, f.video_thumbnail_frame_seconds, field_order)
+            diff = None
+            if frame is not None:
+                candidate = VideoFaceExtractor._square_thumbnail(frame, box)
+                diff = _mean_abs_diff(candidate, stored)
+
+            if diff is not None and diff <= threshold:
+                continue  # fast check already confirms a good match
+
+            # Fast check failed or was inconclusive -- confirm with a
+            # slower, frame-exact re-check before trusting it, since a
+            # fast approximate seek landing a few frames off the true
+            # target can make even genuinely-correct data look wrong.
+            frame_accurate = _extract_frame(
+                video.filename, f.video_thumbnail_frame_seconds, field_order, accurate=True
+            )
+            diff_accurate = None
+            if frame_accurate is not None:
+                candidate_accurate = VideoFaceExtractor._square_thumbnail(frame_accurate, box)
+                diff_accurate = _mean_abs_diff(candidate_accurate, stored)
+
+            if diff_accurate is None or diff_accurate > threshold:
                 flagged += 1
                 bad_video_ids.add(video.id)
-                self.stdout.write(f'  face {f.id} ({video.filename}): diff={diff}')
+                self.stdout.write(
+                    f'  face {f.id} ({video.filename}): fast_diff={diff} accurate_diff={diff_accurate}'
+                )
 
             if checked % 200 == 0:
                 self.stdout.write(f'  ... {checked}/{total} checked, {flagged} flagged so far')
