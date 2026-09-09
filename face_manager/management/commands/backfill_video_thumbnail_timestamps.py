@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import time
 
 from django.core.management.base import BaseCommand
 
@@ -64,7 +65,9 @@ class Command(BaseCommand):
 
         resolved = 0
         unresolved = 0
-        for video_id, video_faces in by_video.items():
+        n_videos = len(by_video)
+        for vi, (video_id, video_faces) in enumerate(by_video.items(), start=1):
+            video_start = time.time()
             video = video_faces[0].source_video_file
             spans = [
                 (f.video_first_timestamp_seconds, f.video_last_timestamp_seconds)
@@ -86,17 +89,30 @@ class Command(BaseCommand):
             stride = sample_stride(fps)
             lo = min(s[0] for s in spans)
             hi = max(s[1] for s in spans)
-            lo_frame = max(0, int(lo * fps) - stride)
-            hi_frame = int(hi * fps) + stride
 
-            frames = {}
-            idx = 0
-            for frame in ffmpeg_frame_iterator(video.filename, width, height, vf_filter=vf_filter):
-                if idx > hi_frame:
+            # Seek near the window start (fast, approximate -- snaps to the
+            # nearest preceding keyframe) rather than always decoding from
+            # frame 0, which was needlessly slow for a face whose window
+            # starts well into a longer video. Correctness doesn't depend
+            # on exact seek/frame-index precision here -- the pixel match
+            # below finds whichever sampled candidate actually looks like
+            # the stored thumbnail, regardless of its assumed timestamp
+            # being a frame or two off from the original detection pass's
+            # own sample grid.
+            seek_seconds = max(0, lo - 5)
+            hi_cutoff = hi + (stride / fps)
+
+            frames = {}  # timestamp (seconds) -> frame array
+            n = 0
+            for frame in ffmpeg_frame_iterator(
+                video.filename, width, height, vf_filter=vf_filter, seek_seconds=seek_seconds
+            ):
+                t = seek_seconds + n / fps
+                if t > hi_cutoff:
                     break
-                if idx >= lo_frame and (idx - lo_frame) % stride == 0:
-                    frames[idx] = frame.copy()
-                idx += 1
+                if t >= lo and n % stride == 0:
+                    frames[t] = frame.copy()
+                n += 1
 
             if not frames:
                 self.stdout.write(f'  no frames decoded for {video.filename} (span {lo}-{hi}s)')
@@ -106,18 +122,17 @@ class Command(BaseCommand):
             for f in video_faces:
                 stored = _decode_stored_thumbnail(f)
                 box = (f.box_left, f.box_top, f.box_right, f.box_bottom)
-                best_idx, best_diff = None, None
-                for fidx, frame in frames.items():
+                best_t, best_diff = None, None
+                for t, frame in frames.items():
                     candidate = VideoFaceExtractor._square_thumbnail(frame, box)
                     diff = _mean_abs_diff(candidate, stored)
                     if diff is not None and (best_diff is None or diff < best_diff):
-                        best_idx, best_diff = fidx, diff
+                        best_t, best_diff = t, diff
 
-                if best_idx is not None and best_diff <= threshold:
-                    ts = best_idx / fps
+                if best_t is not None and best_diff <= threshold:
                     resolved += 1
                     if not dry_run:
-                        f.video_thumbnail_frame_seconds = ts
+                        f.video_thumbnail_frame_seconds = best_t
                         f.save(update_fields=['video_thumbnail_frame_seconds'])
                 else:
                     unresolved += 1
@@ -125,6 +140,12 @@ class Command(BaseCommand):
                         f'  face {f.id} ({video.filename}): no match within threshold '
                         f'(best_diff={best_diff})'
                     )
+
+            self.stdout.write(
+                f'[{vi}/{n_videos}] {video.filename}: {len(video_faces)} face(s), '
+                f'window {lo:.1f}-{hi:.1f}s, {len(frames)} frames decoded, '
+                f'{time.time() - video_start:.1f}s'
+            )
 
         self.stdout.write(
             f"{'Would resolve' if dry_run else 'Resolved'}: {resolved}, unresolved: {unresolved}."
