@@ -1058,6 +1058,16 @@ class VideoFile(models.Model):
     height = models.IntegerField(validators=[MinValueValidator(1)])
     codec = models.CharField(max_length=32, null=True, blank=True)
 
+    # ffprobe's interlacing flag ('progressive', 'tt', 'bb', 'unknown', ...)
+    # -- cached at ingestion time from data _run_ffprobe() already fetches
+    # (no extra subprocess call needed) so on-demand frame extraction
+    # (api/views.py's _extract_video_face_frame) doesn't have to re-run
+    # ffprobe on every single request just to decide whether to
+    # deinterlace. Nullable for rows ingested before this field existed;
+    # those fall back to a live ffprobe call (see
+    # backfill_video_field_order management command for a one-time catch-up).
+    field_order = models.CharField(max_length=16, null=True, blank=True)
+
     # Raw file size on disk (os.path.getsize()), unlike ImageFile which has
     # no equivalent field -- added specifically to help size the Phase 5
     # transcode pipeline's disk footprint (see CLAUDE.md).
