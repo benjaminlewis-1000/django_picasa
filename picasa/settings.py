@@ -564,6 +564,18 @@ CELERY_BEAT_SCHEDULE = {
       'schedule': crontab( minute = '0', hour='*'),
       'args': (False, ), # Don't reassign all of them.
   },
+   'video_face_extraction': {
+       'task': 'face_manager.video_face_extraction',
+       # Every 3 hours, each run capped at 2.5h (kwargs below) so the
+       # heavy ONNX/torch inference this task does doesn't pin cores for
+       # the full multi-day backfill straight through -- runs 2.5h, sits
+       # idle ~0.5h, repeats. The advisory lock inside the task itself
+       # makes any overlap with a still-running previous invocation a
+       # harmless no-op, so exact alignment with the 3h period isn't
+       # required for correctness.
+       'schedule': crontab(minute='0', hour='*/3'),
+       'kwargs': {'max_runtime_seconds': 9000},
+   },
    # 'classify_unlabeled_all_weekly': {
    #     'task': 'face_manager.assign_faces',
    #     # This schedule should be sufficient to
