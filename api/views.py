@@ -462,6 +462,14 @@ class PersonParamView(APIView):
         # Populated only for field == 'face_declared' with
         # only_unverified=true - see there for what this is.
         cluster_groups = {}
+        # Populated for both face_declared and face_poss (not directory,
+        # whose id_list is ImageFile ids, not Face ids) - lets the
+        # frontend gate its fast/accurate video-frame double-fetch
+        # (api/views.py's face_source `fast` param) to only the faces
+        # that actually need it, rather than either always double-
+        # fetching (wasteful for the image-sourced majority) or never
+        # doing the accurate-frame swap at all.
+        video_face_ids = []
 
         id_key = kwargs['id']
         field = kwargs['field']
@@ -543,6 +551,10 @@ class PersonParamView(APIView):
                     faces = []
                 
             id_list = list(faces)
+            video_face_ids = list(
+                Face.objects.filter(id__in=id_list, source_video_file__isnull=False)
+                .values_list('id', flat=True)
+            )
         else:
             try:
                 dir_obj = Directory.objects.get(id=id_key)
@@ -556,7 +568,10 @@ class PersonParamView(APIView):
             image_set = ImageFile.objects.filter(directory=dir_obj).order_by('-dateTaken').values_list('id', flat=True)
             id_list = list(image_set)
 
-        js = {'num_results': len(id_list), 'type': field, 'id_list': id_list, 'cluster_groups': cluster_groups}
+        js = {
+            'num_results': len(id_list), 'type': field, 'id_list': id_list,
+            'cluster_groups': cluster_groups, 'video_face_ids': video_face_ids,
+        }
 
         return HttpResponse(json.dumps(js), content_type='application/json')
 
@@ -941,11 +956,22 @@ def _extract_video_face_frame(face):
     Face -- the video equivalent of just opening an image-sourced face's
     source_image_file.filename directly. Deliberately not precomputed/
     stored (would cost real disk space across the whole video library,
-    for something reviewed only occasionally) -- re-extracted via ffmpeg
-    at request time instead, from the exact timestamp the face's current
-    thumbnail/box/kps came from (video_thumbnail_frame_seconds). Returns
-    a PIL Image, or None if there's no video source, no stored timestamp,
-    or extraction fails for any reason (missing file, corrupt video)."""
+    for something reviewed only occasionally) -- re-extracted at request
+    time instead, from the exact timestamp the face's current thumbnail/
+    box/kps came from (video_thumbnail_frame_seconds). Returns a PIL
+    Image, or None if there's no video source, no stored timestamp, or
+    extraction fails for any reason (missing file, corrupt video).
+
+    Uses PyAV, not ffmpeg's -ss flag. Real benchmarking (2026-09-09, see
+    CLAUDE.md) found -ss-based seeking has a genuine ~30% mismatch rate
+    against the frame a face's stored thumbnail actually came from, even
+    given the exact correct target timestamp -- ffmpeg's own post-seek
+    frame selection doesn't always agree with true sequential decode
+    order for some files in this library. video_face_pipeline.py's
+    extract_frame_near_timestamp() fixes this by decoding a small window
+    around the target and picking whichever frame's own box-crop best
+    matches this face's already-stored thumbnail, rather than trusting
+    any single seek/index computation to land on the right frame."""
     video = face.source_video_file
     if video is None or face.video_thumbnail_frame_seconds is None:
         return None
@@ -953,35 +979,80 @@ def _extract_video_face_frame(face):
     # ffprobe already returns there, no extra call needed) -- falls back
     # to a live ffprobe call only for rows ingested before that field
     # existed (see backfill_video_field_order).
+    from video_face_pipeline import ffprobe_info, extract_frame_near_timestamp
+    field_order = video.field_order
+    try:
+        # rotation comes from THIS ffprobe call's own side_data_list
+        # parse, not VideoFile.rotation -- that field is populated from
+        # exiftool's Rotation tag (filepopulator/video_scripts.py), a
+        # different tool with a different sign convention than ffprobe's
+        # side_data rotation, which is what extract_frame_near_timestamp
+        # (and ffmpeg's own raw-pipe auto-rotation elsewhere in this
+        # pipeline) assumes. Confirmed via real production data
+        # (2026-09-09): the two disagree in sign for real files (e.g.
+        # cached 270 vs. this call's 90), silently rotating the wrong
+        # direction if the cached field were used here instead.
+        _, _, avg_fps, probed_field_order, rotation = ffprobe_info(video.filename)
+    except Exception:
+        return None
+    if field_order is None:
+        field_order = probed_field_order
+    box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
+    try:
+        face.face_thumbnail.open('rb')
+        thumb_bytes = face.face_thumbnail.read()
+    except Exception:
+        return None
+    finally:
+        try:
+            face.face_thumbnail.close()
+        except Exception:
+            pass
+    reference_bgr = cv2.imdecode(np.frombuffer(thumb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    try:
+        arr = extract_frame_near_timestamp(
+            video.filename, face.video_thumbnail_frame_seconds, avg_fps,
+            field_order, rotation, box, reference_bgr,
+        )
+    except Exception:
+        return None
+    if arr is None:
+        return None
+    try:
+        return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+    except Exception:
+        return None
+
+
+def _extract_video_face_frame_fast(face):
+    """Approximate, sub-second variant of _extract_video_face_frame --
+    the original -ss-based implementation, kept as the `fast=true`
+    branch of face_source's video path. Frontend contract: fetch this
+    one first to show something immediately, then fetch the plain
+    (accurate) endpoint and swap it in once that resolves -- same
+    "placeholder, then real image" pattern as a blurred-thumbnail swap.
+    Usually correct, but real benchmarking (2026-09-09, see CLAUDE.md)
+    found ffmpeg's own -ss frame selection has a genuine ~30% mismatch
+    rate against the frame a face's stored thumbnail actually came from
+    -- that's the accurate endpoint's whole reason to exist. Returns a
+    PIL Image, or None on any failure."""
+    video = face.source_video_file
+    if video is None or face.video_thumbnail_frame_seconds is None:
+        return None
     field_order = video.field_order
     if field_order is None:
         from video_face_pipeline import ffprobe_info
         try:
-            _, _, _, field_order = ffprobe_info(video.filename)
+            _, _, _, field_order, _rotation = ffprobe_info(video.filename)
         except Exception:
             return None
-    # -ss placed BEFORE -i (fast, approximate -- snaps to the nearest
-    # preceding keyframe) rather than after -i (frame-accurate, but
-    # decodes the entire video from the start to reach the target).
-    # Originally built the other way on the assumption that correctness
-    # mattered more than speed for an "occasional manual review" request
-    # -- real benchmarking (2026-09-09) proved that wrong: elapsed time
-    # scaled linearly with the target timestamp (~0.5s of decode per
-    # second of video content), and a face late in a ~33-minute video
-    # extrapolated to ~10 minutes of decode, silently hitting this
-    # function's own 60s subprocess timeout and returning a 404 instead
-    # of an image -- a real failure, not just slowness. This is a
-    # "roughly this moment" context viewer, not a frame-exact one (same
-    # reasoning already applied to the backfill command's own seek), so
-    # landing a frame or two off the exact target is an acceptable
-    # trade for latency that no longer scales with video length.
     cmd = ['ffmpeg', '-v', 'error',
            '-ss', str(face.video_thumbnail_frame_seconds), '-i', video.filename]
     if field_order not in ('progressive', 'unknown'):
         cmd += ['-vf', 'yadif=0']
     cmd += ['-frames:v', '1', '-f', 'image2', '-q:v', '2', 'pipe:1']
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
     except subprocess.TimeoutExpired:
         return None
     if result.returncode != 0 or not result.stdout:
@@ -1005,8 +1076,16 @@ class KeyedImageView(APIView):
         face_highlight: key type - person. Gets the highlight image of that person
         face_array: key type - face. Gets the cropped image of just that face
         face_source: key type: face. Gets the full image containing that face.
+          For a video-sourced face, also accepts &fast=true for an
+          approximate, sub-second frame (see _extract_video_face_frame_fast) --
+          intended as a placeholder to show immediately while a second,
+          plain (accurate, ~1-2s) request is made and swapped in. The
+          `video_face_ids` list returned by paginate_obj_ids tells the
+          caller which face ids are video-sourced and need this two-step
+          fetch at all; every other face_source request is unaffected by
+          `fast` (image-sourced faces have no video path to begin with).
         slideshow: key type: image. Gets a reduced resolution image for the slideshow.
-        full_big/medium/small: key type: image. Gets the corresponding thumbnail image. 
+        full_big/medium/small: key type: image. Gets the corresponding thumbnail image.
         '''
 
         params = self.request.query_params
@@ -1149,7 +1228,14 @@ class KeyedImageView(APIView):
             return HttpResponse(json.dumps(js), content_type='application/json')
 
         if image_type == 'face_source' and face.source_video_file_id is not None:
-            image = _extract_video_face_frame(face)
+            # fast=true: approximate, sub-second placeholder (frontend
+            # contract: show this immediately, then fetch the plain/
+            # accurate response and swap it in). See
+            # _extract_video_face_frame_fast's docstring.
+            if params.get('fast', '').lower() == 'true':
+                image = _extract_video_face_frame_fast(face)
+            else:
+                image = _extract_video_face_frame(face)
             if image is None:
                 return err_404('Could not extract a context frame for this video-sourced face.')
         else:
