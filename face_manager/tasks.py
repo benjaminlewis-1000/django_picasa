@@ -16,12 +16,39 @@ from picasa import celery_app
 import os
 import queue
 import random
+import signal
 import threading
 import time
 import traceback
 
 
-# from image_face_extractor import reencoder, ip_finder 
+# from image_face_extractor import reencoder, ip_finder
+
+# Per-video hard timeout for process_video_faces() below -- a pathological
+# video (an unusually large raw detection/track count blowing up the
+# clustering step's distance-matrix computation) can otherwise stall the
+# whole batch indefinitely, since max_runtime_seconds is only checked
+# *between* videos. Confirmed necessary 2026-09-09: a real production
+# video ran for 2+ hours with zero completion (vs. the slowest known-good
+# real video, 58 face groups, ~17 minutes) and had to be killed by hand.
+# Set comfortably above that known-good outlier. Known limitation: a
+# signal-based alarm can only interrupt at a Python bytecode boundary, so
+# it won't preempt a single very-long-running C-level call (e.g. one
+# AgglomerativeClustering.fit() invocation) mid-call -- it fires as soon
+# as that call returns, which still bounds *most* realistic slow-python-
+# loop cases but isn't a hard real-time guarantee against every possible
+# blowup.
+PER_VIDEO_TIMEOUT_SECONDS = 1800
+
+
+class _VideoProcessingTimeout(Exception):
+    pass
+
+
+def _raise_video_timeout(signum, frame):
+    raise _VideoProcessingTimeout(
+        f"Video processing exceeded {PER_VIDEO_TIMEOUT_SECONDS}s"
+    )
 
 if not settings.configured:
     settings.configure()
@@ -106,7 +133,12 @@ def process_video_faces(max_runtime_seconds=None):
                 )
                 break
             try:
-                faces = extractor.process_video(video)
+                signal.signal(signal.SIGALRM, _raise_video_timeout)
+                signal.alarm(PER_VIDEO_TIMEOUT_SECONDS)
+                try:
+                    faces = extractor.process_video(video)
+                finally:
+                    signal.alarm(0)
                 settings.LOGGER.debug(
                     f"Video face extraction: {video.filename} -> {len(faces)} face group(s)."
                 )
