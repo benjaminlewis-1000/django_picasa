@@ -36,14 +36,15 @@ RUN pip3 install -r /code/requirements.txt
 # installed model runs correctly against the newer already-pinned
 # versions despite the stale metadata bounds.
 RUN pip3 install --no-deps facenet-pytorch==2.6.0
-# Pre-fetch the pretrained weights at build time (~107MB) rather than
-# relying on a runtime download on first real use -- same reasoning as
-# insightface's own models being baked in, not downloaded live. Caches to
-# /root/.cache/torch/checkpoints/ -- the container runs as root at
-# runtime (confirmed: the `user`/`usergrp` created below is unused, no
-# USER directive switches to it), so this cache location is the one that
-# actually gets hit later, not a mismatched path.
-RUN python3 -c "from facenet_pytorch import InceptionResnetV1; InceptionResnetV1(pretrained='vggface2')"
+# Pretrained weights (~107MB) are NOT baked in here -- torch.hub's cache
+# dir is redirected via TORCH_HOME (docker-compose.yaml) onto the same
+# persistent /models bind mount insightface's own model packs and the
+# gallery pkl cache already live on, so the weights survive container
+# recreates the same way those do, without bloating the image layer or
+# needing a rebuild if they're ever lost. Downloaded once via a real
+# runtime call the first time this environment is stood up (same
+# one-time-backfill pattern already used for insightface's buffalo_s
+# pack, which had the same gap -- see CLAUDE.md).
 
 RUN apt remove cmake -y
 

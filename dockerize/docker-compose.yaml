@@ -21,9 +21,16 @@ services:
       - .env
     environment:
       - TZ=America/New_York
+      # Redirects torch.hub's (and facenet-pytorch's) model cache onto the
+      # same persistent /models bind mount insightface's own models and
+      # the gallery pkl cache already live on, rather than the image's own
+      # writable layer -- keeps every downloaded-model dependency in one
+      # place that survives container recreates without needing to be
+      # baked into the image at build time.
+      - TORCH_HOME=/models/torch_home
       # Add the following line to your /etc/profile:
       # HOST_IP=`ip route | grep default | awk '{print $9}'`
-      # - DOCKER_HOST_IP=${HOST_IP} 
+      # - DOCKER_HOST_IP=${HOST_IP}
     ports:
       - "${CLIENT_FACE_PORT}:${CLIENT_FACE_PORT}/udp"
       - 44480:8000
