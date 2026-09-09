@@ -29,6 +29,7 @@ from io import BytesIO
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import pdist, squareform
 from sklearn.cluster import AgglomerativeClustering
+import av
 import cv2
 import insightface.app.common
 from insightface.app import FaceAnalysis
@@ -268,7 +269,7 @@ def ffprobe_info(path):
             rotation = int(sd['rotation'])
     if rotation in (90, -90, 270, -270):
         width, height = height, width
-    return width, height, fps, field_order
+    return width, height, fps, field_order, rotation
 
 
 def ffmpeg_frame_iterator(path, width, height, vf_filter=None, seek_seconds=0):
@@ -297,6 +298,104 @@ def ffmpeg_frame_iterator(path, width, height, vf_filter=None, seek_seconds=0):
     finally:
         proc.stdout.close()
         proc.wait()
+
+
+def _mean_abs_pixel_diff(a, b):
+    if a is None or b is None or a.shape != b.shape:
+        return None
+    return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16))))
+
+
+def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rotation,
+                                  box, reference_bgr, window_seconds=0.5):
+    """On-demand exact-frame retrieval for the video-face "full context"
+    viewer (api/views.py's _extract_video_face_frame) -- NOT used by the
+    main extraction pipeline itself, which already reads frames
+    sequentially in original decode order and has no need for this.
+
+    Real benchmarking (2026-09-09, see CLAUDE.md) found ffmpeg's own -ss
+    seeking (either placed before or after -i) has a real ~30% mismatch
+    rate against the frame a face's stored thumbnail/box actually came
+    from -- even when fed the exact correct target timestamp, ffmpeg's
+    internal frame-selection after a seek doesn't always agree with true
+    sequential decode order for some files in this library.
+
+    Fixed by using PyAV directly, and by not trusting any single index/
+    pts computation to land on the exactly-right frame at all: seek to
+    the nearest keyframe before a small window around the target, decode
+    every frame in that window, and return whichever one's own box-crop
+    is the closest pixel match to the face's ALREADY-STORED thumbnail.
+    This absorbed every real failure mode found during benchmarking --
+    off-by-a-few-frame rounding between how a timestamp was originally
+    derived (sequential frame count / avg_fps at pipeline time) and how
+    it's re-derived here, PTS start-time offsets on some older containers
+    (confirmed on real Pre_camcorder-era MPGs, ~3 frames on one real
+    file), and a stored target that slightly overshoots the real last
+    frame (falls back to the closest frame that actually exists) --
+    without needing to get the seek/index math exactly right, since the
+    stored thumbnail is the real ground truth either way. Only decodes
+    roughly 2*window_seconds*avg_fps frames, not the whole video.
+
+    Returns a raw BGR numpy array (full frame, not cropped), or None if
+    no frame in the window decodes at all.
+    """
+    container = av.open(path)
+    try:
+        stream = container.streams.video[0]
+        stream.thread_type = 'AUTO'
+
+        graph = None
+        if field_order not in ('progressive', 'unknown'):
+            graph = av.filter.Graph()
+            buf = graph.add_buffer(template=stream)
+            yadif = graph.add('yadif', 'mode=0')
+            buf.link_to(yadif)
+            sink = graph.add('buffersink')
+            yadif.link_to(sink)
+            graph.configure()
+
+        # Frame time must be computed relative to the stream's OWN start
+        # pts, not raw pts=0 -- some real files (old camcorder-era MPGs)
+        # have a nonzero start offset that otherwise silently shifts
+        # every frame's computed time by a few frames' worth.
+        start_pts = stream.start_time if stream.start_time is not None else 0
+        seek_target = max(0.0, target_seconds - window_seconds)
+        container.seek(int(seek_target * av.time_base), backward=True, any_frame=False, stream=None)
+
+        best_arr = None
+        best_diff = None
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                candidates = [frame]
+                if graph is not None:
+                    graph.push(frame)
+                    candidates = []
+                    while True:
+                        try:
+                            candidates.append(graph.pull())
+                        except Exception:
+                            break
+                for out_frame in candidates:
+                    pts = out_frame.pts if out_frame.pts is not None else 0
+                    frame_time = float((pts - start_pts) * stream.time_base)
+                    if frame_time > target_seconds + window_seconds:
+                        return best_arr
+                    if frame_time < target_seconds - window_seconds:
+                        continue
+                    arr = out_frame.to_ndarray(format='bgr24')
+                    # ffmpeg's raw pipe (used elsewhere in this file)
+                    # auto-applies the container's rotation side-data;
+                    # PyAV does not, so it's applied explicitly here.
+                    if rotation:
+                        arr = np.rot90(arr, k=round(rotation / 90) % 4)
+                    crop = VideoFaceExtractor._square_thumbnail(arr, box)
+                    d = _mean_abs_pixel_diff(crop, reference_bgr)
+                    if d is not None and (best_diff is None or d < best_diff):
+                        best_diff = d
+                        best_arr = arr
+        return best_arr
+    finally:
+        container.close()
 
 
 def sample_stride(fps):
@@ -568,7 +667,7 @@ class VideoFaceExtractor(object):
         row per final union-merge group. Returns the list of created
         Face objects."""
         video_path = video_obj.filename
-        width, height, fps, field_order = ffprobe_info(video_path)
+        width, height, fps, field_order, _rotation = ffprobe_info(video_path)
         deinterlace = field_order not in ('progressive', 'unknown')
         vf_filter = 'yadif=0' if deinterlace else None
 

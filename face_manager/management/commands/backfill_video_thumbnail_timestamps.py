@@ -87,7 +87,7 @@ class Command(BaseCommand):
                 continue
 
             try:
-                width, height, fps, field_order = ffprobe_info(video.filename)
+                width, height, fps, field_order, _rotation = ffprobe_info(video.filename)
             except Exception as e:
                 self.stdout.write(f'  ffprobe failed for {video.filename}: {e}')
                 unresolved += len(video_faces)

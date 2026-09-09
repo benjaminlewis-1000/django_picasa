@@ -2694,39 +2694,98 @@ active production issue, not just cleanup — worth prioritizing the deploy once
 - **Slideshow metadata overlay**: serve slideshow images with the photo's date (nicely formatted, not a raw timestamp) and location (feeds off the geocoding work above) alongside the image itself.
 - **Video support**: the pipeline currently assumes still images end-to-end — `ImageFile`'s filename validator/extension checks, thumbnailing, EXIF/GPS extraction, and the face-detection pipeline are all image-only. Adding video would need real planning: a distinct model (or a shared base) for video assets, a thumbnailing strategy (extract a representative frame, or several), whether/how face detection runs against video (sample frames vs. skip entirely), metadata extraction differences (video containers carry EXIF-equivalent metadata differently than JPEGs), and slideshow/API changes to serve a different media type. Not started — flagged here as a bigger feature needing a design pass, not a quick add.
 
-## OPEN: on-demand video-face-frame viewer has a real ~30% failure rate (2026-09-09)
+## DONE (2026-09-09): on-demand video-face-frame viewer's ~30% failure rate fixed with PyAV, deployed to production
 
-Separate from the (now-fixed, verified) `avg_frame_rate` timestamp-correctness
-bug: `api/views.py`'s `_extract_video_face_frame()` (backing `KeyedImageView`'s
-`face_source` type for video-sourced faces) uses `-ss` placed BEFORE `-i` for
-fast, approximate seeking. Real benchmark against 20 already-reprocessed
-(post-fps-fix) faces, comparing the viewer's own actual extraction method
-against a reliable ground-truth sequential decode (the same method the core
-pipeline itself uses, already verified ~100% correct): **14/20 good, 6/20
-bad (30% failure rate)**, including one outright extraction failure. This
-confirms the underlying STORED data (thumbnails/boxes/embeddings/timestamps)
-is correct, but the VIEWER's own retrieval at request time is not reliably
-reproducing the right frame even when given a correct timestamp -- a real,
-separate problem from the fps bug, previously suspected (see the
-`video_thumbnail_frame_seconds` investigation write-up above, face 1090496)
-but not previously quantified across a real sample.
+Follow-up to the `avg_frame_rate` timestamp-correctness fix above. Real
+benchmarking found `api/views.py`'s `_extract_video_face_frame()` (backing
+`KeyedImageView`'s `face_source` type for video-sourced faces), which used
+`-ss` placed before `-i` for fast approximate seeking, had a genuine ~30%
+mismatch rate against the frame a face's stored thumbnail/box actually came
+from (14/20 good in one real sample) -- confirming the STORED data (boxes/
+embeddings/timestamps) was correct, but ffmpeg's own post-`-ss` frame
+selection doesn't always agree with true sequential decode order for some
+files in this library, even given the exact correct target timestamp.
 
-**Root cause, not yet fully diagnosed**: even feeding `-ss` (either before or
-after `-i`) the *exact* ground-truth PTS of a target frame (confirmed via
-`ffprobe -show_entries frame=pts_time`) did not always reproduce that frame's
-content in earlier spot-testing -- suggesting `-ss`'s frame-selection logic
-doesn't always agree with sequential decode order for some of this library's
-real files, independent of timestamp accuracy.
+**Root cause, fully diagnosed this time**: not one bug but several, found by
+prototyping a PyAV-based replacement and benchmarking it against real faces
+until the failures were understood, not just patched over:
+1. **Frame-index math must subtract the stream's own `start_time`/start pts**,
+   not assume frame 0 occurs at raw pts=0 -- some real files (old Pre_camcorder-
+   era MPGs) have a nonzero start offset (confirmed ~0.11s, ~3 frames at 25fps
+   on one real file) that silently shifted every computed frame index by a
+   few frames if not accounted for.
+2. **Rotation sign convention mismatch**: `VideoFile.rotation` (cached at
+   ingestion from exiftool's `Rotation` tag, `filepopulator/video_scripts.py`)
+   uses the OPPOSITE sign convention from ffprobe's own `side_data_list`
+   rotation (confirmed on real files: cached `270` vs. ffprobe's own `90` for
+   the same file) -- these are two different tools' conventions, not
+   interchangeable. `ffmpeg`'s raw pipe (used elsewhere in this pipeline)
+   auto-applies rotation using its OWN (ffprobe-convention) side-data, so
+   PyAV -- which does not auto-rotate -- must apply rotation using that same
+   ffprobe-sourced value, never the cached `VideoFile.rotation` field.
+3. **Even correct index math still lands off by ~1 frame sometimes**, from
+   ordinary rounding between how a timestamp was originally derived
+   (sequential frame count / avg_fps at pipeline time) and how it's
+   re-derived at read time -- not a bug to chase further, just real floating-
+   point granularity at frame-time boundaries.
 
-**Planned fix, not yet built**: replace `-ss`-based seeking in the on-demand
-path with a fast-keyframe-jump + sequential-frame-count-forward approach
-(matching the core pipeline's own proven-reliable method), using **PyAV**
-(python bindings around ffmpeg's own libraries) instead of shelling out to
-the `ffmpeg` CLI -- PyAV exposes real per-frame PTS/index during decode, so a
-keyframe jump can be corrected by counting forward with certainty rather than
-trusting the CLI's own `-ss` frame-selection. This is a real new dependency
-(image rebuild), not a quick patch.
+**Fix**: `face_manager/video_face_pipeline.py`'s new
+`extract_frame_near_timestamp()` -- seeks to the nearest keyframe before a
+small window (0.5s each side) around the target time via PyAV, decodes every
+frame in that window, and returns whichever one's own box-crop is the closest
+pixel match to the face's ALREADY-STORED thumbnail, rather than trusting any
+single seek/index computation to land on the exact right frame. This
+absorbed every failure mode above by construction, since the stored
+thumbnail is real ground truth regardless of index/rotation/rounding
+correctness. `ffprobe_info()` now also returns `rotation` (a 5-tuple, not
+4 -- all call sites updated) so callers use the same ffprobe-sourced
+rotation convention consistently, rather than mixing it with
+`VideoFile.rotation`'s different one.
 
-**Reusable benchmark**: `/tmp/claude-1000/-home-benjamin-git-repos-django-picasa/d8c8c9ae-e060-4ae1-b0c6-eb1afffc49bc/scratchpad/viewer_benchmark.py`
-(session-scratchpad, not committed to the repo) -- re-run against a fresh
-sample to check any future fix's real pass rate before declaring it solved.
+**Validated empirically, not just unit-tested**: repeated 30-face random
+samples against real production data landed at 27-29/30 good (90-97%), with
+the only real failures being (a) one already-known video with corrupted
+timestamps from before the `avg_frame_rate` fix (unrelated, separate data
+issue -- see above) and (b) one borderline near-miss (diff just over the
+10.0 mean-abs-pixel-diff threshold) visually confirmed to be the identical
+frame, just ordinary JPEG re-encoding noise crossing an arbitrary cutoff, not
+a real mismatch. Latency: ~0.2-4.9s per request (mean ~1.2-1.6s) -- slower
+than the old best-case sub-second `-ss` call, but bounded regardless of how
+far into the video the target is (the old method's decode cost scaled with
+target timestamp, and could hit its own 60s timeout on a late-video face) and
+without the ~30% wrong-frame risk. Full fast suite: 349/349 passing (no
+regressions from the `ffprobe_info` signature change or the new `av` import).
+
+**Frontend contract, added alongside the fix**: the web frontend wants a
+fast-then-accurate progressive swap (fetch `fast=true` immediately, show it,
+then fetch the plain/accurate endpoint and swap once it resolves) -- this
+needed one more thing added to the contract, found missing when scoping the
+frontend work: nothing told the frontend which face ids are video-sourced at
+all, so it had no way to gate the double-fetch (always double-fetching would
+be wasteful for the image-sourced majority; never double-fetching would
+defeat the point). Fixed by adding a `video_face_ids` flat id list to
+`PersonParamView` (`paginate_obj_ids`)'s response, alongside the existing
+`cluster_groups` sidecar -- a flat list rather than `cluster_groups`'s
+`{id: value}` dict shape, since a plain "is this video" boolean carries no
+per-face value worth keying a dict on. `KeyedImageView`'s `face_source` type
+gained a `fast=true` query param: approximate/sub-second
+(`_extract_video_face_frame_fast`, the original `-ss`-based implementation,
+kept rather than deleted) vs. the new accurate default
+(`_extract_video_face_frame`). `fast=true` is a no-op for image-sourced faces
+(the branch it's checked in is gated on `source_video_file_id is not None`),
+confirmed safe to pass unconditionally -- the mobile app (PhotoVerify) is
+using exactly that simplification: always append `fast=true` to every
+`face_source` request with no `video_face_ids` check at all, accepting the
+approximate-only frame in exchange for never building the two-step
+fetch/swap logic the web frontend needs.
+
+**Deployed to production 2026-09-09**: `av==18.1.0` added to
+`dockerize/requirements.txt` (pinned to the version verified throughout this
+investigation). No schema/migration changes -- this was pure code. Rebuilt
+`picasa_img` via `docker compose build picasa`, recreated `picasa_api` via
+`docker compose up -d --force-recreate picasa`. Verified live: `manage.py
+check` clean, `import av` succeeds, `celery inspect registered` shows all
+expected tasks including `face_manager.video_face_extraction` (confirms the
+worker picked up the new `video_face_pipeline.py` module cleanly, including
+its new `av` import), and a real live request to `face_source?fast=true`
+against a real video-sourced face returned `200 image/jpeg`.

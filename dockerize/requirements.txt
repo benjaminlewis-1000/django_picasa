@@ -58,6 +58,12 @@ xmltodict==1.0.4
 onnxruntime==1.29.0
 insightface==1.0.1
 tqdm==4.70.0
+# PyAV -- used only by api/views.py's on-demand video-face-frame viewer
+# (via video_face_pipeline.extract_frame_near_timestamp), not the main
+# extraction pipeline. Real per-frame PTS/keyframe control that ffmpeg's
+# own -ss CLI flag doesn't reliably give us -- see that function's
+# docstring and CLAUDE.md's 2026-09-09 write-up for why -ss was replaced.
+av==18.1.0
 # django-allauth[openidconnect]'s "openidconnect" extra is a no-op as of
 # 65.19.1 (pip warns "does not provide the extra") -- the openid_connect
 # provider now ships in the base package. Dropped the extra.
