@@ -144,7 +144,10 @@ class UnlabeledMobileInfo(APIView):
         # to assign the person to that.
 
         face_img = f"{host_url}/keyed_image/face_array/?id={selected_id}&access_key={settings.RANDOM_ACCESS_KEY}"
-        whole_img = f"{host_url}/keyed_image/face_source/?id={selected_id}&access_key={settings.RANDOM_ACCESS_KEY}"
+        # fast=true: for video sources, serve a quick lower-cost frame
+        # extraction rather than a full decode -- good enough for the
+        # mobile zoom modal.
+        whole_img = f"{host_url}/keyed_image/face_source/?id={selected_id}&access_key={settings.RANDOM_ACCESS_KEY}&fast=true"
         ignore_url = f"{host_url}/faces/{selected_id}/ignore_face/"
         ignore_payload = {'ignore_type': 'soft'}
 
