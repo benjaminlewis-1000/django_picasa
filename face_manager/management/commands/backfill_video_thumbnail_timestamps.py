@@ -42,14 +42,15 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument('--dry-run', action='store_true')
         parser.add_argument(
-            '--match-threshold', type=float, default=None,
+            '--match-threshold', type=float, default=10.0,
             help=(
                 'Max mean-abs-pixel-diff (0-255 scale) to accept a match. '
-                'Default (unset): always accept the closest candidate found '
-                '-- this field is only used to re-extract a rough "roughly '
-                'this moment" context frame later, and the candidate is '
-                'already constrained to the face\'s own tracked time span, '
-                'so an approximate match beats leaving it unresolved.'
+                'A union-merge group\'s [first,last] span can have real '
+                'discontinuities (the person leaves frame and reappears '
+                'later) -- always accepting the closest candidate risked '
+                'writing a confidently-wrong timestamp for exactly those '
+                'gaps, so this stays a real gate rather than defaulting to '
+                '"always accept."'
             ),
         )
 
