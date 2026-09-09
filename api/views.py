@@ -35,6 +35,7 @@ from queue import Queue
 import base64
 import common
 import cv2
+import subprocess
 from datetime import datetime, timedelta
 import json
 import numpy as np
@@ -935,6 +936,45 @@ def _set_image_cache_headers(response):
     return response
 
 
+def _extract_video_face_frame(face):
+    """On-demand full (uncropped) frame extraction for a video-sourced
+    Face -- the video equivalent of just opening an image-sourced face's
+    source_image_file.filename directly. Deliberately not precomputed/
+    stored (would cost real disk space across the whole video library,
+    for something reviewed only occasionally) -- re-extracted via ffmpeg
+    at request time instead, from the exact timestamp the face's current
+    thumbnail/box/kps came from (video_thumbnail_frame_seconds). Returns
+    a PIL Image, or None if there's no video source, no stored timestamp,
+    or extraction fails for any reason (missing file, corrupt video)."""
+    video = face.source_video_file
+    if video is None or face.video_thumbnail_frame_seconds is None:
+        return None
+    from video_face_pipeline import ffprobe_info
+    try:
+        _, _, _, field_order = ffprobe_info(video.filename)
+    except Exception:
+        return None
+    # -ss placed after -i (frame-accurate, decodes from the start) rather
+    # than before -i (fast keyframe-nearby seek) -- this endpoint is for
+    # occasional manual review, not a hot path, so correctness is worth
+    # more than shaving a couple seconds off an infrequent request.
+    cmd = ['ffmpeg', '-v', 'error', '-i', video.filename,
+           '-ss', str(face.video_thumbnail_frame_seconds)]
+    if field_order not in ('progressive', 'unknown'):
+        cmd += ['-vf', 'yadif=0']
+    cmd += ['-frames:v', '1', '-f', 'image2', '-q:v', '2', 'pipe:1']
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    try:
+        return Image.open(BytesIO(result.stdout)).convert('RGB')
+    except Exception:
+        return None
+
+
 class KeyedImageView(APIView):
 
     permission_classes = [AllowAny]
@@ -1041,10 +1081,18 @@ class KeyedImageView(APIView):
                 return _set_image_cache_headers(response)
             elif image_type == 'face_source':
                 face = getAndCheckID('face', id_key)
-                source = face.source_image_file
-                image = source.filename
                 height = 700
                 width = 1920 / 1080 * height
+                if face.source_video_file_id is not None:
+                    # No stored full-context image exists for a video-
+                    # sourced face (unlike an image-sourced one, where the
+                    # original photo file already IS the full-context
+                    # image) -- extracted on demand below instead, from
+                    # the same timestamp the current thumbnail came from.
+                    image = None
+                else:
+                    source = face.source_image_file
+                    image = source.filename
             elif image_type == 'slideshow':
                 img_obj = getAndCheckID('image', id_key)
                 image = img_obj.filename
@@ -1074,7 +1122,8 @@ class KeyedImageView(APIView):
         # point is needed for a date lookup.
         if params.get('date', '').lower() == 'true':
             if image_type in ('face_array', 'face_source'):
-                date_taken = face.source_image_file.dateTaken
+                src = face.source_image_file or face.source_video_file
+                date_taken = src.dateTaken if src is not None else None
             elif image_type in ('slideshow', 'full_big', 'full_medium', 'full_small'):
                 date_taken = img_obj.dateTaken
             else:
@@ -1082,9 +1131,14 @@ class KeyedImageView(APIView):
             js = {'date_taken': date_taken.isoformat() if date_taken else None}
             return HttpResponse(json.dumps(js), content_type='application/json')
 
-        # print("Type of image is ", type(image), image_type, dir(image))
-        # if type(image) ==
-        image = common.open_img_oriented(image, as_numpy = False)
+        if image_type == 'face_source' and face.source_video_file_id is not None:
+            image = _extract_video_face_frame(face)
+            if image is None:
+                return err_404('Could not extract a context frame for this video-sourced face.')
+        else:
+            # print("Type of image is ", type(image), image_type, dir(image))
+            # if type(image) ==
+            image = common.open_img_oriented(image, as_numpy = False)
 
         # Resize image. Allow for upsampling now. 
         w, h = image.size[:2]
