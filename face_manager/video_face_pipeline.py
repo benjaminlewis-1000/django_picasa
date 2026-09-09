@@ -255,9 +255,19 @@ def ffprobe_info(path):
     return width, height, fps, field_order
 
 
-def ffmpeg_frame_iterator(path, width, height, vf_filter=None):
+def ffmpeg_frame_iterator(path, width, height, vf_filter=None, seek_seconds=0):
+    """seek_seconds, if given, places -ss BEFORE -i -- a fast, approximate
+    seek (snaps to the nearest preceding keyframe, not frame-accurate),
+    used by callers that already know roughly where they need to start
+    reading and don't need the very first yielded frame to be an exact
+    timestamp (e.g. backfill_video_thumbnail_timestamps.py, which
+    pixel-matches across a window of candidates rather than trusting any
+    single frame's assumed index)."""
     frame_size = width * height * 3
-    cmd = ['ffmpeg', '-v', 'error', '-i', path]
+    cmd = ['ffmpeg', '-v', 'error']
+    if seek_seconds > 0:
+        cmd += ['-ss', str(seek_seconds)]
+    cmd += ['-i', path]
     if vf_filter:
         cmd += ['-vf', vf_filter]
     cmd += ['-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
