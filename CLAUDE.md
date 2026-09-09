@@ -2693,3 +2693,40 @@ active production issue, not just cleanup — worth prioritizing the deploy once
 - **JWT auth (`rest_framework_simplejwt`) is NOT dead code — confirmed live, do not remove.** Previously flagged here as a candidate "dead code after the Authelia migration" audit item. Checked 2026-08-28: the user found, from another project, that its login workflow actively calls this API's JWT endpoints (`/api/token/obtain/` → `TokenPairWithUsername`, `/api/token/refresh/`). So `SIMPLE_JWT` settings, `TokenPairWithUsername`, `token_blacklist` in `INSTALLED_APPS`, and `PyJWT` all stay. Still open: identify *which* project/client this is and whether it also relies on `token_blacklist` (logout/revocation) specifically, not just obtain/refresh — that determines how much of this could ever be trimmed later if that consumer is migrated to Authelia too. Until then, treat this as a second real parallel auth system, not leftover cruft.
 - **Slideshow metadata overlay**: serve slideshow images with the photo's date (nicely formatted, not a raw timestamp) and location (feeds off the geocoding work above) alongside the image itself.
 - **Video support**: the pipeline currently assumes still images end-to-end — `ImageFile`'s filename validator/extension checks, thumbnailing, EXIF/GPS extraction, and the face-detection pipeline are all image-only. Adding video would need real planning: a distinct model (or a shared base) for video assets, a thumbnailing strategy (extract a representative frame, or several), whether/how face detection runs against video (sample frames vs. skip entirely), metadata extraction differences (video containers carry EXIF-equivalent metadata differently than JPEGs), and slideshow/API changes to serve a different media type. Not started — flagged here as a bigger feature needing a design pass, not a quick add.
+
+## OPEN: on-demand video-face-frame viewer has a real ~30% failure rate (2026-09-09)
+
+Separate from the (now-fixed, verified) `avg_frame_rate` timestamp-correctness
+bug: `api/views.py`'s `_extract_video_face_frame()` (backing `KeyedImageView`'s
+`face_source` type for video-sourced faces) uses `-ss` placed BEFORE `-i` for
+fast, approximate seeking. Real benchmark against 20 already-reprocessed
+(post-fps-fix) faces, comparing the viewer's own actual extraction method
+against a reliable ground-truth sequential decode (the same method the core
+pipeline itself uses, already verified ~100% correct): **14/20 good, 6/20
+bad (30% failure rate)**, including one outright extraction failure. This
+confirms the underlying STORED data (thumbnails/boxes/embeddings/timestamps)
+is correct, but the VIEWER's own retrieval at request time is not reliably
+reproducing the right frame even when given a correct timestamp -- a real,
+separate problem from the fps bug, previously suspected (see the
+`video_thumbnail_frame_seconds` investigation write-up above, face 1090496)
+but not previously quantified across a real sample.
+
+**Root cause, not yet fully diagnosed**: even feeding `-ss` (either before or
+after `-i`) the *exact* ground-truth PTS of a target frame (confirmed via
+`ffprobe -show_entries frame=pts_time`) did not always reproduce that frame's
+content in earlier spot-testing -- suggesting `-ss`'s frame-selection logic
+doesn't always agree with sequential decode order for some of this library's
+real files, independent of timestamp accuracy.
+
+**Planned fix, not yet built**: replace `-ss`-based seeking in the on-demand
+path with a fast-keyframe-jump + sequential-frame-count-forward approach
+(matching the core pipeline's own proven-reliable method), using **PyAV**
+(python bindings around ffmpeg's own libraries) instead of shelling out to
+the `ffmpeg` CLI -- PyAV exposes real per-frame PTS/index during decode, so a
+keyframe jump can be corrected by counting forward with certainty rather than
+trusting the CLI's own `-ss` frame-selection. This is a real new dependency
+(image rebuild), not a quick patch.
+
+**Reusable benchmark**: `/tmp/claude-1000/-home-benjamin-git-repos-django-picasa/d8c8c9ae-e060-4ae1-b0c6-eb1afffc49bc/scratchpad/viewer_benchmark.py`
+(session-scratchpad, not committed to the repo) -- re-run against a fresh
+sample to check any future fix's real pass rate before declaring it solved.
