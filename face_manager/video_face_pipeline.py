@@ -411,7 +411,18 @@ class VideoFaceExtractor(object):
 
         thumb = frame[chip_t:chip_b, chip_l:chip_r]
         thumb = np.pad(thumb, ((top_pad, bot_pad), (left_pad, right_pad), (0, 0)), 'constant')
-        thumb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+        # NOTE: no BGR->RGB conversion here, unlike FaceExtractor's own
+        # get_square_face_img() (which this was adapted from) -- that
+        # function's input is already RGB (PIL-decoded, via
+        # common.open_img_oriented), so its own cvtColor(BGR2RGB) call is
+        # actually undoing that RGB order back to BGR, which cv2.imencode
+        # below then correctly re-interprets as BGR and writes a normal-
+        # looking JPEG -- a double-swap that happens to cancel out. This
+        # function's `frame` is genuinely BGR to begin with (raw ffmpeg
+        # pipe, -pix_fmt bgr24), so it's already in the order cv2.imencode
+        # expects -- adding the same cvtColor call here (as an earlier
+        # version of this function did) applies only ONE swap, producing
+        # a thumbnail with red/blue channels genuinely reversed.
         return cv2.resize(thumb, settings.FACE_THUMBNAIL_SIZE)
 
     def _detect_and_track(self, video_path, width, height, fps, vf_filter):
