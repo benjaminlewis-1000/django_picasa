@@ -949,11 +949,17 @@ def _extract_video_face_frame(face):
     video = face.source_video_file
     if video is None or face.video_thumbnail_frame_seconds is None:
         return None
-    from video_face_pipeline import ffprobe_info
-    try:
-        _, _, _, field_order = ffprobe_info(video.filename)
-    except Exception:
-        return None
+    # field_order is cached on VideoFile at ingestion time (from data
+    # ffprobe already returns there, no extra call needed) -- falls back
+    # to a live ffprobe call only for rows ingested before that field
+    # existed (see backfill_video_field_order).
+    field_order = video.field_order
+    if field_order is None:
+        from video_face_pipeline import ffprobe_info
+        try:
+            _, _, _, field_order = ffprobe_info(video.filename)
+        except Exception:
+            return None
     # -ss placed BEFORE -i (fast, approximate -- snaps to the nearest
     # preceding keyframe) rather than after -i (frame-accurate, but
     # decodes the entire video from the start to reach the target).
