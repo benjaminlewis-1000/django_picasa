@@ -67,14 +67,24 @@ def process_faces():
         settings.LOGGER.debug("Ending face adding task")
         
 @shared_task(ignore_result=True, name='face_manager.video_face_extraction')
-def process_video_faces():
+def process_video_faces(max_runtime_seconds=None):
     """Phase 3: one Face row per union-merge track-group, per unprocessed
     VideoFile -- see face_manager/video_face_pipeline.py and CLAUDE.md's
     Phase 3 design. Same advisory-lock convention as face_extraction
     (find_and_encode_faces): the lock covers the whole run, atomic across
     every entry point (scheduled task, manage.py shell, management
     command), and is released automatically if the holding connection
-    ever drops -- no stale-lock cleanup needed."""
+    ever drops -- no stale-lock cleanup needed.
+
+    max_runtime_seconds, if given, stops the loop (and releases the lock)
+    once elapsed wall time exceeds it -- checked only *between* videos,
+    never mid-video, so a video's own Face-group creation is never
+    interrupted partway (which would otherwise risk duplicate Face rows
+    on a later retry, since isProcessed is only set True in the finally
+    block once a video's processing has actually finished). Used to run
+    the full-library backfill in bounded windows (e.g. 2.5h) rather than
+    pinning every core for days straight, with an external scheduler
+    re-invoking this after a cooldown gap."""
     with advisory_lock('face_manager.video_face_extraction') as acquired:
         if not acquired:
             settings.LOGGER.debug("Video face extraction is locked, exiting.")
@@ -87,7 +97,14 @@ def process_video_faces():
 
         from video_face_pipeline import VideoFaceExtractor
         extractor = VideoFaceExtractor()
+        start_time = time.time()
         for video in unprocessed:
+            if max_runtime_seconds is not None and (time.time() - start_time) >= max_runtime_seconds:
+                settings.LOGGER.debug(
+                    f"Video face extraction: time budget ({max_runtime_seconds}s) reached, "
+                    "stopping between videos."
+                )
+                break
             try:
                 faces = extractor.process_video(video)
                 settings.LOGGER.debug(
