@@ -42,8 +42,15 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument('--dry-run', action='store_true')
         parser.add_argument(
-            '--match-threshold', type=float, default=10.0,
-            help='Max mean-abs-pixel-diff (0-255 scale) to accept a match.',
+            '--match-threshold', type=float, default=None,
+            help=(
+                'Max mean-abs-pixel-diff (0-255 scale) to accept a match. '
+                'Default (unset): always accept the closest candidate found '
+                '-- this field is only used to re-extract a rough "roughly '
+                'this moment" context frame later, and the candidate is '
+                'already constrained to the face\'s own tracked time span, '
+                'so an approximate match beats leaving it unresolved.'
+            ),
         )
 
     def handle(self, *args, **options):
@@ -129,7 +136,7 @@ class Command(BaseCommand):
                     if diff is not None and (best_diff is None or diff < best_diff):
                         best_t, best_diff = t, diff
 
-                if best_t is not None and best_diff <= threshold:
+                if best_t is not None and (threshold is None or best_diff <= threshold):
                     resolved += 1
                     if not dry_run:
                         f.video_thumbnail_frame_seconds = best_t
@@ -137,8 +144,9 @@ class Command(BaseCommand):
                 else:
                     unresolved += 1
                     self.stdout.write(
-                        f'  face {f.id} ({video.filename}): no match within threshold '
-                        f'(best_diff={best_diff})'
+                        f'  face {f.id} ({video.filename}): '
+                        + ('no candidate frames at all' if best_t is None
+                           else f'no match within threshold (best_diff={best_diff})')
                     )
 
             self.stdout.write(
