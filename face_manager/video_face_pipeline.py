@@ -36,6 +36,7 @@ from insightface.model_zoo import model_zoo
 from insightface.utils import face_align
 import json
 import numpy as np
+import os
 import subprocess
 import torch
 import torchvision.ops.boxes as bops
@@ -286,7 +287,7 @@ class VideoFaceExtractor(object):
     faceAssigner elsewhere in this codebase)."""
 
     def __init__(self):
-        self.det_model = model_zoo.get_model('/root/.insightface/models/buffalo_s/det_500m.onnx')
+        self.det_model = self._load_det500m_with_fallback()
         self.det_model.prepare(ctx_id=-1, det_size=(640, 640))
         rec_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'recognition'])
         rec_app.prepare(ctx_id=-1, det_size=(640, 640))
@@ -298,6 +299,31 @@ class VideoFaceExtractor(object):
 
         self.blank_face_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
         self._face_assigner = None  # lazily built on first use, reused across videos
+
+    DET500M_PATH = '/root/.insightface/models/buffalo_s/det_500m.onnx'
+
+    @classmethod
+    def _load_det500m_with_fallback(cls):
+        """buffalo_l (used for recognition/det_10g above) and antelopev2
+        are already pre-populated in this project's model volume; buffalo_s
+        (only used here, for the lightweight bulk-sampling detector) was
+        not, and model_zoo.get_model() -- unlike FaceAnalysis(name=...) --
+        only checks the file exists rather than downloading it, so this
+        crashed the first time this pipeline ran for real (2026-09-08).
+        Self-heals by triggering the same auto-download FaceAnalysis(name=
+        'buffalo_s') already does internally, once, if the direct load
+        fails -- so a fresh deploy/wiped model volume doesn't hit this
+        same silent trap again. Requires outbound internet access for
+        that one-time ~120MB download (confirmed available in this
+        environment); if that's ever not the case, this still fails, just
+        with a clearer error than the original bare AssertionError."""
+        if not os.path.exists(cls.DET500M_PATH):
+            settings.LOGGER.warning(
+                "buffalo_s model pack missing at %s -- downloading it now "
+                "(one-time, ~120MB).", cls.DET500M_PATH
+            )
+            FaceAnalysis(name='buffalo_s').prepare(ctx_id=-1)
+        return model_zoo.get_model(cls.DET500M_PATH)
 
     @property
     def face_assigner(self):
