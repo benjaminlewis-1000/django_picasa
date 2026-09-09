@@ -478,7 +478,7 @@ class VideoFaceExtractor(object):
             t['reps'] = reps
         return frame_pixels
 
-    def _classify_and_pick_thumbnail(self, face, pooled_reps, frame_pixels):
+    def _classify_and_pick_thumbnail(self, face, pooled_reps, frame_pixels, fps):
         """face is an already-saved Face row (source_video_file/box/kps/
         thumbnail all set from a provisional -- largest-box -- frame,
         face_encoding_512 set to the group centroid). Runs the real,
@@ -513,10 +513,12 @@ class VideoFaceExtractor(object):
             return
 
         frame = frame_pixels[best_rep['frame_idx']]
-        self._set_face_box_and_thumbnail(face, frame, best_rep['box'], best_rep['kps'])
+        self._set_face_box_and_thumbnail(
+            face, frame, best_rep['box'], best_rep['kps'], best_rep['frame_idx'] / fps
+        )
         face.save()
 
-    def _set_face_box_and_thumbnail(self, face, frame, box, kps):
+    def _set_face_box_and_thumbnail(self, face, frame, box, kps, timestamp_seconds=None):
         l, t, r, b = box
         img_h, img_w, _ = frame.shape
         face.box_left = max(1, int(l))
@@ -524,6 +526,8 @@ class VideoFaceExtractor(object):
         face.box_right = min(img_w, max(face.box_left + 1, int(r)))
         face.box_bottom = min(img_h, max(face.box_top + 1, int(b)))
         face.kps = np.asarray(kps, dtype=float).reshape(-1).tolist()
+        if timestamp_seconds is not None:
+            face.video_thumbnail_frame_seconds = timestamp_seconds
 
         thumbnail = self._square_thumbnail(frame, box)
         is_success, buffer_img = cv2.imencode('.jpg', thumbnail)
@@ -592,10 +596,13 @@ class VideoFaceExtractor(object):
             face.face_encoding_512 = centroid.tolist()
             face.video_first_timestamp_seconds = first_sample / fps
             face.video_last_timestamp_seconds = last_sample / fps
-            self._set_face_box_and_thumbnail(face, provisional_frame, provisional['box'], provisional['kps'])
+            self._set_face_box_and_thumbnail(
+                face, provisional_frame, provisional['box'], provisional['kps'],
+                provisional['frame_idx'] / fps
+            )
             face.save()
 
-            self._classify_and_pick_thumbnail(face, pooled_reps, frame_pixels)
+            self._classify_and_pick_thumbnail(face, pooled_reps, frame_pixels, fps)
             created.append(face)
 
         return created

@@ -142,6 +142,14 @@ class Face(models.Model):
     # this video," not complete per-appearance metadata.
     video_first_timestamp_seconds = models.FloatField(blank=True, null=True)
     video_last_timestamp_seconds = models.FloatField(blank=True, null=True)
+    # Exact timestamp of the frame the current thumbnail/box/kps came from
+    # -- lets the API re-extract that specific frame on demand (via ffmpeg)
+    # to serve a "full context" image for this face, the video equivalent
+    # of an image-sourced face's source_image_file.filename. Deliberately
+    # NOT storing the extracted frame itself (would cost real disk space
+    # across the whole library) -- this field is the only new state needed
+    # to make on-demand re-extraction possible.
+    video_thumbnail_frame_seconds = models.FloatField(blank=True, null=True)
     # ArrayField supported in PostGres
     dateTakenUTC = models.FloatField(default=0)
 
