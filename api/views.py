@@ -954,12 +954,23 @@ def _extract_video_face_frame(face):
         _, _, _, field_order = ffprobe_info(video.filename)
     except Exception:
         return None
-    # -ss placed after -i (frame-accurate, decodes from the start) rather
-    # than before -i (fast keyframe-nearby seek) -- this endpoint is for
-    # occasional manual review, not a hot path, so correctness is worth
-    # more than shaving a couple seconds off an infrequent request.
-    cmd = ['ffmpeg', '-v', 'error', '-i', video.filename,
-           '-ss', str(face.video_thumbnail_frame_seconds)]
+    # -ss placed BEFORE -i (fast, approximate -- snaps to the nearest
+    # preceding keyframe) rather than after -i (frame-accurate, but
+    # decodes the entire video from the start to reach the target).
+    # Originally built the other way on the assumption that correctness
+    # mattered more than speed for an "occasional manual review" request
+    # -- real benchmarking (2026-09-09) proved that wrong: elapsed time
+    # scaled linearly with the target timestamp (~0.5s of decode per
+    # second of video content), and a face late in a ~33-minute video
+    # extrapolated to ~10 minutes of decode, silently hitting this
+    # function's own 60s subprocess timeout and returning a 404 instead
+    # of an image -- a real failure, not just slowness. This is a
+    # "roughly this moment" context viewer, not a frame-exact one (same
+    # reasoning already applied to the backfill command's own seek), so
+    # landing a frame or two off the exact target is an acceptable
+    # trade for latency that no longer scales with video length.
+    cmd = ['ffmpeg', '-v', 'error',
+           '-ss', str(face.video_thumbnail_frame_seconds), '-i', video.filename]
     if field_order not in ('progressive', 'unknown'):
         cmd += ['-vf', 'yadif=0']
     cmd += ['-frames:v', '1', '-f', 'image2', '-q:v', '2', 'pipe:1']
