@@ -256,6 +256,23 @@ class Face(models.Model):
                 ),
                 name='face_exactly_one_source',
             ),
+            # The video_* fields (timestamps, thumbnail-frame timestamp)
+            # only ever mean anything for a video-sourced face -- this
+            # mirrors the XOR constraint above, guarding against one of
+            # them ever being set on an image-sourced row by mistake
+            # (e.g. a future code path touching Face without going
+            # through video_face_pipeline.py).
+            models.CheckConstraint(
+                condition=(
+                    models.Q(source_video_file__isnull=False) |
+                    models.Q(
+                        video_first_timestamp_seconds__isnull=True,
+                        video_last_timestamp_seconds__isnull=True,
+                        video_thumbnail_frame_seconds__isnull=True,
+                    )
+                ),
+                name='face_video_fields_require_video_source',
+            ),
         ]
 
     def __str__(self):
