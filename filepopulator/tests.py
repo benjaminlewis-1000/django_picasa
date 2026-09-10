@@ -1648,6 +1648,34 @@ class FindNearestNamedPlaceTests(unittest.TestCase):
         self.assertIsNone(distance_km)
 
 
+class NominatimRateLimiterReuseTests(unittest.TestCase):
+    """Regression test for a real bug (found 2026-09-10): a fresh
+    RateLimiter used to be constructed on every single call - min_delay_
+    seconds is enforced via *instance* state, so a fresh instance had
+    never made a call before and every coordinate in a backfill run got
+    waved through with zero delay, never actually throttling anything."""
+
+    def setUp(self):
+        import filepopulator.geocode as geocode_module
+        self._geocode_module = geocode_module
+        self._orig_reverse = geocode_module._reverse_rate_limiter
+        self._orig_forward = geocode_module._forward_rate_limiter
+        geocode_module._reverse_rate_limiter = None
+        geocode_module._forward_rate_limiter = None
+
+    def tearDown(self):
+        self._geocode_module._reverse_rate_limiter = self._orig_reverse
+        self._geocode_module._forward_rate_limiter = self._orig_forward
+
+    def test_reverse_limiter_is_a_reused_singleton(self):
+        from filepopulator.geocode import _get_nominatim_geocode
+        self.assertIs(_get_nominatim_geocode(), _get_nominatim_geocode())
+
+    def test_forward_limiter_is_a_reused_singleton(self):
+        from filepopulator.geocode import _get_nominatim_forward_geocode
+        self.assertIs(_get_nominatim_forward_geocode(), _get_nominatim_forward_geocode())
+
+
 class ReverseGeocodePreciseExtractionTests(unittest.TestCase):
     """reverse_geocode_precise()'s locality extraction, exercised against
     a mocked Nominatim client (patched at _get_nominatim_geocode, one
