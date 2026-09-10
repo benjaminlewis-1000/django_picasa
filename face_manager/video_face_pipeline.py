@@ -562,7 +562,13 @@ class VideoFaceExtractor(object):
                 kps_list = kpss.tolist() if kpss is not None and bboxes.shape[0] else []
                 sampled.append((idx, boxes, scores, kps_list))
             idx += 1
-        return _iou_track(sampled), stride
+        # idx is now the true total decoded frame count -- returned so the
+        # caller can derive a REAL fps (total_frames / known duration)
+        # instead of trusting ffprobe's r_frame_rate/avg_frame_rate, either
+        # of which can be wrong for a given file in different ways (see
+        # process_video's real_fps comment for the real case that proved
+        # this necessary).
+        return _iou_track(sampled), stride, idx
 
     def _pool_representative_frames(self, video_path, width, height, vf_filter, tracks):
         """Picks each track's best N_BEST_FRAMES_PER_TRACK frames (by
@@ -643,6 +649,31 @@ class VideoFaceExtractor(object):
         )
         face.save()
 
+    @staticmethod
+    def _clamp_to_duration(video_obj, seconds, label):
+        """A computed video_*_timestamp_seconds value should never exceed
+        the video's own real duration -- but a real bug (2026-09-09,
+        confirmed on /videos/Our_Home_Videos/2020/20200618_221605.mp4,
+        source_video_file id 368) produced timestamps up to ~4x the real
+        199.5s duration, root cause not yet fully diagnosed (raw decoded
+        frame count vs. avg_frame_rate*duration mismatch under
+        investigation). This is a safety net, not a fix for whatever
+        produces an out-of-range value in the first place -- clamps to
+        the video's own duration and logs loudly, so a face still gets a
+        usable (if approximate) timestamp instead of one that points past
+        the end of the file, while leaving a clear trail to investigate
+        rather than silently masking a real miscalculation."""
+        duration = video_obj.duration_seconds
+        if duration is None or seconds <= duration:
+            return seconds
+        settings.LOGGER.warning(
+            "video_face_pipeline: %s timestamp %.2fs exceeds video %s's own "
+            "duration %.2fs (file=%s) -- clamping to duration. This points "
+            "at a real timestamp-computation bug, not expected behavior.",
+            label, seconds, video_obj.id, duration, video_obj.filename,
+        )
+        return duration
+
     def _set_face_box_and_thumbnail(self, face, frame, box, kps, timestamp_seconds=None):
         l, t, r, b = box
         img_h, img_w, _ = frame.shape
@@ -652,7 +683,9 @@ class VideoFaceExtractor(object):
         face.box_bottom = min(img_h, max(face.box_top + 1, int(b)))
         face.kps = np.asarray(kps, dtype=float).reshape(-1).tolist()
         if timestamp_seconds is not None:
-            face.video_thumbnail_frame_seconds = timestamp_seconds
+            face.video_thumbnail_frame_seconds = self._clamp_to_duration(
+                face.source_video_file, timestamp_seconds, 'video_thumbnail_frame_seconds'
+            )
 
         thumbnail = self._square_thumbnail(frame, box)
         is_success, buffer_img = cv2.imencode('.jpg', thumbnail)
@@ -671,9 +704,39 @@ class VideoFaceExtractor(object):
         deinterlace = field_order not in ('progressive', 'unknown')
         vf_filter = 'yadif=0' if deinterlace else None
 
-        tracks, stride = self._detect_and_track(video_path, width, height, fps, vf_filter)
+        tracks, stride, total_frames = self._detect_and_track(video_path, width, height, fps, vf_filter)
         if not tracks:
             return []
+
+        # real_fps (actual decoded frame count / the video's own known
+        # duration) replaces ffprobe's fps for every frame-index-to-
+        # seconds conversion below -- confirmed necessary 2026-09-09 on a
+        # real file (source_video_file id 368) where ffprobe's own
+        # avg_frame_rate metadata (nb_frames/duration) understated the
+        # true decoded frame count by exactly 4x (5981 claimed vs. 23935
+        # actually decoded, for a real 199.5s video) -- a genuine
+        # container/metadata quirk (likely a slow-motion capture whose
+        # declared duration doesn't match its real frame count), not a
+        # "wrong ffprobe field selected" bug like the earlier interlaced-
+        # PAL case this file's r_frame_rate/avg_frame_rate split was
+        # originally built for. Neither ffprobe field is reliably correct
+        # for every file, but the actual decode already happened above
+        # (for detection) at zero extra cost, so deriving fps from ITS
+        # real frame count is unconditionally more trustworthy than
+        # either metadata field. Falls back to ffprobe's fps only if
+        # duration_seconds isn't known (shouldn't happen for anything
+        # that reached this point, but avoids a divide-by-zero/None).
+        duration = video_obj.duration_seconds
+        real_fps = (total_frames / duration) if duration else fps
+        if duration and abs(real_fps - fps) / fps > 0.05:
+            settings.LOGGER.warning(
+                "video_face_pipeline: video %s (%s) real fps %.2f (from "
+                "%d decoded frames / %.2fs duration) differs from "
+                "ffprobe's %.2f by more than 5%% -- using the real value.",
+                video_obj.id, video_obj.filename, real_fps, total_frames,
+                duration, fps,
+            )
+        fps = real_fps
 
         frame_pixels = self._pool_representative_frames(video_path, width, height, vf_filter, tracks)
 
@@ -719,8 +782,12 @@ class VideoFaceExtractor(object):
             face.reencoded = True
             face.written_to_photo_metadata = False
             face.face_encoding_512 = centroid.tolist()
-            face.video_first_timestamp_seconds = first_sample / fps
-            face.video_last_timestamp_seconds = last_sample / fps
+            face.video_first_timestamp_seconds = self._clamp_to_duration(
+                video_obj, first_sample / fps, 'video_first_timestamp_seconds'
+            )
+            face.video_last_timestamp_seconds = self._clamp_to_duration(
+                video_obj, last_sample / fps, 'video_last_timestamp_seconds'
+            )
             self._set_face_box_and_thumbnail(
                 face, provisional_frame, provisional['box'], provisional['kps'],
                 provisional['frame_idx'] / fps
