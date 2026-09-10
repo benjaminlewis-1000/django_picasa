@@ -3,6 +3,7 @@ from django.conf.urls import include
 from rest_framework import routers
 from api import views
 from api import mobile_views
+from api import geocode_views
 from django.urls import path
 from rest_framework.authtoken.views import obtain_auth_token  # <-- Here
 
@@ -46,4 +47,7 @@ urlpatterns = [
     path(r'mobile/verify_candidates/', mobile_views.VerifyCandidatesList.as_view(), name='verify_candidates'),
     path(r'mobile/verify_ignore_candidates/', mobile_views.VerifyIgnoreCandidatesList.as_view(), name='verify_ignore_candidates'),
     path(r'mobile/bulk_verify/', mobile_views.BulkVerify.as_view(), name='bulk_verify'),
+    path(r'geocode_review/', geocode_views.GeocodeReviewListView.as_view(), name='geocode_review'),
+    path(r'geocode_review/action/', geocode_views.GeocodeReviewActionView.as_view(), name='geocode_review_action'),
+    path(r'geocode_review/search_places/', geocode_views.GeocodeReviewSearchPlacesView.as_view(), name='geocode_review_search_places'),
 ]

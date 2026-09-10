@@ -63,6 +63,21 @@ def _load_major_places():
     return places
 
 
+def search_major_places(query, limit=10):
+    """Type-ahead over the offline major_places.csv gazetteer -- case-
+    insensitive substring match, largest-population-first. Backs the
+    geocode-review tool's editable metro field while typing; unlike
+    resolve_named_place below, this is purely offline and cheap enough to
+    call on every keystroke (no rate limit to respect)."""
+    query = query.strip().lower()
+    if not query:
+        return []
+    places = _load_major_places()
+    matches = [p for p in places if query in p['name'].lower()]
+    matches.sort(key=lambda p: p['population'], reverse=True)
+    return matches[:limit]
+
+
 def find_nearest_metro(lat, lon):
     """Returns (name, distance_km) for the largest populated place within
     the nearest radius band that has any candidate at all, or (None, None)
@@ -110,6 +125,66 @@ def _get_nominatim_geocode():
     # more headroom and, being a background batch job with no user
     # waiting on it, the slower throughput costs nothing.
     return RateLimiter(geolocator.reverse, min_delay_seconds=2.0, max_retries=2, error_wait_seconds=5.0)
+
+
+def _get_nominatim_forward_geocode():
+    from geopy.geocoders import Nominatim
+    from geopy.extra.rate_limiter import RateLimiter
+
+    geolocator = Nominatim(user_agent=settings.NOMINATIM_USER_AGENT, timeout=10)
+    return RateLimiter(geolocator.geocode, min_delay_seconds=2.0, max_retries=2, error_wait_seconds=5.0)
+
+
+def resolve_named_place(query):
+    """Forward-geocodes an arbitrary place name via Nominatim -- the
+    geocode-review tool's fallback for a correction that isn't in the
+    offline major_places.csv gazetteer (a hometown too small to be
+    "major", a national park, a landmark, anything OSM has a name for).
+    Nominatim actually resolving it *is* the realness check: there's no
+    separate list of "valid" places to maintain, since a match is by
+    definition real, named OSM data, not free text.
+
+    Unlike search_major_places above, this is a single on-submit network
+    call (rate-limited the same as reverse_geocode_precise), not something
+    to call on every keystroke.
+
+    Returns {'name', 'lat', 'lon', 'country', 'state', 'display_name'}, or
+    None if Nominatim found nothing, or found something with no resolvable
+    country (not a real place we can trust), or -- when the resolved
+    country is the United States specifically -- no resolvable state
+    (the one extra check the user asked for: "valid state if USA").
+    """
+    forward = _get_nominatim_forward_geocode()
+    location = forward(query, exactly_one=True, language='en')
+
+    if location is None:
+        return None
+
+    address = location.raw.get('address', {})
+    country = address.get('country')
+    state = address.get('state')
+
+    if not country:
+        return None
+    if country == 'United States' and not state:
+        return None
+
+    # Nominatim has no single "the name of this place" field for a mix of
+    # settlements, parks, and landmarks the way `address.city` does for a
+    # settlement specifically -- `location.raw['name']` is the resolved
+    # feature's own name when set (a national park, a named landmark),
+    # falling back to the query text itself (a settlement's `name` is
+    # often blank in the raw response even though `address.city` isn't).
+    name = location.raw.get('name') or query
+
+    return {
+        'name': name,
+        'lat': location.latitude,
+        'lon': location.longitude,
+        'country': country,
+        'state': state,
+        'display_name': location.address,
+    }
 
 
 def reverse_geocode_precise(lat, lon):

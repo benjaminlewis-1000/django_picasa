@@ -365,6 +365,26 @@ class GeocodeCache(models.Model):
     nearest_metro_name = models.CharField(max_length=256, null=True, blank=True)
     nearest_metro_distance_km = models.FloatField(null=True, blank=True)
 
+    # Human review of the metro pick above (api/geocode_views.py's
+    # GeocodeReviewActionView) -- "largest place within the nearest radius
+    # band" sometimes disagrees with what a person would intuitively pick
+    # (e.g. Pisa resolving to Livorno instead of Florence). Both fields are
+    # set together by either action; metro_validated alone doesn't say
+    # whether the value actually changed:
+    #   - "validate as-is": metro_validated=True, metro_override stays False.
+    #   - "correct to a different place": both True, and
+    #     nearest_metro_name/nearest_metro_distance_km are overwritten with
+    #     the corrected place's name and a freshly-computed haversine
+    #     distance -- same shape as an algorithm-produced value, so nothing
+    #     downstream can tell the two apart without explicitly checking
+    #     metro_override.
+    # Never touched by run_geocoding_backfill, which only ever creates rows
+    # for previously-uncached coordinates -- a manual correction here is
+    # permanent, not at risk of being silently overwritten by the next
+    # scheduled backfill run.
+    metro_validated = models.BooleanField(default=False)
+    metro_override = models.BooleanField(default=False)
+
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=['lat', 'lon'], name='unique_geocode_cache_coordinate')
