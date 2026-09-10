@@ -1230,6 +1230,97 @@ user (2026-09-04) has no test exercising it yet. Add real test coverage for the 
 (likely mocking the Nominatim HTTP call, given its rate-limit policy) before considering this
 fully done.
 
+**DONE (2026-09-10): fixed a real Nominatim rate-limit incident (a batch of "unknown" locations
+turned out to be swallowed real failures, not genuine empty results), added a 150m proximity-reuse
+optimization to make the resulting backfill cheap, found and fixed a real chain-drift bug in that
+same optimization (caught before wide rollout, but real production data was briefly corrupted and
+had to be remediated), and re-enabled the hourly task.** Root causes (all in
+`filepopulator/geocode.py`, fixed and deployed to `master`):
+- geopy's `RateLimiter` defaults to `swallow_exceptions=True` -- a real transient failure
+  (timeout/429/network blip) after retries was silently converted to `None`, indistinguishable
+  from "Nominatim genuinely found nothing here." Fixed: `swallow_exceptions=False` on both the
+  reverse (batch) and forward (interactive-correction) limiters.
+- Locality extraction was too strict (only `city`/`town`/`village`/`hamlet`/`suburb`) -- relaxed
+  to also accept `municipality`/`county`/`state_district`/`borough` before giving up. Plus a new
+  offline last-resort fallback, `find_nearest_named_place()` (nearest place in `major_places.csv`
+  regardless of population), marked via `GeocodeCache.locality_is_approximate` so nothing
+  downstream mistakes it for a real precise geocode.
+- **The actual severity culprit**: `_get_nominatim_geocode()`/`_get_nominatim_forward_geocode()`
+  built a brand-new `RateLimiter` on every single call -- once per coordinate inside
+  `run_geocoding_backfill`'s loop. `min_delay_seconds` is enforced via *instance* state
+  (`RateLimiter._last_call`), so a fresh instance had never made a call before and every
+  coordinate got waved through with zero actual delay -- the "N seconds between requests" was
+  never really happening across a batch run, which is very likely what got the server's IP
+  rate-limited/blocked in the first place. Fixed: both limiters are now module-level singletons,
+  built once and reused for the process's lifetime. Delay raised to 15s (4/min), matching
+  Nominatim's stated usage policy for "scripts running continuously or at regular intervals."
+- Interactive correction path made fail-fast (`max_retries=0`) -- a rate-limited retry-with-wait
+  was taking 23+ seconds, blowing past axios's 15s client timeout and losing the specific error
+  message in the frontend.
+- The hourly `geocode_new_images` Celery task was temporarily disabled while the above landed and
+  the rate-limit cooldown was confirmed cleared (a plain `requests.get(...)` against Nominatim
+  returning 200, not 429) -- **re-enabled same day** once confirmed.
+
+**Proximity-reuse optimization, added because the real remaining backlog (~1278 uncached
+coordinates) looked far more expensive than it actually was.** A photo library has a lot of
+"wandered the same block across visits" GPS noise -- `GeocodeCache.ROUND_DECIMALS` only collapses
+coordinates into ~11m cache-key cells, so two shots 50-100m apart still land in different cells
+and would each cost a separate Nominatim call under the old code. Measured against real production
+data before building anything: of 1278 then-uncached coordinates, 1059 were within 150m of an
+already-successfully-geocoded coordinate, and clustering the true "new area" points against each
+other got the real minimum Nominatim-call count down to 208 -- roughly 52 minutes at 15s/call,
+not the ~5.3 hours a naive 1-call-per-coordinate estimate implied. `GEOCODE_REUSE_RADIUS_KM = 0.15`
+(tight enough to be confident it's the same address/block, not just "same neighborhood") --
+`_find_nearby_precise_geocode()` checks a coordinate against every already-known PRECISE (real
+Nominatim tag, never the offline fallback) result before calling Nominatim, copying
+locality/county/state/country/display_name directly if one's found within radius, no network call
+consumed. Candidates are loaded once from `GeocodeCache` at the start of a run and grown in-place
+as the run resolves its own coordinates, so later coordinates in the same run can reuse earlier
+ones too, not just rows that predate the run.
+
+**Real chain-drift bug found and fixed the same day, before wide rollout but not before some real
+production data was briefly corrupted.** The first version of the reuse optimization above added
+EVERY resolved coordinate -- including ones resolved via the reuse check itself, not just genuine
+Nominatim results -- back into the reuse-candidate pool. That lets a sequence of points spaced just
+under the 150m radius apart (a completely realistic shape for a real GPS trace along a street or
+across someone's regular haunts in a metro area) each individually pass the "within 150m of the
+previous point" check while drifting arbitrarily far, hop by hop, from the one real Nominatim
+result the whole chain actually traces back to -- caught by the user asking directly whether the
+reuse check could chain this way before the feature had been running long. **Confirmed as a real,
+already-manifested bug, not just a theoretical risk**: the production backfill had been running
+for ~40 minutes with the buggy code before the fix landed. Direct verification against the rows it
+had already written found a coordinate 14m from a genuine, already-cached "Fairborn" anchor that
+had been labeled "Beavercreek" instead -- inherited through a multi-hop chain rather than found
+against its own actual nearest real anchor. **Fixed**: a reused result is never added back to the
+candidate pool -- only genuine, Nominatim-confirmed results (loaded at start, or produced by a real
+call during the run) ever seed further reuse, so any reused row's actual distance to the reason it
+got its answer is always bounded by the reuse radius itself, never a multi-hop accumulation.
+Covered by a new regression test (`test_reuse_does_not_chain_through_a_previously_reused_result`)
+that reproduces the exact shape (three points ~100m apart in a line; the third must not inherit
+the first's locality through the second). **Data remediation**: since this was the very first run
+of a brand-new feature, every row with `raw_response IS NULL, lookup_failed=False,
+locality_is_approximate=False, geocoded_at` set was unambiguously a reuse-hit from the buggy run --
+821 such rows were deleted outright (`ImageFile.geocode` is `on_delete=models.SET_NULL`, so linked
+images just fall back to needing re-geocoding, no cascade risk) rather than trying to cherry-pick
+only the provably-wrong ones, since the detection method used to find the one confirmed-bad row
+could easily have missed subtler cases where a chained value happened to coincidentally match a
+genuine nearby anchor's name. The backfill was re-run with the fixed code afterward.
+
+**Also added the same day: retrying previously-failed coordinates.** `run_geocoding_backfill`'s
+"what's missing" query only checked whether a coordinate had *any* `GeocodeCache` row at all --
+once a coordinate got a row, even a `lookup_failed=True` one, it was permanently treated as
+"already cached" and never retried, even after whatever caused the failure was long since
+resolved. Found 80 real production rows stuck this way, all `Non-successful status code 429` --
+exactly the rate-limit storm this session's other fixes addressed. Now retries every
+`lookup_failed=True` row (updating the existing row in place rather than creating a new one,
+avoiding the unique `(lat, lon)` constraint), processed before brand-new coordinates each run.
+
+**Status at end of session**: the corrected backfill was re-launched against production
+(`docker exec -d picasa_api ... > /tmp/geocode_backfill2.log`) and was still running when this
+session wrapped up. Check `GeocodeCache.objects.filter(lookup_failed=True).count()` (should trend
+toward 0, modulo any genuinely-still-rate-limited retries) and the log's `FINAL:` line for the
+real succeeded/failed/reused_nearby/retried counts if picking this up again.
+
 **DONE (2026-09-04): stripped out the legacy `rest_framework_simplejwt` auth path.** The user
 believed the external client project that depended on it (`/api/token/obtain/`,
 `/api/token/refresh/`) had since dropped that dependency. Checked production logs before touching
