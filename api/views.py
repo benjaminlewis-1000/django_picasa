@@ -382,8 +382,24 @@ class PersonListView(APIView):
                 # would overcount relative to what's actually shown
                 # there.
                 p_dict['num_possibilities'] = max(0, p_dict['num_possibilities'] - num_flagged)
+                # Backs the verify screen's "Flagged & unverified"
+                # subordinate row - faces already confirmed to .ignore,
+                # not yet verified, that were ALSO flagged at some point
+                # (mobile_review_hidden survives confirm - see
+                # PersonParamView's face_declared/do_only_unverified
+                # branch). Same complementary-partition reasoning as
+                # num_possibilities' adjustment just above, but against
+                # num_unverified_faces instead - the main verify screen's
+                # own query excludes these, so its sidebar count needs the
+                # same exclusion.
+                num_flagged_unverified = Face.objects.filter(
+                    declared_name=p, validated=False, mobile_review_hidden=True
+                ).count()
+                p_dict['num_review_flagged_unverified'] = num_flagged_unverified
+                p_dict['num_unverified_faces'] = max(0, p_dict['num_unverified_faces'] - num_flagged_unverified)
             else:
                 p_dict['num_review_flagged'] = 0
+                p_dict['num_review_flagged_unverified'] = 0
 
             result_list.append(p_dict)
 
@@ -499,6 +515,29 @@ class PersonParamView(APIView):
                 # singleton, always still verified individually.
                 if do_only_unverified:
                     faces_qs = Face.objects.filter(default_query & unverified_query)
+                    # Frontend's ".ignore" sidebar subordinate row on the
+                    # verify screen ("Flagged & unverified") - faces
+                    # already confirmed to .ignore but not yet verified,
+                    # that were ALSO flagged at some point by the mobile
+                    # app's ignore-review flow (mobile_review_hidden).
+                    # Nothing clears that flag on confirm (Face.
+                    # associate_person et al - checked, none of them touch
+                    # it), so a flagged candidate that later gets manually
+                    # confirmed as .ignore still carries it. Same
+                    # complementary-partition shape as the face_poss
+                    # branch's own `flagged` handling below: the main
+                    # verify screen and this subordinate row split
+                    # .ignore's unverified faces with no overlap either
+                    # way, same reasoning (a mobile-skipped candidate
+                    # shouldn't just vanish from the person's own gallery -
+                    # see the face_poss branch's real-person carve-out).
+                    if person_obj.person_name == settings.SOFT_IGNORE_NAME:
+                        if do_flagged_only:
+                            faces_qs = faces_qs.filter(mobile_review_hidden=True)
+                        else:
+                            faces_qs = faces_qs.filter(
+                                Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False)
+                            )
                     cluster_groups = {
                         str(fid): group for fid, group in
                         faces_qs.values_list('id', 'verification_cluster_group')
