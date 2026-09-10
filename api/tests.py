@@ -1,6 +1,7 @@
 import json
 import unittest
 from io import BytesIO
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -13,7 +14,7 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from face_manager.models import Face, Person
-from filepopulator.models import ImageFile
+from filepopulator.models import GeocodeCache, ImageFile
 from filepopulator.scripts import create_image_file
 
 # This module intentionally never imports `api.views` (or triggers URL
@@ -1828,3 +1829,161 @@ class AutheliaOIDCAuthenticationTests(TestCase):
         # JWKS now unreachable, but we've seen this key before -> still 200.
         self._jwks_mock.side_effect = _jwt.PyJWKClientError("boom")
         self.assertEqual(self._get(self._token()).status_code, status.HTTP_200_OK)
+
+
+class GeocodeReviewTests(ApiTestCase):
+    # GeocodeCache is keyed per-coordinate (~11m rounding), not per place -
+    # these tests exercise the grouping (api/geocode_views.py) that turns
+    # that into a "one row per place" review table, and the two actions
+    # (validate-as-is / correct) that write back to every coordinate in a
+    # group at once.
+    def setUp(self):
+        super().setUp()
+        self.image = self.make_image()
+        # Pisa-area coordinate that resolves (wrongly, per the real bug
+        # this feature is for) to Livorno instead of Florence - two
+        # distinct coordinates sharing the same (locality, country, metro)
+        # triple, so they should collapse into one review-table row.
+        self.pisa_1 = GeocodeCache.objects.create(
+            lat=43.7000, lon=10.4000, locality='Pisa', country='Italy',
+            nearest_metro_name='Livorno', nearest_metro_distance_km=20.0,
+        )
+        self.pisa_2 = GeocodeCache.objects.create(
+            lat=43.7050, lon=10.4050, locality='Pisa', country='Italy',
+            nearest_metro_name='Livorno', nearest_metro_distance_km=21.0,
+        )
+        # A different, unrelated locality that happens to ALSO resolve to
+        # "Livorno" as its nearest metro - must stay a separate group, and
+        # must NOT be touched by a correction scoped to the Pisa group.
+        self.other_livorno_area = GeocodeCache.objects.create(
+            lat=43.55, lon=10.30, locality='Collesalvetti', country='Italy',
+            nearest_metro_name='Livorno', nearest_metro_distance_km=8.0,
+        )
+        self.image.geocode = self.pisa_1
+        self.image.save(update_fields=['geocode'])
+
+    def _pisa_group_payload(self, **overrides):
+        payload = {'locality': 'Pisa', 'country': 'Italy', 'metro_name': 'Livorno'}
+        payload.update(overrides)
+        return payload
+
+    def test_list_groups_by_locality_country_metro_not_by_metro_alone(self):
+        resp = self.client.get('/api/geocode_review/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = json.loads(resp.content)
+        self.assertEqual(data['metrics']['total'], 2)  # Pisa group + Collesalvetti group
+        self.assertEqual(data['metrics']['validated'], 0)
+
+        pisa_row = next(r for r in data['results'] if r['locality'] == 'Pisa')
+        self.assertEqual(pisa_row['metro_name'], 'Livorno')
+        self.assertEqual(pisa_row['num_coords'], 2)
+        self.assertEqual(pisa_row['num_images'], 1)
+        self.assertFalse(pisa_row['metro_validated'])
+
+        other_row = next(r for r in data['results'] if r['locality'] == 'Collesalvetti')
+        self.assertEqual(other_row['num_coords'], 1)
+
+    def test_validate_marks_every_row_in_the_group_without_changing_the_name(self):
+        resp = self.client.patch(
+            '/api/geocode_review/action/', self._pisa_group_payload(action='validate'),
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        self.pisa_1.refresh_from_db()
+        self.pisa_2.refresh_from_db()
+        self.other_livorno_area.refresh_from_db()
+        self.assertTrue(self.pisa_1.metro_validated)
+        self.assertTrue(self.pisa_2.metro_validated)
+        self.assertFalse(self.pisa_1.metro_override)
+        self.assertEqual(self.pisa_1.nearest_metro_name, 'Livorno')
+        # Not part of the Pisa group - untouched.
+        self.assertFalse(self.other_livorno_area.metro_validated)
+
+    def test_correct_via_major_places_gazetteer_updates_every_row_in_group_only(self):
+        resp = self.client.patch(
+            '/api/geocode_review/action/',
+            self._pisa_group_payload(action='correct', metro_name_correction='Florence'),
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = json.loads(resp.content)
+        self.assertEqual(data['metro_name'], 'Florence')
+        self.assertGreater(data['metro_distance_km'], 20)  # Florence is further than Livorno
+
+        self.pisa_1.refresh_from_db()
+        self.pisa_2.refresh_from_db()
+        self.other_livorno_area.refresh_from_db()
+        self.assertEqual(self.pisa_1.nearest_metro_name, 'Florence')
+        self.assertEqual(self.pisa_2.nearest_metro_name, 'Florence')
+        self.assertTrue(self.pisa_1.metro_override)
+        self.assertTrue(self.pisa_1.metro_validated)
+        # Distance recomputed per-row, not copied from row 1 to row 2 -
+        # the two Pisa coordinates aren't identical.
+        self.assertNotEqual(self.pisa_1.nearest_metro_distance_km, self.pisa_2.nearest_metro_distance_km)
+        # The unrelated Collesalvetti/Livorno group is untouched by a
+        # correction scoped to the Pisa group, even though it shares the
+        # same OLD metro name - the exact corruption this feature must
+        # avoid (see api/geocode_views.py's _group_filter comment).
+        self.assertEqual(self.other_livorno_area.nearest_metro_name, 'Livorno')
+        self.assertFalse(self.other_livorno_area.metro_override)
+
+    def test_correct_falls_back_to_nominatim_for_a_place_not_in_the_gazetteer(self):
+        fake_location = mock.Mock()
+        fake_location.raw = {'address': {'country': 'United States', 'state': 'Wyoming'}, 'name': 'Yellowstone National Park'}
+        fake_location.latitude = 44.4280
+        fake_location.longitude = -110.5885
+        fake_location.address = 'Yellowstone National Park, Wyoming, United States'
+
+        with mock.patch('filepopulator.geocode._get_nominatim_forward_geocode', return_value=lambda *a, **k: fake_location):
+            resp = self.client.patch(
+                '/api/geocode_review/action/',
+                self._pisa_group_payload(action='correct', metro_name_correction='Yellowstone National Park'),
+                format='json',
+            )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = json.loads(resp.content)
+        self.assertEqual(data['metro_name'], 'Yellowstone National Park')
+
+        self.pisa_1.refresh_from_db()
+        self.assertEqual(self.pisa_1.nearest_metro_name, 'Yellowstone National Park')
+        self.assertTrue(self.pisa_1.metro_override)
+
+    def test_correct_rejects_an_unrecognized_place(self):
+        with mock.patch('filepopulator.geocode._get_nominatim_forward_geocode', return_value=lambda *a, **k: None):
+            resp = self.client.patch(
+                '/api/geocode_review/action/',
+                self._pisa_group_payload(action='correct', metro_name_correction='Asdfqwertyville'),
+                format='json',
+            )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.pisa_1.refresh_from_db()
+        self.assertEqual(self.pisa_1.nearest_metro_name, 'Livorno')  # unchanged
+
+    def test_correct_rejects_a_us_result_with_no_resolvable_state(self):
+        fake_location = mock.Mock()
+        fake_location.raw = {'address': {'country': 'United States'}, 'name': 'Somewhere'}
+        fake_location.latitude = 40.0
+        fake_location.longitude = -100.0
+        fake_location.address = 'Somewhere, United States'
+
+        with mock.patch('filepopulator.geocode._get_nominatim_forward_geocode', return_value=lambda *a, **k: fake_location):
+            resp = self.client.patch(
+                '/api/geocode_review/action/',
+                self._pisa_group_payload(action='correct', metro_name_correction='Somewhere'),
+                format='json',
+            )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_action_requires_authentication(self):
+        resp = self.anon_client.patch(
+            '/api/geocode_review/action/', self._pisa_group_payload(action='validate'), format='json',
+        )
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_search_places_returns_matches_sorted_by_population(self):
+        resp = self.client.get('/api/geocode_review/search_places/', {'q': 'florence'})
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = json.loads(resp.content)
+        names = [r['name'] for r in data['results']]
+        self.assertIn('Florence', names)
