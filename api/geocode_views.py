@@ -9,6 +9,7 @@ reasoning as mobile_views.py being separate.
 
 import json
 
+from geopy.exc import GeocoderRateLimited
 from django.db.models import Count, Q
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
@@ -184,13 +185,29 @@ class GeocodeReviewActionView(APIView):
 
         try:
             resolved = _resolve_correction(corrected_name, rows[0].lat, rows[0].lon)
+        except GeocoderRateLimited:
+            # Confirmed for real 2026-09-10: Nominatim's public instance
+            # rate-limits/temporarily blocks a server's IP for a cooldown
+            # period (observed lasting way longer than our own 2s
+            # between-request delay would suggest) once it decides a
+            # client has sent too much traffic - a single heavy backfill
+            # batch is enough to trigger it. There's no Retry-After we can
+            # rely on (Nominatim returned "0" during the actual incident),
+            # so this is a rough, honest estimate rather than a promise -
+            # better than the generic "try again in a moment" this used to
+            # say, which was actively misleading for what's usually a
+            # much longer wait than "a moment".
+            return HttpResponse(
+                json.dumps({'success': False, 'error': "Likely hit Nominatim's rate limit - please wait about an hour and try again."}),
+                content_type='application/json', status=429,
+            )
         except Exception as e:
-            # A real Nominatim failure (timeout/429/network) - swallow_
-            # exceptions=False on the forward-geocode RateLimiter (see
-            # geocode.py) means this now actually reaches here instead of
-            # silently looking identical to "not a real place" below.
-            # Distinct status/message so the frontend can tell a user
-            # "try again" rather than "that place doesn't exist".
+            # Some other real Nominatim failure (timeout/network) -
+            # swallow_exceptions=False on the forward-geocode RateLimiter
+            # (see geocode.py) means this now actually reaches here
+            # instead of silently looking identical to "not a real place"
+            # below. Distinct status/message so the frontend can tell a
+            # user "try again" rather than "that place doesn't exist".
             return HttpResponse(
                 json.dumps({'success': False, 'error': f'Could not reach the geocoding service - try again in a moment. ({e})'}),
                 content_type='application/json', status=503,

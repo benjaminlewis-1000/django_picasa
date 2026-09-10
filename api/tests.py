@@ -2045,6 +2045,29 @@ class GeocodeReviewTests(ApiTestCase):
         self.pisa_1.refresh_from_db()
         self.assertEqual(self.pisa_1.nearest_metro_name, 'Livorno')  # unchanged
 
+    def test_correct_surfaces_a_rate_limit_with_a_specific_wait_message(self):
+        # Confirmed for real 2026-09-10: Nominatim's public instance can
+        # temporarily rate-limit/block a server's IP for a cooldown period
+        # noticeably longer than "try again in a moment" - this needs its
+        # own distinct message/status so the frontend doesn't undersell
+        # how long the wait actually is, or auto-retry into it.
+        from geopy.exc import GeocoderRateLimited
+        with mock.patch(
+            'filepopulator.geocode._get_nominatim_forward_geocode',
+            return_value=lambda *a, **k: (_ for _ in ()).throw(GeocoderRateLimited('Non-successful status code 429')),
+        ):
+            resp = self.client.patch(
+                '/api/geocode_review/action/',
+                self._pisa_group_payload(action='correct', metro_name_correction='Asdfqwertyville'),
+                format='json',
+            )
+        self.assertEqual(resp.status_code, 429)
+        data = json.loads(resp.content)
+        self.assertIn('rate limit', data['error'].lower())
+        self.assertIn('hour', data['error'].lower())
+        self.pisa_1.refresh_from_db()
+        self.assertEqual(self.pisa_1.nearest_metro_name, 'Livorno')  # unchanged
+
     def test_list_exposes_locality_is_approximate(self):
         GeocodeCache.objects.create(
             lat=2.0, lon=2.0, locality='Nearest Named Place', locality_is_approximate=True,
