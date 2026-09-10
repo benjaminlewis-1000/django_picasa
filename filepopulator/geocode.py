@@ -155,7 +155,12 @@ def resolve_named_place(query):
     (the one extra check the user asked for: "valid state if USA").
     """
     forward = _get_nominatim_forward_geocode()
-    location = forward(query, exactly_one=True, language='en')
+    # addressdetails=True is NOT geopy's default for forward geocode()
+    # (unlike reverse(), which returns the structured breakdown either
+    # way) - without it, location.raw has no 'address' key at all, so
+    # every real, correctly-resolved place (e.g. "Bremerton, WA") looked
+    # like it had no resolvable country and got rejected as unrecognized.
+    location = forward(query, exactly_one=True, language='en', addressdetails=True)
 
     if location is None:
         return None
