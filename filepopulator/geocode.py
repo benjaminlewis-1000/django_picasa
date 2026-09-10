@@ -364,6 +364,46 @@ def reverse_geocode_precise(lat, lon):
     }
 
 
+# Reuse radius for the proximity check below -- deliberately much wider
+# than GeocodeCache.ROUND_DECIMALS' ~11m grid cell (that's a cache *key*
+# granularity, not a "these are close enough to share a locality"
+# judgment). 150m is tight enough to be confident it's still the same
+# address/block (not just "same neighborhood"), which is what actually
+# matters here: many of a real photo library's still-uncached coordinates
+# are someone wandering the same building/block across separate visits,
+# each landing in a different ~11m cell. Confirmed against real
+# production data 2026-09-10: of 1278 then-uncached coordinates, 1059
+# were within this radius of an already-successful precise geocode.
+GEOCODE_REUSE_RADIUS_KM = 0.15
+
+
+def _find_nearby_precise_geocode(lat, lon, candidates, radius_km=GEOCODE_REUSE_RADIUS_KM):
+    """candidates: a list of (lat, lon, dict) tuples for already-known
+    PRECISE (real Nominatim tag, not the offline nearest-named-place
+    fallback) geocode results -- either loaded from the DB once at the
+    start of a run, or appended to during the run as new coordinates
+    resolve, so later coordinates in the same run can chain off earlier
+    ones too. Returns the nearest match's dict within radius_km, or None.
+
+    Deliberately excludes locality_is_approximate rows (the offline
+    fallback) as reuse sources -- propagating an already-approximate guess
+    to a second, different coordinate would compound the imprecision
+    rather than share a genuine answer."""
+    best = None
+    best_dist = None
+    for clat, clon, data in candidates:
+        # Cheap bounding-box pre-filter, same trick find_nearest_metro
+        # uses -- can only ever be too permissive, never too strict.
+        if abs(clat - lat) > radius_km / 111.0:
+            continue
+        if abs(clon - lon) > radius_km / 111.0:
+            continue
+        dist = _haversine_km(lat, lon, clat, clon)
+        if dist <= radius_km and (best_dist is None or dist < best_dist):
+            best, best_dist = data, dist
+    return best
+
+
 def run_geocoding_backfill(limit=None, dry_run=False, log=print):
     """Geocodes every distinct (rounded) GPS coordinate among ImageFiles
     that doesn't already have a GeocodeCache entry, then links matching
@@ -373,6 +413,15 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
     differing only in how large a batch (`limit`) makes sense to run at
     once.
 
+    Before calling Nominatim for a coordinate, checks for an already-known
+    PRECISE geocode (this run's own results so far, plus everything
+    already in GeocodeCache) within GEOCODE_REUSE_RADIUS_KM and copies its
+    locality/county/state/country/display_name directly if found -- no
+    network call, no rate-limit consumption. This is what keeps a large
+    backlog from costing one Nominatim call per coordinate: real photo
+    libraries have a lot of "wandered the same block across visits" GPS
+    noise that the ~11m cache-key rounding alone doesn't catch.
+
     Safe to interrupt and re-run: a coordinate is only ever processed once
     it has no GeocodeCache row, so a partial run just picks up where it
     left off. A failure geocoding one coordinate is recorded
@@ -380,7 +429,8 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
     run for every other coordinate queued behind it.
 
     Returns a dict of counts: distinct, already_cached, remaining,
-    succeeded, failed.
+    succeeded, failed, reused_nearby (a subset of succeeded that were
+    resolved via the proximity check rather than a real Nominatim call).
     """
     from filepopulator.models import GeocodeCache, ImageFile
 
@@ -402,7 +452,7 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
 
     result = {
         'distinct': coords.count(), 'already_cached': len(existing),
-        'remaining': len(todo), 'succeeded': 0, 'failed': 0,
+        'remaining': len(todo), 'succeeded': 0, 'failed': 0, 'reused_nearby': 0,
     }
 
     if dry_run:
@@ -411,6 +461,20 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
 
     if limit is not None:
         todo = todo[:limit]
+
+    # Loaded once, up front -- every already-cached PRECISE (real
+    # Nominatim tag, not the offline fallback) result is a candidate reuse
+    # source for the proximity check below. Grown in-place as this run
+    # resolves its own coordinates, so a later coordinate in the same run
+    # can chain off an earlier one too, not just off what predates this
+    # run.
+    reuse_candidates = [
+        (lat, lon, {'locality': locality, 'county': county, 'state': state,
+                    'country': country, 'display_name': display_name})
+        for lat, lon, locality, county, state, country, display_name in
+        GeocodeCache.objects.filter(lookup_failed=False, locality_is_approximate=False)
+        .values_list('lat', 'lon', 'locality', 'county', 'state', 'country', 'display_name')
+    ]
 
     start = time.time()
 
@@ -423,34 +487,54 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
             nearest_metro_distance_km=metro_distance,
         )
 
-        try:
-            precise = reverse_geocode_precise(lat, lon)
-            cache_entry.locality = precise['locality']
-            cache_entry.county = precise['county']
-            cache_entry.state = precise['state']
-            cache_entry.country = precise['country']
-            cache_entry.display_name = precise['display_name']
-            cache_entry.raw_response = precise['raw_response']
+        nearby = _find_nearby_precise_geocode(lat, lon, reuse_candidates)
+        if nearby is not None:
+            cache_entry.locality = nearby['locality']
+            cache_entry.county = nearby['county']
+            cache_entry.state = nearby['state']
+            cache_entry.country = nearby['country']
+            cache_entry.display_name = nearby['display_name']
             cache_entry.geocoded_at = timezone.now()
-            # Nominatim genuinely had nothing usable (not a failure - see
-            # swallow_exceptions=False's comment above for the failure
-            # case) - fall back to the nearest named place we know of
-            # offline, rather than leaving this permanently "unknown".
-            # Marked approximate so nothing mistakes it for the actual
-            # place a photo was taken.
-            if not cache_entry.locality:
-                fallback_name, fallback_country, _ = find_nearest_named_place(lat, lon)
-                if fallback_name:
-                    cache_entry.locality = fallback_name
-                    cache_entry.locality_is_approximate = True
-                    if not cache_entry.country:
-                        cache_entry.country = fallback_country
             result['succeeded'] += 1
-        except Exception as e:
-            cache_entry.lookup_failed = True
-            cache_entry.lookup_error = str(e)
-            result['failed'] += 1
-            log(f"Failed to geocode ({lat}, {lon}): {e}")
+            result['reused_nearby'] += 1
+            reuse_candidates.append((lat, lon, nearby))
+        else:
+            try:
+                precise = reverse_geocode_precise(lat, lon)
+                cache_entry.locality = precise['locality']
+                cache_entry.county = precise['county']
+                cache_entry.state = precise['state']
+                cache_entry.country = precise['country']
+                cache_entry.display_name = precise['display_name']
+                cache_entry.raw_response = precise['raw_response']
+                cache_entry.geocoded_at = timezone.now()
+                # Nominatim genuinely had nothing usable (not a failure -
+                # see swallow_exceptions=False's comment above for the
+                # failure case) - fall back to the nearest named place we
+                # know of offline, rather than leaving this permanently
+                # "unknown". Marked approximate so nothing mistakes it for
+                # the actual place a photo was taken.
+                if not cache_entry.locality:
+                    fallback_name, fallback_country, _ = find_nearest_named_place(lat, lon)
+                    if fallback_name:
+                        cache_entry.locality = fallback_name
+                        cache_entry.locality_is_approximate = True
+                        if not cache_entry.country:
+                            cache_entry.country = fallback_country
+                else:
+                    # A genuine, precise result -- available for later
+                    # coordinates in this same run to reuse.
+                    reuse_candidates.append((lat, lon, {
+                        'locality': cache_entry.locality, 'county': cache_entry.county,
+                        'state': cache_entry.state, 'country': cache_entry.country,
+                        'display_name': cache_entry.display_name,
+                    }))
+                result['succeeded'] += 1
+            except Exception as e:
+                cache_entry.lookup_failed = True
+                cache_entry.lookup_error = str(e)
+                result['failed'] += 1
+                log(f"Failed to geocode ({lat}, {lon}): {e}")
 
         try:
             with transaction.atomic():
@@ -479,5 +563,6 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
             elapsed = time.time() - start
             log(f"{i + 1}/{len(todo)} coordinates processed ({elapsed:.0f}s elapsed)")
 
-    log(f"Done. {result['succeeded']} succeeded, {result['failed']} failed, {time.time() - start:.0f}s total.")
+    log(f"Done. {result['succeeded']} succeeded ({result['reused_nearby']} via nearby reuse, "
+        f"no Nominatim call), {result['failed']} failed, {time.time() - start:.0f}s total.")
     return result
