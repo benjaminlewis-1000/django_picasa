@@ -790,6 +790,129 @@ class IgnoreReviewFlaggedPartitionTests(ApiTestCase):
         self.assertIn(skipped_face.id, id_list)
 
 
+class IgnoreReviewFlaggedUnverifiedPartitionTests(ApiTestCase):
+    # A face's mobile_review_hidden flag survives being manually confirmed
+    # as .ignore (declared_name set, poss_identN cleared) - nothing in
+    # Face.associate_person/reject_association clears it (checked). The
+    # verify screen's main ".ignore" query and its "Flagged & unverified"
+    # subordinate row (PersonParamView's face_declared/do_only_unverified
+    # branch, `flagged` param) are meant to be a complementary partition of
+    # .ignore's unverified-and-declared faces, same shape as
+    # IgnoreReviewFlaggedPartitionTests above but one step further along
+    # (already confirmed, not just proposed).
+    def setUp(self):
+        super().setUp()
+        self.image = self.make_image()
+        self.ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        self.flagged_unverified_face = self.make_face(
+            self.image, declared_name=self.ignore, validated=False, mobile_review_hidden=True,
+        )
+        self.plain_unverified_face = self.make_face(
+            self.image, declared_name=self.ignore, validated=False, mobile_review_hidden=False,
+        )
+        self.never_reviewed_unverified_face = self.make_face(
+            self.image, declared_name=self.ignore, validated=False,
+        )
+        # Already verified, and flagged - should show up in neither the
+        # main verify query nor the flagged one, both of which require
+        # validated=False.
+        self.flagged_but_verified_face = self.make_face(
+            self.image, declared_name=self.ignore, validated=True, mobile_review_hidden=True,
+        )
+
+    def test_default_only_unverified_excludes_flagged(self):
+        resp = self.client.get(f"/api/paginate_obj_ids/{self.ignore.id}/face_declared?only_unverified=true")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        id_list = json.loads(resp.content)["id_list"]
+        self.assertNotIn(self.flagged_unverified_face.id, id_list)
+        self.assertIn(self.plain_unverified_face.id, id_list)
+        self.assertIn(self.never_reviewed_unverified_face.id, id_list)
+        self.assertNotIn(self.flagged_but_verified_face.id, id_list)
+
+    def test_flagged_true_returns_only_flagged_unverified(self):
+        resp = self.client.get(
+            f"/api/paginate_obj_ids/{self.ignore.id}/face_declared?only_unverified=true&flagged=true"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        id_list = json.loads(resp.content)["id_list"]
+        self.assertEqual(id_list, [self.flagged_unverified_face.id])
+
+    def test_flagged_and_unflagged_partition_the_full_unverified_set(self):
+        main_ids = set(json.loads(
+            self.client.get(f"/api/paginate_obj_ids/{self.ignore.id}/face_declared?only_unverified=true").content
+        )["id_list"])
+        flagged_ids = set(json.loads(
+            self.client.get(
+                f"/api/paginate_obj_ids/{self.ignore.id}/face_declared?only_unverified=true&flagged=true"
+            ).content
+        )["id_list"])
+        all_unverified_ids = set(
+            Face.objects.filter(declared_name=self.ignore, validated=False).values_list("id", flat=True)
+        )
+        self.assertEqual(main_ids & flagged_ids, set(), "a face should never appear in both")
+        self.assertEqual(main_ids | flagged_ids, all_unverified_ids, "union should cover every unverified face")
+
+    def test_flagged_true_is_a_no_op_for_a_real_person(self):
+        # Scoped to .ignore, same as the face_poss branch's own gate - a
+        # real person's unverified faces shouldn't be filtered by this
+        # mobile-only flag.
+        real_person = Person.objects.create(person_name="Flagged Unverified Real Person")
+        real_face = self.make_face(
+            self.image, declared_name=real_person, validated=False, mobile_review_hidden=True,
+        )
+        resp = self.client.get(
+            f"/api/paginate_obj_ids/{real_person.id}/face_declared?only_unverified=true&flagged=true"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        id_list = json.loads(resp.content)["id_list"]
+        self.assertIn(real_face.id, id_list)
+
+    def test_default_face_declared_without_only_unverified_is_unaffected(self):
+        # The flagged partition only applies to the do_only_unverified
+        # branch - plain browsing of .ignore's full declared gallery
+        # (verify screen off) should still show every confirmed face
+        # regardless of the flag, same as before this feature.
+        resp = self.client.get(f"/api/paginate_obj_ids/{self.ignore.id}/face_declared")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        id_list = json.loads(resp.content)["id_list"]
+        self.assertIn(self.flagged_unverified_face.id, id_list)
+        self.assertIn(self.flagged_but_verified_face.id, id_list)
+
+
+@override_settings(MEDIA_ROOT="/tmp/api_test_media")
+class IgnoreReviewFlaggedUnverifiedCountTests(FaceFixtureMixin, TransactionTestCase):
+    # Same threading/visibility reasoning as IgnoreReviewFlaggedCountTests
+    # above - num_unverified_faces comes from compute_live_face_counts,
+    # farmed out to worker threads on separate DB connections, so this
+    # needs TransactionTestCase (real commits) rather than a plain
+    # TestCase's rolled-back transaction.
+    def setUp(self):
+        ensure_sentinel_people()
+        self.user = User.objects.create_user(username="tester_flagged_unverified_count", password="pw123456")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+        self.image = self.make_image()
+        self.ignore = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        self.make_face(
+            self.image, declared_name=self.ignore, validated=False, mobile_review_hidden=True,
+        )
+
+    def test_person_list_num_unverified_excludes_flagged_for_ignore(self):
+        self.make_face(
+            self.image, declared_name=self.ignore, validated=False, mobile_review_hidden=False,
+        )
+        self.make_face(
+            self.image, declared_name=self.ignore, validated=False, mobile_review_hidden=False,
+        )
+        resp = self.client.get("/api/person_list/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        results = json.loads(resp.content)["results"]
+        ignore_dict = next(p for p in results if p["id"] == self.ignore.id)
+        self.assertEqual(ignore_dict["num_unverified_faces"], 2)
+        self.assertEqual(ignore_dict["num_review_flagged_unverified"], 1)
+
+
 @override_settings(MEDIA_ROOT="/tmp/api_test_media")
 class IgnoreReviewFlaggedCountTests(FaceFixtureMixin, TransactionTestCase):
     # PersonListView farms its per-person work out to worker threads
