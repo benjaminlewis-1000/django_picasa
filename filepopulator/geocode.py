@@ -382,13 +382,25 @@ def _find_nearby_precise_geocode(lat, lon, candidates, radius_km=GEOCODE_REUSE_R
     PRECISE (real Nominatim tag, not the offline nearest-named-place
     fallback) geocode results -- either loaded from the DB once at the
     start of a run, or appended to during the run as new coordinates
-    resolve, so later coordinates in the same run can chain off earlier
-    ones too. Returns the nearest match's dict within radius_km, or None.
+    resolve via a REAL Nominatim call, so a later coordinate in the same
+    run can reuse an earlier one too, not just rows that predate this run.
+    Returns the nearest match's dict within radius_km, or None.
 
     Deliberately excludes locality_is_approximate rows (the offline
     fallback) as reuse sources -- propagating an already-approximate guess
     to a second, different coordinate would compound the imprecision
-    rather than share a genuine answer."""
+    rather than share a genuine answer.
+
+    Just as deliberately, a coordinate that itself only got its answer
+    via THIS reuse check (rather than a real Nominatim call) is never
+    added as a candidate either -- see run_geocoding_backfill's own
+    comment at its append site for why: letting reused results chain
+    would let a sequence of points spaced just under radius_km apart each
+    individually pass the check while drifting arbitrarily far, hop by
+    hop, from the one real geocode the whole chain traces back to. Every
+    candidate here is always a genuine, Nominatim-confirmed result, so
+    the actual distance from any coordinate to the reason it got its
+    answer is always <= radius_km, never a multi-hop accumulation."""
     best = None
     best_dist = None
     for clat, clon, data in candidates:
@@ -422,6 +434,19 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
     libraries have a lot of "wandered the same block across visits" GPS
     noise that the ~11m cache-key rounding alone doesn't catch.
 
+    Also retries every existing lookup_failed=True row (real, previously-
+    recorded failures -- timeout/429/network blip, NOT "Nominatim found
+    nothing here", which is a different, non-failure outcome -- see
+    swallow_exceptions=False's comment above). Found real production data
+    2026-09-10: a coordinate that once failed had no path back to being
+    retried at all -- the "what's missing" query below only checks whether
+    a coordinate has ANY GeocodeCache row, so a failed one looked
+    permanently "already cached" forever, even after whatever caused the
+    failure (e.g. the rate-limit cooldown this session diagnosed) was long
+    since resolved. Retries are processed before brand-new coordinates
+    (already-known real places worth fixing first) and update the
+    existing row in place rather than creating a new one.
+
     Safe to interrupt and re-run: a coordinate is only ever processed once
     it has no GeocodeCache row, so a partial run just picks up where it
     left off. A failure geocoding one coordinate is recorded
@@ -429,8 +454,10 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
     run for every other coordinate queued behind it.
 
     Returns a dict of counts: distinct, already_cached, remaining,
-    succeeded, failed, reused_nearby (a subset of succeeded that were
-    resolved via the proximity check rather than a real Nominatim call).
+    retry_eligible, succeeded, failed, reused_nearby (a subset of
+    succeeded that were resolved via the proximity check rather than a
+    real Nominatim call), retried (how many of this run's attempts were
+    retries of a previous failure), retried_succeeded.
     """
     from filepopulator.models import GeocodeCache, ImageFile
 
@@ -444,21 +471,32 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
     )
 
     existing = set(GeocodeCache.objects.values_list('lat', 'lon'))
-    todo = [(lat, lon) for lat, lon in coords if (lat, lon) not in existing]
+    new_coords_todo = [(lat, lon) for lat, lon in coords if (lat, lon) not in existing]
+    retry_todo = list(GeocodeCache.objects.filter(lookup_failed=True).values_list('lat', 'lon'))
 
     log(f"Distinct coordinates with GPS: {coords.count()}")
     log(f"Already cached: {len(existing)}")
-    log(f"Remaining to geocode: {len(todo)}")
+    log(f"Remaining to geocode: {len(new_coords_todo)}")
+    log(f"Previously-failed coordinates eligible for retry: {len(retry_todo)}")
 
     result = {
         'distinct': coords.count(), 'already_cached': len(existing),
-        'remaining': len(todo), 'succeeded': 0, 'failed': 0, 'reused_nearby': 0,
+        'remaining': len(new_coords_todo), 'retry_eligible': len(retry_todo),
+        'succeeded': 0, 'failed': 0, 'reused_nearby': 0,
+        'retried': 0, 'retried_succeeded': 0,
     }
 
     if dry_run:
         log("Dry run -- no changes written.")
         return result
 
+    # Retries first -- these are already-known real places that hit a
+    # transient failure, not brand-new unknowns; worth fixing before
+    # spending the same run's budget on new coordinates. `limit` (the
+    # hourly task's small-batch cap) applies to the combined queue, same
+    # as it always has for new_coords_todo alone.
+    todo = [(lat, lon, True) for lat, lon in retry_todo] + \
+           [(lat, lon, False) for lat, lon in new_coords_todo]
     if limit is not None:
         todo = todo[:limit]
 
@@ -478,14 +516,24 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
 
     start = time.time()
 
-    for i, (lat, lon) in enumerate(todo):
+    for i, (lat, lon, is_retry) in enumerate(todo):
         metro_name, metro_distance = find_nearest_metro(lat, lon)
 
-        cache_entry = GeocodeCache(
-            lat=lat, lon=lon,
-            nearest_metro_name=metro_name,
-            nearest_metro_distance_km=metro_distance,
-        )
+        if is_retry:
+            result['retried'] += 1
+            # Update the existing failed row in place rather than
+            # constructing a new instance -- a fresh GeocodeCache(lat=,
+            # lon=) here would be an unsaved instance with no pk, and
+            # .save() would attempt an INSERT that collides with this
+            # coordinate's existing row under the unique (lat, lon)
+            # constraint.
+            cache_entry = GeocodeCache.objects.get(lat=lat, lon=lon)
+            cache_entry.lookup_failed = False
+            cache_entry.lookup_error = None
+        else:
+            cache_entry = GeocodeCache(lat=lat, lon=lon)
+        cache_entry.nearest_metro_name = metro_name
+        cache_entry.nearest_metro_distance_km = metro_distance
 
         nearby = _find_nearby_precise_geocode(lat, lon, reuse_candidates)
         if nearby is not None:
@@ -497,7 +545,18 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
             cache_entry.geocoded_at = timezone.now()
             result['succeeded'] += 1
             result['reused_nearby'] += 1
-            reuse_candidates.append((lat, lon, nearby))
+            if is_retry:
+                result['retried_succeeded'] += 1
+            # Deliberately NOT appended to reuse_candidates -- this result
+            # was itself only ever within GEOCODE_REUSE_RADIUS_KM of its
+            # own (real) anchor, not independently confirmed by Nominatim.
+            # Letting a reused result seed further reuse would let a chain
+            # of points spaced just under the radius apart (a real shape
+            # for GPS traces along a street/metro area) each individually
+            # pass the "close to the previous point" check while drifting
+            # arbitrarily far, hop by hop, from the one real geocode the
+            # whole chain traces back to. Every reuse must measure
+            # distance directly against a genuine Nominatim result.
         else:
             try:
                 precise = reverse_geocode_precise(lat, lon)
@@ -530,6 +589,8 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
                         'display_name': cache_entry.display_name,
                     }))
                 result['succeeded'] += 1
+                if is_retry:
+                    result['retried_succeeded'] += 1
             except Exception as e:
                 cache_entry.lookup_failed = True
                 cache_entry.lookup_error = str(e)
@@ -564,5 +625,6 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
             log(f"{i + 1}/{len(todo)} coordinates processed ({elapsed:.0f}s elapsed)")
 
     log(f"Done. {result['succeeded']} succeeded ({result['reused_nearby']} via nearby reuse, "
-        f"no Nominatim call), {result['failed']} failed, {time.time() - start:.0f}s total.")
+        f"no Nominatim call), {result['failed']} failed, {time.time() - start:.0f}s total. "
+        f"Retries: {result['retried']} attempted, {result['retried_succeeded']} now succeeded.")
     return result
