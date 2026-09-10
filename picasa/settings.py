@@ -537,18 +537,17 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'filepopulator.check_mod_dates',
         'schedule': crontab(minute='0', hour = '23'),
     },
-   # Temporarily disabled 2026-09-10: Nominatim's public instance rate-
-   # limited/temporarily blocked our server's IP after a heavy backfill
-   # batch (see the geocode-review tool work in CLAUDE.md) - this task
-   # calling run_geocoding_backfill every hour would keep making requests
-   # into that same cooldown and likely extend it indefinitely. Re-enable
-   # (uncomment) once the cooldown is confirmed clear - a plain
-   # `requests.get('https://nominatim.openstreetmap.org/search', ...)`
-   # returning something other than 429 confirms it.
-   # 'geocode_new_images': {
-   #     'task': 'filepopulator.geocode_new_images',
-   #     'schedule': crontab(minute='30', hour='*'),
-   # },
+   # Re-enabled 2026-09-10: was temporarily disabled after Nominatim's
+   # public instance rate-limited/temporarily blocked our server's IP
+   # following a heavy backfill batch (see the geocode-review tool work in
+   # CLAUDE.md). Root cause fixed (module-level RateLimiter singletons +
+   # 15s/4-per-minute delay, filepopulator/geocode.py) and the cooldown
+   # confirmed lifted (a plain `requests.get(...)` against Nominatim
+   # returns 200, not 429) before re-enabling.
+   'geocode_new_images': {
+       'task': 'filepopulator.geocode_new_images',
+       'schedule': crontab(minute='30', hour='*'),
+   },
    'find_similar_images': {
         'task': 'filepopulator.find_similar_images',
         'schedule': crontab(minute='45', hour='*'),
