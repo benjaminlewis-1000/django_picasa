@@ -43,7 +43,7 @@ def _build_review_groups():
     base_rows = list(
         GeocodeCache.objects
         .filter(nearest_metro_name__isnull=False)
-        .values('locality', 'country', 'nearest_metro_name', 'lat', 'lon',
+        .values('locality', 'state', 'country', 'nearest_metro_name', 'lat', 'lon',
                  'nearest_metro_distance_km', 'metro_validated', 'metro_override')
     )
     image_counts = {
@@ -63,10 +63,23 @@ def _build_review_groups():
     for row in base_rows:
         key = _group_key(row)
         if key not in groups:
+            # Best-effort US state for the metro pick itself - looked up
+            # against the same offline gazetteer a correction would use
+            # (nearest match if the name exists more than once worldwide),
+            # not persisted anywhere. Only major_places.csv's US rows have
+            # a human-readable admin1_code (the 2-letter state, e.g. "CA")
+            # - every other country's admin1_code is a bare GeoNames
+            # number, not worth showing. Silently None for a metro name
+            # that came from a Nominatim-resolved correction not in the
+            # gazetteer at all (a small hometown, a park) - nothing to
+            # look up in that case.
+            metro_state = _major_place_state(row['nearest_metro_name'], row['lat'], row['lon'])
             groups[key] = {
                 'locality': row['locality'],
+                'state': row['state'],
                 'country': row['country'],
                 'metro_name': row['nearest_metro_name'],
+                'metro_state': metro_state,
                 'metro_distance_km': row['nearest_metro_distance_km'],
                 'lat': row['lat'],
                 'lon': row['lon'],
@@ -77,9 +90,15 @@ def _build_review_groups():
             }
         groups[key]['num_coords'] += 1
 
+    # Sort key, in priority order: validated sinks to the bottom; within
+    # "not yet validated", a row with no precise locality at all (a
+    # failed/empty reverse-geocode - see CLAUDE.md's note on this) sinks
+    # below every row that actually has one to compare the metro pick
+    # against, since there's nothing to usefully compare there; then
+    # alphabetical.
     return sorted(
         groups.values(),
-        key=lambda g: (g['metro_validated'], g['locality'] or '', g['country'] or ''),
+        key=lambda g: (g['metro_validated'], g['locality'] is None, g['locality'] or '', g['country'] or ''),
     )
 
 
@@ -113,7 +132,13 @@ class GeocodeReviewSearchPlacesView(APIView):
         query = request.query_params.get('q', '')
         matches = search_major_places(query, limit=10)
         js = {'results': [
-            {'name': m['name'], 'country_code': m['country_code'], 'population': m['population']}
+            {
+                'name': m['name'], 'country_code': m['country_code'], 'population': m['population'],
+                # Human-readable only for US rows - see _major_place_state's
+                # own comment. Frontend falls back to showing country_code
+                # for everything else.
+                'state': m['admin1_code'] if m['country_code'] == 'US' else None,
+            }
             for m in matches
         ]}
         return HttpResponse(json.dumps(js), content_type='application/json')
@@ -175,8 +200,28 @@ class GeocodeReviewActionView(APIView):
         return HttpResponse(json.dumps({
             'success': True,
             'metro_name': resolved['name'],
+            'metro_state': resolved['state'],
             'metro_distance_km': _haversine_km(rows[0].lat, rows[0].lon, resolved['lat'], resolved['lon']),
         }), content_type='application/json')
+
+
+def _exact_major_place_matches(name):
+    return [p for p in search_major_places(name, limit=1000) if p['name'].lower() == name.lower()]
+
+
+def _major_place_state(name, lat, lon):
+    """US-only best-effort state lookup for a name already known to be a
+    major_places.csv entry (major_places.csv's admin1_code is only a
+    human-readable state abbreviation for US rows - every other country's
+    is a bare GeoNames number). Returns None if the name isn't in the
+    gazetteer at all, or the nearest match isn't in the US."""
+    if not name:
+        return None
+    matches = _exact_major_place_matches(name)
+    if not matches:
+        return None
+    best = min(matches, key=lambda p: _haversine_km(lat, lon, p['lat'], p['lon']))
+    return best['admin1_code'] if best['country_code'] == 'US' else None
 
 
 def _resolve_correction(corrected_name, lat, lon):
@@ -186,13 +231,17 @@ def _resolve_correction(corrected_name, lat, lon):
     case of correcting to another well-known metro. Tier 2: Nominatim
     forward-geocode (resolve_named_place) for anything not in that curated
     list - a smaller hometown, a national park, a landmark. Returns
-    {'name', 'lat', 'lon'} or None if neither tier resolves it."""
-    exact_matches = [
-        p for p in search_major_places(corrected_name, limit=1000)
-        if p['name'].lower() == corrected_name.lower()
-    ]
+    {'name', 'lat', 'lon', 'state'} (state is US-only, same reasoning as
+    _major_place_state above - Nominatim's own 'state' is a real name for
+    any country, so tier 2 doesn't have that same limitation) or None if
+    neither tier resolves it."""
+    exact_matches = _exact_major_place_matches(corrected_name)
     if exact_matches:
         best = min(exact_matches, key=lambda p: _haversine_km(lat, lon, p['lat'], p['lon']))
-        return {'name': best['name'], 'lat': best['lat'], 'lon': best['lon']}
+        state = best['admin1_code'] if best['country_code'] == 'US' else None
+        return {'name': best['name'], 'lat': best['lat'], 'lon': best['lon'], 'state': state}
 
-    return resolve_named_place(corrected_name)
+    resolved = resolve_named_place(corrected_name)
+    if resolved is None:
+        return None
+    return {'name': resolved['name'], 'lat': resolved['lat'], 'lon': resolved['lon'], 'state': resolved['state']}
