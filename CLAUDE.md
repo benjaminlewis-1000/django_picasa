@@ -2789,3 +2789,126 @@ expected tasks including `face_manager.video_face_extraction` (confirms the
 worker picked up the new `video_face_pipeline.py` module cleanly, including
 its new `av` import), and a real live request to `face_source?fast=true`
 against a real video-sourced face returned `200 image/jpeg`.
+
+## DONE (2026-09-09/10): a SECOND, deeper root cause found and fixed -- ffprobe's own frame-count metadata can be wrong, not just "the wrong field selected"
+
+Surfaced by a real user report: the app couldn't load face 1091402 at all (not
+"wrong frame," `_extract_video_face_frame`/`_extract_video_face_frame_fast`
+both returned `None`). Traced to `source_video_file` id 368
+(`/videos/Our_Home_Videos/2020/20200618_221605.mp4`): its stored
+`video_thumbnail_frame_seconds` (588.6s) was **beyond the video's own real
+duration (199.5s)** -- not a viewer-retrieval problem at all, a stale bad
+timestamp baked into the DATA itself, from before the `avg_frame_rate` fix
+higher up in this file. A quick sweep (any processed video where a face's
+`video_last_timestamp_seconds` exceeds `VideoFile.duration_seconds`) found 5
+more affected videos (ids 108, 642, 657, 683, and 665 -- the last a smaller,
+different-looking anomaly, investigated separately below). All 6 were reset
+(faces deleted, `isProcessed=False`) for reprocessing -- the standard fix
+pattern already established in this file.
+
+**But the user's own follow-up question exposed that this reset alone
+wouldn't actually fix anything**: "If this video is really 4x as long, why
+am I not getting a full frame image at that time?" Investigating that
+directly found the REAL root cause, and it's a different, deeper bug than
+the `r_frame_rate`-vs-`avg_frame_rate` field-selection fix earlier in this
+file. A raw decode of video 368 (`ffmpeg_frame_iterator`, no filters, just
+counting frames) produced **23,935 real frames** for a video whose own
+`duration_seconds` is 199.46s -- but ffprobe's `avg_frame_rate` metadata
+(`nb_frames`/`duration`) claims only **5,981** frames, exactly 4x fewer than
+what actually decodes. This is a genuine per-file metadata inaccuracy
+(ffprobe's own `nb_frames` field undercounting a real slow-motion-style
+capture, where `r_frame_rate=120` was actually closer to the true rate all
+along for this specific file) -- NOT the interlaced-PAL field-rate confusion
+the earlier `r_frame_rate`/`avg_frame_rate` fix was built for. Neither
+ffprobe field is reliably correct for every file; trusting either one
+unconditionally was always going to be wrong for *some* real videos in this
+library.
+
+**Confirmed empirically, not just theorized**: back-computed what the
+correct real-time position should be for the same underlying raw frame
+(`588.6s * wrong_fps(29.986) / real_fps(120.0) = 147.08s`), then manually
+decoded frame 17650 directly -- a real, valid, sharp frame (a grandparent
+reading a book to a toddler) exists exactly there. The 588.6s value was
+never "content that failed to load" -- it was a timestamp pointing at a
+moment in the video's timeline that simply doesn't exist, since the video's
+real playback length is 199.5s regardless of how many raw frames it
+contains.
+
+**Real fix**: `video_face_pipeline.py`'s `_detect_and_track()` already fully
+decodes each video once for detection -- so it now also returns the true
+decoded frame count, and `process_video()` derives `real_fps =
+total_decoded_frames / video_obj.duration_seconds` (the video's own
+already-reliable duration field, confirmed via `ffprobe`'s `format.duration`)
+and uses THAT for every frame-index-to-seconds conversion, replacing
+ffprobe's `fps` entirely -- at zero extra decode cost, since the decode
+already happened. Logs loudly (`settings.LOGGER.warning`) whenever the two
+disagree by more than 5%, so future cases like this surface immediately
+instead of silently corrupting data again. A defensive safety net
+(`VideoFaceExtractor._clamp_to_duration()`) was also added at the one shared
+write path all three `video_*_timestamp_seconds` fields funnel through --
+belt-and-suspenders in case some other not-yet-found bug ever produces an
+out-of-range value again, logging loudly rather than silently truncating.
+
+**Backfill for already-processed videos, `backfill_video_real_fps.py`**:
+critically, this does NOT require redetecting anything. Boxes/kps/embeddings/
+thumbnails are computed directly from a frame's actual decoded pixel content
+addressed by its RAW frame index -- none of that depends on fps. Only the
+derived *seconds* value was ever wrong. So the backfill is pure arithmetic:
+for each already-processed video, do a lightweight frame-count-ONLY decode
+(no detection/embedding -- still a real full decode, but much cheaper than
+the full pipeline) to get `real_fps`, and if it differs from ffprobe's fps by
+more than 5%, rescale that video's three timestamp fields by
+`(ffprobe_fps / real_fps)`, clamped to `duration_seconds`. `--dry-run`
+supported, matches this project's established convention.
+
+**Real scope, found by running the dry-run against the full currently-
+processed set (358 videos with faces), not assumed from the original 6**:
+**38 of 358 (10.6%) affected** -- far broader than the "timestamp exceeds
+duration" heuristic alone would have caught, confirming the deeper sweep was
+necessary. Real ratio patterns found: the dominant one (~0.25x, real fps
+≈120 vs. ffprobe's ~30 -- a 4x slow-motion-style mismatch, most of the 38);
+a few at ~0.50x (real fps ≈60); several at ~0.90-0.95x (milder ffprobe
+overstatement, a few percent to ~12%, likely just imprecise `nb_frames`
+estimates rather than a slow-mo pattern); and a few at ~1.11-1.18x where
+ffprobe actually UNDERSTATED the real fps -- the opposite direction,
+confirming this is a genuine two-sided metadata reliability problem, not a
+one-directional "always prefer the smaller/larger value" fix.
+
+**Deployed to production 2026-09-10**: no new dependency this time (pure
+code), so no image rebuild needed -- `/code` is bind-mounted into
+`picasa_api`, so `docker compose up -d --force-recreate picasa` alone picks
+up the new code (confirmed the `docker compose build` step was a full cache
+hit, 0.2s, correctly reflecting that nothing dependency-related changed).
+Verified live: `manage.py check` clean, a live dry-run against video 368
+correctly detected and quantified the exact same 4x mismatch, a live real
+run correctly rescaled its 18 faces to land within [0, 199.46s] (thumbnail
+timestamp landed at exactly the hand-computed 147.08s), and both
+`_extract_video_face_frame`/`_extract_video_face_frame_fast` now
+successfully return real images for the previously-`None` face. Full fast
+suite: 349/349 passing throughout (clamp-only, then combined with real_fps,
+then with the backfill command added -- three separate full runs, all
+green). Committed on both `master` (`fc9f99c`) and `backend_upgrade`
+(`d610536`).
+
+**Also discovered while investigating**: all 6 originally-reset videos had
+already been silently reprocessed by the scheduled task *with the still-
+buggy code* in the window between the reset and the fix's deployment --
+they were never going to self-heal via "reprocessing" at all (they're back
+to `isProcessed=True`, so the scheduler won't touch them again). They were
+fixed by the same rescale backfill as the other 32 affected videos, not by
+redetection -- confirmed individually afterward (108: 14.83s/22.95s dur,
+368: 147.08s/199.46s dur, 642: 56.77s/56.84s dur, 657: 21.64s/22.02s dur,
+665: 78.11s/81.81s dur, 683: 80.94s/81.31s dur -- all within bounds).
+
+**Status at session end**: the real (non-dry-run) backfill run against all
+358 processed-videos-with-faces was still running in the background when
+this session wrapped up (the 6 originally-flagged videos were confirmed
+fixed individually before the broader run finished; the remaining ~32 were
+mid-sweep). Check `VideoFile.objects.filter(isProcessed=True, face__isnull=
+False).count()` vs. how many the log reports "Checked" to see whether it
+completed, and re-run `backfill_video_real_fps --dry-run` (cheap relative to
+the full sweep only in that it skips writes, not the decode cost) to confirm
+zero affected videos remain if picking this up again. The main video face-
+detection backfill (unrelated, separate, on its own 3-hour Celery Beat
+schedule) was at 497 processed / 6,454 remaining at last check -- continues
+unattended; nothing further needed there.
