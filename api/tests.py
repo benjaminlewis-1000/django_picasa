@@ -1883,6 +1883,58 @@ class GeocodeReviewTests(ApiTestCase):
         other_row = next(r for r in data['results'] if r['locality'] == 'Collesalvetti')
         self.assertEqual(other_row['num_coords'], 1)
 
+    def test_unknown_locality_sinks_below_known_pending_but_above_validated(self):
+        # A row with no precise locality at all (a failed/empty reverse-
+        # geocode - see CLAUDE.md) has nothing to usefully compare its
+        # metro pick against, so it sinks below known-but-pending rows -
+        # but it's still unresolved work, unlike an already-validated row,
+        # so it stays above those.
+        GeocodeCache.objects.create(
+            lat=10.0, lon=10.0, locality=None, country=None,
+            nearest_metro_name='Nowhereville', nearest_metro_distance_km=5.0,
+        )
+        self.other_livorno_area.metro_validated = True
+        self.other_livorno_area.save(update_fields=['metro_validated'])
+
+        resp = self.client.get('/api/geocode_review/')
+        data = json.loads(resp.content)
+        localities = [r['locality'] for r in data['results']]
+        self.assertEqual(localities, ['Pisa', None, 'Collesalvetti'])
+
+    def test_us_precise_city_and_metro_area_expose_state(self):
+        GeocodeCache.objects.create(
+            lat=47.6062, lon=-122.3321, locality='Bothell', state='Washington', country='United States',
+            nearest_metro_name='Seattle', nearest_metro_distance_km=15.0,
+        )
+        resp = self.client.get('/api/geocode_review/')
+        data = json.loads(resp.content)
+        row = next(r for r in data['results'] if r['locality'] == 'Bothell')
+        self.assertEqual(row['state'], 'Washington')
+        self.assertEqual(row['metro_state'], 'WA')
+        # Non-US metro names don't get a (meaningless, numeric) state.
+        pisa_row = next(r for r in data['results'] if r['locality'] == 'Pisa')
+        self.assertIsNone(pisa_row['metro_state'])
+
+    def test_search_places_includes_state_for_us_only(self):
+        resp = self.client.get('/api/geocode_review/search_places/', {'q': 'seattle'})
+        data = json.loads(resp.content)
+        seattle = next(r for r in data['results'] if r['name'] == 'Seattle')
+        self.assertEqual(seattle['state'], 'WA')
+
+        resp2 = self.client.get('/api/geocode_review/search_places/', {'q': 'florence'})
+        data2 = json.loads(resp2.content)
+        florence = next(r for r in data2['results'] if r['name'] == 'Florence' and r['country_code'] == 'IT')
+        self.assertIsNone(florence['state'])
+
+    def test_correct_response_includes_metro_state_when_available(self):
+        resp = self.client.patch(
+            '/api/geocode_review/action/',
+            self._pisa_group_payload(action='correct', metro_name_correction='Seattle'),
+            format='json',
+        )
+        data = json.loads(resp.content)
+        self.assertEqual(data['metro_state'], 'WA')
+
     def test_validate_marks_every_row_in_the_group_without_changing_the_name(self):
         resp = self.client.patch(
             '/api/geocode_review/action/', self._pisa_group_payload(action='validate'),
