@@ -1961,6 +1961,101 @@ class BackfillGeocodingTests(TestCase):
         self.assertEqual(img_chain.geocode.locality, 'Seattle')
         self.assertFalse(img_chain.geocode.locality_is_approximate)
 
+    def test_previously_failed_coordinate_is_retried_and_recovers(self):
+        # Real production scenario (2026-09-10): 80 coordinates failed
+        # with a genuine 429 during the rate-limit storm this session
+        # diagnosed and fixed -- before this fix, a failed row looked
+        # permanently "already cached" and was never retried, even once
+        # the underlying rate-limit issue was resolved.
+        from filepopulator.models import GeocodeCache
+        img = self._make_bare_image_file("/tmp/geocode_test/l.jpg", 47.6062, -122.3321)
+        stale = GeocodeCache.objects.create(
+            lat=47.6062, lon=-122.3321, lookup_failed=True,
+            lookup_error='Non-successful status code 429',
+        )
+        # A plain .update() rather than img.save() -- ImageFile.save()
+        # unconditionally re-decodes the file for its pixel hash, and this
+        # bare test fixture has no real file on disk.
+        ImageFile.objects.filter(pk=img.pk).update(geocode=stale)
+
+        fake_result = {
+            'locality': 'Seattle', 'county': 'King', 'state': 'Washington',
+            'country': 'United States', 'display_name': 'Seattle, WA, USA',
+            'raw_response': {'address': {}},
+        }
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise', return_value=fake_result):
+            result = call_command('backfill_geocoding')
+
+        # GeocodeCache row is updated in place, not duplicated.
+        self.assertEqual(GeocodeCache.objects.count(), 1)
+        stale.refresh_from_db()
+        self.assertFalse(stale.lookup_failed)
+        self.assertIsNone(stale.lookup_error)
+        self.assertEqual(stale.locality, 'Seattle')
+        img.refresh_from_db()
+        self.assertEqual(img.geocode.locality, 'Seattle')
+
+    def test_previously_failed_coordinate_that_fails_again_stays_flagged(self):
+        from filepopulator.models import GeocodeCache
+        self._make_bare_image_file("/tmp/geocode_test/m.jpg", 47.6062, -122.3321)
+        GeocodeCache.objects.create(
+            lat=47.6062, lon=-122.3321, lookup_failed=True,
+            lookup_error='Non-successful status code 429',
+        )
+
+        def still_failing(lat, lon):
+            raise RuntimeError("still rate-limited")
+
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise', side_effect=still_failing):
+            call_command('backfill_geocoding')
+
+        self.assertEqual(GeocodeCache.objects.count(), 1)
+        entry = GeocodeCache.objects.get(lat=47.6062, lon=-122.3321)
+        self.assertTrue(entry.lookup_failed)
+        self.assertEqual(entry.lookup_error, 'still rate-limited')
+
+    def test_reuse_does_not_chain_through_a_previously_reused_result(self):
+        # Real concern raised 2026-09-10: if a reused (not independently
+        # Nominatim-confirmed) result could itself seed further reuse, a
+        # sequence of points spaced just under GEOCODE_REUSE_RADIUS_KM
+        # apart -- a realistic shape for a GPS trace along a street or
+        # across a metro area -- could drift arbitrarily far from the one
+        # real geocode the whole chain traces back to, each hop
+        # individually "within radius" of the previous one. A must reuse
+        # B, and B must reuse C, but C should never inherit A's answer if
+        # C is actually outside the reuse radius of A itself.
+        from filepopulator.models import GeocodeCache
+        GeocodeCache.objects.create(
+            lat=47.6062, lon=-122.3321, locality='Seattle', county='King',
+            state='Washington', country='United States',
+            display_name='Seattle, WA, USA',
+        )
+        # ~100m north of the real anchor -- within the 150m reuse radius,
+        # should reuse 'Seattle' with no Nominatim call.
+        img_b = self._make_bare_image_file("/tmp/geocode_test/n.jpg", 47.6071, -122.3321)
+        # ~100m further north again -- ~200m from the real anchor, so
+        # OUTSIDE the reuse radius of it. If B (itself only reused, never
+        # independently confirmed) were allowed to seed reuse, this would
+        # wrongly inherit 'Seattle' from B. It must not.
+        img_c = self._make_bare_image_file("/tmp/geocode_test/o.jpg", 47.6080, -122.3321)
+
+        tacoma_result = {
+            'locality': 'Tacoma', 'county': 'Pierce', 'state': 'Washington',
+            'country': 'United States', 'display_name': 'Tacoma, WA, USA',
+            'raw_response': {'address': {}},
+        }
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise', return_value=tacoma_result) as mock_reverse:
+            call_command('backfill_geocoding')
+            # Exactly one real call -- for C, which is genuinely out of
+            # every real anchor's reuse radius. B needed none at all.
+            mock_reverse.assert_called_once()
+
+        img_b.refresh_from_db()
+        img_c.refresh_from_db()
+        self.assertEqual(img_b.geocode.locality, 'Seattle')
+        self.assertEqual(img_c.geocode.locality, 'Tacoma')
+        self.assertNotEqual(img_c.geocode.locality, img_b.geocode.locality)
+
 
 class SimilarityTests(TestCase):
     """Exercises phash-based near-duplicate detection
