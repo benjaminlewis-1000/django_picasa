@@ -353,6 +353,16 @@ class GeocodeCache(models.Model):
     state = models.CharField(max_length=256, null=True, blank=True)
     country = models.CharField(max_length=256, null=True, blank=True)
     display_name = models.CharField(max_length=512, null=True, blank=True)
+    # True when `locality` came from the offline nearest-named-place
+    # fallback (filepopulator/geocode.py's find_nearest_named_place)
+    # rather than a genuine Nominatim reverse-geocode result - i.e. every
+    # real address tag (city/town/village/hamlet/suburb, and the weaker
+    # municipality/county/state_district/borough tier) came back empty,
+    # so this is "the nearest real place we could find", not "the place
+    # this coordinate is actually in." Lets the geocode-review tool (and
+    # anything else) tell the two apart without guessing from the value
+    # alone.
+    locality_is_approximate = models.BooleanField(default=False)
     raw_response = models.JSONField(null=True, blank=True)
     geocoded_at = models.DateTimeField(null=True, blank=True)
     lookup_failed = models.BooleanField(default=False)

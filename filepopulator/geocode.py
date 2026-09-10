@@ -110,6 +110,42 @@ def find_nearest_metro(lat, lon):
     return place['name'], dist
 
 
+# Last-resort fallback for reverse_geocode_precise/run_geocoding_backfill
+# when Nominatim genuinely has nothing usable for a coordinate (no
+# city/town/village/hamlet/suburb tag, and none of the weaker
+# municipality/county/state_district/borough tags either) - "the nearest
+# real, named place we know of" rather than leaving it permanently
+# unknown. Deliberately generous (200km) since this only ever fires when
+# every other option has already failed - some real answer, even a
+# distant one, communicates more than nothing, as long as the caller
+# marks it approximate (GeocodeCache.locality_is_approximate) rather than
+# presenting it as the actual place a photo was taken.
+NAMED_PLACE_FALLBACK_RADIUS_KM = 200
+
+
+def find_nearest_named_place(lat, lon, max_radius_km=NAMED_PLACE_FALLBACK_RADIUS_KM):
+    """Unlike find_nearest_metro above (largest place within the nearest
+    of several fixed radius bands), this picks the single NEAREST place
+    in the gazetteer regardless of population, capped at max_radius_km.
+    Returns (name, country_code, distance_km), or (None, None, None) if
+    nothing in the dataset is within range."""
+    places = _load_major_places()
+    best = None
+    best_dist = None
+    for place in places:
+        if abs(place['lat'] - lat) > max_radius_km / 111.0:
+            continue
+        if abs(place['lon'] - lon) > max_radius_km / 111.0:
+            continue
+        dist = _haversine_km(lat, lon, place['lat'], place['lon'])
+        if dist <= max_radius_km and (best_dist is None or dist < best_dist):
+            best, best_dist = place, dist
+
+    if best is None:
+        return None, None, None
+    return best['name'], best['country_code'], best_dist
+
+
 def _get_nominatim_geocode():
     from geopy.geocoders import Nominatim
     from geopy.extra.rate_limiter import RateLimiter
@@ -124,7 +160,23 @@ def _get_nominatim_geocode():
     # still drew frequent 429s during a real backfill run -- 2.0s gives
     # more headroom and, being a background batch job with no user
     # waiting on it, the slower throughput costs nothing.
-    return RateLimiter(geolocator.reverse, min_delay_seconds=2.0, max_retries=2, error_wait_seconds=5.0)
+    #
+    # swallow_exceptions=False (geopy's RateLimiter default is True) -
+    # found real, live production data 2026-09-10: a real, transient
+    # failure (timeout/429/network blip) after exhausting max_retries
+    # used to be silently converted to a plain `None` return, which
+    # reverse_geocode_precise treats identically to "Nominatim
+    # successfully found nothing here" - the two are NOT the same
+    # (one is worth retrying, the other isn't), but were indistinguishable
+    # in the stored data. With this off, a real failure now raises and
+    # gets caught by run_geocoding_backfill's own try/except, which
+    # already correctly records lookup_failed/lookup_error - that
+    # handling existed from the start, it just never actually ran for
+    # this specific failure mode.
+    return RateLimiter(
+        geolocator.reverse, min_delay_seconds=2.0, max_retries=2, error_wait_seconds=5.0,
+        swallow_exceptions=False,
+    )
 
 
 def _get_nominatim_forward_geocode():
@@ -132,7 +184,16 @@ def _get_nominatim_forward_geocode():
     from geopy.extra.rate_limiter import RateLimiter
 
     geolocator = Nominatim(user_agent=settings.NOMINATIM_USER_AGENT, timeout=10)
-    return RateLimiter(geolocator.geocode, min_delay_seconds=2.0, max_retries=2, error_wait_seconds=5.0)
+    # swallow_exceptions=False - same reasoning as _get_nominatim_geocode
+    # above: a real failure here (this is the interactive, on-submit path
+    # behind the geocode-review tool's "Save correction" button) shouldn't
+    # look identical to "not a real place" - api/geocode_views.py's
+    # GeocodeReviewActionView catches this specifically to tell a user
+    # "try again" apart from "that isn't a place we recognize".
+    return RateLimiter(
+        geolocator.geocode, min_delay_seconds=2.0, max_retries=2, error_wait_seconds=5.0,
+        swallow_exceptions=False,
+    )
 
 
 def resolve_named_place(query):
@@ -192,6 +253,31 @@ def resolve_named_place(query):
     }
 
 
+def _extract_locality(address):
+    """The locality-extraction tier logic, pulled out of
+    reverse_geocode_precise so a one-off remediation pass can re-run it
+    against already-cached raw_response data (see the 2026-09-10 backfill
+    migration/cleanup) without needing a fresh Nominatim call - the
+    address dict was already fetched and cached once; there's nothing new
+    to learn from calling Nominatim again for the SAME coordinate, only
+    from extracting more out of what's already there.
+
+    First tier: an actual settlement-level tag. Second, weaker tier
+    (relaxed 2026-09-10, real production data): a real Nominatim tag
+    still, just a coarser one - a rural landmark/attraction/plantation
+    often has an address with no city/town/etc at all, but does have a
+    county or municipality, which is still a genuine, useful answer
+    rather than nothing. Both tiers are real reverse-geocoded data; only
+    find_nearest_named_place (run_geocoding_backfill) is an offline
+    approximation, and that's the true last resort."""
+    return (
+        address.get('city') or address.get('town') or address.get('village')
+        or address.get('hamlet') or address.get('suburb')
+        or address.get('municipality') or address.get('county')
+        or address.get('state_district') or address.get('borough')
+    )
+
+
 def reverse_geocode_precise(lat, lon):
     """Queries Nominatim for the precise place at (lat, lon). Returns a
     dict of the fields GeocodeCache stores, or raises on failure -- callers
@@ -207,12 +293,8 @@ def reverse_geocode_precise(lat, lon):
         }
 
     address = location.raw.get('address', {})
-    locality = (
-        address.get('city') or address.get('town') or address.get('village')
-        or address.get('hamlet') or address.get('suburb')
-    )
     return {
-        'locality': locality,
+        'locality': _extract_locality(address),
         'county': address.get('county'),
         'state': address.get('state'),
         'country': address.get('country'),
@@ -289,6 +371,19 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
             cache_entry.display_name = precise['display_name']
             cache_entry.raw_response = precise['raw_response']
             cache_entry.geocoded_at = timezone.now()
+            # Nominatim genuinely had nothing usable (not a failure - see
+            # swallow_exceptions=False's comment above for the failure
+            # case) - fall back to the nearest named place we know of
+            # offline, rather than leaving this permanently "unknown".
+            # Marked approximate so nothing mistakes it for the actual
+            # place a photo was taken.
+            if not cache_entry.locality:
+                fallback_name, fallback_country, _ = find_nearest_named_place(lat, lon)
+                if fallback_name:
+                    cache_entry.locality = fallback_name
+                    cache_entry.locality_is_approximate = True
+                    if not cache_entry.country:
+                        cache_entry.country = fallback_country
             result['succeeded'] += 1
         except Exception as e:
             cache_entry.lookup_failed = True
