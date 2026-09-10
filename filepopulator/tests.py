@@ -1622,6 +1622,76 @@ class FindNearestMetroTests(unittest.TestCase):
         self.assertIsNone(distance_km)
 
 
+class FindNearestNamedPlaceTests(unittest.TestCase):
+    """find_nearest_named_place() is the last-resort, population-blind
+    fallback used when Nominatim has nothing at all - pure/offline, same
+    as FindNearestMetroTests above."""
+
+    def test_returns_nearest_regardless_of_population(self):
+        from filepopulator.geocode import find_nearest_named_place
+        # Bothell itself may not be "major" enough for find_nearest_metro
+        # to prefer it over Seattle/Bellevue (population-ranked within
+        # the radius band) - this function doesn't rank by population at
+        # all, so the literal nearest place wins even if it's small.
+        name, country_code, distance_km = find_nearest_named_place(47.7623, -122.2054)
+        self.assertIsNotNone(name)
+        self.assertEqual(country_code, 'US')
+        self.assertLess(distance_km, 25)
+
+    def test_nothing_within_radius_returns_none(self):
+        from filepopulator.geocode import find_nearest_named_place
+        # Middle of the Pacific, nowhere near any place in the gazetteer
+        # even at this function's generous default radius.
+        name, country_code, distance_km = find_nearest_named_place(0.0, -150.0)
+        self.assertIsNone(name)
+        self.assertIsNone(country_code)
+        self.assertIsNone(distance_km)
+
+
+class ReverseGeocodePreciseExtractionTests(unittest.TestCase):
+    """reverse_geocode_precise()'s locality extraction, exercised against
+    a mocked Nominatim client (patched at _get_nominatim_geocode, one
+    level below reverse_geocode_precise itself) rather than mocking the
+    function wholesale like BackfillGeocodingTests does - this is
+    specifically testing the extraction logic those tests take as given."""
+
+    def _location(self, address, display_name='Somewhere'):
+        location = mock.Mock()
+        location.raw = {'address': address, 'name': ''}
+        location.address = display_name
+        return location
+
+    def test_settlement_tag_wins_over_weaker_tags(self):
+        from filepopulator.geocode import reverse_geocode_precise
+        address = {'city': 'Bothell', 'county': 'King County', 'country': 'United States', 'state': 'Washington'}
+        with mock.patch('filepopulator.geocode._get_nominatim_geocode',
+                         return_value=lambda *a, **k: self._location(address)):
+            result = reverse_geocode_precise(47.7623, -122.2054)
+        self.assertEqual(result['locality'], 'Bothell')
+
+    def test_falls_back_to_county_when_no_settlement_tag(self):
+        # Real production case (2026-09-10): a rural attraction/landmark
+        # address has no city/town/village/hamlet/suburb tag at all, but
+        # does have a county - a real, useful answer that was previously
+        # discarded entirely in favor of leaving locality None.
+        from filepopulator.geocode import reverse_geocode_precise
+        address = {'county': 'Honolulu County', 'country': 'United States', 'state': 'Hawaii'}
+        with mock.patch('filepopulator.geocode._get_nominatim_geocode',
+                         return_value=lambda *a, **k: self._location(address)):
+            result = reverse_geocode_precise(21.5258, -158.038)
+        self.assertEqual(result['locality'], 'Honolulu County')
+
+    def test_no_address_tags_at_all_leaves_locality_none(self):
+        # Nothing left to fall back to at this level - run_geocoding_
+        # backfill's own offline nearest-named-place fallback is what
+        # handles this case, not reverse_geocode_precise itself.
+        from filepopulator.geocode import reverse_geocode_precise
+        with mock.patch('filepopulator.geocode._get_nominatim_geocode',
+                         return_value=lambda *a, **k: self._location({})):
+            result = reverse_geocode_precise(1.0, 1.0)
+        self.assertIsNone(result['locality'])
+
+
 class BackfillGeocodingTests(TestCase):
     """Exercises the backfill_geocoding management command against a
     mocked Nominatim lookup (no real network calls in tests) -- covers
@@ -1703,6 +1773,26 @@ class BackfillGeocodingTests(TestCase):
         self.assertTrue(img_fail.geocode.lookup_failed)
         self.assertFalse(img_ok.geocode.lookup_failed)
         self.assertEqual(img_ok.geocode.locality, 'Portland')
+
+    def test_empty_locality_falls_back_to_nearest_named_place(self):
+        # Real production bug (2026-09-10): Nominatim genuinely finding
+        # nothing usable (not a failure) used to leave locality
+        # permanently None. run_geocoding_backfill now falls back to the
+        # offline nearest-named-place lookup and marks it approximate.
+        from filepopulator.models import GeocodeCache
+        img = self._make_bare_image_file("/tmp/geocode_test/f.jpg", 47.7623, -122.2054)  # near Bothell, WA
+
+        fake_result = {
+            'locality': None, 'county': None, 'state': None, 'country': None,
+            'display_name': None, 'raw_response': None,
+        }
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise', return_value=fake_result):
+            call_command('backfill_geocoding')
+
+        img.refresh_from_db()
+        self.assertIsNotNone(img.geocode.locality)
+        self.assertTrue(img.geocode.locality_is_approximate)
+        self.assertFalse(img.geocode.lookup_failed)  # a genuine empty result, not a failure
 
     def test_concurrent_duplicate_coordinate_does_not_crash_the_batch(self):
         # Regression test for a real production bug (2026-08-27): the

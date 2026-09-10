@@ -43,7 +43,7 @@ def _build_review_groups():
     base_rows = list(
         GeocodeCache.objects
         .filter(nearest_metro_name__isnull=False)
-        .values('locality', 'state', 'country', 'nearest_metro_name', 'lat', 'lon',
+        .values('locality', 'state', 'country', 'locality_is_approximate', 'nearest_metro_name', 'lat', 'lon',
                  'nearest_metro_distance_km', 'metro_validated', 'metro_override')
     )
     image_counts = {
@@ -76,6 +76,7 @@ def _build_review_groups():
             metro_state = _major_place_state(row['nearest_metro_name'], row['lat'], row['lon'])
             groups[key] = {
                 'locality': row['locality'],
+                'locality_is_approximate': row['locality_is_approximate'],
                 'state': row['state'],
                 'country': row['country'],
                 'metro_name': row['nearest_metro_name'],
@@ -181,7 +182,19 @@ class GeocodeReviewActionView(APIView):
                 content_type='application/json', status=400,
             )
 
-        resolved = _resolve_correction(corrected_name, rows[0].lat, rows[0].lon)
+        try:
+            resolved = _resolve_correction(corrected_name, rows[0].lat, rows[0].lon)
+        except Exception as e:
+            # A real Nominatim failure (timeout/429/network) - swallow_
+            # exceptions=False on the forward-geocode RateLimiter (see
+            # geocode.py) means this now actually reaches here instead of
+            # silently looking identical to "not a real place" below.
+            # Distinct status/message so the frontend can tell a user
+            # "try again" rather than "that place doesn't exist".
+            return HttpResponse(
+                json.dumps({'success': False, 'error': f'Could not reach the geocoding service - try again in a moment. ({e})'}),
+                content_type='application/json', status=503,
+            )
         if resolved is None:
             return HttpResponse(
                 json.dumps({'success': False, 'error': f'"{corrected_name}" isn\'t a place we could recognize.'}),

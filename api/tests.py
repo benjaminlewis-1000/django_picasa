@@ -2027,6 +2027,37 @@ class GeocodeReviewTests(ApiTestCase):
             )
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_correct_surfaces_a_real_nominatim_failure_distinctly(self):
+        # swallow_exceptions=False (geocode.py) means a real Nominatim
+        # failure now actually raises instead of looking identical to
+        # "not a real place" - this should reach the user as a distinct,
+        # retry-worthy error rather than "we don't recognize that place".
+        with mock.patch(
+            'filepopulator.geocode._get_nominatim_forward_geocode',
+            return_value=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('simulated Nominatim timeout')),
+        ):
+            resp = self.client.patch(
+                '/api/geocode_review/action/',
+                self._pisa_group_payload(action='correct', metro_name_correction='Asdfqwertyville'),
+                format='json',
+            )
+        self.assertEqual(resp.status_code, 503)
+        self.pisa_1.refresh_from_db()
+        self.assertEqual(self.pisa_1.nearest_metro_name, 'Livorno')  # unchanged
+
+    def test_list_exposes_locality_is_approximate(self):
+        GeocodeCache.objects.create(
+            lat=2.0, lon=2.0, locality='Nearest Named Place', locality_is_approximate=True,
+            nearest_metro_name='Some Metro', nearest_metro_distance_km=50.0,
+        )
+        resp = self.client.get('/api/geocode_review/')
+        data = json.loads(resp.content)
+        row = next(r for r in data['results'] if r['locality'] == 'Nearest Named Place')
+        self.assertTrue(row['locality_is_approximate'])
+        # Pisa's locality came from a real precise lookup in this fixture set.
+        pisa_row = next(r for r in data['results'] if r['locality'] == 'Pisa')
+        self.assertFalse(pisa_row['locality_is_approximate'])
+
     def test_action_requires_authentication(self):
         resp = self.anon_client.patch(
             '/api/geocode_review/action/', self._pisa_group_payload(action='validate'), format='json',
