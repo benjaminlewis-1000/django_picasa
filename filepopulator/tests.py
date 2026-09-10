@@ -1863,6 +1863,104 @@ class BackfillGeocodingTests(TestCase):
         self.assertEqual(img_race.geocode.locality, 'Concurrent Winner')
         self.assertEqual(img_ok.geocode.locality, 'Portland')
 
+    def test_nearby_uncached_coordinate_reuses_existing_precise_geocode_without_a_network_call(self):
+        # A real production scenario (2026-09-10): a photo library has a
+        # lot of "wandered the same block across visits" GPS noise -- two
+        # coordinates ~50m apart round to different ~11m GeocodeCache
+        # cells (ROUND_DECIMALS=4) but are still clearly the same place.
+        # An already-cached PRECISE result within GEOCODE_REUSE_RADIUS_KM
+        # should be copied directly, with zero Nominatim calls.
+        from filepopulator.models import GeocodeCache
+        GeocodeCache.objects.create(
+            lat=47.6062, lon=-122.3321, locality='Seattle', county='King',
+            state='Washington', country='United States',
+            display_name='Seattle, WA, USA',
+        )
+        # ~50m north of the cached coordinate -- well within the 150m
+        # reuse radius, but a different rounded (lat, lon) cache key.
+        img = self._make_bare_image_file("/tmp/geocode_test/g.jpg", 47.60665, -122.3321)
+
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise') as mock_reverse:
+            call_command('backfill_geocoding')
+            mock_reverse.assert_not_called()
+
+        self.assertEqual(GeocodeCache.objects.count(), 2)
+        img.refresh_from_db()
+        self.assertEqual(img.geocode.locality, 'Seattle')
+        self.assertEqual(img.geocode.state, 'Washington')
+        self.assertFalse(img.geocode.locality_is_approximate)
+
+    def test_far_uncached_coordinate_still_calls_nominatim(self):
+        # The reuse radius is tight (150m) -- a coordinate genuinely in a
+        # different area must not silently inherit a nearby cache entry's
+        # locality.
+        from filepopulator.models import GeocodeCache
+        GeocodeCache.objects.create(
+            lat=47.6062, lon=-122.3321, locality='Seattle', county='King',
+            state='Washington', country='United States',
+            display_name='Seattle, WA, USA',
+        )
+        img = self._make_bare_image_file("/tmp/geocode_test/h.jpg", 45.5152, -122.6784)
+
+        fake_result = {
+            'locality': 'Portland', 'county': 'Multnomah', 'state': 'Oregon',
+            'country': 'United States', 'display_name': 'Portland, OR, USA',
+            'raw_response': {'address': {}},
+        }
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise', return_value=fake_result) as mock_reverse:
+            call_command('backfill_geocoding')
+            mock_reverse.assert_called_once()
+
+        img.refresh_from_db()
+        self.assertEqual(img.geocode.locality, 'Portland')
+
+    def test_approximate_existing_entry_is_not_reused_as_a_source(self):
+        # An offline nearest-named-place fallback result
+        # (locality_is_approximate=True) is itself already a guess -- it
+        # must not be propagated to a second, different coordinate as if
+        # it were a genuine precise answer.
+        from filepopulator.models import GeocodeCache
+        GeocodeCache.objects.create(
+            lat=47.6062, lon=-122.3321, locality='Some Distant Named Place',
+            country='United States', locality_is_approximate=True,
+        )
+        img = self._make_bare_image_file("/tmp/geocode_test/i.jpg", 47.60665, -122.3321)
+
+        fake_result = {
+            'locality': 'Real Nearby Place', 'county': 'King', 'state': 'Washington',
+            'country': 'United States', 'display_name': 'Real Nearby Place, WA, USA',
+            'raw_response': {'address': {}},
+        }
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise', return_value=fake_result) as mock_reverse:
+            call_command('backfill_geocoding')
+            mock_reverse.assert_called_once()
+
+        img.refresh_from_db()
+        self.assertEqual(img.geocode.locality, 'Real Nearby Place')
+
+    def test_reuse_chains_within_the_same_run(self):
+        # A coordinate resolved earlier in THIS run (not predating it)
+        # should also be usable as a reuse source for a later coordinate
+        # in the same run, not just rows that already existed beforehand.
+        from filepopulator.models import GeocodeCache
+        img_seed = self._make_bare_image_file("/tmp/geocode_test/j.jpg", 47.6062, -122.3321)
+        img_chain = self._make_bare_image_file("/tmp/geocode_test/k.jpg", 47.60665, -122.3321)
+
+        fake_result = {
+            'locality': 'Seattle', 'county': 'King', 'state': 'Washington',
+            'country': 'United States', 'display_name': 'Seattle, WA, USA',
+            'raw_response': {'address': {}},
+        }
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise', return_value=fake_result) as mock_reverse:
+            call_command('backfill_geocoding')
+            mock_reverse.assert_called_once()
+
+        img_seed.refresh_from_db()
+        img_chain.refresh_from_db()
+        self.assertEqual(img_seed.geocode.locality, 'Seattle')
+        self.assertEqual(img_chain.geocode.locality, 'Seattle')
+        self.assertFalse(img_chain.geocode.locality_is_approximate)
+
 
 class SimilarityTests(TestCase):
     """Exercises phash-based near-duplicate detection
