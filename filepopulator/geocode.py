@@ -146,7 +146,28 @@ def find_nearest_named_place(lat, lon, max_radius_km=NAMED_PLACE_FALLBACK_RADIUS
     return best['name'], best['country_code'], best_dist
 
 
+# Nominatim's usage policy (operations.osmfoundation.org/policies/nominatim)
+# singles out "scripts running continuously or at regular intervals" for a
+# stricter cap than its general ~1/sec guidance: max 4 requests/minute,
+# results cached locally. Our own traffic - a recurring hourly batch task
+# (run_geocoding_backfill) plus this tool's occasional interactive
+# corrections, both from the same server IP - fits exactly that
+# description, and we already cache every result (GeocodeCache, keyed
+# per-coordinate) as required. Applied to both RateLimiters below.
+NOMINATIM_MIN_DELAY_SECONDS = 15.0  # 60s / 4 requests-per-minute
+
+# Built once per process and reused - see the comment inside
+# _get_nominatim_geocode below for why that reuse is the actual fix, not
+# just an optimization.
+_reverse_rate_limiter = None
+_forward_rate_limiter = None
+
+
 def _get_nominatim_geocode():
+    global _reverse_rate_limiter
+    if _reverse_rate_limiter is not None:
+        return _reverse_rate_limiter
+
     from geopy.geocoders import Nominatim
     from geopy.extra.rate_limiter import RateLimiter
 
@@ -156,11 +177,6 @@ def _get_nominatim_geocode():
     # ReadTimeoutError (never surfaced in tests, which mock the network
     # call entirely).
     geolocator = Nominatim(user_agent=settings.NOMINATIM_USER_AGENT, timeout=10)
-    # min_delay_seconds=1.1 (just over Nominatim's stated 1 req/sec limit)
-    # still drew frequent 429s during a real backfill run -- 2.0s gives
-    # more headroom and, being a background batch job with no user
-    # waiting on it, the slower throughput costs nothing.
-    #
     # swallow_exceptions=False (geopy's RateLimiter default is True) -
     # found real, live production data 2026-09-10: a real, transient
     # failure (timeout/429/network blip) after exhausting max_retries
@@ -173,13 +189,35 @@ def _get_nominatim_geocode():
     # already correctly records lookup_failed/lookup_error - that
     # handling existed from the start, it just never actually ran for
     # this specific failure mode.
-    return RateLimiter(
-        geolocator.reverse, min_delay_seconds=2.0, max_retries=2, error_wait_seconds=5.0,
+    #
+    # Built ONCE per process (the module-level global above) rather than
+    # fresh on every call, which is what this used to do (a new
+    # RateLimiter was constructed inside every reverse_geocode_precise()
+    # call, i.e. once per coordinate inside run_geocoding_backfill's own
+    # loop). That was a real, previously-undiscovered bug, not just a
+    # missed optimization: min_delay_seconds is enforced via *instance*
+    # state (RateLimiter._last_call) - a fresh instance has never made a
+    # call before, so every single coordinate looked like this limiter's
+    # first-ever request and got waved through with zero delay. The
+    # "2 seconds between requests" this used to claim was never actually
+    # happening across a batch run at all, which goes a long way toward
+    # explaining how much harder we were getting rate-limited than a 2s
+    # gap should cause (found investigating that 2026-09-10). Reusing one
+    # instance for the process's lifetime is what makes min_delay_seconds
+    # mean anything across more than a single call.
+    _reverse_rate_limiter = RateLimiter(
+        geolocator.reverse, min_delay_seconds=NOMINATIM_MIN_DELAY_SECONDS,
+        max_retries=2, error_wait_seconds=NOMINATIM_MIN_DELAY_SECONDS,
         swallow_exceptions=False,
     )
+    return _reverse_rate_limiter
 
 
 def _get_nominatim_forward_geocode():
+    global _forward_rate_limiter
+    if _forward_rate_limiter is not None:
+        return _forward_rate_limiter
+
     from geopy.geocoders import Nominatim
     from geopy.extra.rate_limiter import RateLimiter
 
@@ -190,10 +228,33 @@ def _get_nominatim_forward_geocode():
     # look identical to "not a real place" - api/geocode_views.py's
     # GeocodeReviewActionView catches this specifically to tell a user
     # "try again" apart from "that isn't a place we recognize".
-    return RateLimiter(
-        geolocator.geocode, min_delay_seconds=2.0, max_retries=2, error_wait_seconds=5.0,
+    #
+    # max_retries=0 (unlike the reverse/batch RateLimiter above, which
+    # retries twice) - confirmed for real 2026-09-10: a rate-limited (429)
+    # call retrying twice, 15s apart (see NOMINATIM_MIN_DELAY_SECONDS),
+    # would take 30s+ to finally raise, well past axios's 15s client-side
+    # timeout in the frontend - so the specific, useful error message
+    # never even arrived; the request just looked like a plain network
+    # timeout with no response body at all. Retrying against an *active*
+    # rate limit is futile anyway (it will almost certainly 429 again
+    # seconds later) - this is a single, latency-sensitive, on-submit call
+    # with a real user waiting on it, not a patient background batch job.
+    # Fail fast and let the "wait about an hour" message
+    # (GeocodeReviewActionView) do its job instead of silently eating the
+    # time budget first. error_wait_seconds is passed anyway (unused with
+    # 0 retries) only because RateLimiter's constructor asserts it's >=
+    # min_delay_seconds.
+    #
+    # Also built once per process, same reasoning as the reverse limiter
+    # above - a rapid-fire sequence of manual corrections (unlikely, but
+    # possible) should still be spaced out rather than each looking like
+    # this limiter's first-ever call.
+    _forward_rate_limiter = RateLimiter(
+        geolocator.geocode, min_delay_seconds=NOMINATIM_MIN_DELAY_SECONDS,
+        max_retries=0, error_wait_seconds=NOMINATIM_MIN_DELAY_SECONDS,
         swallow_exceptions=False,
     )
+    return _forward_rate_limiter
 
 
 def resolve_named_place(query):
