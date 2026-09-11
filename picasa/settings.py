@@ -698,6 +698,23 @@ UPLOAD_SESSION_TTL_HOURS = 48
 UPLOAD_FILE_OWNER_UID = int(os.environ.get('UPLOAD_FILE_OWNER_UID', 1000)) if in_docker else None
 UPLOAD_FILE_OWNER_GID = int(os.environ.get('UPLOAD_FILE_OWNER_GID', 1000)) if in_docker else None
 
+# api/photos_watch_views.py -- Google Photos Picker API sync. Google
+# retired background/library-wide access in 2025 (see CLAUDE.md); the
+# Picker API is a one-time, user-driven selection per sync, so there's no
+# scheduled task here -- each sync is triggered by a frontend request.
+# A subdirectory of UPLOAD_STAGING_DIR rather than a new bind mount: it's
+# already the one directory this container can write into (see that
+# setting's own comment), and it's already inside PHOTO_ROOT so
+# filepopulator's existing scan picks these up for free.
+GOOGLE_PHOTOS_STAGING_DIR = os.path.join(UPLOAD_STAGING_DIR, 'google_photos')
+# Long-lived refresh token minted once via the local bootstrap script
+# (scripts/google_photos_authorize.py) -- see that script and CLAUDE.md
+# for the one-time Google Cloud Console setup this depends on. Client
+# id/secret come from the same OAuth client registration.
+GOOGLE_PHOTOS_CLIENT_ID = os.environ.get('GOOGLE_PHOTOS_CLIENT_ID')
+GOOGLE_PHOTOS_CLIENT_SECRET = os.environ.get('GOOGLE_PHOTOS_CLIENT_SECRET')
+GOOGLE_PHOTOS_REFRESH_TOKEN = os.environ.get('GOOGLE_PHOTOS_REFRESH_TOKEN')
+
 FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code.
 FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory that will have validation images when testing the app.
 FILEPOPULATOR_MAX_SHORT_EDGE_THUMBNAIL = 150 # Maximum size of the short edge for thumbnails.

@@ -59,3 +59,33 @@ class UploadChunk(models.Model):
 
     def __str__(self):
         return f"UploadChunk(session={self.session_id}, index={self.chunk_index})"
+
+
+class GooglePhotosWatchedAlbum(models.Model):
+    """A user-named entry in the Tools-tab "Google Photos" list
+    (api/photos_watch_views.py). Google's Picker API returns no album/
+    sharer metadata at all (see CLAUDE.md) - `title` is purely what the
+    user typed when adding it, not anything fetched from Google."""
+    title = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    def __str__(self):
+        return f"GooglePhotosWatchedAlbum({self.title!r})"
+
+
+class GooglePhotosSyncedItem(models.Model):
+    """One already-downloaded item for a GooglePhotosWatchedAlbum.
+    google_media_item_id is Google's PickedMediaItem.id, documented as a
+    persistent identifier stable across sessions - the whole dedup
+    mechanism, since the Picker API itself has no "only what's new"
+    concept and the user reselects an album's full contents every sync."""
+    watched_album = models.ForeignKey(
+        GooglePhotosWatchedAlbum, on_delete=models.CASCADE, related_name='synced_items')
+    google_media_item_id = models.CharField(max_length=255, unique=True)
+    filename = models.CharField(max_length=1024)
+    downloaded_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"GooglePhotosSyncedItem({self.google_media_item_id}, {self.filename!r})"
