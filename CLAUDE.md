@@ -3065,17 +3065,88 @@ key decisions, and why:
   `--timeout 600` (10 minutes) as a starting point, not yet verified against a real large-file
   upload in production.
 - **Not built, deliberately out of scope for this pass**: no persistent DB record of upload
-  attempts/history (a natural follow-up if the frontend wants a "your recent uploads" surface, but
-  not asked for); no antivirus/signature scanning (the content-verification + zip-structural guards
-  above are what "guard against the most obvious viruses" resolved to, per the user's own
-  authenticated-users-only framing -- a real AV integration, e.g. ClamAV, remains a possible future
-  hardening step if ever needed); resumable/chunked upload (single-request only -- fine for the
-  client-checksum design agreed on, would need real protocol work like tus if large uploads over
-  flaky connections become a real problem in practice).
+  attempts/history beyond what the chunked flow's own `UploadSession` incidentally provides (see
+  below -- a natural follow-up if the frontend wants a "your recent uploads" surface, but not asked
+  for); no antivirus/signature scanning (the content-verification + zip-structural guards above are
+  what "guard against the most obvious viruses" resolved to, per the user's own authenticated-
+  users-only framing -- a real AV integration, e.g. ClamAV, remains a possible future hardening step
+  if ever needed).
 
 New tests: `api/tests.py::UploadFileViewTests` (15 cases) covering auth requirement, missing/wrong
 checksum, a real text-file-renamed-as-.jpg rejection, valid image and video acceptance (video via
 the committed `ci_fixtures/video_stub/synthetic.mp4` fixture), unsupported extensions, file-size-
 over-limit, zip mixed valid/invalid/nested-zip entries, zip-slip landing safely inside the staging
 dir, filename-collision disambiguation, zip entry-count/uncompressed-size caps, and a corrupted/
-non-zip rejection. Full fast suite: 400/400 passing (385 baseline + 15 new).
+non-zip rejection.
+
+## DONE (2026-09-10, same day): chunked/resumable upload flow, added after realizing the
+600s gunicorn timeout above still isn't a real fix for genuinely large files
+
+The user's own follow-up question exposed the gap: a 4GiB file (the cap `UPLOAD_MAX_FILE_SIZE_
+BYTES` allows) over a modest 10Mbps home upload connection takes ~55 minutes -- past even a
+generous fixed timeout, and a dropped connection at any point loses the ENTIRE transfer with no
+partial credit (the gunicorn worker gets killed, the client sees a bare connection reset, nothing
+staged, checksum never even computed). Presented three options (raise the timeout further, cap
+file size down to fit within a short timeout, or real chunking) -- **chunked upload chosen**, since
+it's the only one that actually scales rather than just moving the same fixed-timeout problem to a
+different number, and it adds real resumability as a side benefit (a dropped connection only costs
+the current chunk, not the whole file).
+
+**Design**: four new endpoints (`api/upload_views.py`), additive alongside the existing
+single-shot `/api/upload/` (kept unchanged -- still the simpler path for ordinary photos/short
+clips; the frontend can just use it directly below some size threshold rather than always
+chunking):
+- `POST /api/upload/chunked/init/` -- `{filename, total_size, checksum}` (checksum: whole-file
+  SHA-256), returns `{upload_id, chunk_size, total_chunks}`. Validates filename extension and
+  total_size the same way the single-shot endpoint does.
+- `PUT /api/upload/chunked/<upload_id>/chunk/<index>/` -- multipart `chunk` (raw bytes) + its own
+  per-chunk `checksum`. Idempotent (resending the same index just overwrites), so a client can
+  retry one failed chunk without restarting the whole transfer -- the actual point of chunking
+  beyond "smaller requests."
+- `GET /api/upload/chunked/<upload_id>/status/` -- which chunk indices have already been received,
+  so a frontend can resume after a dropped connection or page reload without re-sending chunks it
+  already successfully delivered.
+- `POST /api/upload/chunked/<upload_id>/complete/` -- reassembles every chunk in index order into
+  a fresh scratch file, re-verifies the WHOLE-FILE checksum declared at init (defense in depth
+  beyond the per-chunk checks -- also catches e.g. a chunk written out of order), then runs through
+  the exact same `_stage_validated_file()` content-verification/staging logic the single-shot
+  endpoint uses (refactored out into a shared function specifically so this security-sensitive
+  logic exists in exactly one place, not two copies that could drift).
+- **Real state, not in-memory**: two new models, `UploadSession` and `UploadChunk` (new `api`
+  app -- its first models/migration ever; `api/models.py`, `api/migrations/0001_initial.py`).
+  Necessary because different chunks of the same upload can be (and, for parallel-chunk-upload
+  frontends, likely will be) handled by different gunicorn WORKER PROCESSES across separate HTTP
+  requests -- state has to live somewhere every worker can see. `UploadChunk` is one row per
+  (session, chunk_index) rather than a shared list field on `UploadSession`, specifically to avoid
+  a read-modify-write race if two different chunk indices are uploaded concurrently (a naive
+  shared-list append would lose one side's update under real concurrency -- exactly the kind of bug
+  this project's own history has hit before with shared mutable state).
+- **Chunk data lives OUTSIDE the scanned photo tree** (`UPLOAD_CHUNK_SCRATCH_DIR`, a new setting,
+  `tempfile.gettempdir()/upload_chunks` -- container-local, not a mounted volume), same reasoning
+  as the single-shot endpoint's scratch temp file: the ingestion scanner must never see partial
+  data. Acceptable known gap: this is wiped by a container `--force-recreate` mid-upload (a rare
+  deploy colliding with an in-progress large upload) -- the user just restarts the upload; not
+  worth engineering around for how rarely it'd actually happen.
+- **Ownership enforced per-session** (`get_object_or_404(UploadSession, upload_id=..., user=
+  request.user)`) -- a different authenticated user gets a plain 404 (not 403) for someone else's
+  session, so existence isn't leaked either.
+- **Cleanup**: new scheduled task `api.cleanup_stale_uploads` (`api/tasks.py`, `CELERY_BEAT_
+  SCHEDULE`, daily at 1:15am -- same off-peak window as this project's other nightly jobs) deletes
+  any `UploadSession` (regardless of status) older than `UPLOAD_SESSION_TTL_HOURS` (48h default),
+  removing its chunk scratch directory too if somehow still present. Prevents an abandoned upload
+  (closed browser tab, permanently dropped connection) from accumulating disk usage forever.
+- `UPLOAD_CHUNK_SIZE_BYTES = 25MiB` default -- small enough that even a very slow (~1Mbps)
+  connection transfers one chunk in well under any reasonable timeout, big enough that per-chunk
+  overhead stays negligible.
+
+New tests: `api/tests.py::ChunkedUploadTests` (13 cases, `UPLOAD_CHUNK_SIZE_BYTES=16` to keep test
+data tiny while still exercising real multi-chunk splitting) -- init validation (extension,
+missing/invalid checksum, oversized total_size), a full multi-chunk roundtrip confirming the
+reassembled bytes exactly match the original and land correctly in the staging dir, incomplete-
+upload reporting exactly which indices are missing, a wrong-checksum chunk being rejected and NOT
+recorded as received, idempotent chunk resend, out-of-range and oversized chunk rejection, the
+whole-file-checksum-mismatch-at-complete-time case (every individual chunk correct, final checksum
+still catches a mismatch, session marked `failed`), and cross-user access correctly 404ing on
+someone else's session. `api/tests.py::CleanupStaleUploadsTaskTests` (1 case) confirms a backdated
+session and its on-disk chunk directory are both removed while a fresh session survives. Full fast
+suite: 413/413 passing (400 baseline + 13 new).
