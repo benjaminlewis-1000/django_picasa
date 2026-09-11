@@ -86,6 +86,12 @@ if in_docker:
     MEDIA_URL_USER = os.environ['APACHE_USER']
     MEDIA_URL_PW = os.environ['APACHE_PWD']
     HOST_DOMAIN = 'https://' + os.environ['API_DOMAIN']
+    # Which frontend to bounce back to after the Google Photos OAuth
+    # callback (api/photos_watch_views.py) -- same DEV split as
+    # REDIS_HOST/DB_HOST above, since dev and prod are genuinely
+    # different frontend domains (see CLAUDE.md), not just a path
+    # difference on one host.
+    FRONTEND_DOMAIN = os.environ['FRONTEND_DEV_DOMAIN'] if DEV else os.environ['FRONTEND_DOMAIN']
 else:
     DB_NAME = 'picasa'
     DB_USER = 'benjamin'
@@ -108,6 +114,7 @@ else:
     STATIC_SERVER = '/var/www/html/static'
     LOG_DIR = '/home/benjamin/git_repos/picasa_files/logs'
     HOST_DOMAIN = 'http://localhost'
+    FRONTEND_DOMAIN = 'localhost:3000'
 
 RANDOM_ACCESS_KEY = ''.join([random.choice(string.ascii_letters + string.digits) for n in range(32)])
 # print(MEDIA_URL)
@@ -697,6 +704,25 @@ UPLOAD_SESSION_TTL_HOURS = 48
 # in case a future deployment's host user differs from this one's.
 UPLOAD_FILE_OWNER_UID = int(os.environ.get('UPLOAD_FILE_OWNER_UID', 1000)) if in_docker else None
 UPLOAD_FILE_OWNER_GID = int(os.environ.get('UPLOAD_FILE_OWNER_GID', 1000)) if in_docker else None
+
+# api/photos_watch_views.py -- Google Photos Picker API sync. Google
+# retired background/library-wide access in 2025 (see CLAUDE.md); the
+# Picker API is a one-time, user-driven selection per sync, so there's no
+# scheduled task here -- each sync is triggered by a frontend request.
+# A subdirectory of UPLOAD_STAGING_DIR rather than a new bind mount: it's
+# already the one directory this container can write into (see that
+# setting's own comment), and it's already inside PHOTO_ROOT so
+# filepopulator's existing scan picks these up for free.
+GOOGLE_PHOTOS_STAGING_DIR = os.path.join(UPLOAD_STAGING_DIR, 'google_photos')
+# The OAuth client id/secret and refresh token themselves are NOT settings
+# -- they're entered/stored through the Tools tab's "Connect Google
+# Photos" panel (api/models.py's GooglePhotosCredential, a DB row) rather
+# than .env, per the user's own request to manage this through the app's
+# GUI instead of server config. This is the one fixed value Google itself
+# requires be registered in advance (Cloud Console's OAuth client redirect
+# URI must match exactly) -- HOST_DOMAIN is already this project's
+# existing per-environment API domain constant (see above).
+GOOGLE_PHOTOS_OAUTH_REDIRECT_URI = f'{HOST_DOMAIN}/api/google_photos/oauth/callback/'
 
 FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code.
 FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory that will have validation images when testing the app.

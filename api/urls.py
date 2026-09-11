@@ -5,6 +5,7 @@ from api import views
 from api import mobile_views
 from api import geocode_views
 from api import upload_views
+from api import photos_watch_views
 from django.urls import path
 from rest_framework.authtoken.views import obtain_auth_token  # <-- Here
 
@@ -56,4 +57,12 @@ urlpatterns = [
     path(r'upload/chunked/<uuid:upload_id>/chunk/<int:index>/', upload_views.UploadChunkView.as_view(), name='upload_chunk'),
     path(r'upload/chunked/<uuid:upload_id>/status/', upload_views.ChunkedUploadStatusView.as_view(), name='upload_chunk_status'),
     path(r'upload/chunked/<uuid:upload_id>/complete/', upload_views.CompleteChunkedUploadView.as_view(), name='upload_chunk_complete'),
+    path(r'google_photos/credentials/', photos_watch_views.GooglePhotosCredentialView.as_view(), name='google_photos_credentials'),
+    path(r'google_photos/oauth/start/', photos_watch_views.GooglePhotosOAuthStartView.as_view(), name='google_photos_oauth_start'),
+    path(r'google_photos/oauth/callback/', photos_watch_views.GooglePhotosOAuthCallbackView.as_view(), name='google_photos_oauth_callback'),
+    path(r'google_photos/watch/', photos_watch_views.WatchedAlbumListView.as_view(), name='google_photos_watch_list'),
+    path(r'google_photos/watch/<int:album_id>/', photos_watch_views.WatchedAlbumDetailView.as_view(), name='google_photos_watch_detail'),
+    path(r'google_photos/watch/<int:album_id>/session/init/', photos_watch_views.WatchedAlbumSessionInitView.as_view(), name='google_photos_session_init'),
+    path(r'google_photos/watch/<int:album_id>/session/<str:session_id>/poll/', photos_watch_views.WatchedAlbumSessionPollView.as_view(), name='google_photos_session_poll'),
+    path(r'google_photos/watch/<int:album_id>/session/<str:session_id>/complete/', photos_watch_views.WatchedAlbumSessionCompleteView.as_view(), name='google_photos_session_complete'),
 ]
