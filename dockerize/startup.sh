@@ -47,7 +47,15 @@ celery -A picasa worker -l INFO -c 20 --max-tasks-per-child 3 -n worker  & # --u
 # concurrent request slots, a middle ground that fixes that serialization
 # without competing too hard against celery's own -c 20 concurrency above
 # for the same host's cores.
-gunicorn -b 0.0.0.0:8000 --workers 4 --threads 8 --worker-class gthread picasa.wsgi &
+#
+# --timeout 600 (gunicorn's own default is 30s): the file-upload endpoint
+# (api/upload_views.py) accepts uploads up to UPLOAD_MAX_FILE_SIZE_BYTES
+# (4GiB by default) -- gunicorn's timeout kills a worker that hasn't
+# checked in within this window, and a large upload over a modest home
+# connection can easily take several minutes just to receive the request
+# body, well past the 30s default. 10 minutes is a starting point, not a
+# hard ceiling verified against real large-file uploads yet.
+gunicorn -b 0.0.0.0:8000 --workers 4 --threads 8 --worker-class gthread --timeout 600 picasa.wsgi &
 
 
 

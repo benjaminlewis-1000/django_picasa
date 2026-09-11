@@ -42,6 +42,12 @@ services:
       - ${DJANGO_FILES_ROOT}:/code
       - ${PHOTO_ROOT}:/photos:ro
       - ${PHOTO_ROOT}:/photos_rw
+      # Dedicated read-write mount for the upload endpoint
+      # (api/upload_views.py) -- deliberately its own narrow mount rather
+      # than reusing /photos_rw's whole-tree access, so the container can
+      # only ever write inside this one directory regardless of what the
+      # application code does. Host directory is created if missing.
+      - ${PHOTO_ROOT}/aggregated/uploaded:/photos_upload
       - ${VIDEO_ROOT}:/videos:ro
       - ${TEST_PHOTOS_FILEPOPULATE}:/test_imgs_filepopulate
       - ${MEDIA_FILES_LOCATION}:/media
