@@ -2172,10 +2172,8 @@ class UploadFileViewTests(ApiTestCase):
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
         staged = self._staged_files()
         self.assertEqual(len(staged), 1)
-        self.assertTrue(staged[0].endswith('photo.jpg'))
-        # Landed in its own per-request subdirectory, not directly in the
-        # staging root (collision avoidance across separate uploads).
-        self.assertIn(os.sep, staged[0])
+        # Flat -- lands directly in the staging root, not a subdirectory.
+        self.assertEqual(staged[0], 'photo.jpg')
 
     def test_unsupported_extension_rejected(self):
         data = b'hello world'
