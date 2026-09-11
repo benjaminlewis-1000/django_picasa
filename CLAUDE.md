@@ -3150,3 +3150,50 @@ still catches a mismatch, session marked `failed`), and cross-user access correc
 someone else's session. `api/tests.py::CleanupStaleUploadsTaskTests` (1 case) confirms a backdated
 session and its on-disk chunk directory are both removed while a fresh session survives. Full fast
 suite: 413/413 passing (400 baseline + 13 new).
+
+## DONE (2026-09-11): fixed a real 404 on the video-face "large image" viewer for interlaced-source
+videos -- yadif deinterlace output frames carry a different time_base than the source stream
+
+User-reported: face 1097880's large image 404'd. Root-caused to a real, systemic bug in
+`extract_frame_near_timestamp` (`face_manager/video_face_pipeline.py`, the PyAV-based "accurate"
+frame retrieval built 2026-09-09 -- see that section above): it applied the source stream's own
+`time_base` uniformly to every candidate frame's pts, but a frame that has passed through the
+function's own yadif deinterlace filter graph (used for any interlaced-source video -- `.m2ts`/
+`.mts`/`.mpg`) carries its OWN, different `time_base`. Confirmed directly against the real file
+(`20190522190610.m2ts`, `field_order=tt`): yadif's `mode=0` output frames report `time_base=
+1/180000` against the stream's own `1/90000` -- exactly double. Applying the wrong time_base
+silently doubled the computed `frame_time` for every deinterlaced frame, so the windowed search
+around the target timestamp found nothing whenever the true target wasn't within about a second of
+the very start of the file -- this is a *systemic* bug affecting essentially every interlaced-
+source video face beyond the first second, not just this one report. Confirmed via a random 15-face
+sample across `.mts`/`.m2ts`/`.mpg`-sourced faces after the fix: 15/15 now succeed (was reliably
+failing before).
+
+**Fixed** by converting each frame's pts to seconds via that specific frame's own `.time_base`
+attribute, never the outer stream's -- extracted into a small, directly-testable `_frame_seconds(
+pts, time_base, start_seconds)` helper. No committed interlaced video fixture exists for a full
+integration test (the real interlaced samples are host-only, per this project's established real-
+fixture convention), so covered with 3 focused unit tests on the pts-to-seconds conversion directly,
+each grounded in the exact real pts/time_base values pulled from the real file that reproduced the
+bug (`face_manager/tests.py::VideoFaceFrameSecondsTests`) -- including a test that reproduces the
+pre-fix bug exactly (stream time_base applied to a 1/180000 pts gives ~2x the correct value) and one
+confirming the same real moment is recovered whether computed via the input frame's pts/time_base or
+the deinterlaced output frame's differing pts/time_base.
+
+**Separately confirmed, NOT fixed (a different, already-documented issue)**: the *fast* path
+(`_extract_video_face_frame_fast`, plain `ffmpeg -ss` seeking) also 404'd for this same face --
+traced to a real `ffmpeg` decode error at that seek position (`reference picture missing during
+reorder`), which is exactly the already-known ~30% fast-path mismatch/failure rate documented when
+the accurate endpoint was originally built (2026-09-09), not a new bug. Worth remembering: the
+mobile app (PhotoVerify) is deliberately configured to call `fast=true` exclusively, per its own
+earlier design simplification -- so it will still occasionally 404 on a face like this one even
+after this fix, since it never falls back to the now-corrected accurate endpoint the way the web
+frontend's two-step fetch does. Not changed without being asked, since that fast-only behavior was
+a deliberate prior tradeoff, but worth knowing if a mobile-app 404 report comes in that looks like
+this same symptom.
+
+Deployed same day: code-only change (no migration), `docker restart picasa_api` picked it up
+(`/code` is bind-mounted). Verified live: `manage.py check` clean, face 1097880's accurate endpoint
+now returns a real 1920x1080 image (previously `None`), and a random 15-face sample across
+interlaced-source videos all succeed post-fix. Full fast suite: 416/416 passing (413 baseline + 3
+new).
