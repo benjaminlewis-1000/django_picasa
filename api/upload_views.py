@@ -118,10 +118,21 @@ def _verify_content(path, kind):
 
 
 def _unique_destination(directory, basename):
-    """Two different zip entries (from different subfolders inside the
-    archive) can share the same basename once path components are
-    stripped for zip-slip safety -- disambiguate rather than silently
-    overwrite one with the other."""
+    """Two different files can end up wanting the same basename in the
+    same flat directory -- two different zip entries from different
+    subfolders once path components are stripped for zip-slip safety, or
+    two separate uploads (at different times, possibly different users)
+    of a same-named file, since UPLOAD_STAGING_DIR is intentionally flat
+    (no per-upload subdirectory -- see CLAUDE.md's 2026-09-11 write-up).
+    Disambiguate with a short random suffix rather than silently
+    overwriting one with the other.
+
+    Accepted, low-probability race: this checks-then-creates rather than
+    atomically reserving the name, so two uploads of the identical
+    filename landing at the exact same instant could both pick the same
+    "doesn't exist yet" name. Not hardened against further -- this is a
+    private multi-user family app, not a high-concurrency public one, and
+    the cost of a real collision is just re-uploading the losing file."""
     dest = os.path.join(directory, basename)
     if not os.path.exists(dest):
         return dest
@@ -129,7 +140,26 @@ def _unique_destination(directory, basename):
     return os.path.join(directory, f"{root}_{uuid.uuid4().hex[:8]}{ext}")
 
 
-def _handle_zip(tmp_path, batch_dir):
+def _chown_upload_path(path):
+    """Uploaded content should be owned by the real host user
+    (settings.UPLOAD_FILE_OWNER_UID/GID), not root. The container runs
+    as root (see CLAUDE.md), so anything it creates defaults to
+    root:root ownership -- awkward for anything on the host side (Samba
+    browsing, manual cleanup) that expects the same ownership as the
+    rest of the photo tree. A no-op if either setting is unset (e.g.
+    local dev, where the process already runs as the real user).
+    Best-effort: never let an ownership hiccup block a real upload."""
+    uid = getattr(settings, 'UPLOAD_FILE_OWNER_UID', None)
+    gid = getattr(settings, 'UPLOAD_FILE_OWNER_GID', None)
+    if uid is None or gid is None:
+        return
+    try:
+        os.chown(path, uid, gid)
+    except OSError:
+        pass
+
+
+def _handle_zip(tmp_path, dest_dir):
     """Returns (response_body, http_status). Shared by both the
     single-shot and chunked-complete entry points."""
     results = []
@@ -189,11 +219,11 @@ def _handle_zip(tmp_path, batch_dir):
                     any_rejected_or_skipped = True
                     continue
 
-                os.makedirs(batch_dir, exist_ok=True)
-                dest = _unique_destination(batch_dir, basename)
+                os.makedirs(dest_dir, exist_ok=True)
+                dest = _unique_destination(dest_dir, basename)
                 # Defense in depth beyond the basename-only join above --
-                # confirm the resolved path still lands inside batch_dir.
-                if os.path.dirname(os.path.realpath(dest)) != os.path.realpath(batch_dir):
+                # confirm the resolved path still lands inside dest_dir.
+                if os.path.dirname(os.path.realpath(dest)) != os.path.realpath(dest_dir):
                     results.append({'filename': info.filename, 'status': 'rejected',
                                      'reason': 'unsafe path'})
                     any_rejected_or_skipped = True
@@ -209,6 +239,7 @@ def _handle_zip(tmp_path, batch_dir):
                     any_rejected_or_skipped = True
                     continue
 
+                _chown_upload_path(dest)
                 results.append({'filename': info.filename, 'status': 'accepted'})
                 any_accepted = True
     except zipfile.BadZipFile:
@@ -228,16 +259,24 @@ def _stage_validated_file(tmp_path, original_filename):
     """Given a file already sitting at tmp_path (its checksum already
     verified by the caller), classify + content-verify + stage it under
     UPLOAD_STAGING_DIR. Returns (response_body, http_status). Shared by
-    UploadFileView (single-shot) and CompleteChunkedUploadView."""
+    UploadFileView (single-shot) and CompleteChunkedUploadView.
+
+    Staging is deliberately FLAT -- every accepted file (whether a
+    direct upload or a zip member) lands directly in UPLOAD_STAGING_DIR
+    itself, not a per-upload subdirectory (that was the original design;
+    changed 2026-09-11 per the user's own preference for a flat layout).
+    _unique_destination handles the resulting cross-upload collision
+    case that the old per-upload subdirectory used to avoid for free."""
     kind = _classify_extension(original_filename)
     if kind is None:
         return ({'error': f'Unsupported file type for "{original_filename}" -- '
                            f'expected an image, video, or .zip file.'}, 400)
 
-    batch_dir = os.path.join(settings.UPLOAD_STAGING_DIR, uuid.uuid4().hex)
+    os.makedirs(settings.UPLOAD_STAGING_DIR, exist_ok=True)
+    _chown_upload_path(settings.UPLOAD_STAGING_DIR)
 
     if kind == 'zip':
-        return _handle_zip(tmp_path, batch_dir)
+        return _handle_zip(tmp_path, settings.UPLOAD_STAGING_DIR)
 
     if not _verify_content(tmp_path, kind):
         return ({
@@ -248,9 +287,9 @@ def _stage_validated_file(tmp_path, original_filename):
             }],
         }, 400)
 
-    os.makedirs(batch_dir, exist_ok=True)
-    dest = os.path.join(batch_dir, os.path.basename(original_filename))
+    dest = _unique_destination(settings.UPLOAD_STAGING_DIR, os.path.basename(original_filename))
     shutil.move(tmp_path, dest)
+    _chown_upload_path(dest)
     return ({
         'status': 'accepted',
         'files': [{'filename': original_filename, 'status': 'accepted'}],

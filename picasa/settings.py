@@ -687,6 +687,16 @@ UPLOAD_CHUNK_SCRATCH_DIR = os.path.join(tempfile.gettempdir(), 'upload_chunks')
 # the api.cleanup_stale_uploads scheduled task rather than left to
 # accumulate disk usage forever.
 UPLOAD_SESSION_TTL_HOURS = 48
+# picasa_api runs as root inside the container (see CLAUDE.md), so any
+# file it writes defaults to root:root ownership -- awkward on the host
+# side (Samba browsing, manual cleanup) where the rest of the photo tree
+# is owned by the real host user. api/upload_views.py chowns each staged
+# file to this UID/GID after writing it. None (the local-dev/non-Docker
+# default below) skips this entirely -- outside Docker the process
+# already runs as the real user, nothing to fix. Overridable via env var
+# in case a future deployment's host user differs from this one's.
+UPLOAD_FILE_OWNER_UID = int(os.environ.get('UPLOAD_FILE_OWNER_UID', 1000)) if in_docker else None
+UPLOAD_FILE_OWNER_GID = int(os.environ.get('UPLOAD_FILE_OWNER_GID', 1000)) if in_docker else None
 
 FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code.
 FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory that will have validation images when testing the app.
