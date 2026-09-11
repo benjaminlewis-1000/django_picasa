@@ -1816,6 +1816,64 @@ class MergeDuplicateImageFilesTests(TestCase):
         self.assertEqual(ImageFile.objects.filter(filename__in=dup_filenames).count(), 0)
 
 
+class VideoFaceFrameSecondsTests(unittest.TestCase):
+    """_frame_seconds: real, live bug found 2026-09-11 via a production
+    404 (face 1097880's "large image" -- see CLAUDE.md) -- a frame that
+    has passed through extract_frame_near_timestamp's yadif deinterlace
+    filter graph carries a DIFFERENT time_base than the source stream
+    (confirmed on a real interlaced .m2ts file: 1/180000 vs the stream's
+    own 1/90000), so applying the stream's time_base uniformly silently
+    doubled the computed time for every deinterlaced frame. No real
+    interlaced fixture is committed for a full integration test, but the
+    actual bug is entirely in this one pts-to-seconds conversion, so a
+    focused unit test on it directly covers the real fix."""
+
+    def test_same_pts_with_different_time_bases_gives_different_seconds(self):
+        # This is the bug itself, made concrete: the SAME numeric pts
+        # value means a different real time depending on which
+        # time_base it's interpreted through.
+        from fractions import Fraction
+
+        from video_face_pipeline import _frame_seconds
+        pts = 44522298
+        seconds_at_90k = _frame_seconds(pts, Fraction(1, 90000), start_seconds=0)
+        seconds_at_180k = _frame_seconds(pts, Fraction(1, 180000), start_seconds=0)
+        self.assertAlmostEqual(seconds_at_90k, seconds_at_180k * 2, places=6)
+
+    def test_matching_real_world_time_survives_a_time_base_change(self):
+        # The actual real-production values: an input frame at pts=
+        # 22261149 in the stream's native 1/90000 time_base represents
+        # the exact same real-world instant as yadif's corresponding
+        # deinterlaced output (its first output overall -- yadif's
+        # mode=0 needs one input's worth of buffering delay before its
+        # first output, so this is the deinterlaced version of the
+        # FIRST input frame, not the second) at pts=44522298 in yadif's
+        # 1/180000 time_base -- confirmed directly against the real file
+        # (2026-09-11). Using each frame's own time_base must recover
+        # the same real second count for both.
+        from fractions import Fraction
+
+        from video_face_pipeline import _frame_seconds
+        start_seconds = _frame_seconds(99009, Fraction(1, 90000), start_seconds=0)
+        input_seconds = _frame_seconds(22261149, Fraction(1, 90000), start_seconds=start_seconds)
+        output_seconds = _frame_seconds(44522298, Fraction(1, 180000), start_seconds=start_seconds)
+        self.assertAlmostEqual(input_seconds, output_seconds, places=3)
+        self.assertAlmostEqual(input_seconds, 246.246, places=2)
+
+    def test_pre_fix_bug_reproduced_with_stream_time_base_applied_to_both(self):
+        # Demonstrates the actual regression: naively applying the
+        # STREAM's time_base (1/90000) to an output frame's pts that's
+        # really in 1/180000 units produces roughly double the correct
+        # value -- exactly the silent doubling that made
+        # extract_frame_near_timestamp return None for interlaced videos.
+        from fractions import Fraction
+
+        from video_face_pipeline import _frame_seconds
+        correct = _frame_seconds(44522298, Fraction(1, 180000), start_seconds=0)
+        buggy = _frame_seconds(44522298, Fraction(1, 90000), start_seconds=0)
+        self.assertAlmostEqual(buggy, correct * 2, places=3)
+
+
 class VideoFaceIOUTrackingTests(unittest.TestCase):
     """_iou_track: pure frame-to-frame linking, no Django/model deps --
     see video_face_pipeline.py / CLAUDE.md's Phase 3 design for the full

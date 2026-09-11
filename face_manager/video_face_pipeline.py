@@ -306,6 +306,21 @@ def _mean_abs_pixel_diff(a, b):
     return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16))))
 
 
+def _frame_seconds(pts, time_base, start_seconds):
+    """A PyAV frame's real-world timestamp in seconds -- always via that
+    SPECIFIC frame's own time_base, never a time_base borrowed from
+    somewhere else (e.g. the source stream). Confirmed real, live bug
+    2026-09-11: a frame that has passed through this file's yadif
+    deinterlace filter graph carries a DIFFERENT time_base than the
+    stream's own (1/180000 vs the stream's 1/90000 on a real interlaced
+    .m2ts file) -- applying the stream's time_base to such a frame's pts
+    silently doubles its computed time, which made
+    extract_frame_near_timestamp systematically fail (return None,
+    surfacing as a 404) for interlaced-source videos whenever a target
+    timestamp wasn't extremely close to the very start of the file."""
+    return float(pts * time_base) - start_seconds
+
+
 def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rotation,
                                   box, reference_bgr, window_seconds=0.5):
     """On-demand exact-frame retrieval for the video-face "full context"
@@ -357,8 +372,21 @@ def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rot
         # Frame time must be computed relative to the stream's OWN start
         # pts, not raw pts=0 -- some real files (old camcorder-era MPGs)
         # have a nonzero start offset that otherwise silently shifts
-        # every frame's computed time by a few frames' worth.
-        start_pts = stream.start_time if stream.start_time is not None else 0
+        # every frame's computed time by a few frames' worth. Expressed
+        # in real seconds (not raw pts units) up front, since frames
+        # coming back out of the yadif filter graph below carry a
+        # DIFFERENT time_base than the stream's own -- confirmed
+        # 2026-09-11 on a real interlaced .m2ts file: yadif's mode=0
+        # output frames report time_base=1/180000 against the stream's
+        # own 1/90000, exactly double, silently doubling every computed
+        # frame_time for any deinterlaced frame if the stream's time_base
+        # were (as this used to do) applied uniformly to both. Each
+        # frame's pts must always be converted through its OWN
+        # `.time_base` attribute, never the outer stream's, once it may
+        # have passed through a filter graph.
+        start_seconds = float(
+            (stream.start_time if stream.start_time is not None else 0) * stream.time_base
+        )
         seek_target = max(0.0, target_seconds - window_seconds)
         container.seek(int(seek_target * av.time_base), backward=True, any_frame=False, stream=None)
 
@@ -377,7 +405,8 @@ def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rot
                             break
                 for out_frame in candidates:
                     pts = out_frame.pts if out_frame.pts is not None else 0
-                    frame_time = float((pts - start_pts) * stream.time_base)
+                    tb = out_frame.time_base if out_frame.time_base is not None else stream.time_base
+                    frame_time = _frame_seconds(pts, tb, start_seconds)
                     if frame_time > target_seconds + window_seconds:
                         return best_arr
                     if frame_time < target_seconds - window_seconds:
