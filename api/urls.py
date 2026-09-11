@@ -52,4 +52,8 @@ urlpatterns = [
     path(r'geocode_review/action/', geocode_views.GeocodeReviewActionView.as_view(), name='geocode_review_action'),
     path(r'geocode_review/search_places/', geocode_views.GeocodeReviewSearchPlacesView.as_view(), name='geocode_review_search_places'),
     path(r'upload/', upload_views.UploadFileView.as_view(), name='upload_file'),
+    path(r'upload/chunked/init/', upload_views.InitChunkedUploadView.as_view(), name='upload_chunked_init'),
+    path(r'upload/chunked/<uuid:upload_id>/chunk/<int:index>/', upload_views.UploadChunkView.as_view(), name='upload_chunk'),
+    path(r'upload/chunked/<uuid:upload_id>/status/', upload_views.ChunkedUploadStatusView.as_view(), name='upload_chunk_status'),
+    path(r'upload/chunked/<uuid:upload_id>/complete/', upload_views.CompleteChunkedUploadView.as_view(), name='upload_chunk_complete'),
 ]
