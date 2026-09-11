@@ -58,6 +58,14 @@ if in_docker:
         
     PHOTO_ROOT = '/photos'
     PHOTO_ROOT_RW = '/photos_rw'
+    # Deliberately its OWN bind mount (docker-compose.yaml), not a reuse
+    # of PHOTO_ROOT_RW's whole-tree read-write access -- the upload
+    # endpoint (api/upload_views.py) can only ever write inside this one
+    # directory at the container/mount level, so a path-traversal bug in
+    # the zip-extraction code (or anywhere else in that view) can't reach
+    # the rest of the photo library, regardless of what the application
+    # code itself does or doesn't check.
+    UPLOAD_STAGING_DIR = '/photos_upload'
     VIDEO_ROOT = '/videos'
     TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
     ALLOWED_HOSTS = ['localhost',
@@ -87,6 +95,10 @@ else:
     SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
     ALLOWED_HOSTS = ['localhost', '127.0.0.1']
     PHOTO_ROOT = '/home/benjamin/git_repos/picasa_files/actual_imgs'
+    # No separate mount in local dev -- just a subdirectory of the same
+    # tree, matching the Docker layout's intent (staged uploads land
+    # somewhere the ingestion scanner already walks).
+    UPLOAD_STAGING_DIR = os.path.join(PHOTO_ROOT, 'aggregated', 'uploaded')
     VIDEO_ROOT = '/home/benjamin/git_repos/picasa_files/actual_videos'
     TEST_IMG_DIR_FILEPOPULATE = '/home/benjamin/git_repos/picasa_files/test_imgs'
 
@@ -640,6 +652,14 @@ FILEPOPULATOR_SERVER_VIDEO_DIRS = VIDEO_ROOTS + [PHOTO_ROOT]
 # before the more expensive exiftool call, so a short clip is also
 # cheaper to (repeatedly, harmlessly) rule out than a normal one.
 MIN_VIDEO_DURATION_SECONDS = 3
+
+# api/upload_views.py -- authenticated user-facing upload endpoint.
+# Deliberately generous defaults (easy to lower later once real usage
+# patterns are known) rather than a tight guess now that could block a
+# legitimate large video upload.
+UPLOAD_MAX_FILE_SIZE_BYTES = 4 * 1024 * 1024 * 1024       # 4GiB, single file/zip
+UPLOAD_MAX_ZIP_UNCOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024  # 8GiB, zip-bomb guard
+UPLOAD_MAX_ZIP_ENTRY_COUNT = 5000
 
 FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code.
 FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory that will have validation images when testing the app.

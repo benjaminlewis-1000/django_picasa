@@ -1,5 +1,10 @@
+import hashlib
 import json
+import os
+import shutil
+import tempfile
 import unittest
+import zipfile
 from io import BytesIO
 from unittest import mock
 
@@ -8,6 +13,7 @@ import numpy as np
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.files.base import ContentFile
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils.functional import SimpleLazyObject
 from rest_framework import status
@@ -2093,3 +2099,204 @@ class GeocodeReviewTests(ApiTestCase):
         data = json.loads(resp.content)
         names = [r['name'] for r in data['results']]
         self.assertIn('Florence', names)
+
+
+def _sha256_hex(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _make_zip(entries):
+    """entries: list of (name_in_zip, bytes). Returns raw zip bytes."""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, 'w') as zf:
+        for name, data in entries:
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+@override_settings(UPLOAD_MAX_FILE_SIZE_BYTES=10 * 1024 * 1024,
+                    UPLOAD_MAX_ZIP_UNCOMPRESSED_BYTES=10 * 1024 * 1024,
+                    UPLOAD_MAX_ZIP_ENTRY_COUNT=5000)
+class UploadFileViewTests(ApiTestCase):
+    """api/upload_views.py -- authenticated file upload with real content
+    verification (not just extension/Content-Type), checksum enforcement,
+    and zip handling (zip-slip safety, nested-zip/non-media skipping,
+    size/entry-count guards)."""
+
+    def setUp(self):
+        super().setUp()
+        self._staging_dir = tempfile.mkdtemp(prefix='upload_test_staging_')
+        self._settings_override = override_settings(UPLOAD_STAGING_DIR=self._staging_dir)
+        self._settings_override.enable()
+        self.addCleanup(self._settings_override.disable)
+        self.addCleanup(shutil.rmtree, self._staging_dir, True)
+
+    def _staged_files(self):
+        """Every file path under the staging dir, relative to it."""
+        found = []
+        for root, _dirs, files in os.walk(self._staging_dir):
+            for f in files:
+                found.append(os.path.relpath(os.path.join(root, f), self._staging_dir))
+        return found
+
+    def _post_upload(self, client, filename, data, checksum=None):
+        upload = SimpleUploadedFile(filename, data)
+        payload = {'file': upload}
+        if checksum is not None:
+            payload['checksum'] = checksum
+        return client.post('/api/upload/', payload, format='multipart')
+
+    def test_requires_authentication(self):
+        data = _tiny_jpeg_bytes()
+        resp = self._post_upload(self.anon_client, 'photo.jpg', data, _sha256_hex(data))
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+        self.assertEqual(self._staged_files(), [])
+
+    def test_missing_checksum_rejected(self):
+        data = _tiny_jpeg_bytes()
+        resp = self._post_upload(self.client, 'photo.jpg', data)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._staged_files(), [])
+
+    def test_wrong_checksum_rejected_and_nothing_written(self):
+        data = _tiny_jpeg_bytes()
+        resp = self._post_upload(self.client, 'photo.jpg', data, checksum='0' * 64)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('checksum', json.loads(resp.content)['error'].lower())
+        self.assertEqual(self._staged_files(), [])
+
+    def test_valid_image_is_accepted_and_staged(self):
+        data = _tiny_jpeg_bytes()
+        resp = self._post_upload(self.client, 'photo.jpg', data, _sha256_hex(data))
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        staged = self._staged_files()
+        self.assertEqual(len(staged), 1)
+        self.assertTrue(staged[0].endswith('photo.jpg'))
+        # Landed in its own per-request subdirectory, not directly in the
+        # staging root (collision avoidance across separate uploads).
+        self.assertIn(os.sep, staged[0])
+
+    def test_unsupported_extension_rejected(self):
+        data = b'hello world'
+        resp = self._post_upload(self.client, 'notes.txt', data, _sha256_hex(data))
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._staged_files(), [])
+
+    def test_text_file_renamed_as_jpg_is_rejected(self):
+        # The core "don't trust the extension" guard -- a real decode
+        # attempt catches this even though the filename/extension look
+        # like a legitimate image.
+        data = b'this is definitely not a real jpeg\x00\x01\x02'
+        resp = self._post_upload(self.client, 'fake.jpg', data, _sha256_hex(data))
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._staged_files(), [])
+
+    def test_valid_video_is_accepted_and_staged(self):
+        # ci_fixtures/video_stub/synthetic.mp4 is committed in-repo (see
+        # ci_fixtures/generate_fixtures.py) specifically so tests like
+        # this one work the same in CI as locally, with no dependency on
+        # any real-sample mount.
+        video_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'ci_fixtures', 'video_stub', 'synthetic.mp4',
+        )
+        with open(video_path, 'rb') as f:
+            data = f.read()
+        resp = self._post_upload(self.client, 'clip.mp4', data, _sha256_hex(data))
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        staged = self._staged_files()
+        self.assertEqual(len(staged), 1)
+        self.assertTrue(staged[0].endswith('clip.mp4'))
+
+    def test_file_over_size_limit_rejected(self):
+        data = _tiny_jpeg_bytes()
+        with override_settings(UPLOAD_MAX_FILE_SIZE_BYTES=len(data) - 1):
+            resp = self._post_upload(self.client, 'photo.jpg', data, _sha256_hex(data))
+        self.assertEqual(resp.status_code, status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+        self.assertEqual(self._staged_files(), [])
+
+    def test_zip_with_mixed_valid_and_invalid_entries(self):
+        good1 = _tiny_jpeg_bytes(color=(10, 10, 10))
+        good2 = _tiny_jpeg_bytes(color=(20, 20, 20))
+        bad = b'not an image'
+        zip_bytes = _make_zip([
+            ('photos/a.jpg', good1),
+            ('photos/b.jpg', good2),
+            ('notes.txt', bad),
+            ('nested.zip', _make_zip([('inner.jpg', good1)])),
+        ])
+        resp = self._post_upload(self.client, 'batch.zip', zip_bytes, _sha256_hex(zip_bytes))
+        self.assertEqual(resp.status_code, status.HTTP_207_MULTI_STATUS)
+        data = json.loads(resp.content)
+        by_status = {}
+        for entry in data['files']:
+            by_status.setdefault(entry['status'], []).append(entry['filename'])
+        self.assertEqual(sorted(by_status['accepted']), ['photos/a.jpg', 'photos/b.jpg'])
+        self.assertIn('notes.txt', by_status['skipped'])
+        self.assertIn('nested.zip', by_status['skipped'])
+        staged = self._staged_files()
+        self.assertEqual(len(staged), 2)
+        self.assertTrue(any(f.endswith('a.jpg') for f in staged))
+        self.assertTrue(any(f.endswith('b.jpg') for f in staged))
+
+    def test_zip_all_entries_invalid_is_rejected(self):
+        zip_bytes = _make_zip([('notes.txt', b'not an image')])
+        resp = self._post_upload(self.client, 'batch.zip', zip_bytes, _sha256_hex(zip_bytes))
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._staged_files(), [])
+
+    def test_zip_slip_path_traversal_entry_lands_safely_inside_staging_dir(self):
+        # A traversal-style entry name is stripped down to its basename
+        # before ever being joined to a real path, so this lands safely
+        # inside the per-request subdirectory as a plain "evil.jpg" --
+        # never at the traversal-implied location outside the staging
+        # tree entirely.
+        good = _tiny_jpeg_bytes()
+        zip_bytes = _make_zip([('../../evil.jpg', good)])
+        resp = self._post_upload(self.client, 'batch.zip', zip_bytes, _sha256_hex(zip_bytes))
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        staged = self._staged_files()
+        self.assertEqual(len(staged), 1)
+        self.assertTrue(staged[0].endswith('evil.jpg'))
+        # And, critically, nothing was written outside the staging dir at
+        # the literal traversal-implied path.
+        parent = os.path.dirname(self._staging_dir.rstrip('/'))
+        self.assertFalse(os.path.exists(os.path.join(parent, 'evil.jpg')))
+
+    def test_zip_filename_collision_across_subfolders_is_disambiguated(self):
+        good1 = _tiny_jpeg_bytes(color=(1, 1, 1))
+        good2 = _tiny_jpeg_bytes(color=(2, 2, 2))
+        zip_bytes = _make_zip([
+            ('folderA/photo.jpg', good1),
+            ('folderB/photo.jpg', good2),
+        ])
+        resp = self._post_upload(self.client, 'batch.zip', zip_bytes, _sha256_hex(zip_bytes))
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        staged = self._staged_files()
+        self.assertEqual(len(staged), 2)
+        # Both accepted, and both files genuinely exist on disk with
+        # distinct names (no silent overwrite of one by the other).
+        basenames = [os.path.basename(f) for f in staged]
+        self.assertEqual(len(set(basenames)), 2)
+
+    def test_zip_entry_count_over_limit_rejected(self):
+        entries = [(f'{i}.jpg', _tiny_jpeg_bytes()) for i in range(5)]
+        zip_bytes = _make_zip(entries)
+        with override_settings(UPLOAD_MAX_ZIP_ENTRY_COUNT=3):
+            resp = self._post_upload(self.client, 'batch.zip', zip_bytes, _sha256_hex(zip_bytes))
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._staged_files(), [])
+
+    def test_zip_uncompressed_size_over_limit_rejected(self):
+        data = _tiny_jpeg_bytes(size=(200, 200))
+        zip_bytes = _make_zip([('big.jpg', data)])
+        with override_settings(UPLOAD_MAX_ZIP_UNCOMPRESSED_BYTES=len(data) - 1):
+            resp = self._post_upload(self.client, 'batch.zip', zip_bytes, _sha256_hex(zip_bytes))
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._staged_files(), [])
+
+    def test_not_a_real_zip_is_rejected(self):
+        data = b'PK\x03\x04not actually a zip body'
+        resp = self._post_upload(self.client, 'batch.zip', data, _sha256_hex(data))
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._staged_files(), [])
