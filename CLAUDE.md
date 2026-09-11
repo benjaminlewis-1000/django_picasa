@@ -3197,3 +3197,39 @@ Deployed same day: code-only change (no migration), `docker restart picasa_api` 
 now returns a real 1920x1080 image (previously `None`), and a random 15-face sample across
 interlaced-source videos all succeed post-fix. Full fast suite: 416/416 passing (413 baseline + 3
 new).
+
+## DONE (2026-09-11, same day): flattened upload staging output, fixed root-owned uploaded files
+
+Two follow-up requests on the upload feature above, both in `api/upload_views.py`:
+
+1. **Flat staging directory.** Every accepted upload used to land under its own per-request
+   `UPLOAD_STAGING_DIR/<uuid>/filename` subdirectory (collision avoidance across separate uploads).
+   The user wants a flat layout instead -- every accepted file (direct upload or zip member) now
+   lands directly in `UPLOAD_STAGING_DIR` itself. `_unique_destination` (already built for the
+   within-zip same-basename-different-subfolder case) now also covers the cross-upload collision
+   case the per-request subdirectory used to avoid for free -- a short random suffix on collision,
+   same as before, just applied more broadly. Accepted, documented tradeoff: this is a check-then-
+   create, not atomic, so two uploads of the identical filename at the exact same instant could
+   theoretically both pick the same "free" name -- not hardened further, since this is a private
+   multi-user family app, not a high-concurrency public one, and the cost of a real collision is
+   just re-uploading the losing file.
+2. **File ownership.** `picasa_api` runs as root inside the container (see this file's own earlier
+   notes), so anything it writes defaults to root:root ownership -- confirmed on real uploads
+   already sitting in the staging directory from actual frontend testing before this was caught.
+   Awkward on the host side (Samba browsing, manual cleanup) where the rest of the photo tree is
+   owned by the real host user (`benjamin`, uid/gid 1000/1000). New settings
+   `UPLOAD_FILE_OWNER_UID`/`UPLOAD_FILE_OWNER_GID` (1000/1000 by default, overridable via env var)
+   are applied via a best-effort `os.chown()` right after each file lands -- `None`/no-op outside
+   Docker, where the process already runs as the real user already.
+
+No new tests added -- the existing upload test suite already exercises the same collision/chown
+code paths (`_unique_destination`, `_stage_validated_file`), just updated one assertion
+(`test_valid_image_is_accepted_and_staged`) that had explicitly checked for the now-removed
+subdirectory nesting. Full fast suite: 416/416 passing (no count change).
+
+Deployed same day: code-only change (no migration), `docker restart picasa_api`. Verified live via
+a real request: a fresh upload landed flat (`/photos_upload/<filename>`, no subdirectory) and
+correctly owned `benjamin:benjamin` on the host side (confirmed by inspecting the real host path,
+not just the container's view). The two real uploads that had been sitting in the old root-owned/
+nested format from earlier frontend testing were gone by the time this was checked (never ingested
+into the DB -- no `ImageFile` rows referenced them) -- nothing left to migrate.
