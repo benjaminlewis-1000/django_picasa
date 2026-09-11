@@ -37,10 +37,8 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
 - "Mark image for deletion" button for the slideshow.
 - "Failed to open" image list surface (backend data — `image_load_failed`/`FailedImageFile` — is
   ready; frontend work never started).
-- A way to upload new files from the frontend, including zip archives (would need server-side
-  unpacking before the normal ingestion path could pick them up) — requested 2026-09-07, not
-  scoped (no existing upload endpoint on this backend at all yet — would need a new one designed
-  alongside the frontend work).
+- Frontend UI for the upload endpoint below (DONE on the backend, 2026-09-10 — see the dated
+  write-up further down; frontend work itself is out of scope for this repo).
 - A status page — requested 2026-09-07, not scoped. `/api/server_stats/` (`StatsViewSet` /
   `ServerStatsSerializer`) already exists and surfaces some of this (image/face counts, percent
   processed, estimated time remaining) but was built for a different purpose; worth checking
@@ -3003,3 +3001,81 @@ zero affected videos remain if picking this up again. The main video face-
 detection backfill (unrelated, separate, on its own 3-hour Celery Beat
 schedule) was at 497 processed / 6,454 remaining at last check -- continues
 unattended; nothing further needed there.
+
+## DONE (2026-09-10): backend upload endpoint (`api/upload_views.py`) -- authenticated users can
+upload images/videos/zips, staged for the existing ingestion scan to pick up
+
+Requested this session: a way to get new photos/videos into the library without going through the
+filesystem directly (the frontend's own upload UI is out of scope for this repo, but needs this
+backend piece to build against). Design discussed with the user before writing anything --
+key decisions, and why:
+
+- **A dedicated, narrow bind mount, not a reuse of the existing whole-tree `/photos_rw` mount.**
+  `docker-compose.yaml` already had `${PHOTO_ROOT}:/photos_rw` (read-write, the entire photo tree)
+  sitting mostly unused -- reusing it for uploads would mean any bug in the new endpoint (a zip-slip
+  path-traversal flaw, say) could write anywhere in the whole library. Instead added
+  `${PHOTO_ROOT}/aggregated/uploaded:/photos_upload`, its own mount, so the container can only ever
+  write inside that one directory at the OS/mount level regardless of what the application code
+  does or doesn't check -- real defense in depth, not just an app-level path check. New setting
+  `UPLOAD_STAGING_DIR = '/photos_upload'` (Docker branch) /
+  `os.path.join(PHOTO_ROOT, 'aggregated', 'uploaded')` (local-dev branch, no separate mount needed
+  there). Host directory (`/mnt/data/samba_share/Photos/aggregated/uploaded`) created ahead of the
+  deploy, matching its parent's ownership/permissions -- Docker would auto-create a missing bind
+  mount source too, but as root:root, which is worth avoiding deliberately rather than relying on.
+  Since `UPLOAD_STAGING_DIR` is a subdirectory of `PHOTO_ROOT` (`FILEPOPULATOR_SERVER_IMG_DIR`),
+  the existing scheduled ingestion scan picks up anything staged there automatically on its next
+  pass -- no new ingestion path needed at all.
+- **One file per POST request, not a batch.** Simpler retry/progress semantics for a frontend file
+  picker (fire one request per file, each with its own progress/retry) than juggling a multi-file
+  batch response.
+- **Client-sent SHA-256 checksum, required on every request.** Computed server-side in the same
+  single pass as writing the upload to a scratch temp file (no second read), so this costs
+  essentially nothing extra (SHA-256 throughput is hundreds of MB/s to over 1GB/s on modern
+  hardware -- a 1GB file adds a couple seconds of CPU, dwarfed by the transfer time itself).
+  Rejects with a clear error on mismatch rather than silently accepting a corrupted transfer.
+- **Real content verification, not just extension/Content-Type trust** -- the actual "don't accept
+  a text file masquerading as a JPEG" guard the user asked for. Images: `PIL.Image.open(...).
+  verify()` then a fresh `Image.open(...).load()` (verify() alone doesn't catch everything, since
+  it deliberately skips fully decoding pixel data). Videos: `av.open(...)` and confirm a real video
+  stream exists. A file that fails decode is rejected outright, never staged.
+- **Zip handling, deliberately not fully sandboxed** -- per the user's own call that authenticated-
+  only uploads don't need to defend against deliberately malicious zip *content* the way a public
+  endpoint would, since `zipfile` never executes anything from the archive (it's a data format, not
+  code); the real risks are structural. Guards actually built: `ZipFile.testzip()` (built-in
+  per-entry CRC32 check) before touching anything; a total-uncompressed-size cap
+  (`UPLOAD_MAX_ZIP_UNCOMPRESSED_BYTES`, zip-bomb guard) and an entry-count cap
+  (`UPLOAD_MAX_ZIP_ENTRY_COUNT`) checked up front; zip-slip defeated by reducing every entry name to
+  its bare `os.path.basename()` before ever joining it to a real path (plus a `realpath`
+  containment check as a second layer); a nested zip, or any non-image/video entry, is *skipped and
+  reported*, not treated as a hard error, per the user's explicit call; every extracted entry goes
+  through the exact same content-verification as a direct upload before being kept, and a filename
+  collision between two different zip subfolders (e.g. `folderA/photo.jpg` and
+  `folderB/photo.jpg`) is disambiguated with a short random suffix rather than silently overwriting.
+- **Defaults for the size caps** (`UPLOAD_MAX_FILE_SIZE_BYTES` 4GiB, `UPLOAD_MAX_ZIP_UNCOMPRESSED_
+  BYTES` 8GiB, `UPLOAD_MAX_ZIP_ENTRY_COUNT` 5000) are deliberately generous placeholders -- easy to
+  lower later once real usage patterns are known, chosen over a tight guess that could block a
+  legitimate large video upload.
+- **`IsAuthenticated` only** (`api/upload_views.py`'s `UploadFileView`), explicit even though it's
+  also this project's global DRF default -- same reasoning the slideshow-facing views are explicit
+  about their own permission class: this endpoint must never be reachable via the slideshow key.
+- **Real operational gap found and fixed while scoping this, unrelated to the endpoint's own code**:
+  gunicorn was running with its default 30-second worker timeout (`dockerize/startup.sh`) -- a
+  multi-GB upload over a modest home connection could easily take several minutes just to transfer
+  the request body, well past 30s, which would get the worker killed mid-upload. Raised to
+  `--timeout 600` (10 minutes) as a starting point, not yet verified against a real large-file
+  upload in production.
+- **Not built, deliberately out of scope for this pass**: no persistent DB record of upload
+  attempts/history (a natural follow-up if the frontend wants a "your recent uploads" surface, but
+  not asked for); no antivirus/signature scanning (the content-verification + zip-structural guards
+  above are what "guard against the most obvious viruses" resolved to, per the user's own
+  authenticated-users-only framing -- a real AV integration, e.g. ClamAV, remains a possible future
+  hardening step if ever needed); resumable/chunked upload (single-request only -- fine for the
+  client-checksum design agreed on, would need real protocol work like tus if large uploads over
+  flaky connections become a real problem in practice).
+
+New tests: `api/tests.py::UploadFileViewTests` (15 cases) covering auth requirement, missing/wrong
+checksum, a real text-file-renamed-as-.jpg rejection, valid image and video acceptance (video via
+the committed `ci_fixtures/video_stub/synthetic.mp4` fixture), unsupported extensions, file-size-
+over-limit, zip mixed valid/invalid/nested-zip entries, zip-slip landing safely inside the staging
+dir, filename-collision disambiguation, zip entry-count/uncompressed-size caps, and a corrupted/
+non-zip rejection. Full fast suite: 400/400 passing (385 baseline + 15 new).
