@@ -17,6 +17,7 @@ import os
 import random
 import re
 import string
+import tempfile
 # from .custom_cors import LocalNetworkCorsMiddleware
 
 today = datetime.today()
@@ -578,6 +579,14 @@ CELERY_BEAT_SCHEDULE = {
         # vacuum-swap (3am Monday) jobs.
         'schedule': crontab(minute='0', hour='1'),
     },
+   'cleanup_stale_uploads': {
+        'task': 'api.cleanup_stale_uploads',
+        # Once daily is plenty -- UPLOAD_SESSION_TTL_HOURS (48h) means an
+        # abandoned session sits at most ~72h before cleanup, not a tight
+        # deadline. 1:15am, same off-peak window as the other nightly
+        # jobs above/below.
+        'schedule': crontab(minute='15', hour='1'),
+    },
   'classify_unlabeled': {
       'task': 'face_manager.assign_faces',
       'schedule': crontab( minute = '0', hour='*'),
@@ -660,6 +669,24 @@ MIN_VIDEO_DURATION_SECONDS = 3
 UPLOAD_MAX_FILE_SIZE_BYTES = 4 * 1024 * 1024 * 1024       # 4GiB, single file/zip
 UPLOAD_MAX_ZIP_UNCOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024  # 8GiB, zip-bomb guard
 UPLOAD_MAX_ZIP_ENTRY_COUNT = 5000
+
+# Chunked upload (large/slow uploads that would otherwise risk exceeding
+# gunicorn's worker timeout in a single request -- see CLAUDE.md's
+# 2026-09-10 write-up). 25MiB keeps any single request's transfer time
+# well under any reasonable timeout even on a slow connection, while
+# still being large enough that per-chunk overhead is negligible.
+UPLOAD_CHUNK_SIZE_BYTES = 25 * 1024 * 1024
+# Where in-progress chunks are staged (container-local, deliberately
+# NOT under PHOTO_ROOT -- an incomplete/partial chunk must never be
+# reachable by the ingestion scanner). Fine if wiped by a container
+# recreate mid-upload -- an interrupted large upload during a rare
+# deploy is an acceptable edge case; the user just restarts it.
+UPLOAD_CHUNK_SCRATCH_DIR = os.path.join(tempfile.gettempdir(), 'upload_chunks')
+# An UploadSession older than this with no completion is abandoned (a
+# closed browser tab, a permanently dropped connection) -- cleaned up by
+# the api.cleanup_stale_uploads scheduled task rather than left to
+# accumulate disk usage forever.
+UPLOAD_SESSION_TTL_HOURS = 48
 
 FILEPOPULATOR_CODE_DIR = PROJECT_ROOT # '/home/benjamin/git_repos/local_picasa' # root directory of the code.
 FILEPOPULATOR_VAL_DIRECTORY = TEST_IMG_DIR_FILEPOPULATE  # point to a directory that will have validation images when testing the app.
