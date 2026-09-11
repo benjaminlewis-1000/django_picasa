@@ -353,21 +353,29 @@ def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rot
 
     Returns a raw BGR numpy array (full frame, not cropped), or None if
     no frame in the window decodes at all.
+
+    Real bug found and fixed 2026-09-11 (face 1099842, a Pre_camcorder-era
+    .wmv/ASF file): `container.seek()` can be badly inaccurate on some
+    real files in this library -- confirmed directly on this file, a
+    backward seek aimed at ~23.3s landed at 27.8s instead, more than 4s
+    past the END of the search window, so the scan's very first decoded
+    frame already exceeded `target_seconds + window_seconds` and the
+    function returned None immediately, even though the target frame
+    decodes perfectly fine via plain sequential playback from the start.
+    Old ASF/WMV files with sparse keyframe indexes seem to be the trigger
+    (not reproduced on any of the mp4/mov/mts/m2ts/mpg samples this
+    pipeline was originally validated against), but nothing about the
+    fix below is format-specific: whenever the seek-based scan comes back
+    empty, and the seek wasn't already starting from the true beginning,
+    retry with one full sequential decode from frame zero instead of
+    trusting the seek a second time. This is strictly a fallback (only
+    paid for the rare case where the seek-based scan already found
+    nothing), not a general slowdown.
     """
     container = av.open(path)
     try:
         stream = container.streams.video[0]
         stream.thread_type = 'AUTO'
-
-        graph = None
-        if field_order not in ('progressive', 'unknown'):
-            graph = av.filter.Graph()
-            buf = graph.add_buffer(template=stream)
-            yadif = graph.add('yadif', 'mode=0')
-            buf.link_to(yadif)
-            sink = graph.add('buffersink')
-            yadif.link_to(sink)
-            graph.configure()
 
         # Frame time must be computed relative to the stream's OWN start
         # pts, not raw pts=0 -- some real files (old camcorder-era MPGs)
@@ -387,41 +395,58 @@ def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rot
         start_seconds = float(
             (stream.start_time if stream.start_time is not None else 0) * stream.time_base
         )
+
+        def scan_from_current_position():
+            graph = None
+            if field_order not in ('progressive', 'unknown'):
+                graph = av.filter.Graph()
+                buf = graph.add_buffer(template=stream)
+                yadif = graph.add('yadif', 'mode=0')
+                buf.link_to(yadif)
+                sink = graph.add('buffersink')
+                yadif.link_to(sink)
+                graph.configure()
+
+            best_arr = None
+            best_diff = None
+            for packet in container.demux(stream):
+                for frame in packet.decode():
+                    candidates = [frame]
+                    if graph is not None:
+                        graph.push(frame)
+                        candidates = []
+                        while True:
+                            try:
+                                candidates.append(graph.pull())
+                            except Exception:
+                                break
+                    for out_frame in candidates:
+                        pts = out_frame.pts if out_frame.pts is not None else 0
+                        tb = out_frame.time_base if out_frame.time_base is not None else stream.time_base
+                        frame_time = _frame_seconds(pts, tb, start_seconds)
+                        if frame_time > target_seconds + window_seconds:
+                            return best_arr
+                        if frame_time < target_seconds - window_seconds:
+                            continue
+                        arr = out_frame.to_ndarray(format='bgr24')
+                        # ffmpeg's raw pipe (used elsewhere in this file)
+                        # auto-applies the container's rotation side-data;
+                        # PyAV does not, so it's applied explicitly here.
+                        if rotation:
+                            arr = np.rot90(arr, k=round(rotation / 90) % 4)
+                        crop = VideoFaceExtractor._square_thumbnail(arr, box)
+                        d = _mean_abs_pixel_diff(crop, reference_bgr)
+                        if d is not None and (best_diff is None or d < best_diff):
+                            best_diff = d
+                            best_arr = arr
+            return best_arr
+
         seek_target = max(0.0, target_seconds - window_seconds)
         container.seek(int(seek_target * av.time_base), backward=True, any_frame=False, stream=None)
-
-        best_arr = None
-        best_diff = None
-        for packet in container.demux(stream):
-            for frame in packet.decode():
-                candidates = [frame]
-                if graph is not None:
-                    graph.push(frame)
-                    candidates = []
-                    while True:
-                        try:
-                            candidates.append(graph.pull())
-                        except Exception:
-                            break
-                for out_frame in candidates:
-                    pts = out_frame.pts if out_frame.pts is not None else 0
-                    tb = out_frame.time_base if out_frame.time_base is not None else stream.time_base
-                    frame_time = _frame_seconds(pts, tb, start_seconds)
-                    if frame_time > target_seconds + window_seconds:
-                        return best_arr
-                    if frame_time < target_seconds - window_seconds:
-                        continue
-                    arr = out_frame.to_ndarray(format='bgr24')
-                    # ffmpeg's raw pipe (used elsewhere in this file)
-                    # auto-applies the container's rotation side-data;
-                    # PyAV does not, so it's applied explicitly here.
-                    if rotation:
-                        arr = np.rot90(arr, k=round(rotation / 90) % 4)
-                    crop = VideoFaceExtractor._square_thumbnail(arr, box)
-                    d = _mean_abs_pixel_diff(crop, reference_bgr)
-                    if d is not None and (best_diff is None or d < best_diff):
-                        best_diff = d
-                        best_arr = arr
+        best_arr = scan_from_current_position()
+        if best_arr is None and seek_target > 0:
+            container.seek(0, backward=True, any_frame=False, stream=None)
+            best_arr = scan_from_current_position()
         return best_arr
     finally:
         container.close()
