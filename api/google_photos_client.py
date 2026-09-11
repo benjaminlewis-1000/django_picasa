@@ -11,17 +11,28 @@ this depends on.
 
 Deliberately plain `requests` (no google-auth/google-api-python-client
 dependency) -- the only Google-side operations needed are a standard OAuth
-refresh-token exchange and a handful of REST calls, both already well within
-what `requests` (an existing dependency) handles directly.
+authorization-code/refresh-token exchange and a handful of REST calls, both
+already well within what `requests` (an existing dependency) handles
+directly.
+
+The OAuth client id/secret and refresh token are read from
+api.models.GooglePhotosCredential (a DB row managed through the Tools tab's
+"Connect Google Photos" panel), not settings/.env -- see that model's
+docstring.
 """
 
 import time
+from urllib.parse import urlencode
 
 import requests
 from django.conf import settings
 
+from api.models import GooglePhotosCredential
+
+AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
 TOKEN_URL = 'https://oauth2.googleapis.com/token'
 API_BASE = 'https://photospicker.googleapis.com/v1'
+SCOPE = 'https://www.googleapis.com/auth/photospicker.mediaitems.readonly'
 
 # Cached in-process (per worker) rather than persisted -- an access token is
 # only valid ~1 hour, cheap to re-mint, and there's no multi-process
@@ -35,26 +46,68 @@ class GooglePhotosError(Exception):
     pass
 
 
-def _require_credentials():
-    if not (settings.GOOGLE_PHOTOS_CLIENT_ID and settings.GOOGLE_PHOTOS_CLIENT_SECRET
-            and settings.GOOGLE_PHOTOS_REFRESH_TOKEN):
+def build_authorization_url(state):
+    """Returns the URL to send the browser to for the "Connect Google
+    Photos" flow (api/photos_watch_views.py's OAuthStartView).
+    access_type=offline + prompt=consent -- without both, Google can omit
+    the refresh_token on a repeat authorization from an account that's
+    already granted this client access before, which would silently leave
+    an existing (possibly revoked) token in place instead of replacing it."""
+    creds = GooglePhotosCredential.load()
+    if not (creds.client_id and creds.client_secret):
         raise GooglePhotosError(
-            'Google Photos isn\'t configured -- GOOGLE_PHOTOS_CLIENT_ID/'
-            'CLIENT_SECRET/REFRESH_TOKEN must be set (see '
-            'scripts/google_photos_authorize.py).')
+            'Google Photos client ID/secret haven\'t been saved yet -- '
+            'enter them in the Tools tab first.')
+    params = {
+        'client_id': creds.client_id,
+        'redirect_uri': settings.GOOGLE_PHOTOS_OAUTH_REDIRECT_URI,
+        'response_type': 'code',
+        'scope': SCOPE,
+        'access_type': 'offline',
+        'prompt': 'consent',
+        'state': state,
+    }
+    return f'{AUTH_URL}?{urlencode(params)}'
+
+
+def exchange_code_for_refresh_token(code):
+    """Called from OAuthCallbackView once Google redirects back with an
+    authorization code -- stores the resulting refresh token on the same
+    GooglePhotosCredential row the client id/secret already live on."""
+    creds = GooglePhotosCredential.load()
+    response = requests.post(TOKEN_URL, data={
+        'client_id': creds.client_id,
+        'client_secret': creds.client_secret,
+        'code': code,
+        'grant_type': 'authorization_code',
+        'redirect_uri': settings.GOOGLE_PHOTOS_OAUTH_REDIRECT_URI,
+    }, timeout=15)
+    if not response.ok:
+        raise GooglePhotosError(f'Failed to exchange authorization code: {response.text}')
+
+    refresh_token = response.json().get('refresh_token')
+    if not refresh_token:
+        raise GooglePhotosError(
+            'Google did not return a refresh token -- disconnect this app at '
+            'https://myaccount.google.com/permissions and try connecting again.')
+    creds.refresh_token = refresh_token
+    creds.save(update_fields=['refresh_token', 'updated_at'])
 
 
 def _get_access_token():
     global _access_token, _access_token_expiry
-    _require_credentials()
+    creds = GooglePhotosCredential.load()
+    if not (creds.client_id and creds.client_secret and creds.refresh_token):
+        raise GooglePhotosError(
+            'Google Photos isn\'t connected yet -- use "Connect Google Photos" in the Tools tab.')
     # 60s safety margin so a token doesn't expire mid-request.
     if _access_token and time.time() < _access_token_expiry - 60:
         return _access_token
 
     response = requests.post(TOKEN_URL, data={
-        'client_id': settings.GOOGLE_PHOTOS_CLIENT_ID,
-        'client_secret': settings.GOOGLE_PHOTOS_CLIENT_SECRET,
-        'refresh_token': settings.GOOGLE_PHOTOS_REFRESH_TOKEN,
+        'client_id': creds.client_id,
+        'client_secret': creds.client_secret,
+        'refresh_token': creds.refresh_token,
         'grant_type': 'refresh_token',
     }, timeout=15)
     if not response.ok:

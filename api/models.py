@@ -61,6 +61,28 @@ class UploadChunk(models.Model):
         return f"UploadChunk(session={self.session_id}, index={self.chunk_index})"
 
 
+class GooglePhotosCredential(models.Model):
+    """Singleton (always pk=1, see load()) holding the OAuth client
+    registered in Google Cloud Console plus the refresh token minted by
+    the Tools tab's "Connect Google Photos" button
+    (api/photos_watch_views.py's OAuth start/callback views). A DB row
+    rather than settings.py/.env values, deliberately - lets these be
+    entered and rotated entirely through the app's own GUI instead of
+    editing server config and restarting a container."""
+    client_id = models.CharField(max_length=255, blank=True, default='')
+    client_secret = models.CharField(max_length=255, blank=True, default='')
+    refresh_token = models.CharField(max_length=512, blank=True, default='')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def __str__(self):
+        return f"GooglePhotosCredential(configured={bool(self.client_id)}, connected={bool(self.refresh_token)})"
+
+
 class GooglePhotosWatchedAlbum(models.Model):
     """A user-named entry in the Tools-tab "Google Photos" list
     (api/photos_watch_views.py). Google's Picker API returns no album/

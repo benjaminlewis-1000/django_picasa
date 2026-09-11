@@ -13,18 +13,103 @@ frontend button click, not a periodic task.
 """
 
 import os
+import secrets
+from urllib.parse import quote
 
 from django.conf import settings
+from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from api.google_photos_client import GooglePhotosError, create_session, delete_session, \
-    download_media_item, get_session, list_media_items
-from api.models import GooglePhotosSyncedItem, GooglePhotosWatchedAlbum
+from api.google_photos_client import GooglePhotosError, build_authorization_url, create_session, \
+    delete_session, download_media_item, exchange_code_for_refresh_token, get_session, list_media_items
+from api.models import GooglePhotosCredential, GooglePhotosSyncedItem, GooglePhotosWatchedAlbum
 from api.upload_views import _chown_upload_path, _unique_destination
+
+
+def _frontend_tools_url():
+    return f'https://{settings.FRONTEND_DOMAIN}/faces'
+
+
+class GooglePhotosCredentialView(APIView):
+    """GET/POST /api/google_photos/credentials/ -- backs the Tools tab's
+    "Connect Google Photos" panel. The client secret is write-only over
+    this API (never echoed back in GET) - only whether one is configured."""
+
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        creds = GooglePhotosCredential.load()
+        return Response({
+            'client_id': creds.client_id,
+            'configured': bool(creds.client_id and creds.client_secret),
+            'connected': bool(creds.refresh_token),
+        })
+
+    def post(self, request):
+        client_id = (request.data.get('client_id') or '').strip()
+        client_secret = (request.data.get('client_secret') or '').strip()
+        if not client_id or not client_secret:
+            return Response({'error': 'Both "client_id" and "client_secret" are required.'}, status=400)
+
+        creds = GooglePhotosCredential.load()
+        creds.client_id = client_id
+        creds.client_secret = client_secret
+        # A changed client invalidates any existing refresh token - it was
+        # minted against whatever the previous client_id/secret were.
+        creds.refresh_token = ''
+        creds.save(update_fields=['client_id', 'client_secret', 'refresh_token', 'updated_at'])
+        return Response({'client_id': creds.client_id, 'configured': True, 'connected': False})
+
+
+class GooglePhotosOAuthStartView(APIView):
+    """GET /api/google_photos/oauth/start/ -- the frontend navigates the
+    whole browser here directly (window.location, not axios/XHR) to begin
+    the "Connect Google Photos" flow; there's nothing to return but a
+    redirect to Google's consent screen. `state` is round-tripped through
+    the Django session (already cookie-based in this app) and re-checked
+    in the callback below as basic CSRF protection on the flow."""
+
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        state = secrets.token_urlsafe(32)
+        request.session['google_photos_oauth_state'] = state
+        try:
+            url = build_authorization_url(state)
+        except GooglePhotosError as e:
+            return HttpResponseRedirect(f'{_frontend_tools_url()}?google_photos_error={quote(str(e))}')
+        return HttpResponseRedirect(url)
+
+
+class GooglePhotosOAuthCallbackView(APIView):
+    """GET /api/google_photos/oauth/callback/ -- Google redirects here
+    after the user approves (or denies) access. Exchanges the code for a
+    refresh token, stores it, and bounces the browser back to the
+    frontend's Tools tab with a query param the UI reads to show a
+    success/error banner (see picasaScreen.jsx)."""
+
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        error = request.GET.get('error')
+        if error:
+            return HttpResponseRedirect(f'{_frontend_tools_url()}?google_photos_error={quote(error)}')
+
+        state = request.GET.get('state')
+        expected_state = request.session.pop('google_photos_oauth_state', None)
+        if not state or state != expected_state:
+            return HttpResponseRedirect(f'{_frontend_tools_url()}?google_photos_error=invalid_state')
+
+        try:
+            exchange_code_for_refresh_token(request.GET.get('code'))
+        except GooglePhotosError as e:
+            return HttpResponseRedirect(f'{_frontend_tools_url()}?google_photos_error={quote(str(e))}')
+
+        return HttpResponseRedirect(f'{_frontend_tools_url()}?google_photos_connected=1')
 
 
 class WatchedAlbumListView(APIView):
