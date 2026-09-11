@@ -3233,3 +3233,42 @@ correctly owned `benjamin:benjamin` on the host side (confirmed by inspecting th
 not just the container's view). The two real uploads that had been sitting in the old root-owned/
 nested format from earlier frontend testing were gone by the time this was checked (never ingested
 into the DB -- no `ImageFile` rows referenced them) -- nothing left to migrate.
+
+## DONE (2026-09-11, same day): a SECOND, distinct video-face "large image" 404 cause found --
+`av.Container.seek()` can badly overshoot on some real ASF/WMV files, not just the yadif
+time_base bug fixed earlier the same day
+
+User-reported: face 1099842's `fast=false` (accurate) large image also 404'd -- a different face
+than the one that surfaced the time_base bug above, and a different root cause once investigated.
+`source_video_file` id 1797 (`/videos/Our_Home_Videos/Pre_camcorder/IMG_0104.wmv`, `wmv2`/ASF,
+18fps, not interlaced) -- `extract_frame_near_timestamp()`'s own `container.seek()` call, aimed at
+`target_seconds - window_seconds` (~23.3s), landed the read position at **27.8s -- more than 4
+seconds past the far edge of the ±0.5s search window**. Confirmed directly: the function's very
+first decoded frame after the seek already exceeded `target_seconds + window_seconds`, so the
+scan returned `None` immediately without ever seeing a single candidate frame, even though the
+target frame decodes perfectly well via ordinary sequential playback from the start (confirmed
+by decoding from frame 0 with no seek at all: reached the target time after 443 frames, and the
+frame there is a near-pixel-exact match to the face's stored thumbnail, `mean_abs_diff=1.44`).
+Old ASF/WMV camcorder-era files appear to be the trigger (not reproduced on any mp4/mov/mts/m2ts/
+mpg sample this pipeline was validated against when first built 2026-09-09) -- plausibly a sparse
+or inaccurate seek index on these older files, not chased further since the fix doesn't need to
+know why the seek is wrong, only that it sometimes is.
+
+**Fix**: `extract_frame_near_timestamp()` now retries with one full sequential decode from frame
+zero (no seek at all) whenever the seek-based scan comes back with nothing AND the seek wasn't
+already starting from the true beginning -- refactored the scan body into a local
+`scan_from_current_position()` helper called twice (seek-based first, sequential-from-start only
+as a fallback) rather than duplicating the loop. This is strictly a fallback, paid only for the
+rare case where the fast seek-based scan already failed -- every other file continues to pay only
+the original ~2*window_seconds*avg_fps decode cost.
+
+**Validated broadly, not just against the one reported face**: all 31 WMV-sourced faces in
+production now resolve successfully (previously at least one, likely more, silently 404ing) via a
+live re-check of `_extract_video_face_frame()`; a separate random 30-face sample across the full
+video-sourced population (any container format) also came back 30/30 -- confirms the fallback adds
+no regression for files where the seek already worked correctly. Full fast suite: 416/416 passing.
+
+Deployed same day: code-only change (no migration), `docker restart picasa_api` (bind-mounted
+`/code`, no rebuild needed). Verified live post-deploy: `manage.py check` clean, face 1099842's
+accurate endpoint now returns a real `(240, 320, 3)` frame (previously `None`), and both broader
+sweeps (31/31 wmv faces, 30/30 random sample) re-confirmed against the live container.
