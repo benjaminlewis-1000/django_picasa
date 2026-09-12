@@ -21,7 +21,7 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from face_manager.models import Face, Person
-from filepopulator.models import GeocodeCache, ImageFile
+from filepopulator.models import GeocodeCache, ImageFile, Directory, VideoFile
 from filepopulator.scripts import create_image_file
 
 # This module intentionally never imports `api.views` (or triggers URL
@@ -1029,6 +1029,43 @@ class StatsAndParametersTests(ApiTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertGreaterEqual(resp.data["num_imgs"], 1)
         self.assertGreaterEqual(resp.data["num_faces"], 1)
+
+    def test_stats_endpoint_video_fields_with_no_videos(self):
+        """No VideoFile rows at all -- percentages must not divide by zero."""
+        img = self.make_image()
+        self.make_face(img)
+        resp = self.client.get("/api/server_stats/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["num_videos"], 0)
+        self.assertEqual(resp.data["num_videos_processed"], 0)
+        self.assertEqual(resp.data["percent_video_processed"], "0.00%")
+        self.assertEqual(resp.data["percent_video_length_processed"], "0.00%")
+        self.assertEqual(resp.data["total_video_length"], "00:00:00")
+        self.assertEqual(resp.data["unprocessed_video_length"], "00:00:00")
+
+    def test_stats_endpoint_video_fields_with_data(self):
+        img = self.make_image()
+        self.make_face(img)
+        directory = Directory.objects.create(dir_path="/videos/stats_test")
+        VideoFile.objects.create(
+            filename="/videos/stats_test/a.mp4", directory=directory,
+            width=100, height=100, duration_seconds=3700,  # 1h 00m 00s
+            isProcessed=True,
+        )
+        VideoFile.objects.create(
+            filename="/videos/stats_test/b.mp4", directory=directory,
+            width=100, height=100, duration_seconds=90000,  # 1d 01h 00m 00s
+            isProcessed=False,
+        )
+        resp = self.client.get("/api/server_stats/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["num_videos"], 2)
+        self.assertEqual(resp.data["num_videos_processed"], 1)
+        self.assertEqual(resp.data["percent_video_processed"], "50.00%")
+        self.assertEqual(resp.data["total_video_length"], "1d 02:01:40")
+        self.assertEqual(resp.data["unprocessed_video_length"], "1d 01:00:00")
+        # processed = 3700 / total (93700) = 3.949...%
+        self.assertEqual(resp.data["percent_video_length_processed"], "3.95%")
 
 
 class MobileViewTests(ApiTestCase):

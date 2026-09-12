@@ -5,12 +5,25 @@ from django.contrib.auth.models import User, Group
 from django.core.paginator import Paginator
 from drf_queryfields import QueryFieldsMixin
 from face_manager.models import Person, Face
-from filepopulator.models import ImageFile, Directory
+from filepopulator.models import ImageFile, Directory, VideoFile
 from rest_framework import serializers
 import datetime
 import dateutil.parser
 import json
-from django.db.models import Q
+from django.db.models import Q, Sum
+
+
+def _format_duration_seconds(total_seconds):
+    """'Dd HH:MM:SS' -- days only included when nonzero, since most of
+    this library's individual videos/aggregates are well under a day
+    but the unprocessed-backlog total is not."""
+    total_seconds = int(round(total_seconds or 0))
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f'{days}d {hours:02d}:{minutes:02d}:{seconds:02d}'
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
 
 
 class FaceSubsetSerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
@@ -219,10 +232,16 @@ class ServerStatsSerializer(serializers.Serializer):
     num_verified = serializers.IntegerField()
     num_tagged = serializers.IntegerField()
     verified_progress = serializers.CharField(max_length=256)
+    num_videos = serializers.IntegerField()
+    num_videos_processed = serializers.IntegerField()
+    percent_video_processed = serializers.CharField(max_length=256)
+    total_video_length = serializers.CharField(max_length=256)
+    unprocessed_video_length = serializers.CharField(max_length=256)
+    percent_video_length_processed = serializers.CharField(max_length=256)
 
     class Stats(object):
         def __init__(self):
-            self.num_imgs = ImageFile.objects.count() 
+            self.num_imgs = ImageFile.objects.count()
             self.num_face_processed = ImageFile.objects.filter(isProcessed=True).count()
             self.num_people = Person.objects.count()
             self.num_faces = Face.objects.count()
@@ -236,6 +255,20 @@ class ServerStatsSerializer(serializers.Serializer):
             self.num_verified = Face.objects.filter(validated=True).count()
             self.num_tagged = Face.objects.filter(~Q(declared_name__person_name__in=settings.IGNORED_NAMES) ).count()
             self.verified_progress = f'{self.num_verified / self.num_tagged * 100:.2f}%'
+
+            self.num_videos = VideoFile.objects.count()
+            self.num_videos_processed = VideoFile.objects.filter(isProcessed=True).count()
+            video_percent = (self.num_videos_processed / self.num_videos * 100) if self.num_videos else 0.0
+            self.percent_video_processed = f'{video_percent:.2f}%'
+
+            total_seconds = VideoFile.objects.aggregate(total=Sum('duration_seconds'))['total'] or 0
+            unprocessed_seconds = VideoFile.objects.filter(isProcessed=False).aggregate(
+                total=Sum('duration_seconds'))['total'] or 0
+            self.total_video_length = _format_duration_seconds(total_seconds)
+            self.unprocessed_video_length = _format_duration_seconds(unprocessed_seconds)
+            processed_seconds = total_seconds - unprocessed_seconds
+            length_percent = (processed_seconds / total_seconds * 100) if total_seconds else 0.0
+            self.percent_video_length_processed = f'{length_percent:.2f}%'
 
     def create(self, validated_data):
         return Stats()
