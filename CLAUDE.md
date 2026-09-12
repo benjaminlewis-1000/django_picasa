@@ -3272,3 +3272,21 @@ Deployed same day: code-only change (no migration), `docker restart picasa_api` 
 `/code`, no rebuild needed). Verified live post-deploy: `manage.py check` clean, face 1099842's
 accurate endpoint now returns a real `(240, 320, 3)` frame (previously `None`), and both broader
 sweeps (31/31 wmv faces, 30/30 random sample) re-confirmed against the live container.
+
+## DONE (2026-09-12): video stats added to `/api/server_stats/`
+
+`api/serializers.py`'s `ServerStatsSerializer` gained: `num_videos`/`num_videos_processed`/
+`percent_video_processed` (mirrors the existing image equivalents), plus `total_video_length`/
+`unprocessed_video_length` (formatted via a new `_format_duration_seconds()` helper as
+`'Dd HH:MM:SS'`, days omitted when zero) and `percent_video_length_processed` -- deliberately a
+*second*, different percentage from `percent_video_processed`: percent of video **count**
+processed skews misleadingly optimistic, since the backfill (per its own scheduling) has no
+preference for short clips over long ones, but percent of total **duration** processed is the
+number that actually reflects how much footage is left to grind through. Both percentages guard
+against a `ZeroDivisionError` when `VideoFile.objects.count()` is 0 (a fresh install with no
+videos ingested yet). Real production values at deploy time: 6,976 total videos, 2,156 (30.91%)
+processed by count, but 69.15% by duration (9d 21h47m total footage, 3d 01h22m unprocessed) --
+confirms the count/duration split is a real, meaningfully different number, not a redundant
+addition. New tests: `StatsAndParametersTests.test_stats_endpoint_video_fields_with_no_videos`/
+`test_stats_endpoint_video_fields_with_data` (`api/tests.py`). Deployed same day: code-only
+change (no migration), `docker restart picasa_api`. Full fast `api` suite: 157/157 passing.
