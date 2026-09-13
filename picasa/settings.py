@@ -604,10 +604,18 @@ CELERY_BEAT_SCHEDULE = {
        # Every 3 hours, each run capped at 2.5h (kwargs below) so the
        # heavy ONNX/torch inference this task does doesn't pin cores for
        # the full multi-day backfill straight through -- runs 2.5h, sits
-       # idle ~0.5h, repeats. The advisory lock inside the task itself
-       # makes any overlap with a still-running previous invocation a
-       # harmless no-op, so exact alignment with the 3h period isn't
-       # required for correctness.
+       # idle ~0.5h, repeats. Deliberate: the ~0.5h cooldown is intentional
+       # (lets the processor take a break), not wasted time to be
+       # optimized away -- confirmed with the user 2026-09-12 after a
+       # since-reverted attempt to remove this cap entirely. The one real,
+       # separate inefficiency is that VideoFaceExtractor's models get
+       # reloaded from scratch on every new invocation (~30s) rather than
+       # staying warm across a run boundary -- if that reload cost is ever
+       # worth avoiding, the fix is keeping a model cache warm across
+       # invocations, NOT removing this cooldown. The advisory lock inside
+       # the task itself makes any overlap with a still-running previous
+       # invocation a harmless no-op, so exact alignment with the 3h
+       # period isn't required for correctness.
        'schedule': crontab(minute='0', hour='*/3'),
        'kwargs': {'max_runtime_seconds': 9000},
    },
