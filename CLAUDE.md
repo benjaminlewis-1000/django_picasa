@@ -3290,3 +3290,61 @@ confirms the count/duration split is a real, meaningfully different number, not 
 addition. New tests: `StatsAndParametersTests.test_stats_endpoint_video_fields_with_no_videos`/
 `test_stats_endpoint_video_fields_with_data` (`api/tests.py`). Deployed same day: code-only
 change (no migration), `docker restart picasa_api`. Full fast `api` suite: 157/157 passing.
+
+## DONE (2026-09-12): eliminated a wasteful second full-video decode in the video face pipeline
+
+Investigated after a user question about the ~27s/video "fixed tax" found in an earlier real
+per-video wall-time regression (see the video-face-extraction throughput investigation above).
+Confirmed first that model loading was NOT the cause -- `VideoFaceExtractor()` is already
+instantiated exactly once per scheduled task invocation (`tasks.py`'s `process_video_faces()`,
+outside its per-video loop), never reloaded per video. Profiling a real unprocessed video
+end-to-end (16.7s, 24 tracks) instead found the real cost split: `_detect_and_track` ~9s (full
+decode + det_500m every Nth frame, necessary), then `_pool_representative_frames` ~20-23s, of
+which only ~6s was actually the redetect+dual-encode inference (genuine, unavoidable CPU cost)
+-- **the rest was a second, complete sequential re-decode of the entire video, just to retrieve
+a small, already-known handful of specific frame indices** (2 per track, picked by
+`det_score*area`) that `_detect_and_track`'s own first pass had already decoded and discarded
+moments earlier.
+
+**Fix**: `_detect_and_track` now opportunistically retains a copy of every sampled frame that
+had >=1 detection (frames without any detection can never become a track member, so this is a
+safe superset of every frame `_pool_representative_frames` could ever need) in a `frame_cache`
+dict, up to a `MAX_CACHED_FRAME_BYTES` budget (1.5GB -- sized against real measurements: a busy
+1080p 24-track clip needed ~50 cached frames, ~310MB). `_pool_representative_frames` uses this
+cache directly instead of a second decode whenever it covers every frame the call actually needs;
+if the cache was capped (a multi-hour compiled-tape video with near-continuous faces could
+otherwise need many GB) or is missing anything, it transparently falls back to the exact original
+full-second-decode code path, unchanged -- so correctness never depends on the cap being sized
+right, only speed does. This structural approach was chosen over a seek-based retrieval (which
+would have reused the general shape of `extract_frame_near_timestamp`'s "seek near, verify,
+fall back" pattern) specifically because this project has already hit two separate real
+seek-accuracy bugs this same week (WMV/ASF seek overshoot, yadif time_base mismatch) -- reusing
+already-decoded, already-correct pixel data sidesteps that whole class of risk entirely rather
+than hardening a seek path further.
+
+**Validated empirically before deploying, per the user's explicit request to confirm "basically
+the same answer" against the old code** -- extracted the pre-change code from git history into a
+sibling module and ran both old and new implementations against 5 diverse real, currently-
+unprocessed production videos (a 0-track clip, 2-track, 24-track, 125-track, and 219-track) via
+direct method calls (read-only, no `.save()`), comparing every resulting track's embeddings and
+boxes: **bit-identical in every case** (`max |emb_if| diff: 0.0`, `max |emb_fn| diff: 0.0`, zero
+box mismatches) -- not merely "close," confirming the optimization changes nothing about *what*
+gets computed, only *how* the frame data is sourced. Also force-triggered the capacity-cap
+fallback path (temporarily set the byte budget to 0) and reconfirmed bit-identical output there
+too. Real speedup is highly shape-dependent, exactly as expected given what's actually being
+cut: the 0-track clip's pool stage went from 2.03s to 0.00s (skipped entirely -- no frames ever
+needed), the 2-track clip's from 9.98s to 1.11s (~9x), while the 219-track and 125-track videos
+barely moved (164.82s->151.51s, 117.34s->116.42s) since redetect/encode inference cost dominates
+overwhelmingly once track counts get large. This matters most for exactly the population that
+makes up most of the remaining backlog (per the earlier duration-vs-count investigation): short
+clips with only a couple of visible faces, where the old code was paying for a full redundant
+decode just to fetch 1-2 frames. Full fast suite: 418/418 passing (413 baseline + no new tests
+needed -- the optimization is internal/behavior-preserving, verified via the ad hoc real-video
+comparison above rather than new unit tests, since the correctness claim being tested --
+"bit-identical to the previous, already-tested implementation" -- isn't itself expressible as a
+synthetic unit test).
+
+Deployed 2026-09-12: code-only change (no migration), `docker restart picasa_api` (interrupts
+any in-progress scheduled run, same as any other deploy -- timed deliberately around a manual
+`process_video_faces(max_runtime_seconds=9000)` invocation so the 2.5h run naturally finishes a
+few minutes before the next scheduled midnight tick, rather than colliding with it).

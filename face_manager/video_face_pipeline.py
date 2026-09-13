@@ -57,6 +57,14 @@ CENTROID_OUTLIER_SIM_FLOOR = 0.35
 DISALLOWED_DIST = 1e6
 REDETECT_PAD_PCT = 0.6
 FACENET_INPUT_SIZE = 160
+# Cap on how many bytes of full decoded frames _detect_and_track will
+# opportunistically retain per video (see its own docstring/comment) --
+# 1.5GB comfortably covers a typical real video's sampled-with-a-detection
+# frame count (measured: a busy 16.7s/24-track 1080p clip needed ~50
+# sampled frames, ~310MB) while bounding the worst case for a multi-hour
+# compiled tape with near-continuous faces, which just falls back to the
+# pre-existing second-decode path instead of risking unbounded memory use.
+MAX_CACHED_FRAME_BYTES = 1_500_000_000
 
 
 def cos_to_euclidean(cos_thresh):
@@ -608,6 +616,23 @@ class VideoFaceExtractor(object):
         stride = sample_stride(fps)
         sampled = []
         idx = 0
+        # Opportunistically cache every sampled frame that had >=1
+        # detection, up to MAX_CACHED_FRAME_BYTES total -- lets
+        # _pool_representative_frames skip its own second full decode
+        # entirely for the (typical) case where the handful of frames it
+        # ends up needing were already retained here, at zero extra decode
+        # cost (this loop already holds each frame in memory momentarily
+        # regardless). Bounded rather than unconditional: a multi-hour
+        # compiled home-movie tape with a face in nearly every sampled
+        # frame could otherwise retain gigabytes of full frames for a
+        # single video -- once the cap is hit, caching just stops (the
+        # detection loop itself is untouched/uninterrupted) and
+        # _pool_representative_frames transparently falls back to its own
+        # original full-second-decode path, exactly as before this change,
+        # so correctness never depends on the cap being sized right.
+        frame_cache = {}
+        cache_bytes = 0
+        cache_capped = False
         for frame in ffmpeg_frame_iterator(video_path, width, height, vf_filter=vf_filter):
             if idx % stride == 0:
                 bboxes, kpss = self.det_model.detect(frame, max_num=0, metric='default')
@@ -615,6 +640,12 @@ class VideoFaceExtractor(object):
                 scores = bboxes[:, 4].tolist() if bboxes.shape[0] else []
                 kps_list = kpss.tolist() if kpss is not None and bboxes.shape[0] else []
                 sampled.append((idx, boxes, scores, kps_list))
+                if boxes and not cache_capped:
+                    if cache_bytes + frame.nbytes > MAX_CACHED_FRAME_BYTES:
+                        cache_capped = True
+                    else:
+                        frame_cache[idx] = frame.copy()
+                        cache_bytes += frame.nbytes
             idx += 1
         # idx is now the true total decoded frame count -- returned so the
         # caller can derive a REAL fps (total_frames / known duration)
@@ -622,13 +653,22 @@ class VideoFaceExtractor(object):
         # of which can be wrong for a given file in different ways (see
         # process_video's real_fps comment for the real case that proved
         # this necessary).
-        return _iou_track(sampled), stride, idx
+        return _iou_track(sampled), stride, idx, frame_cache, cache_capped
 
-    def _pool_representative_frames(self, video_path, width, height, vf_filter, tracks):
+    def _pool_representative_frames(self, video_path, width, height, vf_filter, tracks,
+                                     frame_cache=None, cache_capped=True):
         """Picks each track's best N_BEST_FRAMES_PER_TRACK frames (by
-        det_score*area), re-decodes just those frames, re-detects each
-        with det_10g, and encodes with both models. Mutates each track
-        dict in place, adding 'reps': [{'emb_if','emb_fn','frame_idx','box'}...]."""
+        det_score*area), re-detects each with det_10g, and encodes with
+        both models. Mutates each track dict in place, adding
+        'reps': [{'emb_if','emb_fn','frame_idx','box'}...].
+
+        frame_cache (from _detect_and_track) already holds full pixel
+        data for most/all sampled-with-a-detection frames -- reused
+        directly instead of a second full decode whenever it covers every
+        frame this call ends up needing. Falls back to the original
+        decode-the-whole-video-again path (unchanged) whenever the cache
+        was capped or is otherwise missing something needed, so
+        correctness never depends on the cache being complete."""
         needed_frames = set()
         for t in tracks:
             quality = []
@@ -641,12 +681,16 @@ class VideoFaceExtractor(object):
             for i in best_idxs:
                 needed_frames.add(t['frames'][i])
 
-        frame_pixels = {}
-        idx = 0
-        for frame in ffmpeg_frame_iterator(video_path, width, height, vf_filter=vf_filter):
-            if idx in needed_frames:
-                frame_pixels[idx] = frame.copy()
-            idx += 1
+        frame_cache = frame_cache or {}
+        if cache_capped or not needed_frames.issubset(frame_cache.keys()):
+            frame_pixels = {}
+            idx = 0
+            for frame in ffmpeg_frame_iterator(video_path, width, height, vf_filter=vf_filter):
+                if idx in needed_frames:
+                    frame_pixels[idx] = frame.copy()
+                idx += 1
+        else:
+            frame_pixels = {idx: frame_cache[idx] for idx in needed_frames}
 
         for t in tracks:
             reps = []
@@ -758,7 +802,9 @@ class VideoFaceExtractor(object):
         deinterlace = field_order not in ('progressive', 'unknown')
         vf_filter = 'yadif=0' if deinterlace else None
 
-        tracks, stride, total_frames = self._detect_and_track(video_path, width, height, fps, vf_filter)
+        tracks, stride, total_frames, frame_cache, cache_capped = self._detect_and_track(
+            video_path, width, height, fps, vf_filter
+        )
         if not tracks:
             return []
 
@@ -792,7 +838,10 @@ class VideoFaceExtractor(object):
             )
         fps = real_fps
 
-        frame_pixels = self._pool_representative_frames(video_path, width, height, vf_filter, tracks)
+        frame_pixels = self._pool_representative_frames(
+            video_path, width, height, vf_filter, tracks,
+            frame_cache=frame_cache, cache_capped=cache_capped,
+        )
 
         # Flatten to one row per representative frame for clustering.
         embs_if, embs_fn, face_track_id = [], [], []
