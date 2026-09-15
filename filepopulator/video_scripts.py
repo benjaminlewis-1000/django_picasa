@@ -282,3 +282,18 @@ def add_videos_from_root_dir(root_dirs):
             except Exception as e:
                 print(f"{filename} was not processed. {e}")
                 _record_video_failure(filename, str(e))
+
+
+def delete_removed_videos():
+    """Mirrors scripts.py's delete_removed_photos() -- a VideoFile row
+    for a file that's since vanished from disk (moved, renamed outside
+    this app, deleted) isn't cleaned up by add_videos_from_root_dir()
+    alone, which only ever adds/updates. Previously a deliberate Phase 1
+    scope cut (see CLAUDE.md); built once a real case came up (a VTS_*
+    DVD-rip .avi moved out of the library, 2026-09-15). Uses .delete()
+    per-instance (not a bulk queryset .delete()) so VideoFile.delete()'s
+    own override runs -- cleans up the video's thumbnails and its Face
+    rows' thumbnails too, not just the DB rows."""
+    for video in VideoFile.objects.all():
+        if not os.path.isfile(video.filename):
+            video.delete()

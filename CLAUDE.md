@@ -3421,3 +3421,45 @@ accumulates only from new failures going forward, rather than building a fragile
 log-parsing backfill for a fairly small, already-diagnosed set. Full fast suite: 420/420 passing
 (418 baseline + 2 new). Deployed same day: `filepopulator.0012` migrated, `docker restart
 picasa_api`.
+
+## DONE (2026-09-15): built `delete_removed_videos()`, closing the Phase 1 "no video-side cleanup"
+scope cut
+
+Triggered by a real case: the user moved `/videos/Our_Home_Videos/Pre_camcorder/VTS_01_0.avi`
+(a one-off DVD rip -- checked, confirmed via both the DB and a real filesystem `find` that this
+is the ONLY `VTS_*`-named video in the whole library, so not a pattern worth broader handling)
+out of the library, expecting its `VideoFile` row and the 23 `Face` rows extracted from it to
+disappear on the next scan. They wouldn't have -- `filepopulator/tasks.py`'s
+`load_videos_into_db()` only ever calls `add_videos_from_root_dir()` (add/update), with no
+video-side equivalent of `delete_removed_photos()` (a known, deliberate Phase 1 scope cut, see
+this file's own "Video support" write-up).
+
+**Built**: `delete_removed_videos()` (`filepopulator/video_scripts.py`), a direct mirror of
+`delete_removed_photos()` -- iterates every `VideoFile`, calls `.delete()` on any whose file no
+longer exists on disk. Wired into `load_videos_into_db()` right after
+`add_videos_from_root_dir()`, matching the existing image-side task's own two-step add/delete
+shape. **`VideoFile` also gained its own `.delete()` override** (previously had none -- unlike
+`ImageFile`), mirroring `ImageFile.delete()`'s already-fixed pattern: `Face.source_video_file`
+is `on_delete=CASCADE`, and Django's bulk-SQL cascade-delete collector does NOT call each `Face`'s
+own overridden `delete()` (the one that removes its `face_thumbnail` file from disk) -- so
+without this override, every video cleanup would have silently orphaned that video's Face
+thumbnail files on disk, the exact same bug already found and fixed for images. Deletes per-Face
+(not a bulk queryset `.delete()`) for this reason, plus removes the video's own
+`thumbnail_big`/`_medium`/`_small` files.
+
+New tests (`filepopulator/tests.py`, `DeleteRemovedVideosTests`): a basic vanished-vs-still-
+present row test, and a real-Face-attached test confirming both the `Face` row and its thumbnail
+file are cleaned up, not just the `VideoFile` row. Full fast suite: 422/422 passing (420 baseline
++ 2 new).
+
+**Validated against the real, live case, not just tests**: ran `delete_removed_videos()` directly
+against production (no container restart needed for a one-off `manage.py shell` call -- code was
+already synced to the bind-mounted checkout). Before: `VideoFile` pk 4892 existed, file confirmed
+gone from disk, 23 attached `Face` rows (including 1118222) with all 23 thumbnail files present
+on disk. After: `VideoFile` 4892 gone, all 23 `Face` rows gone (`source_video_file_id=4892` count
+0), thumbnail files confirmed removed from disk. Deployed to the live checkout the same way
+(code-only, no migration) -- `docker restart picasa_api` deliberately deferred to the next
+natural break in the currently-running scheduled `video_face_extraction` pass (see the cooldown-
+is-intentional note earlier in this file) so this doesn't interrupt in-progress backfill work;
+until that restart, the fix is proven correct (ran directly above) but not yet wired into the
+hourly scheduled `populate_videos_from_root` task in the live process.

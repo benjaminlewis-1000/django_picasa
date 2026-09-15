@@ -1156,6 +1156,28 @@ class VideoFile(models.Model):
     def __str__(self):
         return self.filename
 
+    def delete(self):
+        # Same fix as ImageFile.delete() above, mirrored for video:
+        # Face.source_video_file is on_delete=CASCADE, and Django's
+        # cascade-delete collector removes those Face rows with a bulk
+        # SQL DELETE that does NOT call each Face's overridden delete()
+        # (the one that removes its face_thumbnail file from disk) --
+        # so those thumbnails would be silently orphaned on disk every
+        # time a VideoFile is deleted this way (e.g.
+        # delete_removed_videos(), run on every scheduled video ingestion
+        # pass for videos that vanished from disk).
+        from face_manager.models import Face
+        for face in Face.objects.filter(source_video_file=self):
+            face.delete()
+
+        for thumb in (self.thumbnail_big, self.thumbnail_medium, self.thumbnail_small):
+            try:
+                os.remove(thumb.path)
+            except Exception:
+                pass
+
+        super(VideoFile, self).delete()
+
 
 class SimilarImagePair(models.Model):
     """One edge in the near-duplicate graph: two ImageFiles whose phash
