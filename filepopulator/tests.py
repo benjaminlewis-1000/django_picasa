@@ -15,6 +15,7 @@ from datetime import datetime
 from textwrap import wrap # for splitting string
 import os
 import shutil
+import tempfile
 import numpy as np
 import imageio
 import time
@@ -33,7 +34,7 @@ from django.core.management import call_command
 from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, guess_date_from_filename, VideoFile, FailedVideoFile
 # from .forms import ImageFileForm, DirectoryForm
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
-from .video_scripts import create_video_file, add_videos_from_root_dir, _parse_exif_date
+from .video_scripts import create_video_file, add_videos_from_root_dir, delete_removed_videos, _parse_exif_date
 from face_manager.models import Face
 from common.open_img_oriented import apply_exif_orientation
 
@@ -2566,6 +2567,73 @@ class VideoIngestionTests(TestCase):
 
         v = VideoFile.objects.get(filename=path)
         self.assertIsNone(v.file_size_bytes)
+
+
+class DeleteRemovedVideosTests(TestCase):
+    """delete_removed_videos() -- the video-side mirror of scripts.py's
+    delete_removed_photos(), built 2026-09-15 (previously a deliberate
+    Phase 1 scope cut -- see CLAUDE.md) once a real case came up (a
+    VTS_*-named DVD-rip .avi moved out of the library, leaving its
+    VideoFile row and Face row stranded)."""
+
+    VIDEO_DIR = '/photos/video_samples'
+
+    def tearDown(self):
+        VideoFile.objects.all().delete()
+
+    def _a_real_fixture_copy(self):
+        from django.conf import settings
+        from .video_scripts import _run_ffprobe
+
+        for filename in sorted(os.listdir(self.VIDEO_DIR)):
+            src = os.path.join(self.VIDEO_DIR, filename)
+            probe = _run_ffprobe(src)
+            duration = float(probe.get('format', {}).get('duration', 0) or 0)
+            if duration >= settings.MIN_VIDEO_DURATION_SECONDS:
+                tmp_dir = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+                dest = os.path.join(tmp_dir, filename)
+                shutil.copy(src, dest)
+                return dest
+        self.skipTest("no fixture in VIDEO_DIR clears MIN_VIDEO_DURATION_SECONDS")
+
+    def test_delete_removed_videos_removes_vanished_rows_only(self):
+        gone_path = self._a_real_fixture_copy()
+        create_video_file(gone_path)
+        self.assertTrue(VideoFile.objects.filter(filename=gone_path).exists())
+
+        staying_path = self._a_real_fixture_copy()
+        create_video_file(staying_path)
+
+        os.remove(gone_path)
+        delete_removed_videos()
+
+        self.assertFalse(VideoFile.objects.filter(filename=gone_path).exists())
+        self.assertTrue(VideoFile.objects.filter(filename=staying_path).exists())
+
+    def test_delete_removed_videos_cleans_up_attached_face_and_thumbnail(self):
+        from face_manager.models import Person
+
+        gone_path = self._a_real_fixture_copy()
+        create_video_file(gone_path)
+        video = VideoFile.objects.get(filename=gone_path)
+
+        person, _ = Person.objects.get_or_create(person_name="DeleteRemovedVideosTests Person")
+        face = Face(
+            source_video_file=video, declared_name=person,
+            box_left=1, box_top=1, box_right=min(40, video.width - 1), box_bottom=min(40, video.height - 1),
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.save()
+        thumb_path = face.face_thumbnail.path
+        self.assertTrue(os.path.isfile(thumb_path))
+
+        os.remove(gone_path)
+        delete_removed_videos()
+
+        self.assertFalse(VideoFile.objects.filter(pk=video.pk).exists())
+        self.assertFalse(Face.objects.filter(pk=face.pk).exists())
+        self.assertFalse(os.path.isfile(thumb_path))
 
 
 class ParseExifVideoDateTests(unittest.TestCase):
