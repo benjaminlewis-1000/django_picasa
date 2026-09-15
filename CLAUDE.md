@@ -23,6 +23,13 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   both a frontend UI and a backend endpoint/storage design).
 - A looser classification threshold specifically for faces with `.ignore` already in their reject
   list was brainstormed but never validated or built.
+- The ~8 real multi-hour digitized-tape videos (2000.mpg, Christine Funeral.mpg, etc., up to
+  ~2.75hrs each) that hit `PER_VIDEO_TIMEOUT_SECONDS` (30min) during face extraction and fail
+  outright -- worth considering splitting these into shorter chunks (e.g. via `ffmpeg -ss`/`-t`
+  segments) before/during face extraction rather than raising the timeout further, since the
+  per-video timeout exists for a reason (catches genuine hangs, see the `-fps_mode passthrough`
+  fix below) and a multi-hour single pass is a lot of at-risk work to lose to one bad frame.
+  Brainstormed 2026-09-14, not scoped or started.
 
 **Bigger, deliberately unscoped features:**
 - Slideshow metadata overlay (photo date + location shown alongside the image).
@@ -3348,3 +3355,69 @@ Deployed 2026-09-12: code-only change (no migration), `docker restart picasa_api
 any in-progress scheduled run, same as any other deploy -- timed deliberately around a manual
 `process_video_faces(max_runtime_seconds=9000)` invocation so the 2.5h run naturally finishes a
 few minutes before the next scheduled midnight tick, rather than colliding with it).
+
+**Measured real-world effect after 2 days (2026-09-14)**: comparing per-video wall time before vs.
+after the deploy (2,661 samples before, 1,850 after, via the same consecutive-log-line-diff
+method used earlier): active throughput **40 videos/hour -> 51 videos/hour** (~27% faster), wall-
+time-per-second-of-footage ratio **1.76x -> 1.52x**. A real, measurable win, but more modest than
+the per-video speedup numbers alone suggested -- expected, since the fix only removes the wasted
+second decode, and for videos with many tracks the genuinely unavoidable redetect+dual-encode
+inference cost dominates regardless. Backlog: 2,156 -> 4,060 processed over those 2 days (6,988
+total, 2,928 remaining) -- at the improved effective rate (~51/hr active x ~83% duty cycle), ETA
+dropped from ~7 days to **~2.9 days**.
+
+## DONE (2026-09-14): fixed a real ffmpeg frame-duplication bug causing short clips to "hang" for
+the full 30-minute per-video timeout
+
+Investigated a cluster of face-extraction failures found while explaining the backfill's real
+throughput to the user -- of 35 total failures since 2026-09-09, only 8 were genuinely long
+videos hitting `PER_VIDEO_TIMEOUT_SECONDS` (2.75hr digitized VHS tapes -- see the Open TODOs
+entry above about splitting these). The other 27 split into two unrelated causes:
+- **14: `KeyError: 'streams'` from `ffprobe_info()`** -- almost entirely `/photos/aggregated/...`
+  and `temp_holding/...` paths, i.e. files that came through the new upload feature and apparently
+  have no decodable video stream by the time face extraction reaches them, despite passing
+  upload-time validation. Not yet investigated further -- a real, separate gap between what the
+  upload endpoint verifies (`av.open()` succeeds, a real stream exists) and what `ffprobe` finds
+  later; worth a closer look at what's actually landing in that directory.
+- **13: genuine 30-minute timeouts on videos as short as 3.2 seconds.** This is the one
+  root-caused and fixed this session. `ffprobe` on one such file
+  (`/videos/Our_Home_Videos/Phone/2022/20221026_122728_02.mp4`, 3.2s, 290 real frames) reports
+  `r_frame_rate=90000/1` -- literally its raw `1/90000` time_base echoed back as a "frame rate"
+  (a known ffprobe heuristic failure on content with irregular presentation-timestamp spacing --
+  common on phone slow-mo/burst-style clips -- not file corruption; `avg_frame_rate` correctly
+  reports the real ~90fps). `ffmpeg_frame_iterator()`'s raw-pipe command never set an explicit
+  frame-rate/sync mode, so ffmpeg's default behavior tries to reconcile real decoded-frame
+  timestamps against that bogus 90,000fps target by DUPLICATING frames -- confirmed directly by
+  reproducing outside the pipeline: `ffmpeg -i <file> -f rawvideo -pix_fmt bgr24 out.raw` produced
+  **over 9GB of output (2000+ duplicated frames) and was still growing** when killed after 15s,
+  instead of finishing in under a second with the true 290-frame, ~1.35GB output. This is what
+  manifested as the timeout -- not a true hang, just an effectively-unbounded stream of duplicate
+  frames that would never naturally finish (or would eventually fill disk) well before the 30-
+  minute alarm fires.
+
+  **Fix**: added `-fps_mode passthrough` (an *output* option, placed after `-i`) to
+  `ffmpeg_frame_iterator()`'s command -- outputs exactly one frame per real decoded frame, no
+  duplication or dropping, regardless of any declared/bogus frame rate. Confirmed harmless on
+  well-formed constant-frame-rate video: byte-identical raw output with and without the flag on a
+  real fixture. **Validated against all 6 real previously-timing-out short clips**: all now decode
+  in 3-6 seconds with correct frame counts (290, 316, 304, 447, 449, 417 -- matching each file's
+  real `nb_frames`), instead of hanging. Also re-ran the same old-vs-new bit-identical comparison
+  harness used for the second-decode fix above against a normal video -- `max_if_diff: 0.0`,
+  confirming zero behavior change for files that were never affected by the bug.
+
+**Also added this session, per the user's request: `VideoFile.face_extraction_failed`/
+`face_extraction_error`** (migration `filepopulator.0012`) -- set by
+`face_manager.tasks.process_video_faces()`'s existing except branch (which already logged and
+marked `isProcessed=True` regardless of success/failure, but had no persisted record of *which*
+videos failed or why, per this file's own earlier note: "not yet surfaced anywhere an operator
+would see it without checking logs"). Distinct from `FailedVideoFile` (ingestion-time failures --
+a file that never became a `VideoFile` row at all). Surfaced as `num_videos_failed` on
+`/api/server_stats/` (`ServerStatsSerializer`). New tests:
+`ProcessVideoFacesFailureTrackingTests` (`face_manager/tests.py`, mocks `VideoFaceExtractor`
+entirely to stay fast) and an extra `VideoFile` row in `StatsAndParametersTests.
+test_stats_endpoint_video_fields_with_data` (`api/tests.py`). Deliberately not backfilled for the
+35 already-known failures found by log-grepping this session -- the counter starts at 0 and
+accumulates only from new failures going forward, rather than building a fragile one-off
+log-parsing backfill for a fairly small, already-diagnosed set. Full fast suite: 420/420 passing
+(418 baseline + 2 new). Deployed same day: `filepopulator.0012` migrated, `docker restart
+picasa_api`.

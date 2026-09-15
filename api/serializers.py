@@ -238,6 +238,7 @@ class ServerStatsSerializer(serializers.Serializer):
     total_video_length = serializers.CharField(max_length=256)
     unprocessed_video_length = serializers.CharField(max_length=256)
     percent_video_length_processed = serializers.CharField(max_length=256)
+    num_videos_failed = serializers.IntegerField()
 
     class Stats(object):
         def __init__(self):
@@ -269,6 +270,12 @@ class ServerStatsSerializer(serializers.Serializer):
             processed_seconds = total_seconds - unprocessed_seconds
             length_percent = (processed_seconds / total_seconds * 100) if total_seconds else 0.0
             self.percent_video_length_processed = f'{length_percent:.2f}%'
+
+            # Distinct from FailedVideoFile (an ingestion-time failure --
+            # never even became a VideoFile row) -- this counts a
+            # VideoFile that WAS ingested but whose face-extraction pass
+            # raised (see face_manager.tasks.process_video_faces).
+            self.num_videos_failed = VideoFile.objects.filter(face_extraction_failed=True).count()
 
     def create(self, validated_data):
         return Stats()
