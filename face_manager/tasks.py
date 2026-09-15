@@ -142,19 +142,20 @@ def process_video_faces(max_runtime_seconds=None):
                 settings.LOGGER.debug(
                     f"Video face extraction: {video.filename} -> {len(faces)} face group(s)."
                 )
-            except Exception:
+            except Exception as exc:
                 settings.LOGGER.error(
                     f"Video face extraction failed for {video.filename}", exc_info=True
                 )
+                video.face_extraction_failed = True
+                video.face_extraction_error = f"{type(exc).__name__}: {exc}"[:2000]
             finally:
                 # Mark processed regardless of success/failure, same as
                 # find_and_encode_faces()'s corrupted-image handling --
                 # a video that fails once shouldn't be retried forever on
-                # every scheduled run. No separate failure-tracking field
-                # for this (unlike FailedVideoFile, which is about
-                # ingestion, not face extraction) -- the error is logged,
-                # not silently dropped, but not yet surfaced anywhere an
-                # operator would see it without checking logs.
+                # every scheduled run. face_extraction_failed/_error (set
+                # in the except branch above) make this visible on
+                # server_stats and queryable, unlike FailedVideoFile
+                # (which is about ingestion, not face extraction).
                 video.isProcessed = True
                 video.save()
 

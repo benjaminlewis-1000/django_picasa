@@ -287,7 +287,29 @@ def ffmpeg_frame_iterator(path, width, height, vf_filter=None, seek_seconds=0):
     reading and don't need the very first yielded frame to be an exact
     timestamp (e.g. backfill_video_thumbnail_timestamps.py, which
     pixel-matches across a window of candidates rather than trusting any
-    single frame's assumed index)."""
+    single frame's assumed index).
+
+    -fps_mode passthrough (an OUTPUT option -- must come after -i, not
+    before): real, confirmed bug found 2026-09-14 investigating a
+    cluster of face-extraction failures on videos that timed out at
+    exactly PER_VIDEO_TIMEOUT_SECONDS despite being only a few seconds
+    long. Root cause: some real files (phone slow-mo/burst-style clips)
+    report a nonsensical r_frame_rate via ffprobe -- confirmed on one
+    such file, `90000/1` (literally its raw 1/90000 time_base echoed
+    back as if it were a frame rate, not the real ~90fps `avg_frame_rate`
+    correctly reports) -- an ffprobe heuristic failure on irregular
+    presentation-timestamp spacing, not a corrupt file. Without this
+    flag, ffmpeg's raw-pipe muxer tries to reconcile real decoded-frame
+    timestamps against that bogus target rate by DUPLICATING frames --
+    confirmed directly: a 290-frame, ~3.2s video produced over 9GB of
+    output (~2000+ duplicated frames) and was still growing when killed
+    after 15s, instead of finishing in under a second. `-fps_mode
+    passthrough` outputs exactly one frame per decoded frame with no
+    duplication/dropping, matching what this pipeline actually wants
+    (every real decoded frame, in order) regardless of any declared
+    frame rate. Confirmed harmless on well-formed constant-frame-rate
+    video too -- byte-identical raw output with and without the flag on
+    a real, non-pathological fixture."""
     frame_size = width * height * 3
     cmd = ['ffmpeg', '-v', 'error']
     if seek_seconds > 0:
@@ -295,7 +317,7 @@ def ffmpeg_frame_iterator(path, width, height, vf_filter=None, seek_seconds=0):
     cmd += ['-i', path]
     if vf_filter:
         cmd += ['-vf', vf_filter]
-    cmd += ['-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
+    cmd += ['-fps_mode', 'passthrough', '-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=frame_size * 2)
     try:
         while True:

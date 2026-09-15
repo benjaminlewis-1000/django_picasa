@@ -1143,6 +1143,16 @@ class VideoFile(models.Model):
     video_load_failed = models.BooleanField(default=False)
     video_load_error = models.TextField(null=True, blank=True)
 
+    # Set by face_manager.tasks.process_video_faces() when
+    # VideoFaceExtractor.process_video() raises for this video -- a
+    # separate, later pipeline stage than video_load_failed/_error above
+    # (which is about ingestion never having decoded this file at all).
+    # isProcessed is still set True either way (a video that fails once
+    # isn't retried forever), so this is the only way to distinguish "no
+    # faces found" from "face extraction actually failed" after the fact.
+    face_extraction_failed = models.BooleanField(default=False)
+    face_extraction_error = models.TextField(null=True, blank=True)
+
     def __str__(self):
         return self.filename
 

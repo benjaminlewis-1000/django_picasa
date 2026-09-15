@@ -2109,3 +2109,40 @@ class VideoFaceExtractorRealInferenceTests(TestCase):
             f.delete()
         second = self.extractor.process_video(self.video)
         self.assertGreaterEqual(len(second), 1)
+
+
+class ProcessVideoFacesFailureTrackingTests(TestCase):
+    """face_extraction_failed/_error (filepopulator.VideoFile) -- set by
+    process_video_faces()'s except branch, surfaced on /api/server_stats/
+    (see api/serializers.py). Mocks VideoFaceExtractor entirely so this
+    stays a fast test -- the real pipeline's own success path is already
+    covered by VideoFaceExtractorRealInferenceTests above."""
+
+    def setUp(self):
+        from filepopulator.models import Directory, VideoFile
+        directory = Directory.objects.create(dir_path='/videos/failure_test')
+        self.video = VideoFile.objects.create(
+            filename='/videos/failure_test/a.mp4', directory=directory,
+            width=100, height=100, duration_seconds=5, isProcessed=False,
+        )
+
+    def test_failure_sets_tracking_fields_and_still_marks_processed(self):
+        from face_manager.tasks import process_video_faces
+        with patch('video_face_pipeline.VideoFaceExtractor') as MockExtractor:
+            MockExtractor.return_value.process_video.side_effect = RuntimeError("boom")
+            process_video_faces()
+        self.video.refresh_from_db()
+        self.assertTrue(self.video.isProcessed)
+        self.assertTrue(self.video.face_extraction_failed)
+        self.assertIn("RuntimeError", self.video.face_extraction_error)
+        self.assertIn("boom", self.video.face_extraction_error)
+
+    def test_success_leaves_tracking_fields_unset(self):
+        from face_manager.tasks import process_video_faces
+        with patch('video_face_pipeline.VideoFaceExtractor') as MockExtractor:
+            MockExtractor.return_value.process_video.return_value = []
+            process_video_faces()
+        self.video.refresh_from_db()
+        self.assertTrue(self.video.isProcessed)
+        self.assertFalse(self.video.face_extraction_failed)
+        self.assertIsNone(self.video.face_extraction_error)
