@@ -167,6 +167,14 @@ NOMINATIM_USER_AGENT = 'django_picasa (self-hosted photo library, contact: ' + o
 # different (even time-adjacent) photos scored 20+ -- see
 # filepopulator/similarity.py.
 PHASH_SIMILARITY_THRESHOLD = 10
+
+# api/views.py's PersonParamView (GET /paginate_obj_ids/<id>/<field>) --
+# large enough that a ~100k-face queue like .ignore fully loads in ~50
+# requests, small enough that each individual page is fast. The frontend
+# (imageScreen.jsx) renders page 1 immediately and streams the rest in
+# behind it, rather than waiting for the whole set the way this endpoint
+# used to behave (see CLAUDE.md's write-up).
+FACE_PAGE_SIZE = 2000
 # if os.path.isfile(LOCKFILE):
 #     os.remove(LOCKFILE)
 

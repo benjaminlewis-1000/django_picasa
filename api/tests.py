@@ -1057,15 +1057,21 @@ class StatsAndParametersTests(ApiTestCase):
             width=100, height=100, duration_seconds=90000,  # 1d 01h 00m 00s
             isProcessed=False,
         )
+        VideoFile.objects.create(
+            filename="/videos/stats_test/c.mp4", directory=directory,
+            width=100, height=100, duration_seconds=5, isProcessed=True,
+            face_extraction_failed=True, face_extraction_error="RuntimeError: boom",
+        )
         resp = self.client.get("/api/server_stats/")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.data["num_videos"], 2)
-        self.assertEqual(resp.data["num_videos_processed"], 1)
-        self.assertEqual(resp.data["percent_video_processed"], "50.00%")
-        self.assertEqual(resp.data["total_video_length"], "1d 02:01:40")
+        self.assertEqual(resp.data["num_videos"], 3)
+        self.assertEqual(resp.data["num_videos_processed"], 2)
+        self.assertEqual(resp.data["percent_video_processed"], "66.67%")
+        self.assertEqual(resp.data["total_video_length"], "1d 02:01:45")
         self.assertEqual(resp.data["unprocessed_video_length"], "1d 01:00:00")
-        # processed = 3700 / total (93700) = 3.949...%
+        # processed = 3705 / total (93705) = 3.954...%
         self.assertEqual(resp.data["percent_video_length_processed"], "3.95%")
+        self.assertEqual(resp.data["num_videos_failed"], 1)
 
 
 class MobileViewTests(ApiTestCase):

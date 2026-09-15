@@ -458,6 +458,20 @@ class PersonParamView(APIView):
                 return render_404(request, 'Page requested is not an integer.')
         else:
             page = 1
+        page = max(page, 1)
+
+        # Real pagination (this `page` param used to be parsed and then
+        # never actually used - the response always contained the entire
+        # matching id list). For a queue the size of .ignore (~100k faces)
+        # that meant one request returning a ~100k-element JSON array,
+        # taking several seconds to query/serialize/download/iterate
+        # before the frontend would show a single tile - see CLAUDE.md's
+        # write-up. FACE_PAGE_SIZE-sized slices fix that; the frontend
+        # (imageScreen.jsx) renders page 1 immediately and streams the
+        # rest in behind it.
+        page_size = settings.FACE_PAGE_SIZE
+        start = (page - 1) * page_size
+        end = start + page_size
 
         if 'only_unverified' in params.keys():
             value = params['only_unverified']
@@ -538,14 +552,26 @@ class PersonParamView(APIView):
                             faces_qs = faces_qs.filter(
                                 Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False)
                             )
+                    # .order_by('id') -- pagination needs a stable, explicit
+                    # order (an unordered queryset isn't guaranteed to come
+                    # back in the same order across separate LIMIT/OFFSET
+                    # requests, which could silently duplicate or skip ids
+                    # between pages). Cluster groups are fetched in the same
+                    # sliced query as the ids themselves, rather than a
+                    # second scan over the whole queryset like before - both
+                    # now cost only as much as one page, not the whole set.
+                    page_rows = list(
+                        faces_qs.order_by('id')
+                        .values_list('id', 'verification_cluster_group')[start:end]
+                    )
                     cluster_groups = {
-                        str(fid): group for fid, group in
-                        faces_qs.values_list('id', 'verification_cluster_group')
-                        if group is not None
+                        str(fid): group for fid, group in page_rows if group is not None
                     }
-                    faces = faces_qs.values_list('id', flat=True)
+                    faces = [fid for fid, _ in page_rows]
                 else:
-                    faces = Face.objects.filter(default_query).values_list('id', flat=True)
+                    faces = list(
+                        Face.objects.filter(default_query).order_by('id').values_list('id', flat=True)[start:end]
+                    )
             else:
 
                 poss_query = Q(poss_ident1=person_obj)
@@ -575,20 +601,18 @@ class PersonParamView(APIView):
                         # overlap either way.
                         poss_query &= (Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False))
 
-                faces1 = list(Face.objects.filter(poss_query).values_list('id', 'weight_1'))
-                # faces2 = list(Face.objects.filter(poss_ident2=person_obj).values_list('id', 'weight_2'))
-                # faces3 = list(Face.objects.filter(poss_ident3=person_obj).values_list('id', 'weight_3'))
-                # faces4 = list(Face.objects.filter(poss_ident4=person_obj).values_list('id', 'weight_4'))
-                # faces5 = list(Face.objects.filter(poss_ident5=person_obj).values_list('id', 'weight_5'))
+                # Was: fetch every matching row, then sort descending by
+                # weight_1 in Python - fine when the whole set was always
+                # returned anyway, but that meant materializing and sorting
+                # the entire queryset (all of .ignore's ~100k rows) on
+                # every single request regardless of how much was actually
+                # shown. weight_1 is a plain column, so Postgres can do
+                # this ordering directly, which is also what makes real
+                # LIMIT/OFFSET slicing possible here.
+                faces = list(
+                    Face.objects.filter(poss_query).order_by('-weight_1').values_list('id', flat=True)[start:end]
+                )
 
-                f = faces1  # + faces2  #+ faces3 + faces4 + faces5
-                if len(f) > 0:
-                    faces = sorted(f, key=lambda tup: tup[1], reverse=True)
-                    # print("Faces", len(faces1), faces1[0], faces)
-                    faces = [f[0] for f in faces]
-                else:
-                    faces = []
-                
             id_list = list(faces)
             video_face_ids = list(
                 Face.objects.filter(id__in=id_list, source_video_file__isnull=False)
@@ -605,10 +629,19 @@ class PersonParamView(APIView):
             # walks straight through for both tile order and modal prev/next
             # paging, so ordering has to happen here rather than client-side.
             image_set = ImageFile.objects.filter(directory=dir_obj).order_by('-dateTaken').values_list('id', flat=True)
-            id_list = list(image_set)
+            id_list = list(image_set[start:end])
+
+        # A full page came back -> assume there's more rather than running
+        # a separate COUNT(*) query to know for certain. The only cost of
+        # being wrong is one extra request landing on an empty next page,
+        # when the true total happens to be an exact multiple of
+        # page_size - cheap and rare enough not to be worth a second query
+        # on every single page request.
+        has_more = len(id_list) == page_size
 
         js = {
             'num_results': len(id_list), 'type': field, 'id_list': id_list,
+            'has_more': has_more,
             'cluster_groups': cluster_groups, 'video_face_ids': video_face_ids,
         }
 
