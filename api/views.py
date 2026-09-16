@@ -497,6 +497,12 @@ class PersonParamView(APIView):
         else:
             do_only_unverified = False
 
+        # face_poss branch only (below) - lets the frontend's sort-order
+        # toggle (imageScreen.jsx) invert the weight_1 ranking. Default
+        # 'desc' preserves the original behavior (highest-confidence
+        # candidate first).
+        sort_ascending = params.get('order', 'desc').lower() == 'asc'
+
         # Frontend's ".ignore" sidebar subordinate row ("Flagged for
         # review") - faces still proposed as .ignore (poss_ident1) that
         # were reviewed once already via the mobile app's ignore-review
@@ -626,8 +632,9 @@ class PersonParamView(APIView):
                 # shown. weight_1 is a plain column, so Postgres can do
                 # this ordering directly, which is also what makes real
                 # LIMIT/OFFSET slicing possible here.
+                weight_order = 'weight_1' if sort_ascending else '-weight_1'
                 faces = list(
-                    Face.objects.filter(poss_query).order_by('-weight_1').values_list('id', flat=True)[start:end]
+                    Face.objects.filter(poss_query).order_by(weight_order).values_list('id', flat=True)[start:end]
                 )
 
             id_list = list(faces)
