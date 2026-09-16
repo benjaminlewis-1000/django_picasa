@@ -56,25 +56,38 @@ CLUSTER_LINKAGE = 'average'
 CENTROID_OUTLIER_SIM_FLOOR = 0.35
 DISALLOWED_DIST = 1e6
 # Minimum number of matched sampled-frame detections a raw IOU track must
-# have before it's worth the expensive per-track redetect+dual-encode
-# pass in _pool_representative_frames -- this is Stage 2 of the design
-# documented in CLAUDE.md's Phase 3 write-up ("drops short/transient
-# tracklets by a length floor before ever paying for recognition"), which
-# was described there but never actually implemented until found missing
-# 2026-09-16. Confirmed necessary against 3 real production videos that
-# were timing out (>30min) with zero prior symptom of the already-fixed
-# fps-duplication bug: two old MJPEG .AVIs (likely triggering spurious
-# detections off compression-block noise) produced 2,400/2,809 raw
-# tracks, 78-80% of them singletons (a single matched sampled frame,
-# never tracked into anything) -- for comparison, the hardest real video
-# in this pipeline's own original design investigation topped out at ~50
-# tracks for a much busier clip. A floor of 3 cut MOV03400.AVI's 2,400
-# tracks to ~242 (len(t['frames']) >= 3, not the (span[1]-span[0])//stride
-# approximation used only for the diagnostic that found this -- span can
-# overstate true length across a tolerated gap), keeping anything that
-# was matched across at least 3 sampled frames while dropping one/two-hit
-# noise, which was never going to produce a usable embedding anyway.
+# have to survive _filter_short_tracks, but ONLY once a video is already
+# judged pathological (see ABSURD_SINGLETON_TRACK_COUNT below) -- this is
+# Stage 2 of the design documented in CLAUDE.md's Phase 3 write-up
+# ("drops short/transient tracklets by a length floor before ever paying
+# for recognition"). A single-appearance track is often genuinely
+# valuable on a normal video (CLAUDE.md's own Phase 3 design notes a
+# person who appears once, briefly, is still directly classifiable
+# against the gallery from that one track alone) -- so this floor must
+# not apply unconditionally to every video, only to the rare pathological
+# case it was actually built for.
 MIN_TRACK_LEN_SAMPLES = 3
+# Gate for MIN_TRACK_LEN_SAMPLES: the length filter only kicks in once a
+# video's raw single-frame (len==1) track count reaches this many --
+# below it, every track (including genuine singletons) is kept as before.
+# Confirmed necessary and sufficient against 3 real production videos
+# that were timing out (>30min) with zero prior symptom of the already-
+# fixed fps-duplication bug: two old MJPEG .AVIs (likely triggering
+# spurious detections off compression-block noise) produced 1,872/2,242
+# singleton tracks (2,400/2,809 tracks total), and `ward_christmas_
+# program (3).mp4` produced 419 (of 801 total) -- for comparison, the
+# hardest real video in this pipeline's own original design investigation
+# topped out at ~50 tracks TOTAL, so its singleton count was necessarily
+# far below even the lowest of these three. 150 sits comfortably below
+# every pathological case seen and comfortably above anything a normal
+# video has produced. Once tripped, the length filter (MIN_TRACK_LEN_
+# SAMPLES) cut MOV03400.AVI's 2,400 tracks to ~242 (len(t['frames']) >= 3,
+# not the (span[1]-span[0])//stride approximation used only for the
+# diagnostic that found this -- span can overstate true length across a
+# tolerated gap), keeping anything matched across at least 3 sampled
+# frames while dropping the one/two-hit noise that was never going to
+# produce a usable embedding anyway.
+ABSURD_SINGLETON_TRACK_COUNT = 150
 REDETECT_PAD_PCT = 0.6
 FACENET_INPUT_SIZE = 160
 # Cap on how many bytes of full decoded frames _detect_and_track will
@@ -258,12 +271,22 @@ def _trimmed_centroid(embeddings, sim_floor=CENTROID_OUTLIER_SIM_FLOOR):
     return survivors.mean(axis=0)
 
 
-def _filter_short_tracks(tracks, min_len=MIN_TRACK_LEN_SAMPLES):
+def _filter_short_tracks(tracks, min_len=MIN_TRACK_LEN_SAMPLES,
+                          absurd_singleton_count=ABSURD_SINGLETON_TRACK_COUNT):
     """Drops raw IOU tracks matched across fewer than min_len sampled
-    frames -- see MIN_TRACK_LEN_SAMPLES's own comment for why. Pure/
-    testable in isolation: operates on the same track-dict shape
-    _iou_track returns (each with a 'frames' list), no Django/ONNX/video
-    I/O dependency."""
+    frames -- but ONLY if the video's raw singleton (len==1) track count
+    is already at/above absurd_singleton_count. Below that gate, every
+    track is kept unchanged, including genuine singletons -- a normal
+    video's occasional single-appearance track is real signal (still
+    classifiable against the gallery from one track alone), not noise to
+    discard by default. See ABSURD_SINGLETON_TRACK_COUNT's own comment
+    for the real pathological videos that motivated this. Pure/testable
+    in isolation: operates on the same track-dict shape _iou_track
+    returns (each with a 'frames' list), no Django/ONNX/video I/O
+    dependency."""
+    singleton_count = sum(1 for t in tracks if len(t['frames']) == 1)
+    if singleton_count < absurd_singleton_count:
+        return tracks
     return [t for t in tracks if len(t['frames']) >= min_len]
 
 
@@ -858,9 +881,10 @@ class VideoFaceExtractor(object):
         )
 
         # Drop short/transient tracks before ever paying for the
-        # expensive per-track redetect+dual-encode pass below -- see
-        # MIN_TRACK_LEN_SAMPLES's own comment for why this floor exists
-        # and the real videos that motivated it.
+        # expensive per-track redetect+dual-encode pass below -- but only
+        # if this video's raw singleton count looks pathological. See
+        # ABSURD_SINGLETON_TRACK_COUNT's own comment for why this is
+        # gated rather than applied to every video unconditionally.
         n_before = len(tracks)
         tracks = _filter_short_tracks(tracks)
         if len(tracks) != n_before:
