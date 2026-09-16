@@ -1927,6 +1927,39 @@ class VideoFaceIOUTrackingTests(unittest.TestCase):
         self.assertEqual(len(tracks), 2)
 
 
+class VideoFaceShortTrackFilterTests(unittest.TestCase):
+    """_filter_short_tracks: drops raw tracks matched across too few
+    sampled frames before the expensive per-track redetect+dual-encode
+    pass -- see MIN_TRACK_LEN_SAMPLES's own comment in video_face_
+    pipeline.py for the real videos (2 old MJPEG .AVIs producing 2,400+
+    tracks, 78-80% singletons) that motivated this."""
+
+    def _track(self, n_frames):
+        return {'frames': list(range(n_frames))}
+
+    def test_drops_tracks_below_the_floor(self):
+        from video_face_pipeline import _filter_short_tracks
+        tracks = [self._track(1), self._track(2), self._track(3), self._track(10)]
+        kept = _filter_short_tracks(tracks, min_len=3)
+        self.assertEqual([len(t['frames']) for t in kept], [3, 10])
+
+    def test_keeps_everything_when_nothing_is_short(self):
+        from video_face_pipeline import _filter_short_tracks
+        tracks = [self._track(3), self._track(5)]
+        kept = _filter_short_tracks(tracks, min_len=3)
+        self.assertEqual(len(kept), 2)
+
+    def test_empty_input_returns_empty(self):
+        from video_face_pipeline import _filter_short_tracks
+        self.assertEqual(_filter_short_tracks([], min_len=3), [])
+
+    def test_default_min_len_matches_module_constant(self):
+        from video_face_pipeline import _filter_short_tracks, MIN_TRACK_LEN_SAMPLES
+        tracks = [self._track(MIN_TRACK_LEN_SAMPLES - 1), self._track(MIN_TRACK_LEN_SAMPLES)]
+        kept = _filter_short_tracks(tracks)
+        self.assertEqual(len(kept), 1)
+
+
 class VideoFaceClusterTests(unittest.TestCase):
     """_cluster_track_faces: must-link (same track) + cannot-link
     (temporally-overlapping different tracks) constrained clustering."""

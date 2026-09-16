@@ -29,7 +29,14 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   segments) before/during face extraction rather than raising the timeout further, since the
   per-video timeout exists for a reason (catches genuine hangs, see the `-fps_mode passthrough`
   fix below) and a multi-hour single pass is a lot of at-risk work to lose to one bad frame.
-  Brainstormed 2026-09-14, not scoped or started.
+  Brainstormed 2026-09-14, not scoped or started. **Update 2026-09-15/16**: the user moved the 4
+  worst offenders (`1991 really.mpg`, `1992 lewis.mpg`, `New 1998.mpg`, `2000.mpg`) out of
+  `Lewis_family_videos` to re-cut into smaller clips externally -- no re-cutting tooling built on
+  this side yet. `Lewis_family_videos` itself was removed from `VIDEO_ROOTS`/scanning entirely at
+  the user's request (2026-09-16) until that re-cutting work is ready; its 77 `VideoFile` rows
+  (0 attached faces) were deleted. `Christine Funeral.mpg` (164.8min) and
+  `dad_life_stories_fireside.mp4` (45.1min) are currently untouched since the whole folder is out
+  of scan scope now regardless.
 
 **Bigger, deliberately unscoped features:**
 - Slideshow metadata overlay (photo date + location shown alongside the image).
@@ -3462,4 +3469,67 @@ on disk. After: `VideoFile` 4892 gone, all 23 `Face` rows gone (`source_video_fi
 natural break in the currently-running scheduled `video_face_extraction` pass (see the cooldown-
 is-intentional note earlier in this file) so this doesn't interrupt in-progress backfill work;
 until that restart, the fix is proven correct (ran directly above) but not yet wired into the
-hourly scheduled `populate_videos_from_root` task in the live process.
+hourly scheduled `populate_videos_from_root` task in the live process. **Restart done 2026-09-16**
+(bundled with the `MIN_TRACK_LEN_SAMPLES` deploy below), so `delete_removed_videos()` is now live
+in the scheduled task too.
+
+## DONE (2026-09-16): root-caused and fixed the remaining "short clip hangs" -- pathological
+false-positive track counts on grainy/old footage, not the already-fixed fps-duplication bug
+
+Follow-up to the `-fps_mode passthrough` fix above: of the videos still failing after that fix
+shipped, 3 were NOT short slow-mo phone clips with a bogus `r_frame_rate` (the previously-fixed
+cause) -- `MOV03400.AVI` (5.6min), `MOV03401.AVI` (4.3min), and `ward_christmas_program (3).mp4`
+(1.2min), all from `Our_Home_Videos/Pre_camcorder/Movies from Pictures`. All three had completely
+normal, correctly-reported frame rates (confirmed via `ffprobe`), so the earlier fix didn't touch
+them, and they kept hitting the full 30-minute `PER_VIDEO_TIMEOUT_SECONDS`.
+
+**Root-caused via direct stage-by-stage instrumentation** (calling `_detect_and_track` and
+`_pool_representative_frames` separately with timing, rather than trusting the whole-`process_
+video()` black box): `_detect_and_track` itself finished fast (24-99s) in every case, but
+produced a wildly pathological number of raw IOU tracks -- `MOV03400.AVI`: 2,400 tracks/9,989
+frames; `MOV03401.AVI`: 2,809/7,732; `ward_christmas_program`: 801/2,130. For comparison, the
+hardest real video in this pipeline's own original design investigation (`00023.MTS`, a much
+busier 112s clip) topped out around 50 tracks. A length histogram confirmed these are almost
+entirely noise, not real tracked faces: 78-80% of `MOV03400.AVI`/`MOV03401.AVI`'s tracks were
+pure singletons (matched in exactly one sampled frame, never linked into anything), and only
+~2% had 5+ matched frames. The two `.AVI` files are old MJPEG camcorder-era footage -- plausibly
+compression-block noise triggering spurious `det_500m` detections on grainy content, though not
+confirmed further since the fix doesn't depend on knowing the exact visual cause.
+
+**Why this hung**: nothing in the pipeline filtered these out before `_pool_representative_frames`
+(redetect with `det_10g` + dual insightface/facenet encode, per track) -- every one of
+`MOV03400.AVI`'s 2,400 tracks got up to 2 reps each, so ~4,800 heavy inference calls just to
+process mostly single-frame garbage. This is a real gap against the pipeline's own documented
+design: CLAUDE.md's Phase 3 write-up already describes "Stage 2: drops short/transient tracklets
+by a length floor before ever paying for recognition" as part of the intended design, but it was
+never actually implemented in the shipped code until now.
+
+**Fix**: `MIN_TRACK_LEN_SAMPLES = 3` (`face_manager/video_face_pipeline.py`) plus a new pure,
+directly-testable `_filter_short_tracks(tracks, min_len)` function, applied in `process_video()`
+right after `_detect_and_track` returns and before the expensive pooling stage -- drops any track
+matched across fewer than 3 sampled frames. Chosen as a conservative floor (not just `>=2`): at
+this value, `MOV03400.AVI`'s 2,400 tracks drop to ~242 (a tractable ~2-3 minutes of pooling work
+instead of an unbounded stall), while still keeping anything genuinely tracked across at least 3
+sampled frames. 4 new unit tests (`VideoFaceShortTrackFilterTests`, `face_manager/tests.py`) on
+the pure function directly (drops-below-floor, keeps-everything-above, empty input, default
+matches the module constant). Full fast suite passed after the change (`OK`, run against
+`picasa_api_dev_test`).
+
+**Validated against all 3 real previously-hanging videos, end to end (not just the pure-function
+unit tests)** -- reset each to `isProcessed=False` and ran the real, saving `process_video()`
+directly against production: `MOV03400.AVI` completed in 684.0s (~11.4min, 13 face groups),
+`MOV03401.AVI` in 325.7s (~5.4min, 12 groups), `ward_christmas_program` in 346.7s (~5.8min, 48
+groups) -- all comfortably inside the 30-minute budget, zero failures, zero duplicate Face rows
+(double-checked directly in the DB after each run, and after the container's own restart mid-run
+-- see below -- confirmed `MOV03400.AVI`'s 13 faces were never re-created).
+
+**Deployed to production same day**: code-only change (no migration), synced to the bind-mounted
+`/code` checkout and to `backend_upgrade`/`django_picasa_dev`. `picasa_api` restarted mid-
+investigation (~11:09 EDT) for a reason outside this session's own actions (not a `docker
+restart`/`docker compose` command issued here, and `docker events` showed no container-level
+stop/start/die event in the window either -- left unexplained, just noted in case it recurs) --
+this incidentally interrupted an in-progress manual verification run (killed cleanly mid-
+`MOV03401.AVI`, no partial data written since `process_video()` only persists at the very end via
+explicit `Face.save()` calls) but also meant the live celery worker picked up the fix without a
+deliberate restart being needed. Verified live afterward: `manage.py check` clean, all 3 target
+videos correctly `isProcessed=True` with sane face counts and `face_extraction_failed=False`.

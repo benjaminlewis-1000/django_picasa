@@ -55,6 +55,26 @@ CLUSTER_COS_THRESHOLD = 0.5
 CLUSTER_LINKAGE = 'average'
 CENTROID_OUTLIER_SIM_FLOOR = 0.35
 DISALLOWED_DIST = 1e6
+# Minimum number of matched sampled-frame detections a raw IOU track must
+# have before it's worth the expensive per-track redetect+dual-encode
+# pass in _pool_representative_frames -- this is Stage 2 of the design
+# documented in CLAUDE.md's Phase 3 write-up ("drops short/transient
+# tracklets by a length floor before ever paying for recognition"), which
+# was described there but never actually implemented until found missing
+# 2026-09-16. Confirmed necessary against 3 real production videos that
+# were timing out (>30min) with zero prior symptom of the already-fixed
+# fps-duplication bug: two old MJPEG .AVIs (likely triggering spurious
+# detections off compression-block noise) produced 2,400/2,809 raw
+# tracks, 78-80% of them singletons (a single matched sampled frame,
+# never tracked into anything) -- for comparison, the hardest real video
+# in this pipeline's own original design investigation topped out at ~50
+# tracks for a much busier clip. A floor of 3 cut MOV03400.AVI's 2,400
+# tracks to ~242 (len(t['frames']) >= 3, not the (span[1]-span[0])//stride
+# approximation used only for the diagnostic that found this -- span can
+# overstate true length across a tolerated gap), keeping anything that
+# was matched across at least 3 sampled frames while dropping one/two-hit
+# noise, which was never going to produce a usable embedding anyway.
+MIN_TRACK_LEN_SAMPLES = 3
 REDETECT_PAD_PCT = 0.6
 FACENET_INPUT_SIZE = 160
 # Cap on how many bytes of full decoded frames _detect_and_track will
@@ -236,6 +256,15 @@ def _trimmed_centroid(embeddings, sim_floor=CENTROID_OUTLIER_SIM_FLOOR):
     if len(survivors) == 0:
         return mean
     return survivors.mean(axis=0)
+
+
+def _filter_short_tracks(tracks, min_len=MIN_TRACK_LEN_SAMPLES):
+    """Drops raw IOU tracks matched across fewer than min_len sampled
+    frames -- see MIN_TRACK_LEN_SAMPLES's own comment for why. Pure/
+    testable in isolation: operates on the same track-dict shape
+    _iou_track returns (each with a 'frames' list), no Django/ONNX/video
+    I/O dependency."""
+    return [t for t in tracks if len(t['frames']) >= min_len]
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +856,21 @@ class VideoFaceExtractor(object):
         tracks, stride, total_frames, frame_cache, cache_capped = self._detect_and_track(
             video_path, width, height, fps, vf_filter
         )
+
+        # Drop short/transient tracks before ever paying for the
+        # expensive per-track redetect+dual-encode pass below -- see
+        # MIN_TRACK_LEN_SAMPLES's own comment for why this floor exists
+        # and the real videos that motivated it.
+        n_before = len(tracks)
+        tracks = _filter_short_tracks(tracks)
+        if len(tracks) != n_before:
+            settings.LOGGER.warning(
+                "video_face_pipeline: video %s (%s) dropped %d/%d raw tracks "
+                "shorter than %d sampled frames before pooling.",
+                video_obj.id, video_obj.filename, n_before - len(tracks),
+                n_before, MIN_TRACK_LEN_SAMPLES,
+            )
+
         if not tracks:
             return []
 
