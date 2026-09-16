@@ -3533,3 +3533,31 @@ this incidentally interrupted an in-progress manual verification run (killed cle
 explicit `Face.save()` calls) but also meant the live celery worker picked up the fix without a
 deliberate restart being needed. Verified live afterward: `manage.py check` clean, all 3 target
 videos correctly `isProcessed=True` with sane face counts and `face_extraction_failed=False`.
+
+**Same day, follow-up per the user's explicit request: gated the length filter instead of
+applying it unconditionally.** The initial fix above dropped every short/singleton track on
+every video -- correct for the pathological cases, but a real cost on normal videos too: this
+pipeline's own Phase 3 design (see the union-merge/gallery-classification section earlier in this
+file) explicitly values a genuine single-appearance track, since it's still directly classifiable
+against the gallery from that one track alone even though it can never be internally
+"consolidated" with anything else in the same clip. Unconditionally dropping singletons would
+have quietly cost real matches on every ordinary video, not just the 3 pathological ones this was
+built for.
+
+**Fix**: `ABSURD_SINGLETON_TRACK_COUNT = 150` gates `MIN_TRACK_LEN_SAMPLES` -- `_filter_short_
+tracks()` now counts a video's raw singleton (`len==1`) tracks first, and only applies the length
+floor (dropping everything under 3 sampled frames) once that count reaches 150. Below the gate,
+every track is kept unchanged, including genuine singletons, matching pre-fix behavior for normal
+videos. 150 sits comfortably below every real pathological video found this session (419-2,242
+singletons) and comfortably above anything a normal video has ever produced (the hardest real
+video in the original design investigation topped out around 50 tracks TOTAL). 5 tests rewritten/
+added in `VideoFaceShortTrackFilterTests` to cover the gate itself (below-gate keeps everything
+including singletons, at-gate applies the floor, one-below-gate changes nothing, defaults match
+the module constants) -- the prior 4 tests were rewritten since they called the old unconditional
+signature directly. Full fast suite: 427/427 passing.
+
+**Deployed same day, code-only, no migration** -- synced to `/code` and `backend_upgrade`. A
+`video_face_extraction` run was actively in progress at deploy time, so the container restart was
+deliberately deferred to the next natural break (same established practice as elsewhere in this
+file) -- until then, the live worker keeps running the prior (unconditional-filter) code, which
+is safe, just more aggressive than the new gated behavior for the remainder of that run.

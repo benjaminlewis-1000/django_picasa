@@ -1930,34 +1930,51 @@ class VideoFaceIOUTrackingTests(unittest.TestCase):
 class VideoFaceShortTrackFilterTests(unittest.TestCase):
     """_filter_short_tracks: drops raw tracks matched across too few
     sampled frames before the expensive per-track redetect+dual-encode
-    pass -- see MIN_TRACK_LEN_SAMPLES's own comment in video_face_
-    pipeline.py for the real videos (2 old MJPEG .AVIs producing 2,400+
-    tracks, 78-80% singletons) that motivated this."""
+    pass -- but ONLY once a video's raw singleton count looks
+    pathological (ABSURD_SINGLETON_TRACK_COUNT), since a normal video's
+    occasional genuine single-appearance track is real signal, not noise
+    -- see that constant's own comment in video_face_pipeline.py for the
+    real videos (2 old MJPEG .AVIs producing 2,400+ tracks, 78-80%
+    singletons) that motivated this gate."""
 
     def _track(self, n_frames):
         return {'frames': list(range(n_frames))}
 
-    def test_drops_tracks_below_the_floor(self):
+    def test_below_the_gate_keeps_every_track_including_singletons(self):
+        # Only 2 singletons -- nowhere near "absurd" -- so nothing is
+        # dropped, even the singletons themselves.
         from video_face_pipeline import _filter_short_tracks
-        tracks = [self._track(1), self._track(2), self._track(3), self._track(10)]
-        kept = _filter_short_tracks(tracks, min_len=3)
+        tracks = [self._track(1), self._track(1), self._track(3), self._track(10)]
+        kept = _filter_short_tracks(tracks, min_len=3, absurd_singleton_count=150)
+        self.assertEqual(len(kept), 4)
+
+    def test_at_the_gate_drops_tracks_below_the_length_floor(self):
+        # Exactly absurd_singleton_count singletons trips the gate (>=,
+        # not strictly >), and once tripped the length floor applies.
+        from video_face_pipeline import _filter_short_tracks
+        tracks = [self._track(1)] * 3 + [self._track(2), self._track(3), self._track(10)]
+        kept = _filter_short_tracks(tracks, min_len=3, absurd_singleton_count=3)
         self.assertEqual([len(t['frames']) for t in kept], [3, 10])
 
-    def test_keeps_everything_when_nothing_is_short(self):
+    def test_one_below_the_gate_changes_nothing(self):
         from video_face_pipeline import _filter_short_tracks
-        tracks = [self._track(3), self._track(5)]
-        kept = _filter_short_tracks(tracks, min_len=3)
-        self.assertEqual(len(kept), 2)
+        tracks = [self._track(1)] * 2 + [self._track(10)]
+        kept = _filter_short_tracks(tracks, min_len=3, absurd_singleton_count=3)
+        self.assertEqual(len(kept), 3)
 
     def test_empty_input_returns_empty(self):
         from video_face_pipeline import _filter_short_tracks
-        self.assertEqual(_filter_short_tracks([], min_len=3), [])
+        self.assertEqual(_filter_short_tracks([], min_len=3, absurd_singleton_count=3), [])
 
-    def test_default_min_len_matches_module_constant(self):
-        from video_face_pipeline import _filter_short_tracks, MIN_TRACK_LEN_SAMPLES
-        tracks = [self._track(MIN_TRACK_LEN_SAMPLES - 1), self._track(MIN_TRACK_LEN_SAMPLES)]
+    def test_defaults_match_module_constants(self):
+        from video_face_pipeline import (
+            _filter_short_tracks, MIN_TRACK_LEN_SAMPLES, ABSURD_SINGLETON_TRACK_COUNT,
+        )
+        tracks = ([self._track(1)] * ABSURD_SINGLETON_TRACK_COUNT
+                  + [self._track(MIN_TRACK_LEN_SAMPLES - 1), self._track(MIN_TRACK_LEN_SAMPLES)])
         kept = _filter_short_tracks(tracks)
         self.assertEqual(len(kept), 1)
+        self.assertEqual(len(kept[0]['frames']), MIN_TRACK_LEN_SAMPLES)
 
 
 class VideoFaceClusterTests(unittest.TestCase):
