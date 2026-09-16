@@ -86,7 +86,7 @@ def bulk_thread(dataframe: dict):
 
     assert type(face_id_list) is list
     assert type(current_person_id) is int
-    assert operation in ['close_unassigned', 'close_ignored', 'close_assigned', 'confirm_proposed', 'verify_face']
+    assert operation in ['close_unassigned', 'close_ignored', 'close_assigned', 'confirm_proposed', 'verify_face', 'flag_for_review']
 
     for face_id in face_id_list:
         assert type(face_id) is int
@@ -156,6 +156,23 @@ def bulk_thread(dataframe: dict):
             face.associate_person(current_person_id)
         elif operation == 'verify_face':
             face.verify_person_in_image()
+        elif operation == 'flag_for_review':
+            # Frontend's ".ignore" gallery X button, for a still-proposed
+            # (undeclared) candidate specifically (gallery.jsx/lazyImg.jsx,
+            # 2026-09-16 per the user's own request) - same mechanism the
+            # mobile app's ignore-review flow already uses
+            # (mobile_views.py's BulkConfirmIgnore) to mean "looked at,
+            # might actually be someone" rather than an outright reject.
+            # Doesn't touch poss_ident1/declared_name at all - the face
+            # stays exactly the candidate it already was, just moved into
+            # the "Flagged for review" sub-queue (PersonParamView's
+            # `flagged` param) instead of the main .ignore queue.
+            if face.poss_ident1_id == soft_ignore_person.id and not face.mobile_review_hidden:
+                face.mobile_review_hidden = True
+                face.save(update_fields=['mobile_review_hidden'])
+            else:
+                print(f"flag_for_review: face {face.id} is not a still-proposed "
+                      f".ignore candidate (or is already flagged) - no-op.")
 
 def background_bulk_processor():
     print("Background processor initiating")
@@ -987,8 +1004,8 @@ class FaceViewSet(viewsets.ModelViewSet):
         if type(payload['current_person_id']) is not int:
             message = 'The type of current_person_id was not an int.'
             return render_404(request, message)
-        if payload['operation'] not in ['close_unassigned', 'close_ignored', 'close_assigned', 'confirm_proposed', 'verify_face']:
-            message = f"Value in 'operation' key was not one of ['close_unassigned', 'close_ignored', 'close_assigned'], and is not implemented."
+        if payload['operation'] not in ['close_unassigned', 'close_ignored', 'close_assigned', 'confirm_proposed', 'verify_face', 'flag_for_review']:
+            message = f"Value in 'operation' key was not one of ['close_unassigned', 'close_ignored', 'close_assigned', 'confirm_proposed', 'verify_face', 'flag_for_review'], and is not implemented."
             return render_404(request, message)
 
         current_person_id = payload['current_person_id']
