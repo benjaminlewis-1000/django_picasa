@@ -77,7 +77,92 @@ class faceAssigner():
         # BUCKET_THRESHOLDS has one more entry than BUCKET_BOUNDARIES (the
         # last covers everyone at/above the final boundary).
         self.BUCKET_BOUNDARIES = [50, 200, 500]
-        self.BUCKET_THRESHOLDS = [0.558, 0.551, 0.486, 0.394]
+        # Lowered 2026-09-17 for the 50-200/200-500/500+ buckets (bucket 0,
+        # <50 faces, deliberately left at its original 0.558 per the
+        # user's explicit call -- small galleries are noisier, no reason
+        # to think they had the same slack the larger buckets did).
+        # Original values: [0.558, 0.551, 0.486, 0.394]. Prompted by the
+        # user noticing several thousand `.ignore`-proposed faces flagged
+        # via the mobile review flow (`mobile_review_hidden=True`) sitting
+        # with a meaningfully smaller margin-to-threshold (median ~0.085)
+        # than the general `.ignore` population (median ~0.145) -- real
+        # signal that some of these were probably-correct people being
+        # held back by a threshold with room to spare, not a global
+        # precision problem. A live -0.05 reclassification of the entire
+        # ~105,712-face `poss_ident1=.ignore` population (proposals only,
+        # never touches `declared_name` -- fully reversible, a full pre-run
+        # snapshot was taken) landed a steady-state ~11-12% flip rate to a
+        # real candidate once past the oldest (smallest-original-gallery)
+        # faces, confirmed anecdotally by the user via direct spot-checks
+        # of the resulting gallery clustering ("still getting good group
+        # clustering at the end of the gallery... occasional false
+        # alarms") -- kept per that explicit decision.
+        self.BUCKET_THRESHOLDS = [0.558, 0.501, 0.436, 0.344]
+
+        # Per-person threshold nudge on top of the size-only bucket gate
+        # above -- added 2026-09-17 after the -0.05 cut produced 3 real
+        # false-positive "hot spots" (David Redd, Emma, Elder Tim Call)
+        # confirmed by direct visual inspection of their newly-flipped
+        # candidates. Root-caused via a real investigation, not guessed:
+        # two independent single-signal hypotheses were tried and BOTH
+        # failed to predict real hot-spot-ness across the full ~442-person
+        # likely-people population -- "hubness" (a candidate's centroid
+        # being unusually close to the general population of faces) showed
+        # literally no separation between the 3 confirmed hot spots and
+        # people with zero real false positives; gallery cohesion alone
+        # also failed once tested broadly (Joshua/Daniel Lewis have LOWER
+        # cohesion than David Redd but are backed by 12,000+ faces and
+        # never produce disproportionate flips). The combination that
+        # actually explains all 3 real cases: a SMALL gallery (only ~19-
+        # 431 faces, at the low end of its bucket) whose faces are either
+        # too spread out in time (David Redd: cohesion 0.28, faces spanning
+        # decades -- a real, correctly-labeled person tracked from
+        # childhood to adulthood, but that time-span alone makes the
+        # gallery's own p99 statistic unreliable) or too narrowly sampled
+        # (Emma/Elder Tim Call: most of their gallery is one single real-
+        # world session, so the p99 isn't measuring real person-to-person
+        # variation at all). Both failure modes only matter when the
+        # gallery is small enough that a percentile estimate over it is
+        # inherently noisy -- confirmed by checking the ~30 OTHER people
+        # this formula's early cohesion-only draft flagged as
+        # theoretically risky: every one of them had ~0 real flips in the
+        # actual -0.05 reclassification run, while David Redd/Emma/Elder
+        # Tim Call had 5.6x-52x their own gallery size in real false-
+        # positive flips -- confirming size-only cohesion checks aren't
+        # sufficient, the SIZE-SCALED interaction is what actually matters.
+        #
+        # nudge = min(MAX_NUDGE,
+        #             max(0, COHESION_FLOOR - cohesion) * scale * COHESION_WEIGHT
+        #             + max(0, 1 - span_iqr_days/MIN_SPAN_DAYS) * scale * SPAN_WEIGHT)
+        # where scale = min(1, sqrt(THRESHOLD_NUDGE_REFERENCE_N / gallery_size)) --
+        # this is what actually keeps large diffuse galleries (Joshua/
+        # Daniel Lewis, cohesion as low as David Redd's but 12,000+ faces)
+        # from being penalized at all: the SAME cohesion gap contributes a
+        # shrinking penalty as gallery_size grows, since a percentile
+        # estimate over thousands of faces is trustworthy even when the
+        # underlying cohesion is genuinely low, while the identical gap
+        # over a few hundred faces is not.
+        #
+        # Validated against the real production population (442 likely
+        # people) before shipping: all 3 confirmed hot spots land at or
+        # above their ORIGINAL (pre -0.05 cut) threshold once nudged
+        # (David Redd 0.436->0.516 vs original 0.486; Emma 0.558->0.638 vs
+        # original 0.558; Elder Tim Call 0.501->0.544 vs original 0.551),
+        # while the known-good huge galleries (Joshua/Daniel/Randy/
+        # Nathaniel/Liam Lewis, each 11,000-29,000 faces) get a nudge under
+        # 0.02 -- negligible relative to the bucket gap itself.
+        self.THRESHOLD_NUDGE_REFERENCE_N = 50
+        self.COHESION_FLOOR = 0.40
+        self.COHESION_WEIGHT = 2.0
+        self.MIN_SPAN_DAYS = 30
+        self.SPAN_WEIGHT = 0.12
+        self.MAX_THRESHOLD_NUDGE = 0.08
+        # Bounds the O(n^2) cohesion computation for a huge gallery
+        # (Nathaniel Lewis alone is 29,000+ faces) -- a random sample this
+        # size is still a statistically solid mean-cohesion estimate; see
+        # CLAUDE.md for the real sampling-variance check done before
+        # relying on this.
+        self.COHESION_SAMPLE_CAP = 300
 
         # How far below its own bucket threshold a face's closest-call
         # candidate needs to be before it's treated as "confidently far
@@ -105,6 +190,13 @@ class faceAssigner():
         self.likely_people_ids = [p.id for p in assigned_people]
         self.num_likely_people = len(self.likely_people_ids)
 
+        # Populated for real by load_encodings() -- initialized empty
+        # here so classify_unassigned()'s threshold_dict.get(db_id, ...)
+        # falls back cleanly to the plain bucket threshold for a
+        # faceAssigner built without going through load_encodings() (unit
+        # tests that set embedding_dict/norm_dict directly).
+        self.threshold_dict = {}
+
         ########################################################
         # Map people to the likely earliest date they showed up in images,
         # using some outlier statistics.
@@ -128,6 +220,16 @@ class faceAssigner():
             if gallery_size < boundary:
                 return threshold
         return self.BUCKET_THRESHOLDS[-1]
+
+    def _cohesion_and_span_nudge(self, cohesion: float, span_iqr_days: float, gallery_size: int) -> float:
+        """The size-scaled cohesion/span correction added on top of the
+        bucket threshold -- see THRESHOLD_NUDGE_REFERENCE_N's own comment
+        above for the full investigation this came out of. Pure/testable
+        in isolation: plain numbers in, plain number out, no DB access."""
+        scale = min(1.0, np.sqrt(self.THRESHOLD_NUDGE_REFERENCE_N / gallery_size))
+        cohesion_penalty = max(0.0, self.COHESION_FLOOR - cohesion) * scale * self.COHESION_WEIGHT
+        span_penalty = max(0.0, 1 - span_iqr_days / self.MIN_SPAN_DAYS) * scale * self.SPAN_WEIGHT
+        return min(self.MAX_THRESHOLD_NUDGE, cohesion_penalty + span_penalty)
 
     def _current_face_data_signature(self) -> int:
         """Cheap proxy for 'has anything changed since the cache was last
@@ -194,6 +296,7 @@ class faceAssigner():
         self.candidate_dict = {}
         self.embedding_dict = {}
         self.norm_dict = {}
+        self.threshold_dict = {}
 
         cache_is_valid = False
         if os.path.exists(self.ENCODINGS_PKL_FILE) and not reload_pkl_file:
@@ -203,9 +306,17 @@ class faceAssigner():
             cached_date = combo_dict.get('built_date')
             today = datetime.now().date()
 
-            if cached_date is not None and (today - cached_date).days < self.CACHE_MAX_AGE_DAYS:
+            # 'threshold_dict' missing means this cache predates the
+            # cohesion/span nudge -- force a full rebuild rather than
+            # silently falling back to the flat bucket threshold for
+            # every candidate (which is what a plain .get() default would
+            # do), since that's exactly the un-nudged behavior this
+            # feature exists to replace.
+            has_threshold_dict = 'threshold_dict' in combo_dict
+
+            if has_threshold_dict and cached_date is not None and (today - cached_date).days < self.CACHE_MAX_AGE_DAYS:
                 cache_is_valid = True
-            else:
+            elif has_threshold_dict:
                 cached_signature = combo_dict.get('signature')
                 current_signature = self._current_face_data_signature()
                 if current_signature == cached_signature:
@@ -213,11 +324,14 @@ class faceAssigner():
                     cache_is_valid = True
                 else:
                     print("Daily cache check: face data changed since last build -- rebuilding full cache.")
+            else:
+                print("Cache predates the cohesion/span threshold nudge -- rebuilding full cache.")
 
             if cache_is_valid:
                 self.candidate_dict = combo_dict['candidate_dict']
                 self.embedding_dict = combo_dict['embedding_dict']
                 self.norm_dict = combo_dict['norm_dict']
+                self.threshold_dict = combo_dict['threshold_dict']
 
         changed = not cache_is_valid
 
@@ -225,7 +339,8 @@ class faceAssigner():
 
             if face_id in self.candidate_dict.keys() and \
                face_id in self.embedding_dict.keys() and \
-               face_id in self.norm_dict.keys():
+               face_id in self.norm_dict.keys() and \
+               face_id in self.threshold_dict.keys():
                 # print(f'No need to process this face {face_id}')
                 continue
             # print(f"Processing face {face_id}")
@@ -248,6 +363,35 @@ class faceAssigner():
             assert self.embedding_dict[face_id].shape[1] == len(norm_list)
             self.norm_dict[face_id] = norm_list
 
+            # Per-person threshold nudge -- see THRESHOLD_NUDGE_REFERENCE_N's
+            # own comment (in __init__) for the full investigation this
+            # came out of. Cohesion is measured over a bounded random
+            # sample (cmp_embedding/norm_list already hold the WHOLE
+            # gallery regardless of size, so sampling here is purely to
+            # bound the O(n^2) pairwise-similarity cost for a huge
+            # gallery -- no extra DB query). Span uses the already-
+            # fetched dateTakenUTC column directly (epoch seconds), also
+            # free.
+            gallery_size = len(df)
+            if gallery_size > self.COHESION_SAMPLE_CAP:
+                sample_idx = np.random.choice(gallery_size, self.COHESION_SAMPLE_CAP, replace=False)
+            else:
+                sample_idx = np.arange(gallery_size)
+            sample_normed = cmp_embedding[sample_idx] / norm_list[sample_idx, None]
+            sample_sim = sample_normed @ sample_normed.T
+            iu = np.triu_indices(len(sample_idx), k=1)
+            cohesion = float(sample_sim[iu].mean()) if len(iu[0]) > 0 else 1.0
+
+            dates = np.sort(df['dateTakenUTC'].to_numpy())
+            if len(dates) >= 5:
+                q25, q75 = np.percentile(dates, [25, 75])
+                span_iqr_days = (q75 - q25) / 86400.0
+            else:
+                span_iqr_days = float(self.MIN_SPAN_DAYS)  # not enough data to call it "narrow"
+
+            nudge = self._cohesion_and_span_nudge(cohesion, span_iqr_days, gallery_size)
+            self.threshold_dict[face_id] = self._p99_threshold_for_gallery_size(gallery_size) + nudge
+
             # Drop the embedding column before caching: it's only ever
             # used transiently, right here, to build embedding_dict above
             # -- nothing downstream reads candidate_dict's own copy (see
@@ -266,6 +410,7 @@ class faceAssigner():
             all_dict = {'candidate_dict': self.candidate_dict,
                         'embedding_dict': self.embedding_dict,
                         'norm_dict': self.norm_dict,
+                        'threshold_dict': self.threshold_dict,
                         'built_date': datetime.now().date(),
                         'signature': self._current_face_data_signature()}
             try:
@@ -466,7 +611,16 @@ class faceAssigner():
             similarity = all_similarity[lo:hi]
 
             sim_99th = np.percentile(similarity, 99)
-            candidate_threshold = self._p99_threshold_for_gallery_size(hi - lo)
+            # threshold_dict (built in load_encodings(), see its own
+            # comment) already includes the size-only bucket threshold
+            # PLUS the per-person cohesion/span nudge -- falls back to the
+            # plain bucket threshold only for a candidate somehow missing
+            # from it (shouldn't happen in practice: every id in
+            # gallery_offsets came from the same load_encodings() pass
+            # that populates threshold_dict), rather than raising.
+            candidate_threshold = self.threshold_dict.get(
+                db_id, self._p99_threshold_for_gallery_size(hi - lo)
+            )
 
             metrics_array[row_num, :] = [sim_99th, candidate_threshold, db_id]
             if self.DEBUG and db_id == debug_face_id and debug_face_id is not None:

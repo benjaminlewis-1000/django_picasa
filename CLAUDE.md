@@ -3561,3 +3561,162 @@ signature directly. Full fast suite: 427/427 passing.
 deliberately deferred to the next natural break (same established practice as elsewhere in this
 file) -- until then, the live worker keeps running the prior (unconditional-filter) code, which
 is safe, just more aggressive than the new gated behavior for the remainder of that run.
+
+## DONE (2026-09-16/17): lowered `classify_unassigned()`'s bucket thresholds by 0.05, then found
+and fixed 3 real false-positive "hot spots" it created -- per-person cohesion/span threshold nudge
+added to `assign_faces.py`
+
+**Motivation**: the user noticed several thousand `.ignore`-proposed faces flagged via the mobile
+review flow (`mobile_review_hidden=True`, "might actually be someone") sitting with a meaningfully
+smaller margin-to-threshold (median weight_1 0.282, i.e. margin ~0.085) than the general `.ignore`
+population (median weight_1 0.485, margin ~0.145) -- real evidence some of these were probably-
+correct people held back by a threshold with room to spare. `BUCKET_THRESHOLDS` lowered from
+`[0.558, 0.551, 0.486, 0.394]` to `[0.558, 0.501, 0.436, 0.344]` (bucket 0, <50 faces, deliberately
+left unchanged per the user's explicit call -- small galleries are noisier, no reason to think they
+had the same slack).
+
+**Live -0.05 reclassification of the entire ~105,712-face `poss_ident1=.ignore` population**
+(proposals only, `declared_name` never touched -- fully reversible; a full pre-run snapshot was
+taken and saved both in-container and copied to the host before starting) landed a steady-state
+~11-25% flip rate to a real candidate once past the oldest faces (older faces' original galleries
+were smaller at classification time, so gallery-growth-driven reclassification -- not just the
+threshold cut -- explains some of the flip rate; the two effects aren't separable in this run).
+
+**Real problem found via the user's own spot-checking, not assumed clean:** a small number of
+people absorbed a wildly disproportionate share of the new flips. Investigated with real data
+throughout, not guessed:
+- **Flip concentration**: of ~55,000 faces reclassified at the time of checking, David Redd alone
+  received 29.0% of ALL flips (2,693), Emma 10.7% (992), Elder Tim Call 6.6% (618) -- everyone else
+  was under 5%, and once normalized to **flips per gallery-face** (a much cleaner signal than raw
+  count or percentage), the separation was stark: Emma 52.2x, David Redd 6.25x, Elder Tim Call
+  5.57x, vs. under 1x for every other person checked, including huge-gallery Lewis family members
+  with high raw flip counts purely from gallery-growth exposure (Nathaniel Lewis 29,102 faces,
+  ratio 0.013).
+- **Visually confirmed as real false positives**, not just a numeric artifact -- pulled and
+  inspected real thumbnail crops for all 3: David Redd's flips included a woman viewed from
+  behind, an unrelated small child, a girl with braided blonde hair and sunglasses, and an
+  unidentifiable blurry shot; Emma's included a graduation-cap photo and an unrelated boy eating
+  outdoors; Elder Tim Call's included a young woman viewed from the side and an unrelated blurry
+  shot. None of the checked candidates were actually the named person.
+
+**Two hypotheses tried and BOTH failed to explain it, tested against real data before committing
+to anything** (per this project's own established "empirical validation before deploying"
+discipline):
+1. **Gallery diffuseness/date-span** (raw min/max span) -- immediately confounded by the
+   already-known `dateTakenUTC` corruption bug (near-universal ~126.7-year and, for several Lewis
+   family galleries, 1,700-1,900+ year artifacts from one bad outlier date per gallery) -- switched
+   to percentile-trimmed (IQR) span instead.
+2. **"Hub" hypothesis** (a candidate's centroid sitting unusually close to the general population
+   of faces, a known effect in high-dimensional nearest-neighbor search) -- tested directly via a
+   person-balanced population pool (3 embeddings per distinct likely-person, 1,326 total, so no
+   single huge gallery like Nathaniel Lewis's 29k faces could dominate a naive random sample).
+   **Result: no separation at all.** Emma had the LOWEST hub-closeness score of everyone tested
+   (0.0092); people with zero real flips scored higher (Cutler Kid 0.0443, Matthew Crandall 0.0457)
+   than all 3 confirmed hot spots. Hub-closeness does not predict hot-spot-ness in this data.
+3. **Gallery cohesion alone** (mean intra-gallery pairwise cosine similarity) also failed once
+   tested broadly: Joshua Lewis (13,958 faces) and Daniel Lewis (12,292 faces) have LOWER cohesion
+   than David Redd (0.292/0.305 vs 0.285-0.289) but never produce disproportionate flips -- the
+   real differentiator turned out to be gallery SIZE interacting with cohesion, not cohesion alone
+   (a percentile estimate over 12,000+ faces is statistically trustworthy even at low cohesion; the
+   same gap over a few hundred faces is not).
+
+**Root cause, confirmed by combining size + cohesion + span**: all 3 hot spots are small galleries
+(19-431 faces, at the low end of their bucket) whose faces are either too spread out in time
+(David Redd: cohesion 0.285-0.289, a real, correctly-labeled person visually confirmed tracked from
+a 1996 toddler through a 2023 adult across 6 real photos spanning that whole range -- not
+contamination, just genuine aging that makes a small gallery's own p99 statistic unreliable) or too
+narrowly sampled (Emma: 19 faces, ALL from one ~15-minute session on 2018-08-04, cohesion 0.563 --
+the HIGHEST of anyone checked, since near-duplicate photos of one moment aren't real variation;
+Elder Tim Call: IQR span ~14 days, similar single-session-dominated pattern). Both failure modes
+only matter when the gallery is small enough that a percentile estimate over it is inherently
+noisy -- validated directly: an early cohesion-only draft of the fix, run against the full
+442-person likely-people population, flagged ~30 additional people as "theoretically risky" by the
+same cohesion floor, but a direct ground-truth check against the real reclassification's flip data
+found every single one of them had ~0 real flips (max 0.023 flips/gallery-face) -- confirming
+gallery-size-scaled interaction, not a standalone cohesion or span check, is what actually
+separates real hot spots from harmless small galleries.
+
+**Fix, implemented in `face_manager/assign_faces.py`**: a per-person threshold nudge added on top
+of the existing size-only bucket gate --
+```
+scale = min(1, sqrt(THRESHOLD_NUDGE_REFERENCE_N / gallery_size))
+nudge = min(MAX_THRESHOLD_NUDGE,
+            max(0, COHESION_FLOOR - cohesion) * scale * COHESION_WEIGHT
+          + max(0, 1 - span_iqr_days / MIN_SPAN_DAYS) * scale * SPAN_WEIGHT)
+effective_threshold = bucket_threshold + nudge
+```
+Constants (`THRESHOLD_NUDGE_REFERENCE_N=50`, `COHESION_FLOOR=0.40`, `COHESION_WEIGHT=2.0`,
+`MIN_SPAN_DAYS=30`, `SPAN_WEIGHT=0.12`, `MAX_THRESHOLD_NUDGE=0.08`) tuned iteratively against real
+data -- `COHESION_FLOOR` raised from an initial 0.35 to 0.40 and `SPAN_WEIGHT` raised from 0.05 to
+0.12 specifically at the user's direction, after checking the effect on all 3 known cases each
+time. Validated against the real population before shipping: all 3 confirmed hot spots land at or
+above their ORIGINAL (pre -0.05 cut) threshold once nudged (David Redd 0.436->0.516 vs original
+0.486; Emma 0.558->0.638 vs original 0.558; Elder Tim Call 0.501->0.544 vs original 0.551), while
+the known-good huge galleries (Joshua/Daniel/Randy/Nathaniel/Liam Lewis, 11,000-29,000 faces each)
+get a nudge under 0.02 -- negligible. At the final tuning, 99/442 likely people hit the
+`MAX_THRESHOLD_NUDGE` cap (up from 33 at the initial 0.05 span weight) -- mostly small, genuinely
+single-session galleries (e.g. "met once at a family event") that, per the ground-truth check
+above, essentially never produce real flips anyway; accepted deliberately per the user's own
+stated reasoning ("most of the people that are theoretically risky are not likely to get more
+images anyway" -- low cost even where the correction turns out to be unnecessary).
+
+**Implementation detail**: cohesion/span can't be computed per-classification-call (an O(n^2)
+pairwise similarity over a 29,000-face gallery would be prohibitively expensive run repeatedly) --
+computed once per person inside `load_encodings()` (reusing embeddings/dates already fetched for
+`embedding_dict`/`candidate_dict`, zero extra DB queries) and cached in the same
+`ENCODINGS_PKL_FILE` pickle as a new `threshold_dict` entry, alongside the existing
+`embedding_dict`/`norm_dict`/`candidate_dict`. Cohesion sampled at up to `COHESION_SAMPLE_CAP=300`
+faces per gallery (bounds the O(n^2) cost for huge galleries; a 300-face random sample is still a
+statistically solid mean-cohesion estimate, checked against full-population computations for the
+known cases during investigation). A cache built before this feature shipped (missing
+`threshold_dict` entirely) is detected and triggers a full rebuild rather than silently falling
+back to the un-nudged bucket threshold for every candidate. `classify_unassigned()` now looks up
+`self.threshold_dict.get(db_id, <bucket-only fallback>)` instead of calling
+`_p99_threshold_for_gallery_size()` directly -- the fallback matters for unit tests that build a
+`faceAssigner` and set `embedding_dict`/`norm_dict` directly without going through
+`load_encodings()` (`threshold_dict` is now also initialized empty in `__init__` for exactly this
+case). New pure, directly-testable `_cohesion_and_span_nudge()` plus 6 new unit tests
+(`CohesionAndSpanNudgeTests`) covering: no-penalty healthy gallery, small-and-diffuse gets
+penalized, the SAME cohesion gap on a huge gallery gets almost no penalty (the core size-
+interaction property), narrow-single-session gets penalized even at high cohesion, the cap, and
+never-negative. Full fast suite: 433/433 passing (427 baseline + 6 new).
+
+**Real-world validation against David Redd's actual contamination, per the user's explicit
+request** ("run it against David's gallery to see how it works out"): of the 2,707 faces already
+incorrectly flipped to him by the un-nudged -0.05 run, **87.3% (2,363) now correctly revert to
+`.ignore`** under his new nudged threshold (0.436 -> 0.508); only 344 (12.7%) still clear it. Spot-
+checked 4 of those 344 survivors visually -- not a perfectly clean result: one plausible (a
+sleeping toddler, consistent with his real childhood photos), one ambiguous (back of a head), one
+that looks like a different person, one too blurry to judge. The fix removes the clear majority of
+contamination but doesn't achieve perfect precision on the remainder -- expected and accepted, not
+chased further to 100%.
+
+**A real operational mistake made and fixed during this same investigation, worth remembering**:
+an ad hoc check script (verifying the fix against David Redd's gallery specifically) set
+`fa.likely_people_ids = [p.id]` (just David Redd) before calling the real `faceAssigner()`'s
+`load_encodings()` against the REAL production `ENCODINGS_PKL_FILE` path (`/models/
+face_assign_preload.pkl`) -- this correctly triggered the new old-cache-format rebuild check, but
+since only one person's id was in `likely_people_ids` at rebuild time, it overwrote the entire
+442-person production cache down to a single entry. Self-healing in principle (the next real
+`faceAssigner()` with the correct full `likely_people_ids` would detect the other 441 as missing
+and re-fetch them via the existing per-id top-up loop), but proactively rebuilt immediately anyway
+rather than leaving it for whatever scheduled task happened to run next, given the added cohesion
+computation makes a full rebuild meaningfully more expensive now (**402s for all 442 people**, up
+from the previous sub-second cached-load / ~13.7s cold-load baseline -- a real, expected added cost
+of a full rebuild only, not the steady-state cached-load path, which is unaffected since
+`threshold_dict` is just pickled/unpickled with everything else). Confirmed restored: 442/442
+entries in both `embedding_dict` and `threshold_dict` on disk afterward. **Lesson for next time**:
+never mutate `likely_people_ids` on a `faceAssigner` instance that's about to call
+`load_encodings()` against the real production cache path -- use a throwaway
+`ENCODINGS_PKL_FILE` override (the same pattern `LoadEncodingsCachingTests` and the video-face
+real-inference test already establish) for any experiment that needs a narrowed candidate set.
+
+**Deployed to production same day, code-only, no migration** -- synced to `/code` and
+`backend_upgrade`, full fast suite green before deploy. The long-running manual -0.05
+reclassification backfill (started before this fix existed) is NOT retroactively corrected by this
+change -- it's a separate, already-in-memory Python process using the old un-nudged logic in a
+long-lived `manage.py shell` invocation, unaffected by the code file being updated underneath it.
+Whether/how to re-run reclassification specifically for David Redd/Emma/Elder Tim Call (and
+whoever else the nudge would now catch) using the corrected logic, versus leaving the -0.05
+backfill's already-flipped candidates as human-review fodder, is still an open decision -- not
+resolved in this session.
