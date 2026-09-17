@@ -671,11 +671,16 @@ FILEPOPULATOR_SERVER_IMG_DIR = PHOTO_ROOT # root location of images you want to 
 # mount or code change needed.
 VIDEO_ROOTS = [
     os.path.join(VIDEO_ROOT, 'Our_Home_Videos'),
-    # Lewis_family_videos deliberately excluded (2026-09-15, at the
-    # user's request): they're being re-cut into smaller clips outside
-    # this app first, no re-add scheduled yet. Existing VideoFile/Face
-    # rows for this folder were also removed at the same time -- see
-    # CLAUDE.md.
+    # Lewis_family_videos itself deliberately still excluded (2026-09-15,
+    # at the user's request): the original long VHS-encode tapes are
+    # being re-cut into smaller clips outside this app first. Its own
+    # VideoFile/Face rows were removed at the same time -- see CLAUDE.md.
+    #
+    # Lewis_family_VHS_video_clips added 2026-09-16: the re-cut clips
+    # land here as they're produced, each stamped with a real CreateDate
+    # (verified against a real sample -- see CLAUDE.md), so no filename-
+    # date-guessing fallback risk like the original tapes had.
+    os.path.join(VIDEO_ROOT, 'Lewis_family_VHS_video_clips'),
 ]
 # Also scan PHOTO_ROOT for videos interspersed in the existing photo
 # tree (some are, per the user, alongside the two dedicated folders
