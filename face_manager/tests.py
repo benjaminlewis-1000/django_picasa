@@ -2273,3 +2273,21 @@ class ProcessVideoFacesFailureTrackingTests(TestCase):
         self.assertTrue(self.video.isProcessed)
         self.assertFalse(self.video.face_extraction_failed)
         self.assertIsNone(self.video.face_extraction_error)
+
+    def test_timeout_leaves_video_unprocessed_for_a_later_retry(self):
+        # Real 2026-09-17 finding: several completely normal, short videos
+        # timed out purely because a concurrent CPU-heavy job was
+        # competing for cores -- not a permanent problem with the file.
+        # A timeout must NOT be treated like every other failure (marking
+        # isProcessed=True/face_extraction_failed=True would require a
+        # manual reset before it's ever retried); it should just stay in
+        # the unprocessed queue for a future scheduled run to pick up
+        # again once resources free up.
+        from face_manager.tasks import process_video_faces, _VideoProcessingTimeout
+        with patch('video_face_pipeline.VideoFaceExtractor') as MockExtractor:
+            MockExtractor.return_value.process_video.side_effect = _VideoProcessingTimeout("Video processing exceeded 1800s")
+            process_video_faces()
+        self.video.refresh_from_db()
+        self.assertFalse(self.video.isProcessed)
+        self.assertFalse(self.video.face_extraction_failed)
+        self.assertIsNone(self.video.face_extraction_error)

@@ -3720,3 +3720,59 @@ Whether/how to re-run reclassification specifically for David Redd/Emma/Elder Ti
 whoever else the nudge would now catch) using the corrected logic, versus leaving the -0.05
 backfill's already-flipped candidates as human-review fodder, is still an open decision -- not
 resolved in this session.
+
+## DONE (2026-09-17): video face-extraction timeouts caused by resource contention no longer marked
+as a permanent failure
+
+Found while investigating "not many videos completing recently" during the same-day threshold-
+nudge reclassification backfill (a real, CPU-heavy competing job): 4 of 8 currently
+`face_extraction_failed=True` videos were short, completely normal clips (47-105 raw tracks, well
+under the `ABSURD_SINGLETON_TRACK_COUNT=150` pathological-track gate) that should never come close
+to the 30-minute `PER_VIDEO_TIMEOUT_SECONDS` budget. Root cause confirmed directly: `_detect_and_
+track` alone -- a stage that normally takes 10-30s -- took 120-202s for these files, a 5-10x
+slowdown entirely explained by the reclassification backfill competing for the same CPU cores. Not
+a regression in the pathological-track fix (`MIN_TRACK_LEN_SAMPLES`/`ABSURD_SINGLETON_TRACK_COUNT`,
+see above) -- a different, new failure mode: ordinary videos timing out purely from resource
+contention, not bad input data.
+
+**Real design gap this exposed**: `process_video_faces()`'s previous unconditional `finally:
+video.isProcessed = True` treated a timeout exactly the same as a genuine, permanent failure
+(corrupt file, a real bug) -- requiring a manual reset (`isProcessed=False`, `face_extraction_
+failed=False`) before the video would ever be retried, even though a contention-driven timeout is
+likely to succeed on a later run once the competing job finishes, with zero code change needed.
+
+**Fix, per the user's explicit suggestion** ("if a task fails during a resource-constrained time,
+we don't mark it as failed -- we just move on and let it reprocess later"): `_VideoProcessingTimeout`
+now gets its own exception branch in `face_manager/tasks.py`'s `process_video_faces()`, separate
+from the generic `except Exception` branch -- deliberately does NOT set `isProcessed` or
+`face_extraction_failed`/`_error`, just logs a warning and `continue`s to the next video. The video
+simply stays in the `isProcessed=False` queryset and gets picked up again by a future scheduled
+run, no manual intervention needed. Every other exception type (a real bug, a corrupted file, an
+unsupported codec, etc.) keeps the original behavior unchanged -- still marked processed +
+`face_extraction_failed=True`, since blindly retrying a truly-broken file forever would be worse
+than the manual-reset friction it replaces.
+
+**Known, accepted tradeoff, not chased further**: a video that times out for a REAL reason (too
+long, not just contention -- the 3 genuinely multi-hour videos elsewhere in this file) will now
+retry on every single scheduled run indefinitely, each consuming a full 30-minute slot, rather than
+being marked a permanent failure after one attempt. Accepted because the known genuinely-too-long
+videos are already being handled separately (moved out of the scan path for external re-cutting,
+see the `Lewis_family_VHS_video_clips` write-up above) -- if a different, not-yet-identified
+genuinely-too-long video hits this path in the future, it would need the same manual move-aside
+treatment, or a retry-count cap would need to be added; not built preemptively for a case that
+hasn't come up yet.
+
+New test (`ProcessVideoFacesFailureTrackingTests.test_timeout_leaves_video_unprocessed_for_a_later_
+retry`, `face_manager/tests.py`): mocks `VideoFaceExtractor.process_video` to raise `_VideoProcessingTimeout`
+directly (no need to actually wait out a real 1800s alarm), confirms `isProcessed`/`face_extraction_
+failed`/`face_extraction_error` all stay at their default (unset) values. Full fast suite: 434/434
+passing (433 baseline + 1 new).
+
+**Deployed same day, code-only, no migration** -- synced to `/code` and `backend_upgrade`. The 4
+real videos that had been incorrectly marked as permanently failed by contention-driven timeouts
+were manually reset (`isProcessed=False`, `face_extraction_failed=False`, `face_extraction_error=
+None`) to take advantage of the fix immediately rather than waiting for their `face_extraction_
+failed=True` state to be noticed again. The code change itself needs a `picasa_api` restart to
+reach the long-lived scheduled-task celery worker (a `video_face_extraction` run was actively in
+progress at deploy time) -- deliberately deferred to the next natural break, same established
+practice as every other same-day deploy in this file.
