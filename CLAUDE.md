@@ -3775,4 +3775,23 @@ None`) to take advantage of the fix immediately rather than waiting for their `f
 failed=True` state to be noticed again. The code change itself needs a `picasa_api` restart to
 reach the long-lived scheduled-task celery worker (a `video_face_extraction` run was actively in
 progress at deploy time) -- deliberately deferred to the next natural break, same established
-practice as every other same-day deploy in this file.
+practice as every other same-day deploy in this file. **Confirmed working the same day**: one of
+the 4 reset videos (`MOV03789.MPG`) succeeded on retry once contention eased (13 face groups) --
+direct confirmation the timeout really was contention-driven, not a real problem with the file.
+
+**Same day, follow-up per the user's explicit request: capped the "retry forever" risk the fix
+above accepted.** The user pushed back on leaving a genuinely-too-long video (not just
+contention) retrying indefinitely, each attempt burning a full `PER_VIDEO_TIMEOUT_SECONDS` --
+asked for a retry count instead, failing for real after 5 attempts. New field `VideoFile.
+face_extraction_timeout_count` (migration `filepopulator.0013`, `IntegerField(default=0)`) --
+incremented on each timeout; once it reaches `MAX_VIDEO_TIMEOUT_RETRIES=5`
+(`face_manager/tasks.py`), the video is marked a real failure (`face_extraction_failed=True`,
+`face_extraction_error` naming the retry count) instead of retried again. Reset to 0 on an
+eventual real success, so a video manually reset and reprocessed later doesn't inherit a stale
+count toward the cap. 2 new tests (`test_repeated_timeouts_eventually_marked_a_real_failure`,
+`test_eventual_success_resets_timeout_count`) plus the existing timeout test updated to check the
+counter increments. Full fast suite: 436/436 passing (434 baseline + 2 new).
+
+**Deployed same day**: migration applied cleanly on production (additive column, zero
+unapplied-migration risk), code synced to `/code` and `backend_upgrade` -- same deferred-restart
+situation as the fix above, `video_face_extraction` still actively running at deploy time.

@@ -1153,6 +1153,17 @@ class VideoFile(models.Model):
     face_extraction_failed = models.BooleanField(default=False)
     face_extraction_error = models.TextField(null=True, blank=True)
 
+    # A _VideoProcessingTimeout is deliberately NOT counted as a failure
+    # above (isProcessed stays False so it's retried automatically -- see
+    # process_video_faces()'s own comment) since it's plausibly just
+    # resource contention, not a real problem with the file. This counts
+    # how many consecutive timeouts a video has hit; once it reaches
+    # MAX_VIDEO_TIMEOUT_RETRIES, it's marked a real failure instead of
+    # retried again, so a genuinely-too-long (not just contention-caused)
+    # video doesn't burn a full PER_VIDEO_TIMEOUT_SECONDS on every single
+    # scheduled run forever. Reset to 0 on an eventual real success.
+    face_extraction_timeout_count = models.IntegerField(default=0)
+
     def __str__(self):
         return self.filename
 

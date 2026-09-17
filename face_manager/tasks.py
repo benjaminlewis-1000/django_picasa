@@ -40,6 +40,17 @@ import traceback
 # blowup.
 PER_VIDEO_TIMEOUT_SECONDS = 1800
 
+# A timeout is left unprocessed (see the timeout except branch below) so
+# a plausibly-transient one (resource contention from another concurrent
+# job -- confirmed real 2026-09-17) gets retried automatically on a later
+# run, rather than requiring a manual reset. But a genuinely-too-long
+# video (not just contention) would otherwise retry forever, each attempt
+# burning a full PER_VIDEO_TIMEOUT_SECONDS -- MAX_VIDEO_TIMEOUT_RETRIES
+# caps that: once a video has timed out this many times, it's marked a
+# real failure (face_extraction_failed=True) instead of being retried
+# again, per the user's explicit call.
+MAX_VIDEO_TIMEOUT_RETRIES = 5
+
 
 class _VideoProcessingTimeout(Exception):
     pass
@@ -140,22 +151,40 @@ def process_video_faces(max_runtime_seconds=None):
                 finally:
                     signal.alarm(0)
             except _VideoProcessingTimeout as exc:
-                # Deliberately NOT marked isProcessed/face_extraction_failed
-                # here, unlike every other failure below -- a timeout is
-                # plausibly just resource contention (confirmed real
-                # 2026-09-17: several short, completely normal videos
-                # timed out purely because a concurrent CPU-heavy
-                # reclassification backfill was running at the same time,
-                # not because of anything wrong with the file itself).
-                # Leaving isProcessed=False lets this video simply be
-                # picked up again by a future scheduled run once
-                # resources free up, rather than requiring a manual reset
-                # every time contention happens to cause a timeout.
-                settings.LOGGER.warning(
-                    f"Video face extraction timed out for {video.filename} -- "
-                    f"leaving unprocessed to retry later rather than marking "
-                    f"it a permanent failure: {exc}"
-                )
+                # A timeout is plausibly just resource contention
+                # (confirmed real 2026-09-17: several short, completely
+                # normal videos timed out purely because a concurrent
+                # CPU-heavy reclassification backfill was running at the
+                # same time, not because of anything wrong with the file
+                # itself) -- NOT marked isProcessed/face_extraction_failed
+                # like every other failure below, so it's retried
+                # automatically by a future scheduled run instead of
+                # needing a manual reset. But a genuinely-too-long video
+                # (not just contention) would otherwise retry forever,
+                # each attempt burning a full PER_VIDEO_TIMEOUT_SECONDS --
+                # face_extraction_timeout_count caps that at
+                # MAX_VIDEO_TIMEOUT_RETRIES, per the user's explicit call.
+                video.face_extraction_timeout_count += 1
+                if video.face_extraction_timeout_count >= MAX_VIDEO_TIMEOUT_RETRIES:
+                    settings.LOGGER.error(
+                        f"Video face extraction timed out for {video.filename} "
+                        f"{video.face_extraction_timeout_count} times -- giving up "
+                        f"and marking it a real failure: {exc}"
+                    )
+                    video.face_extraction_failed = True
+                    video.face_extraction_error = (
+                        f"Timed out {video.face_extraction_timeout_count} times "
+                        f"(>{PER_VIDEO_TIMEOUT_SECONDS}s each): {exc}"
+                    )[:2000]
+                    video.isProcessed = True
+                else:
+                    settings.LOGGER.warning(
+                        f"Video face extraction timed out for {video.filename} "
+                        f"(attempt {video.face_extraction_timeout_count}/"
+                        f"{MAX_VIDEO_TIMEOUT_RETRIES}) -- leaving unprocessed to "
+                        f"retry later rather than marking it a permanent failure: {exc}"
+                    )
+                video.save()
                 continue
             except Exception as exc:
                 settings.LOGGER.error(
@@ -178,6 +207,11 @@ def process_video_faces(max_runtime_seconds=None):
                 f"Video face extraction: {video.filename} -> {len(faces)} face group(s)."
             )
             video.isProcessed = True
+            # Reset in case this video had previously timed out a few
+            # times before eventually succeeding -- a stale nonzero count
+            # would otherwise wrongly count toward MAX_VIDEO_TIMEOUT_RETRIES
+            # if this video were ever manually reset and reprocessed again.
+            video.face_extraction_timeout_count = 0
             video.save()
 
 @shared_task(ignore_result=True, name='face_manager.reencode')
