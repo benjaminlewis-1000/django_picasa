@@ -962,6 +962,72 @@ class P99ThresholdLookupTests(TestCase):
                 self.assertEqual(self.assigner._p99_threshold_for_gallery_size(gallery_size), expected)
 
 
+class CohesionAndSpanNudgeTests(TestCase):
+    """_cohesion_and_span_nudge(): the per-person threshold correction on
+    top of the size-only bucket gate -- see THRESHOLD_NUDGE_REFERENCE_N's
+    own comment in faceAssigner.__init__ for the full investigation (3
+    real false-positive hot spots after the -0.05 cut, root-caused via
+    real production data) this is calibrated from."""
+
+    def setUp(self):
+        self.assigner = faceAssigner()
+
+    def test_high_cohesion_wide_span_gets_no_nudge(self):
+        # A normal, healthy gallery -- cohesion above the floor, span
+        # well past MIN_SPAN_DAYS -- should be untouched.
+        nudge = self.assigner._cohesion_and_span_nudge(
+            cohesion=0.5, span_iqr_days=365, gallery_size=1000
+        )
+        self.assertEqual(nudge, 0.0)
+
+    def test_low_cohesion_small_gallery_gets_penalized(self):
+        # David Redd's real profile: cohesion well below the floor, a
+        # small-ish gallery so the size-scale factor doesn't crush it.
+        nudge = self.assigner._cohesion_and_span_nudge(
+            cohesion=0.28, span_iqr_days=5000, gallery_size=431
+        )
+        self.assertGreater(nudge, 0.03)
+
+    def test_same_low_cohesion_huge_gallery_gets_almost_no_nudge(self):
+        # The exact same cohesion gap as the case above, but backed by a
+        # huge gallery -- the size-scale factor should crush the penalty
+        # to near zero, since a percentile over thousands of faces is
+        # trustworthy even at low cohesion (this is what actually
+        # separates David Redd from Joshua/Daniel Lewis in production).
+        small = self.assigner._cohesion_and_span_nudge(
+            cohesion=0.28, span_iqr_days=5000, gallery_size=431
+        )
+        huge = self.assigner._cohesion_and_span_nudge(
+            cohesion=0.28, span_iqr_days=5000, gallery_size=14000
+        )
+        self.assertLess(huge, small)
+        self.assertLess(huge, 0.02)
+
+    def test_narrow_single_session_gallery_gets_penalized_even_with_high_cohesion(self):
+        # Emma's real profile: cohesion is actually the HIGHEST of any
+        # real case checked (near-duplicate photos from one session), but
+        # the near-zero span means the p99 isn't measuring real
+        # person-to-person variation -- must still be penalized.
+        nudge = self.assigner._cohesion_and_span_nudge(
+            cohesion=0.56, span_iqr_days=0, gallery_size=19
+        )
+        self.assertGreater(nudge, 0.03)
+
+    def test_nudge_is_capped(self):
+        nudge = self.assigner._cohesion_and_span_nudge(
+            cohesion=0.0, span_iqr_days=0, gallery_size=10
+        )
+        self.assertEqual(nudge, self.assigner.MAX_THRESHOLD_NUDGE)
+
+    def test_nudge_never_negative(self):
+        # A gallery that's BETTER than the floor on both axes must never
+        # get a negative nudge (i.e. loosen the threshold further).
+        nudge = self.assigner._cohesion_and_span_nudge(
+            cohesion=0.9, span_iqr_days=10_000, gallery_size=10
+        )
+        self.assertEqual(nudge, 0.0)
+
+
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class ClassifyUnassignedBucketGateTests(TestCase):
     """Confirms the accept/reject gate actually varies by candidate
@@ -981,15 +1047,17 @@ class ClassifyUnassignedBucketGateTests(TestCase):
         self.query[0] = 1.0
 
         # A similarity strictly between the smallest bucket's threshold
-        # (0.558) and the largest bucket's threshold (0.394) -- accepted
-        # for a large gallery, rejected for a small one.
+        # and the largest bucket's threshold (0.558 / 0.344 as of
+        # 2026-09-17's -0.05 cut to the non-<50 buckets -- see
+        # BUCKET_THRESHOLDS' own comment) -- accepted for a large
+        # gallery, rejected for a small one.
         self.mid_similarity = 0.50
         ref = self.query.copy()
         ref[0] = self.mid_similarity
         ref[1] = np.sqrt(1 - self.mid_similarity ** 2)  # unit vector at exactly mid_similarity cosine to query
 
         small_gallery_size = 10   # falls in the [10,50) bucket -> threshold 0.558
-        large_gallery_size = 600  # falls in the [500+) bucket -> threshold 0.394
+        large_gallery_size = 600  # falls in the [500+) bucket -> threshold 0.344
 
         self.assigner.embedding_dict = {
             self.small_person.id: np.tile(ref.reshape(512, 1), (1, small_gallery_size)),
@@ -1070,16 +1138,22 @@ class IgnoreWeightMarginTests(TestCase):
         return assigner, face
 
     def test_near_miss_gets_low_ignore_weight(self):
-        # Large-gallery bucket threshold is 0.394; scoring 0.39 is a
-        # near-miss margin of 0.004 -- should sort near the back.
-        assigner, face = self._make_face_with_single_candidate(similarity=0.39, gallery_size=600)
+        # Scores 0.004 below the large-gallery bucket's own threshold
+        # (derived from the live attribute, not a hardcoded absolute
+        # value, so this stays valid regardless of where that threshold
+        # is calibrated to) -- should sort near the back.
+        margin = 0.004
+        near_miss_similarity = faceAssigner().BUCKET_THRESHOLDS[-1] - margin
+        assigner, face = self._make_face_with_single_candidate(
+            similarity=near_miss_similarity, gallery_size=600
+        )
 
         with patch.object(Face, "set_possible_person") as mock_set:
             assigner.classify_unassigned(face)
 
         mock_set.assert_called_once()
         _, precedence, weight = mock_set.call_args[0]
-        expected = 0.004 / assigner.IGNORE_WEIGHT_MARGIN_CLAMP
+        expected = margin / assigner.IGNORE_WEIGHT_MARGIN_CLAMP
         self.assertAlmostEqual(weight, expected, places=3)
         self.assertLess(weight, 0.1)
 
@@ -1096,7 +1170,10 @@ class IgnoreWeightMarginTests(TestCase):
         self.assertEqual(weight, 1.0)
 
     def test_far_beats_near_miss_in_sort_order(self):
-        near_miss_assigner, near_miss_face = self._make_face_with_single_candidate(similarity=0.39, gallery_size=600)
+        near_miss_similarity = faceAssigner().BUCKET_THRESHOLDS[-1] - 0.004
+        near_miss_assigner, near_miss_face = self._make_face_with_single_candidate(
+            similarity=near_miss_similarity, gallery_size=600
+        )
         far_assigner, far_face = self._make_face_with_single_candidate(similarity=0.0, gallery_size=600)
 
         with patch.object(Face, "set_possible_person") as mock_set:
