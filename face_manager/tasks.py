@@ -139,25 +139,46 @@ def process_video_faces(max_runtime_seconds=None):
                     faces = extractor.process_video(video)
                 finally:
                     signal.alarm(0)
-                settings.LOGGER.debug(
-                    f"Video face extraction: {video.filename} -> {len(faces)} face group(s)."
+            except _VideoProcessingTimeout as exc:
+                # Deliberately NOT marked isProcessed/face_extraction_failed
+                # here, unlike every other failure below -- a timeout is
+                # plausibly just resource contention (confirmed real
+                # 2026-09-17: several short, completely normal videos
+                # timed out purely because a concurrent CPU-heavy
+                # reclassification backfill was running at the same time,
+                # not because of anything wrong with the file itself).
+                # Leaving isProcessed=False lets this video simply be
+                # picked up again by a future scheduled run once
+                # resources free up, rather than requiring a manual reset
+                # every time contention happens to cause a timeout.
+                settings.LOGGER.warning(
+                    f"Video face extraction timed out for {video.filename} -- "
+                    f"leaving unprocessed to retry later rather than marking "
+                    f"it a permanent failure: {exc}"
                 )
+                continue
             except Exception as exc:
                 settings.LOGGER.error(
                     f"Video face extraction failed for {video.filename}", exc_info=True
                 )
-                video.face_extraction_failed = True
-                video.face_extraction_error = f"{type(exc).__name__}: {exc}"[:2000]
-            finally:
                 # Mark processed regardless of success/failure, same as
                 # find_and_encode_faces()'s corrupted-image handling --
-                # a video that fails once shouldn't be retried forever on
-                # every scheduled run. face_extraction_failed/_error (set
-                # in the except branch above) make this visible on
+                # a video that fails for a real (non-timeout) reason
+                # shouldn't be retried forever on every scheduled run.
+                # face_extraction_failed/_error make this visible on
                 # server_stats and queryable, unlike FailedVideoFile
                 # (which is about ingestion, not face extraction).
+                video.face_extraction_failed = True
+                video.face_extraction_error = f"{type(exc).__name__}: {exc}"[:2000]
                 video.isProcessed = True
                 video.save()
+                continue
+
+            settings.LOGGER.debug(
+                f"Video face extraction: {video.filename} -> {len(faces)} face group(s)."
+            )
+            video.isProcessed = True
+            video.save()
 
 @shared_task(ignore_result=True, name='face_manager.reencode')
 def reencode_missing_faces():
