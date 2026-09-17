@@ -2291,3 +2291,39 @@ class ProcessVideoFacesFailureTrackingTests(TestCase):
         self.assertFalse(self.video.isProcessed)
         self.assertFalse(self.video.face_extraction_failed)
         self.assertIsNone(self.video.face_extraction_error)
+        self.assertEqual(self.video.face_extraction_timeout_count, 1)
+
+    def test_repeated_timeouts_eventually_marked_a_real_failure(self):
+        # A genuinely-too-long video (not just resource contention) would
+        # otherwise retry forever, each attempt burning a full
+        # PER_VIDEO_TIMEOUT_SECONDS -- MAX_VIDEO_TIMEOUT_RETRIES caps
+        # that, per the user's explicit request.
+        from face_manager.tasks import process_video_faces, _VideoProcessingTimeout, MAX_VIDEO_TIMEOUT_RETRIES
+        with patch('video_face_pipeline.VideoFaceExtractor') as MockExtractor:
+            MockExtractor.return_value.process_video.side_effect = _VideoProcessingTimeout("boom")
+            for _ in range(MAX_VIDEO_TIMEOUT_RETRIES - 1):
+                process_video_faces()
+                self.video.refresh_from_db()
+                self.assertFalse(self.video.isProcessed)
+                self.assertFalse(self.video.face_extraction_failed)
+                # isProcessed=False is required for the next call's
+                # unprocessed queryset to pick this video up again.
+                self.video.isProcessed = False
+                self.video.save()
+
+            process_video_faces()
+        self.video.refresh_from_db()
+        self.assertEqual(self.video.face_extraction_timeout_count, MAX_VIDEO_TIMEOUT_RETRIES)
+        self.assertTrue(self.video.isProcessed)
+        self.assertTrue(self.video.face_extraction_failed)
+        self.assertIn(str(MAX_VIDEO_TIMEOUT_RETRIES), self.video.face_extraction_error)
+
+    def test_eventual_success_resets_timeout_count(self):
+        from face_manager.tasks import process_video_faces, _VideoProcessingTimeout
+        self.video.face_extraction_timeout_count = 3
+        self.video.save()
+        with patch('video_face_pipeline.VideoFaceExtractor') as MockExtractor:
+            MockExtractor.return_value.process_video.return_value = []
+            process_video_faces()
+        self.video.refresh_from_db()
+        self.assertEqual(self.video.face_extraction_timeout_count, 0)
