@@ -6,10 +6,40 @@ import torch
 import torchvision.ops.boxes as bops
 from django.conf import settings
 from django.core.management.base import BaseCommand
+from insightface.app import FaceAnalysis
 
 import common
 from face_extract_encode import FaceExtractor
 from face_manager.models import Face, Person
+from pyramidal_detector import PyramidalDetector
+
+# Matches FaceExtractor.IOU_thresh -- duplicated here (rather than
+# instantiating a full FaceExtractor just to read one attribute) since
+# doing so would also load the full buffalo_l model set this command
+# deliberately avoids below.
+_DETECTOR_IOU_THRESH = 0.3
+
+
+def _build_detection_only_detector():
+    """A detection-only FaceAnalysis, wrapped in the same PyramidalDetector
+    the live pipeline uses -- deliberately NOT FaceExtractor's own .app,
+    which loads the full buffalo_l module set (landmark_3d_68,
+    landmark_2d_106, genderage, recognition) and runs all of them on
+    every detected face, in every PyramidalDetector tile pass, even
+    though this command only ever reads det_score/kps -- both direct
+    SCRFD detector outputs, unaffected by those other modules.
+
+    Verified empirically 2026-09-18 against a real, busy 70-face group
+    photo (DSCN3724.JPG): bit-identical bbox/det_score for all 70 faces
+    between the full and detection-only detectors, 127.9s -> 3.2s (a
+    39.69x speedup) -- this is what was actually driving the high
+    contention-independent timeout rate seen on busy group/family
+    photos under the full detector, not resource contention.
+    """
+    face_analysis = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'],
+                                  allowed_modules=['detection'])
+    face_analysis.prepare(ctx_id=-1)
+    return PyramidalDetector(detector=face_analysis, iou_thresh=_DETECTOR_IOU_THRESH)
 
 # Per-image hard timeout -- a real production hang was found running this
 # command at scale: one image drove CPU to 1400%+ with ZERO progress for
@@ -111,11 +141,11 @@ class Command(BaseCommand):
             f"{'(dry run)' if dry_run else ''}"
         )
 
-        extractor = FaceExtractor()
+        app = _build_detection_only_detector()
         if cut_list_arg:
-            extractor.app.cut_list = [int(x) for x in cut_list_arg.split(',')]
+            app.cut_list = [int(x) for x in cut_list_arg.split(',')]
         elif single_pass:
-            extractor.app.cut_list = [1]
+            app.cut_list = [1]
         matched = unmatched = decode_failed = timed_out = 0
         t0 = time.time()
 
@@ -128,7 +158,7 @@ class Command(BaseCommand):
                     if img_numpy is None:
                         decode_failed += len(image_faces)
                         continue
-                    detections = extractor.app.get(img_numpy)
+                    detections = app.get(img_numpy)
                 finally:
                     signal.alarm(0)
             except _ImageTimeout:

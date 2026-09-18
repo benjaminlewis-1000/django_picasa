@@ -3971,3 +3971,75 @@ re-targets only what's still NULL) -- 38,154 distinct source images / 71,246 fac
 (down from the original ~73k scoping estimate, consistent with the ongoing reclassification
 backfill continuing to flip some of this population out of `.ignore` in parallel). Progress/final
 results to be recorded once the run completes or is next checked.
+
+## DONE (2026-09-18, same day): `cut_list=[1,2]` benchmarked as a middle ground, then a much
+bigger win found -- `backfill_det_score` was running the full multi-module `FaceAnalysis` for no
+reason, ~40x slower than necessary on busy photos
+
+Follow-up investigation prompted by the user's own question ("would it be worth doing something
+that detects smaller faces, maybe a `[1,2]` instead of `[1,3]`?"). `cut_list` controls
+`PyramidalDetector`'s tiling: `[1]` = 1 whole-image detection call, `[1,2]` = 1 + 2x2=4 tiled
+calls = 5 total, `[1,3]` (the live-pipeline default) = 1 + 3x3=9 = 10 total.
+
+**Real benchmark against 20 real images / 123 real `.ignore` faces** (read-only, no writes,
+run concurrently with the live production backfill so absolute times are contention-inflated but
+relative comparison still holds): `[1]` matched 105/123 (85.4%); **`[1,2]` and `[1,3]` both matched
+123/123 (100.0%), identically** -- `[1,2]` recovers the SAME recall as the full 10-pass detector at
+half the detection calls. Production's live run was switched from `[1,3]` to `--cut-list 1,2`
+on this evidence. A `--cut-list` flag (comma-separated ints, overrides `--single-pass` if both are
+given) was added to the command rather than hardcoding the choice, so this remains tunable.
+`--single-pass` itself is kept for backward compatibility / an even-cheaper-but-lossier option, but
+is superseded by `--cut-list=1,2` as the recommended default.
+
+**But the real production run under `--cut-list 1,2` still showed an alarmingly high timeout
+rate with no external contention** (0.08 img/s, `matched=50 unmatched=56 decode_failed=0
+timed_out=116` at the very first 50-image checkpoint -- over half the faces processed timed out,
+despite the benchmark no longer running and celery workers sitting mostly idle). Investigated
+directly rather than assumed: only 10 distinct images actually timed out (not 52% of images --
+`timed_out` counts FACES, and those 10 images happened to be busy family/group/vacation photos
+with ~12 faces each on average), and none were unusually large in resolution
+(`DSCN3724.JPG`, one of the 10, is a normal 2288x1712 ~4MP photo).
+
+**Root cause, confirmed empirically**: `backfill_det_score` builds its detector via a plain
+`FaceExtractor()` -- the SAME `FaceAnalysis(name='buffalo_l')` the live image pipeline uses, which
+loads and unconditionally runs `landmark_3d_68`, `landmark_2d_106`, `genderage`, AND `recognition`
+on every single detected face, in every one of `PyramidalDetector`'s tile passes (this exact
+mechanism was already documented in this file's own video-pipeline Phase 3 investigation, but
+never carried over to this command). **Important distinction, checked directly rather than
+assumed**: the 5-point `kps` this command actually needs and stores (`Face.kps`) is NOT produced
+by `landmark_3d_68`/`landmark_2d_106` -- those two modules instead produce separate, higher-
+resolution landmark sets (68 3D points / 106 2D points respectively) as their own distinct `Face`
+attributes, unrelated to `kps`. `kps` is a native SCRFD detector output, jointly regressed with the
+bounding box and `det_score` by the detection model itself -- confirmed directly by
+`test_detection_only_detector_produces_valid_real_scores` still getting a valid 5-point `kps` on
+every detection with `allowed_modules=['detection']` (no landmark modules loaded at all).
+`backfill_det_score` only ever reads `det_score` and `kps` from a matched detection -- both
+already present with `allowed_modules=['detection']` alone, so none of the four other analysis
+modules (including `genderage`, confirmed elsewhere in this file as unused anywhere in the
+codebase) are needed. On a busy 70-face real photo (`DSCN3724.JPG`, the same one that had just
+timed out), a full detect-only-vs-full-modules comparison (both run with `cut_list=[1,2]`) found
+**bit-identical bbox/det_score for all 70 faces between the two**, confirming the extra modules
+contribute nothing this command uses -- and the timing gap was stark: **127.9s (full modules) vs.
+3.2s (detection-only) -- a 39.69x speedup**, with zero difference in output.
+
+**Fixed**: `backfill_det_score.py` no longer instantiates `FaceExtractor()` for its detector at
+all (still imports it solely for the pure static `FaceExtractor._flatten_kps`, which needs no
+instantiation and thus no model loading). New `_build_detection_only_detector()` builds its own
+`FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'], allowed_modules=['detection'])`
+wrapped in the same `PyramidalDetector` (`iou_thresh=0.3`, duplicated as a module constant rather
+than instantiating a whole `FaceExtractor` just to read one attribute). Every existing test's mock
+target moved from `FaceExtractor` to `_build_detection_only_detector` (11 tests total, `--cut-list`
+tests included); the `_flatten_kps` real-vs-mocked juggling the old tests needed is gone entirely,
+since the real static method is now always used directly and costs nothing to call. One new
+real-inference test (`test_detection_only_detector_produces_valid_real_scores`, tagged slow) --
+not a re-proof of the bit-identical-to-full-modules finding above (that was confirmed manually
+against real production data, not worth re-deriving in CI), just a sanity check that the
+detection-only detector produces valid `det_score`/`kps` output against a known fixture, catching
+a regression like a bad `allowed_modules` value breaking detection outright. Full fast suite:
+447/447 passing (446 baseline + 1 new).
+
+**Deployed to production same day**: code-only change (no migration, no restart needed --
+`backfill_det_score` is a fresh management-command invocation each run, always reading current
+code off the bind-mounted `/code`). Live backfill killed and relaunched with the same
+`--cut-list 1,2` flag, now backed by the fast detection-only detector -- see the next entry for
+real before/after throughput once the new run has a checkpoint or two.
