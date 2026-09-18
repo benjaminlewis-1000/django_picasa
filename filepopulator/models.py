@@ -1162,7 +1162,16 @@ class VideoFile(models.Model):
     # retried again, so a genuinely-too-long (not just contention-caused)
     # video doesn't burn a full PER_VIDEO_TIMEOUT_SECONDS on every single
     # scheduled run forever. Reset to 0 on an eventual real success.
-    face_extraction_timeout_count = models.IntegerField(default=0)
+    # db_default (not just default) -- a real production incident
+    # (2026-09-18) found that Python-level `default` alone doesn't
+    # protect against a stale, already-forked Celery worker process
+    # (loaded before this field's migration landed) issuing an INSERT
+    # that omits the column entirely, since Celery's prefork workers
+    # inherit the parent's already-loaded Django app registry rather
+    # than re-running django.setup() per child. A DB-level default
+    # means even that stale INSERT succeeds safely instead of hitting
+    # a NOT NULL violation. See CLAUDE.md for the full incident.
+    face_extraction_timeout_count = models.IntegerField(default=0, db_default=0)
 
     def __str__(self):
         return self.filename

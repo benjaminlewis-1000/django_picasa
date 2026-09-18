@@ -4043,3 +4043,73 @@ a regression like a bad `allowed_modules` value breaking detection outright. Ful
 code off the bind-mounted `/code`). Live backfill killed and relaunched with the same
 `--cut-list 1,2` flag, now backed by the fast detection-only detector -- see the next entry for
 real before/after throughput once the new run has a checkpoint or two.
+
+**Follow-up (2026-09-18): `--cut-list 1,2` -> `--cut-list 1,3` after the detection-only fix made
+the extra tile passes cheap.** With the full-modules detector gone, the earlier `[1,2]` vs `[1,3]`
+benchmark's "identical recall" finding (see above) didn't hold up at real production scale --
+a fresh checkpoint comparison at the same 50-image mark: `[1,2]` gave `matched=66 unmatched=81`
+(a real, substantial unmatched rate); `[1,3]` gave `matched=161 unmatched=0`, at barely any extra
+cost (0.33 img/s vs `[1,2]`'s 0.37 img/s, ~11% slower). Switched the live run to `--cut-list 1,3`
+-- essentially the same speed as `[1,2]` now, much better recall. This reinforces the earlier
+25-image benchmark's own caveat (a small, recency-skewed sample isn't representative of the full
+population's harder tail) -- worth remembering before trusting a small benchmark's exact recall
+numbers again, even when the qualitative direction (a middle-ground cut_list helps) was right.
+
+## DONE (2026-09-18, same day): real production incident -- new-video ingestion silently broke
+for ~6 hours overnight after a same-day NOT-NULL migration, root-caused, fixed structurally (not
+just cleaned up), and a general lesson recorded
+
+Found while checking "have we ingested anything from the Lewis VHS clips folder in the last 24h"
+-- answer was no, and further digging found **73 real ingestion failures** overnight (02:45-03:30),
+all `/videos/Lewis_family_VHS_video_clips/...` files, all with the identical error:
+`null value in column "face_extraction_timeout_count" of relation "filepopulator_videofile"
+violates not-null constraint`. **Scope check confirmed this wasn't Lewis-specific** -- it's a
+general new-video-ingestion bug that just happened to only manifest against Lewis clips because
+that was the only root with genuinely new content landing overnight; any newly-discovered video
+from any root would have hit the same failure in that window.
+
+**Root cause, confirmed by direct reproduction, not assumed**: `face_extraction_timeout_count`
+(migration `filepopulator.0013`, added earlier the same day as part of the video-timeout-retry-cap
+feature above) is a plain `models.IntegerField(default=0)` -- Django's `default=` is a *Python-side*
+convenience applied only when the ORM constructs a new model instance; it does **not** add a
+database-level `DEFAULT` clause to the column. Postgres itself has no fallback for that column at
+all. Meanwhile, Celery's prefork worker pool loads the Django app registry (including the model's
+field list) exactly once, in the *parent* process, at its own startup -- forked child workers
+(recycled every `--max-tasks-per-child 3` tasks) inherit that already-loaded registry rather than
+re-running `django.setup()` per fork. So a parent worker process that had been running since
+*before* this migration landed kept generating `INSERT`s that simply omitted the new column
+entirely -- something that's normally harmless for an additive column (this project's own
+established "additive migrations are safe in either order" deploy practice, used throughout this
+file, assumes exactly this) but breaks specifically for a NOT-NULL column with only a Python-level
+default. The parent worker process wasn't actually restarted until the *next* container restart --
+`picasa_api` was restarted at 08:56 the same morning for an unrelated deploy (the det_score
+video-pipeline work above), which is what silently fixed this without anyone noticing at the time.
+Confirmed directly: re-running `create_video_file()` against one of the 73 failed files on current
+(post-restart) code succeeded immediately, with zero code change -- proving the bug was purely a
+stale-process/schema-skew window, not a real logic error in `create_video_file()` itself.
+
+**Cleanup**: the 72 still-stuck `FailedVideoFile` rows (1 of the original 73 had already been
+manually re-verified and thus cleared) were deleted outright rather than waited on --
+`add_videos_from_root_dir()`'s own mtime-based retry guard means a `FailedVideoFile` row for a file
+whose mtime hasn't changed is *never* automatically retried, so these would have sat there forever
+otherwise, even though the underlying files are now perfectly ingestable. `add_videos_from_root_dir
+(['/videos/Lewis_family_VHS_video_clips'])` re-run directly afterward: all 72 succeeded, 0 remaining
+failures, 88 total `VideoFile` rows now under that root (matching the real on-disk file count).
+
+**Real, structural fix (not just a manual playbook reminder)**: per the user's own question ("how
+could we have prevented this?") -- clearing `FailedVideoFile` rows is cleanup, not prevention, and
+"restart every long-running process immediately after every migration" is real but fragile advice
+to rely on alone (this incident happened specifically because a restart was deferred, and this
+project has an established, deliberate practice elsewhere in this file of *deferring* restarts to
+"the next natural break" around other in-progress work). The actual structural fix:
+`face_extraction_timeout_count` changed to `models.IntegerField(default=0, db_default=0)`
+(migration `filepopulator.0014`, `AlterField`) -- `db_default` (available since Django 5.0, this
+project is on 6.1.1) pushes the default to a real Postgres-level `DEFAULT` clause, so even a stale
+worker process's INSERT that omits the column entirely now succeeds safely instead of violating
+NOT NULL. **General lesson for this codebase going forward**: any new NOT-NULL field with a
+default, added to a model that's written to by a long-running process (Celery workers in
+particular, given the prefork-inherits-parent-registry behavior above), should use `db_default`
+(alone or alongside `default`) rather than `default` alone -- this closes the schema-skew window
+structurally, rather than depending on migration-then-restart timing always being tight. Existing
+NOT-NULL-with-Python-default fields elsewhere in this codebase were not audited/retrofitted this
+session (scope was this one incident's field) -- worth a broader pass if this class of bug recurs.
