@@ -526,6 +526,12 @@ class PersonParamView(APIView):
         # candidate first).
         sort_ascending = params.get('order', 'desc').lower() == 'asc'
 
+        # face_poss branch only (below) - 'image'/'video' restrict the
+        # confirm queue to faces sourced from ordinary photos vs video
+        # frames respectively; anything else (including the default,
+        # unset) means no restriction.
+        media_filter = params.get('media', 'all').lower()
+
         # Frontend's ".ignore" sidebar subordinate row ("Flagged for
         # review") - faces still proposed as .ignore (poss_ident1) that
         # were reviewed once already via the mobile app's ignore-review
@@ -646,6 +652,16 @@ class PersonParamView(APIView):
                         # partition .ignore's poss_ident1 set with no
                         # overlap either way.
                         poss_query &= (Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False))
+
+                # Frontend's confirm-queue media filter (imageScreen.jsx,
+                # 2026-09-18) - lets a person confirm image-sourced faces,
+                # video-sourced faces, or both, separately. source_video_file
+                # is null for an ordinary photo-sourced face, set for one
+                # extracted from a video frame.
+                if media_filter == 'image':
+                    poss_query &= Q(source_video_file__isnull=True)
+                elif media_filter == 'video':
+                    poss_query &= Q(source_video_file__isnull=False)
 
                 # Was: fetch every matching row, then sort descending by
                 # weight_1 in Python - fine when the whole set was always
