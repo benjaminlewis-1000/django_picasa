@@ -399,8 +399,19 @@ class PersonListView(APIView):
                 p_dict['num_possibilities'] = num_blanks
                 p_dict['num_unverified_faces'] = num_blanks
                 p_dict['num_faces'] = num_blanks
+                # Unassigned specifically - one extra targeted query
+                # (not a per-person loop, see live_counts.py's own
+                # reasoning for why that matters) for the frontend's
+                # "Confirm from" sidebar split (personSidebar.jsx).
+                num_blanks_video = Face.objects.filter(
+                    declared_name__person_name=settings.BLANK_FACE_NAME, source_video_file__isnull=False
+                ).count()
+                p_dict['num_possibilities_video'] = num_blanks_video
+                p_dict['num_possibilities_image'] = num_blanks - num_blanks_video
             else:
                 p_dict['num_possibilities'] = counts['num_possibilities']
+                p_dict['num_possibilities_video'] = counts['num_possibilities_video']
+                p_dict['num_possibilities_image'] = counts['num_possibilities'] - counts['num_possibilities_video']
                 p_dict['num_unverified_faces'] = counts['num_unverified_faces']
 
             # Count backing the frontend's ".ignore" sidebar subordinate
@@ -422,6 +433,16 @@ class PersonListView(APIView):
                 # would overcount relative to what's actually shown
                 # there.
                 p_dict['num_possibilities'] = max(0, p_dict['num_possibilities'] - num_flagged)
+                # Same exclusion, applied to the video split specifically -
+                # num_possibilities_image is derived as the remainder
+                # rather than queried separately, so the two always sum
+                # back to the already-adjusted num_possibilities above
+                # exactly, with no separate rounding/drift risk.
+                num_flagged_video = Face.objects.filter(
+                    poss_ident1=p, mobile_review_hidden=True, source_video_file__isnull=False
+                ).count()
+                p_dict['num_possibilities_video'] = max(0, p_dict['num_possibilities_video'] - num_flagged_video)
+                p_dict['num_possibilities_image'] = max(0, p_dict['num_possibilities'] - p_dict['num_possibilities_video'])
                 # Backs the verify screen's "Flagged & unverified"
                 # subordinate row - faces already confirmed to .ignore,
                 # not yet verified, that were ALSO flagged at some point
