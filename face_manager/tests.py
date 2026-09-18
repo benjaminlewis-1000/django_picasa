@@ -2058,6 +2058,32 @@ class BackfillDetScoreTests(TestCase):
         self.assertAlmostEqual(face.det_score, 0.91, places=4)
         self.assertEqual(face.kps, [v for pair in fake_kps for v in pair])
 
+    def test_matched_face_save_does_not_open_thumbnail_file(self):
+        # Real crash found running this at scale: image_list holds every
+        # Face object in memory for the whole run, so nothing is ever
+        # garbage-collected between saves -- Face.save() used to
+        # unconditionally open the thumbnail file (to check it exists)
+        # and never close it, and with thousands of faces processed in
+        # one long-lived process this exhausted the OS fd limit (OSError:
+        # Too many open files, hit for real at ~600/38489 images). Fixed
+        # at the source (Face.save(), see FaceSaveThumbnailCheckTests
+        # below) by using .path (pure filesystem-path computation) instead
+        # of .file.name (which opens the file) -- this test confirms the
+        # backfill command's own save() call benefits from that fix by
+        # never opening the file at all, not just closing it after.
+        from django.core.files.storage import Storage
+        from face_extract_encode import FaceExtractor as RealFaceExtractor
+        face = self._make_ignore_face([10, 10, 50, 50])
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.91)]
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor, \
+             patch.object(Storage, 'open', autospec=True) as mock_storage_open:
+            MockExtractor._flatten_kps = RealFaceExtractor._flatten_kps
+            MockExtractor.return_value.app.get.return_value = fake_dets
+            call_command('backfill_det_score')
+        mock_storage_open.assert_not_called()
+
     def test_no_matching_detection_leaves_det_score_null(self):
         face = self._make_ignore_face([10, 10, 50, 50])
         # A detection far from the stored box -- shouldn't match.
@@ -2110,6 +2136,63 @@ class BackfillDetScoreTests(TestCase):
             call_command('backfill_det_score')
         mock_open.assert_not_called()
         MockExtractor.return_value.app.get.assert_not_called()
+
+    def test_single_pass_flag_restricts_detector_to_one_pass(self):
+        # cut_list=[1,3] (the default, matching the live pipeline exactly)
+        # measured at ~0.10 img/s in real production -- a multi-day run
+        # for the full unlabeled .ignore population. --single-pass trades
+        # some recall (small/edge faces the tiled pass would catch) for
+        # roughly 10x fewer detection calls per image.
+        self._make_ignore_face([10, 10, 50, 50])
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
+            MockExtractor.return_value.app.get.return_value = []
+            call_command('backfill_det_score', '--single-pass')
+        self.assertEqual(MockExtractor.return_value.app.cut_list, [1])
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class FaceSaveThumbnailCheckTests(TestCase):
+    """Face.save()'s thumbnail-existence check uses .path (a pure
+    filesystem-path computation via the storage backend), not
+    .file.name (which OPENS the underlying file via FieldFile._get_file()
+    and is never closed by Django) -- so it stays cheap and leak-free
+    regardless of update_fields, not just for a narrow save. Real crash
+    this was found from: OSError: Too many open files at ~600 images
+    into backfill_det_score, since that command holds every Face object
+    in memory for the whole run so nothing is ever garbage-collected
+    between saves. See BackfillDetScoreTests.
+    test_matched_face_save_does_not_open_thumbnail_file for the same
+    guarantee exercised through the real backfill command."""
+
+    def test_save_never_opens_the_thumbnail_file(self):
+        # Patches Storage.open itself (not FieldFile._get_file) since
+        # property(_get_file, ...) captures that function object at
+        # class-definition time -- patching the _get_file *name*
+        # afterward doesn't change what the already-built property
+        # descriptor actually calls. A freshly-fetched Face (matching how
+        # the real backfill always encounters them) has no cached
+        # FieldFile._file yet either, unlike re-saving the same in-memory
+        # instance make_face() already saved once.
+        from django.core.files.storage import Storage
+        image = make_image()
+        face_id = make_face(image).id
+        for save_kwargs in [{}, {'update_fields': ['detected_age']}, {'update_fields': ['face_thumbnail']}]:
+            with self.subTest(save_kwargs=save_kwargs):
+                face = Face.objects.get(id=face_id)
+                face.detected_age = 42
+                with patch.object(Storage, 'open', autospec=True) as mock_storage_open:
+                    face.save(**save_kwargs)
+                mock_storage_open.assert_not_called()
+
+    def test_missing_thumbnail_file_still_raises(self):
+        image = make_image()
+        face = make_face(image)
+        os.remove(face.face_thumbnail.path)
+        face.detected_age = 43
+        with self.assertRaises(ValidationError):
+            face.save()
 
 
 class VideoFaceShortTrackFilterTests(unittest.TestCase):
