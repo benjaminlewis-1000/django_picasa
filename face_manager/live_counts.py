@@ -55,10 +55,26 @@ def annotate_live_face_counts(queryset):
         .order_by().values('poss_ident1')
         .annotate(c=Count('id')).values('c')
     )
+    # Same shape as poss1_sq, just restricted to video-sourced faces -
+    # backs the frontend's per-person "Confirm from: Images/Video/Both"
+    # sidebar split (personSidebar.jsx/gallery.jsx's buildCountDeltas).
+    # A separate subquery rather than a single query with a conditional
+    # aggregate, matching this module's own established pattern (see the
+    # module docstring on why a join-based combined aggregate is
+    # dangerous here) - and relies on the same
+    # face_manager_face_poss_ident1_id_covering index, extended (see the
+    # migration this shipped with) to INCLUDE source_video_file_id so
+    # this filter stays an index-only scan instead of a heap fetch per row.
+    poss1_video_sq = (
+        Face.objects.filter(poss_ident1=OuterRef('pk'), source_video_file__isnull=False)
+        .order_by().values('poss_ident1')
+        .annotate(c=Count('id')).values('c')
+    )
     return queryset.annotate(
         num_faces=Coalesce(Subquery(faces_sq.values('c')[:1], output_field=IntegerField()), Value(0)),
         num_unverified_faces=Coalesce(Subquery(faces_sq.values('u')[:1], output_field=IntegerField()), Value(0)),
         num_possibilities=Coalesce(Subquery(poss1_sq, output_field=IntegerField()), Value(0)),
+        num_possibilities_video=Coalesce(Subquery(poss1_video_sq, output_field=IntegerField()), Value(0)),
     )
 
 
@@ -74,6 +90,7 @@ def _chunk_live_counts(id_chunk):
         p.id: {
             'num_faces': p.num_faces,
             'num_possibilities': p.num_possibilities,
+            'num_possibilities_video': p.num_possibilities_video,
             'num_unverified_faces': p.num_unverified_faces,
         }
         for p in people
@@ -100,7 +117,7 @@ def compute_live_face_counts(person_ids, n_threads=4):
     in Python.
 
     Returns {person_id: {'num_faces': ..., 'num_possibilities': ...,
-    'num_unverified_faces': ...}}.
+    'num_possibilities_video': ..., 'num_unverified_faces': ...}}.
     """
     person_ids = list(person_ids)
     if not person_ids:
