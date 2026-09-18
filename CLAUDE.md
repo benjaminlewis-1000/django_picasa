@@ -1413,10 +1413,25 @@ The `image_face_extractor` git submodule (separate `faceTagging` repo) is refere
 
 There's a full test suite now (`api`, `face_manager`, `filepopulator`, `common`, and `picasa` itself — `train_classify` untouched). `picasa` isn't in `INSTALLED_APPS` (it's the project, not an app), so its tests run via dotted path rather than app label:
 ```
-python manage.py test --exclude-tag=slow   # fast unit/model/API tests only
-python manage.py test --tag=slow           # real ML inference tests (face_manager only)
-python manage.py test picasa.tests common  # project-level + shared-util tests
+python manage.py test --exclude-tag=slow --parallel 8   # fast unit/model/API tests only -- use --parallel by default, see below
+python manage.py test --tag=slow                        # real ML inference tests (face_manager only) -- do NOT add --parallel here, see below
+python manage.py test picasa.tests common                # project-level + shared-util tests
 ```
+**Always run the fast suite with `--parallel 8`, not serial, on this 24-core machine** — validated
+2026-09-18: real wall time dropped from ~800s serial to ~250-300s at `--parallel 8` (diminishing
+returns tested up to 8; not worth going higher given per-worker DB-setup overhead). This needed two
+real fixes first (both landed, safe to rely on now): `api/views.py`'s background bulk-processor
+thread no longer starts at import time (a DB connection it held used to get duplicated across
+`--parallel`'s forked workers, causing `InterfaceError: connection already closed`); `filepopulator/
+similarity.py`'s `run_phash_backfill()` now detects a daemonic caller (`multiprocessing.current_
+process().daemon`) and falls back to single-process instead of crashing (Python hard-blocks a
+daemonic process from spawning its own `multiprocessing.Pool`, and Django's own `--parallel`
+workers are daemonic). If a `--parallel` run ever reports an opaque `TypeError: cannot pickle
+'traceback' object` instead of a real failure, install `tblib` first (not yet in `requirements.txt`
+as of this writing) to see the actual error. **Do not add `--parallel` to the slow-tagged real-
+inference suite** without separately re-validating it -- it wasn't tested under `--parallel` this
+session and loads heavy ONNX models per test class already.
+
 `face_manager/test_face_cache.py` caches real `PyramidalDetector` output keyed on `sha256(image bytes) + sha256(pyramidal_detector.py source)`, so repeat runs against an unchanged image with an unchanged detector skip the CPU cost entirely (~4s → ~0.01s per image). Change either the image or the detector's code and the cache key changes automatically.
 
 **Bootstrapping a fresh DB from scratch — fixed 2026-08-25** (see "Fixed bugs" for the full writeup): `api/views.py` used to run a module-level query (`Person.objects.filter(person_name='.ignore')[0]`) assuming the `.ignore`/`.realignore`/`_NO_FACE_ASSIGNED_`/etc. `Person` rows already existed, with nothing in the codebase creating them. Now fixed two ways together: the lookups are `SimpleLazyObject`-wrapped (defers the query past import time), and `face_manager/migrations/0003_seed_sentinel_people.py` creates the rows automatically as part of `manage.py migrate`. `ensure_sentinel_people()` in `api/tests.py` still exists as a defensive no-op for tests but is no longer the only thing creating these rows.
@@ -4188,3 +4203,60 @@ processing, with zero additional detect calls. 2 new tests: a non-ignore face on
 gets backfilled (and its `declared_name` is confirmed untouched -- only `det_score`/`kps` written);
 a non-ignore face on an image with no `.ignore` faces at all is confirmed NOT touched (no detect
 call even attempted), proving image-selection scope is unchanged.
+
+## DONE (2026-09-18, same day): real production ingestion bug found while profiling the slow HEIC
+tests -- `ImageFile.save()` was decoding every image twice, not once
+
+Prompted by "any way to speed up the slowest tests?" -- profiling `HeicIngestionTests.test_ingests_
+every_heic_fixture_successfully` (cProfile, sorted by self-time) found `pillow_heif.heif.load()`
+(real libheif decode) called 32 times for a test that loops over only 8 real fixtures once. Traced
+directly (patched `pillow_heif.heif.BaseImage.load()` to log caller + whether `self._data` was
+already cached) rather than guessed: only 2 of those 4 calls per file are genuine decodes (the
+other 2 are free, already-cached no-ops per `BaseImage.load()`'s own `if not self._data` guard) --
+but 2 real decodes per file is still 2x more than necessary.
+
+**Root cause**: `ImageFile.save()` unconditionally called `self._init_image()` (which does
+`PIL.Image.open(self.filename)`, the real decode) even when the caller had already called it once
+on the exact same instance moments earlier -- `create_image_file()`'s common new-file path runs
+`process_new_no_md5()` (which calls `_init_image()`) and then `instance_clean_and_save()` (which
+calls `.save()`, which called `_init_image()` again). The old comment on this line was honest about
+not understanding why: *"I also have to redo the _init_image function for some reason, so that the
+self.image field is populated appropriately (it somehow loses it...)"* -- grepped the whole file:
+`self.image` is only ever assigned inside `_init_image()` itself, nowhere else, so there was no
+real reason it should ever be lost on the same instance. For cheap formats (JPEG) the redundant
+call cost ~0.5ms and was never worth noticing; for HEIC it's a real libheif decode, measured
+**~0.89s each** -- silently doubling real ingestion cost for every HEIC photo in production, not
+just in tests.
+
+**Fix**: `save()` now only calls `_init_image()` when `self.image` isn't already populated
+(`if getattr(self, 'image', None) is None`). Verified empirically before committing to it (this
+project's own established discipline) with a baseline-vs-patched comparison script against all 8
+real HEIC fixtures + 5 real JPEGs, read-only against the dev DB: **byte-identical results** (width,
+height, orientation, pixel_hash, phash, and exact thumbnail file sizes for all 3 sizes) between the
+old always-redecode behavior and the new guarded one, while halving the real decode count (confirmed
+via the same `BaseImage.load()` trace). New regression test
+(`test_save_does_not_redecode_when_image_already_populated`, `HeicIngestionTests`) asserts
+`_init_image()` runs exactly once per real ingestion via a call-counting patch.
+
+**Real, measured speedup**: the 3 `HeicIngestionTests` methods that go through `ImageFile.save()`
+roughly halved (43.2s->22.1s, 41.2s->22.2s, 39.3s->27.0s); the 4th
+(`test_all_orientation_codes_round_trip_correctly_on_real_photos`, pure PIL transforms, never calls
+`.save()`) was unaffected as expected, confirming the fix is scoped correctly. Combined with the
+`--parallel 8` adoption above: full fast suite under `--parallel 8` dropped from 252.9s to **144.3s**
+after this fix landed (451/451 passing) -- roughly a 43% additional speedup on top of parallelization
+alone, and this is a real production ingestion throughput win too (every HEIC photo ingested going
+forward pays for one decode instead of two), not just a test-speed one.
+
+**Separate, still-open finding from the same investigation, NOT fixed**: `_generate_thumbnail()`'s
+loop (`image = self.image; image.thumbnail(size, LANCZOS)` for big/medium/small in turn) does not
+copy `self.image` -- `image` is the same object, and `Image.thumbnail()` mutates in place. So the
+"big" thumbnail is generated correctly from the full-resolution image, but "medium" then gets
+generated from the already-shrunk "big" output, and "small" from the already-shrunk "medium" --
+compounding lossy LANCZOS resizes instead of three independent clean downsamples from the original.
+Not a correctness/crash bug (aspect ratio is preserved throughout, thumbnails still look right at a
+glance), but a real, measurable quality regression for medium/small thumbnails specifically. Not yet
+fixed or asked about -- flagged here for a future session or explicit decision.
+
+**Deployment status**: `filepopulator/models.py` (the `save()` guard) and its test are implemented
+and validated but **not yet committed or deployed** as of this write-up -- see whether a following
+entry records the commit/deploy, or check `git log -- filepopulator/models.py` directly.
