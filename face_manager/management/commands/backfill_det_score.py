@@ -83,10 +83,15 @@ class Command(BaseCommand):
         "for these faces instead of falling back to its own crop-based "
         "redetect path. Groups faces by source image first, so a photo "
         "with several .ignore faces only pays for one decode+detect pass, "
-        "not one per face. A face whose box no longer matches any "
-        "redetection is left NULL (both fields) and counted separately -- "
-        "not retried automatically, since this is a one-time sweep, not a "
-        "scheduled task."
+        "not one per face. .ignore faces still drive WHICH images get "
+        "processed, but every other face on an already-triggered image "
+        "that's also missing det_score (any poss_ident1/declared_name) "
+        "gets backfilled too, at no extra detect cost -- added 2026-09-18 "
+        "per explicit request, since the whole image is already decoded "
+        "and detected regardless of which face triggered it. A face whose "
+        "box no longer matches any redetection is left NULL (both fields) "
+        "and counted separately -- not retried automatically, since this "
+        "is a one-time sweep, not a scheduled task."
     )
 
     def add_arguments(self, parser):
@@ -123,12 +128,30 @@ class Command(BaseCommand):
         cut_list_arg = options['cut_list']
 
         ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
-        faces = Face.objects.filter(
+        trigger_faces = Face.objects.filter(
             poss_ident1=ignore_person, det_score__isnull=True, source_image_file__isnull=False,
         ).select_related('source_image_file')
 
         by_image = defaultdict(list)
-        for face in faces:
+        seen_face_ids = set()
+        for face in trigger_faces:
+            by_image[face.source_image_file].append(face)
+            seen_face_ids.add(face.id)
+
+        # Extend each triggered image to every OTHER face on it that's
+        # also missing det_score, regardless of poss_ident1/declared_name
+        # -- per the user's explicit request (2026-09-18). The detector
+        # already runs against the whole image regardless of which
+        # .ignore face triggered processing it, so backfilling a
+        # non-ignore face's det_score here is free (no extra detect
+        # call), not a separate pass. This does NOT change which images
+        # get processed -- .ignore faces still drive that -- only which
+        # faces on an already-triggered image get saved.
+        image_ids = [img.pk for img in by_image.keys()]
+        extra_faces = Face.objects.filter(
+            source_image_file_id__in=image_ids, det_score__isnull=True,
+        ).exclude(id__in=seen_face_ids).select_related('source_image_file')
+        for face in extra_faces:
             by_image[face.source_image_file].append(face)
 
         image_list = list(by_image.items())
