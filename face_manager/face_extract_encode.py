@@ -446,6 +446,7 @@ class FaceExtractor(object):
 
         existing_face.face_encoding_512 = new_embedding.tolist()
         existing_face.kps = self._flatten_kps(new_data['kps'])
+        existing_face.det_score = new_data['det_score']
         existing_face.box_left = new_left
         existing_face.box_top = new_top
         existing_face.box_right = new_right
@@ -475,6 +476,7 @@ class FaceExtractor(object):
 
         new_face.face_encoding_512 = insight_detected_face['embedding'].tolist()
         new_face.kps = self._flatten_kps(insight_detected_face['kps'])
+        new_face.det_score = insight_detected_face['det_score']
         new_face.declared_name = self.blank_face_person
         new_face.written_to_photo_metadata = False
         new_face.reencoded = True

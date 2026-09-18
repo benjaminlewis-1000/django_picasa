@@ -2004,6 +2004,114 @@ class VideoFaceIOUTrackingTests(unittest.TestCase):
         self.assertEqual(len(tracks), 2)
 
 
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class BackfillDetScoreTests(TestCase):
+    """backfill_det_score management command: re-detects each unlabeled
+    .ignore face's source image and matches the result back to the
+    stored box by IOU, storing the matched detection's own det_score.
+    Mocks FaceExtractor entirely (real model loading is expensive) and
+    common.open_img_oriented (no real image decode needed) -- only the
+    command's own IOU-matching/grouping logic is under test here."""
+
+    class _FakeDetection:
+        def __init__(self, bbox, det_score, kps=None):
+            self.bbox = np.array(bbox, dtype=np.float32)
+            self.det_score = det_score
+            self._kps = kps if kps is not None else [[1.0, 2.0]] * 5
+
+        def __getitem__(self, key):
+            if key == 'kps':
+                return self._kps
+            raise KeyError(key)
+
+    def setUp(self):
+        self.ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        self.image = make_image()
+        self.image.width, self.image.height = 1000, 1000
+        self.image.save()
+
+    def _make_ignore_face(self, box):
+        face = make_face(
+            self.image, declared_name=Person.objects.get(person_name=settings.BLANK_FACE_NAME),
+            box_left=box[0], box_top=box[1], box_right=box[2], box_bottom=box[3],
+        )
+        face.set_possible_person(self.ignore_person, 1, 1.0)
+        face.refresh_from_db()
+        return face
+
+    def test_matched_detection_sets_det_score_and_kps(self):
+        from face_extract_encode import FaceExtractor as RealFaceExtractor
+        face = self._make_ignore_face([10, 10, 50, 50])
+        fake_kps = [[15.0, 15.0], [35.0, 15.0], [25.0, 25.0], [17.0, 35.0], [33.0, 35.0]]
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.91, kps=fake_kps)]
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
+            # _flatten_kps is a pure static method already covered by its
+            # own tests elsewhere -- use the real implementation here so
+            # this test exercises real list data, not a MagicMock (which
+            # would fail Face.kps' ArrayField validation on save()).
+            MockExtractor._flatten_kps = RealFaceExtractor._flatten_kps
+            MockExtractor.return_value.app.get.return_value = fake_dets
+            call_command('backfill_det_score')
+        face.refresh_from_db()
+        self.assertAlmostEqual(face.det_score, 0.91, places=4)
+        self.assertEqual(face.kps, [v for pair in fake_kps for v in pair])
+
+    def test_no_matching_detection_leaves_det_score_null(self):
+        face = self._make_ignore_face([10, 10, 50, 50])
+        # A detection far from the stored box -- shouldn't match.
+        fake_dets = [self._FakeDetection([500, 500, 540, 540], 0.9)]
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
+            MockExtractor.return_value.app.get.return_value = fake_dets
+            call_command('backfill_det_score')
+        face.refresh_from_db()
+        self.assertIsNone(face.det_score)
+
+    def test_dry_run_does_not_save(self):
+        face = self._make_ignore_face([10, 10, 50, 50])
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.91)]
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
+            MockExtractor.return_value.app.get.return_value = fake_dets
+            call_command('backfill_det_score', '--dry-run')
+        face.refresh_from_db()
+        self.assertIsNone(face.det_score)
+
+    def test_multiple_faces_on_same_image_share_one_detect_call(self):
+        from face_extract_encode import FaceExtractor as RealFaceExtractor
+        face1 = self._make_ignore_face([10, 10, 50, 50])
+        face2 = self._make_ignore_face([200, 200, 260, 260])
+        fake_dets = [
+            self._FakeDetection([10, 10, 50, 50], 0.80),
+            self._FakeDetection([200, 200, 260, 260], 0.65),
+        ]
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
+            MockExtractor._flatten_kps = RealFaceExtractor._flatten_kps
+            MockExtractor.return_value.app.get.return_value = fake_dets
+            call_command('backfill_det_score')
+        self.assertEqual(MockExtractor.return_value.app.get.call_count, 1)
+        face1.refresh_from_db()
+        face2.refresh_from_db()
+        self.assertAlmostEqual(face1.det_score, 0.80, places=4)
+        self.assertAlmostEqual(face2.det_score, 0.65, places=4)
+
+    def test_already_populated_faces_are_excluded(self):
+        face = self._make_ignore_face([10, 10, 50, 50])
+        face.det_score = 0.5
+        face.save()
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented') as mock_open, \
+             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
+            call_command('backfill_det_score')
+        mock_open.assert_not_called()
+        MockExtractor.return_value.app.get.assert_not_called()
+
+
 class VideoFaceShortTrackFilterTests(unittest.TestCase):
     """_filter_short_tracks: drops raw tracks matched across too few
     sampled frames before the expensive per-track redetect+dual-encode

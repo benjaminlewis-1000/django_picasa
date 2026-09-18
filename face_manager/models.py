@@ -176,6 +176,21 @@ class Face(models.Model):
                 size=10, blank=True, null=True
             )
 
+    # The detector's own confidence for this detection (insightface's
+    # det_score, 0-1) -- NOT previously stored anywhere despite being
+    # available on every detection since day one. Added 2026-09-18 after
+    # a real investigation found it cleanly separates genuine faces from
+    # bogus detections that happen to numerically match a real person's
+    # gallery (a mean ~0.85 for validated real faces vs. ~0.58 for
+    # confirmed-wrong candidates in a real sample, zero overlap -- see
+    # CLAUDE.md). Nullable since faces detected before this field existed
+    # have none; populated going forward by find_and_encode_faces(), and
+    # backfilled for the existing unlabeled .ignore population via
+    # backfill_det_score (management command) using the same re-detect-
+    # and-IOU-match technique reencode_missing_faces() already uses for
+    # missing embeddings.
+    det_score = models.FloatField(null=True, blank=True, default=None)
+
     # Populated by the nightly face_manager.cluster_unverified_faces task:
     # per-person complete-linkage clustering (see verification_clustering.py)
     # over this person's own unverified faces, so a human reviewing a run
