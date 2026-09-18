@@ -207,8 +207,31 @@ def background_bulk_processor():
 # this thread's held-open DB connection also made the test runner's
 # post-run `DROP DATABASE test_picasa` fail with "being accessed by other
 # users". See CLAUDE.md's "Testing gotcha" note.
-work_thread = threading.Thread(target=background_bulk_processor, daemon=True)
-work_thread.start()
+#
+# Lazily started (NOT as an import-time side effect) -- added 2026-09-18
+# after this being an import-time side effect was found to be one of two
+# real blockers for `manage.py test --parallel`: Django's --parallel
+# forks worker processes AFTER Django/apps are already set up in the
+# parent, and POSIX fork() semantics mean only the calling thread
+# survives in each child while any DB connection this thread was
+# holding gets duplicated (same underlying socket) across parent and
+# every fork -- whichever side closes/reuses it first breaks the rest
+# (InterfaceError: connection already closed), on essentially whichever
+# tests happen to run in that window. Starting the thread lazily, on
+# first real use inside an already-fully-forked worker process (or in
+# a normal non-parallel run), means no connection is ever open across a
+# fork boundary in the first place. See CLAUDE.md's "parallel test
+# blockers" investigation for the full diagnosis.
+work_thread = None
+_work_thread_lock = threading.Lock()
+
+
+def _ensure_background_worker_started():
+    global work_thread
+    with _work_thread_lock:
+        if work_thread is None or not work_thread.is_alive():
+            work_thread = threading.Thread(target=background_bulk_processor, daemon=True)
+            work_thread.start()
 
 def render_404(request, message):
     
@@ -1023,6 +1046,7 @@ class FaceViewSet(viewsets.ModelViewSet):
             response.status_code = 400
             return response
         
+        _ensure_background_worker_started()
         background_queue.put(payload)
 
         js = {'job_submitted': True}

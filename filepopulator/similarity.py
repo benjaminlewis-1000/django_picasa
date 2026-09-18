@@ -118,6 +118,19 @@ def run_phash_backfill(limit=None, dry_run=False, log=print, processes=1, batch_
             batch.clear()
 
     batch = []
+    # A daemonic process (e.g. one of Django's own `--parallel` test
+    # workers, or a multiprocessing.Pool worker in some other caller)
+    # can never spawn its own children -- multiprocessing.Pool() itself
+    # raises AssertionError("daemonic processes are not allowed to have
+    # children") in that context, unconditionally, not just under tests.
+    # Falls back to the single-process path instead of crashing -- a
+    # real, general robustness fix (found via manage.py test --parallel,
+    # but not test-specific), not a test-only workaround. See CLAUDE.md's
+    # "parallel test blockers" investigation.
+    if processes > 1 and multiprocessing.current_process().daemon:
+        log("Running inside a daemonic process -- cannot spawn a "
+            "multiprocessing.Pool here, falling back to single-process.")
+        processes = 1
     if processes > 1:
         with multiprocessing.Pool(processes) as pool:
             for image_id, image_hash, error in pool.imap_unordered(_compute_one_phash, work_items):

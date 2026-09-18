@@ -4147,15 +4147,27 @@ assumed from reading code alone:
    opaque `TypeError: cannot pickle 'traceback' object` instead, no matter what the real underlying
    failure is.
 
-**Not fixed yet, deliberately** -- both are real, structural blockers, not quick patches:
-neither fix was applied to committed code this session (the `work_thread.start()` edit was purely
-diagnostic and reverted). A real fix for #1 would need the thread to either not start at
-import-time at all (lazy-start on first real request) or be skipped under a test-detection guard;
-a real fix for #2 would need that one test to detect it's already running inside a
-`multiprocessing`-daemonic context (`multiprocessing.current_process().daemon`) and either skip
-itself or fall back to a single-process path in that case. `tblib` was installed only in the
-throwaway `picasa_api_dev_test` container for this diagnostic session, not added to
-`requirements.txt` -- would be needed permanently if `--parallel` is ever adopted for real.
+**Both fixed the same session, per the user's follow-up request to actually work on them.**
+Fix #1: `work_thread` is no longer started as an import-time side effect -- `api/views.py` now
+lazily starts it (`_ensure_background_worker_started()`, guarded by a lock, checks
+`work_thread is None or not work_thread.is_alive()`) at the one real enqueue point
+(`bulk_operation`'s `background_queue.put(payload)`), so no DB connection is ever held open across
+a fork boundary in the first place -- a general robustness improvement, not just a test-mode
+workaround (the thread also doesn't need to exist at all until there's real work for it).
+Fix #2: `run_phash_backfill()` (`filepopulator/similarity.py`) now checks
+`multiprocessing.current_process().daemon` before attempting `multiprocessing.Pool(processes)` and
+falls back to the single-process path if true, logging why -- also a general fix (any daemonic
+caller, not just a `--parallel` test worker, would hit the same crash) rather than a test-only
+patch.
+
+**Validated together**: full fast suite under `--parallel 4` now passes **450/450** in 299.4s, vs.
+~786-850s serial (a real ~2.7x wall-clock speedup on this machine, with only 4 of the 24 available
+cores used for the split -- not yet tested at a higher worker count). `tblib` (needed to see real
+tracebacks from parallel worker failures, otherwise Django reports an opaque
+`TypeError: cannot pickle 'traceback' object`) was installed in `picasa_api_dev_test` for this
+investigation but is NOT yet added to `dockerize/requirements.txt` -- worth adding if `--parallel`
+becomes the normal way this suite is run, so a real future failure under `--parallel` doesn't
+require reinstalling it first just to see what broke.
 
 ## DONE (2026-09-18, same day): `backfill_det_score` extended to also backfill non-`.ignore`
 faces on an already-triggered image, at no extra detect cost
