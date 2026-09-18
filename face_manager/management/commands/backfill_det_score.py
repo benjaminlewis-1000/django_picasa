@@ -71,16 +71,26 @@ class Command(BaseCommand):
                                  "tiled pass would have caught (those land in 'unmatched' "
                                  "instead of getting a score). Measured real throughput on the "
                                  "full cut_list: ~0.10 img/s, a multi-day run for the full "
-                                 "~73k-face population -- --single-pass is the practical "
-                                 "default for a first sweep; faces left unmatched can be "
-                                 "revisited with a second, non---single-pass run later (the "
-                                 "same query naturally targets only what's still NULL)."
+                                 "~73k-face population. Superseded by --cut-list=1,2 as the "
+                                 "practical default -- see that flag's own help text -- kept "
+                                 "for backward compatibility / an even-cheaper-but-lossier option."
+                             ))
+        parser.add_argument('--cut-list', type=str, default=None,
+                             help=(
+                                 "Comma-separated PyramidalDetector cut_list, e.g. '1,2' -- "
+                                 "overrides --single-pass if both are given. Benchmarked "
+                                 "2026-09-18 against 20 real images / 123 real .ignore faces: "
+                                 "[1,2] (5 detection calls/image) matched EXACTLY as well as the "
+                                 "full default [1,3] (10 calls/image) -- 123/123 for both, vs "
+                                 "105/123 for [1] alone -- at roughly half the compute of [1,3]. "
+                                 "'1,2' is the recommended middle ground for a first sweep."
                              ))
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
         limit = options['limit']
         single_pass = options['single_pass']
+        cut_list_arg = options['cut_list']
 
         ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
         faces = Face.objects.filter(
@@ -102,7 +112,9 @@ class Command(BaseCommand):
         )
 
         extractor = FaceExtractor()
-        if single_pass:
+        if cut_list_arg:
+            extractor.app.cut_list = [int(x) for x in cut_list_arg.split(',')]
+        elif single_pass:
             extractor.app.cut_list = [1]
         matched = unmatched = decode_failed = timed_out = 0
         t0 = time.time()
