@@ -1556,6 +1556,46 @@ class HeicIngestionTests(TestCase):
         obj = ImageFile.objects.get(filename=path)
         self.assertTrue(os.path.isfile(obj.thumbnail_big.path))
 
+    def test_save_does_not_redecode_when_image_already_populated(self):
+        # Real perf bug found 2026-09-18 while profiling why this test
+        # class was so slow: ImageFile.save() used to call _init_image()
+        # unconditionally, even when process_new_no_md5() (the normal
+        # create_image_file() path) had already called it once on the
+        # same instance -- silently doubling every HEIC decode (~0.89s
+        # each, confirmed via pillow_heif.heif.BaseImage.load() tracing
+        # against real fixtures; negligible for cheap formats like JPEG,
+        # which is why it went unnoticed). self.image is only ever
+        # assigned inside _init_image() itself, so guarding on
+        # self.image already being set can never skip a genuinely-needed
+        # decode -- verified separately (see CLAUDE.md) against all 8
+        # real HEIC fixtures + 5 real JPEGs with byte-identical results.
+        # This test targets the specific mechanism (a second
+        # _init_image() call is skipped), not full-pipeline correctness.
+        # Use whichever real fixture actually ingests successfully --
+        # same "work with whatever's present" convention as the rest of
+        # this class (a local dev fixture may include a multi-frame Live
+        # Photo that's expected to fail loudly instead; CI's single
+        # synthetic stub is expected to succeed).
+        for filename in self._heic_files():
+            path = os.path.join(self.HEIC_DIR, filename)
+            call_count = {'n': 0}
+            real_init_image = ImageFile._init_image
+
+            def counting_init_image(self):
+                call_count['n'] += 1
+                return real_init_image(self)
+
+            with mock.patch.object(ImageFile, '_init_image', counting_init_image):
+                create_image_file(path)
+
+            if ImageFile.objects.filter(filename=path).exists():
+                self.assertEqual(
+                    call_count['n'], 1,
+                    "_init_image() should run exactly once per real ingestion, not twice",
+                )
+                return
+        self.skipTest("no fixture in HEIC_DIR ingested successfully")
+
 
 class NormalizeNullIslandGpsTests(TestCase):
     """Regression test for the normalize_null_island_gps management
