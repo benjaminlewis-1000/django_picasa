@@ -3795,3 +3795,70 @@ counter increments. Full fast suite: 436/436 passing (434 baseline + 2 new).
 **Deployed same day**: migration applied cleanly on production (additive column, zero
 unapplied-migration risk), code synced to `/code` and `backend_upgrade` -- same deferred-restart
 situation as the fix above, `video_face_extraction` still actively running at deploy time.
+**Restart done later the same day** (once contention cleared) -- confirmed all expected tasks
+registered afterward, including `face_manager.video_face_extraction`. Also confirmed the timeout
+fix working for real: 2 more of the 4 reset short videos (`20231213_105144.mp4`,
+`20230624_084905.mp4`) succeeded on retry once contention eased.
+
+## DONE (2026-09-18): investigated and root-caused a real false-positive mechanism the cohesion/
+span nudge can't reach -- bogus (non-face) detections; added `Face.det_score` and a backfill
+
+Follow-up to the Leslie Williams/Luca Wilson question above (their false positives aren't fixed
+by the cohesion/span nudge -- their galleries are large enough that the size-scaling factor
+crushes any correction to near zero). Tried 2 more gallery-side signals, both real negative
+results, not guessed: **hub-closeness** already failed broadly (see above); **tail cohesion**
+(p10/p5, not just mean -- the signal that caught Emma's high-mean-but-low-p10 gallery) also
+failed for Leslie/Luca specifically -- their p10/p5 values were actually BETTER than Joshua
+Lewis's (a confirmed-fine huge gallery), ruling out a hidden long tail of bad pairs too.
+
+**Root cause found by direct visual investigation instead of guessing a 5th proxy signal** (per
+this project's own established discipline: stop guessing after repeated proxy failures, look at
+real data): pulled real thumbnails of Leslie's actual flip candidates. Found a genuinely
+different failure mode from David Redd/Emma/Elder Tim Call -- one flip candidate was **not a
+face at all**, autumn leaves/tree bark misdetected and compared against every gallery anyway.
+This is a **query-side** problem (the detection itself is garbage), not a candidate-gallery-side
+one -- explains why every gallery-property signal tried so far (hub, mean cohesion, span, tail
+cohesion) necessarily missed it, since none of them can ever fix a bad query regardless of how
+good any candidate's own gallery is.
+
+**Confirmed with real data, not assumed**: re-ran the exact leaf detection through the same
+`PyramidalDetector` the live pipeline uses (`FaceExtractor.app`) -- reproduced EXACTLY (IOU=1.0,
+identical box) at `det_score=0.5513`, while the other 3 real detections in that same photo scored
+0.85-0.87. Broadened to a real 24-face sample across 3 categories: **validated real faces**
+0.787-0.892 (mean ~0.85); **8 already-visually-confirmed-wrong `.ignore` flip candidates**
+(pulled from this session's own earlier spot-checks) 0.504-0.639 (mean ~0.575) -- zero overlap
+with the validated group in this sample; **random `.ignore` population** 0.512-0.780 (mean
+~0.686, a mix of both, as expected). A real, clean, previously-uncaptured signal -- `det_score`
+had never been stored anywhere despite being available on every detection since this pipeline's
+first day.
+
+**Built, per the user's explicit request** ("may be something to attempt to backfill for at
+least the unlabeled ignore faces"): `Face.det_score` (nullable `FloatField`, migration
+`face_manager.0013`) plus, added mid-build at the user's follow-up request ("can we backfill the
+face key point field while we're at it"), `Face.kps` is now ALSO backfilled from the same
+redetection pass -- free, since the image is already being redetected for `det_score` anyway;
+lets a future `reencode_missing_faces()` run replay the exact alignment for these faces instead
+of falling back to its own crop-based redetect path. `face_extract_encode.py`'s
+`add_new_face()`/`update_existing_face_to_insightface()` now persist `det_score` going forward
+too, not just the one-time backfill.
+
+New management command `backfill_det_score` -- targets the unlabeled `poss_ident1=.ignore`
+population (92,515 faces at the time this was scoped), groups faces by source image first so a
+photo with several `.ignore` faces only pays for one decode+detect pass (not one per face),
+matches each redetection back to its stored box by IOU (>=0.3), stores the matched det_score/kps.
+A face whose box no longer matches any redetection is left NULL and counted separately (not
+retried automatically -- a one-time sweep, not a scheduled task). 5 new tests
+(`BackfillDetScoreTests`) mocking `FaceExtractor` entirely (real model loading is expensive) --
+matched-sets-both-fields (using the real `_flatten_kps` static method, not a MagicMock, since
+`Face.kps`'s ArrayField validation would reject a MagicMock on save), no-match-leaves-null,
+dry-run-does-not-save, multiple-faces-share-one-detect-call, already-populated-faces-excluded.
+Full fast suite: 441/441 passing (436 baseline + 5 new).
+
+**Deployed to production, migration applied cleanly** (additive column). A first backfill launch
+was killed almost immediately (before its first progress checkpoint, so minimal lost work -- only
+9 faces had already gotten `det_score` set, reset back to NULL) once the kps request came in
+mid-run, to avoid a second, fully-redundant redetection pass over the same faces later. Restarted
+with the combined det_score+kps version once `picasa_api` was restarted anyway for the video
+timeout-retry-cap deploy above -- both landed in the same restart. Real backfill run against the
+full ~92,515-face unlabeled `.ignore` population launched same day; see the next entry for
+results once it completes.
