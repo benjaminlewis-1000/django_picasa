@@ -627,7 +627,8 @@ class VideoFaceExtractor(object):
         box_out = [bboxes[best, 0] + l2, bboxes[best, 1] + t2,
                    bboxes[best, 2] + l2, bboxes[best, 3] + t2]
         kps_out = (kpss[best] + np.array([l2, t2])).tolist()
-        return box_out, kps_out
+        score_out = float(bboxes[best, 4])
+        return box_out, kps_out, score_out
 
     @staticmethod
     def _square_thumbnail(frame, box, extension_mult=2):
@@ -773,11 +774,18 @@ class VideoFaceExtractor(object):
                 frame = frame_pixels[frame_idx]
                 orig_box = t['boxes'][i]
                 redet = self._redetect_in_crop(frame, orig_box)
-                box_use, kps_use = redet if redet is not None else (orig_box, t['kps'][i])
+                # Falls back to the original (lighter det_500m) sampling
+                # pass's own score when the det_10g crop redetect fails --
+                # same fallback shape as the existing box_use/kps_use
+                # fallback, just carrying the score along with it.
+                if redet is not None:
+                    box_use, kps_use, score_use = redet
+                else:
+                    box_use, kps_use, score_use = orig_box, t['kps'][i], t['scores'][i]
                 emb_if = self._encode_insightface(frame, kps_use)
                 emb_fn = self._encode_facenet(frame, kps_use)
                 reps.append({'emb_if': emb_if, 'emb_fn': emb_fn, 'frame_idx': frame_idx,
-                             'box': box_use, 'kps': kps_use})
+                             'box': box_use, 'kps': kps_use, 'det_score': score_use})
             t['reps'] = reps
         return frame_pixels
 
@@ -817,7 +825,8 @@ class VideoFaceExtractor(object):
 
         frame = frame_pixels[best_rep['frame_idx']]
         self._set_face_box_and_thumbnail(
-            face, frame, best_rep['box'], best_rep['kps'], best_rep['frame_idx'] / fps
+            face, frame, best_rep['box'], best_rep['kps'], best_rep['frame_idx'] / fps,
+            det_score=best_rep['det_score'],
         )
         face.save()
 
@@ -846,7 +855,7 @@ class VideoFaceExtractor(object):
         )
         return duration
 
-    def _set_face_box_and_thumbnail(self, face, frame, box, kps, timestamp_seconds=None):
+    def _set_face_box_and_thumbnail(self, face, frame, box, kps, timestamp_seconds=None, det_score=None):
         l, t, r, b = box
         img_h, img_w, _ = frame.shape
         face.box_left = max(1, int(l))
@@ -854,6 +863,8 @@ class VideoFaceExtractor(object):
         face.box_right = min(img_w, max(face.box_left + 1, int(r)))
         face.box_bottom = min(img_h, max(face.box_top + 1, int(b)))
         face.kps = np.asarray(kps, dtype=float).reshape(-1).tolist()
+        if det_score is not None:
+            face.det_score = float(det_score)
         if timestamp_seconds is not None:
             face.video_thumbnail_frame_seconds = self._clamp_to_duration(
                 face.source_video_file, timestamp_seconds, 'video_thumbnail_frame_seconds'
@@ -983,7 +994,7 @@ class VideoFaceExtractor(object):
             )
             self._set_face_box_and_thumbnail(
                 face, provisional_frame, provisional['box'], provisional['kps'],
-                provisional['frame_idx'] / fps
+                provisional['frame_idx'] / fps, det_score=provisional['det_score'],
             )
             face.save()
 
