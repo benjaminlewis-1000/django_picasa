@@ -2151,6 +2151,27 @@ class BackfillDetScoreTests(TestCase):
             call_command('backfill_det_score', '--single-pass')
         self.assertEqual(MockExtractor.return_value.app.cut_list, [1])
 
+    def test_cut_list_flag_overrides_default(self):
+        # Benchmarked 2026-09-18: cut_list=[1,2] matched exactly as well as
+        # the full [1,3] on a real 20-image/123-face sample (123/123 both),
+        # at half the detection calls -- the recommended middle ground.
+        self._make_ignore_face([10, 10, 50, 50])
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
+            MockExtractor.return_value.app.get.return_value = []
+            call_command('backfill_det_score', '--cut-list', '1,2')
+        self.assertEqual(MockExtractor.return_value.app.cut_list, [1, 2])
+
+    def test_cut_list_flag_takes_precedence_over_single_pass(self):
+        self._make_ignore_face([10, 10, 50, 50])
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
+            MockExtractor.return_value.app.get.return_value = []
+            call_command('backfill_det_score', '--single-pass', '--cut-list', '1,3')
+        self.assertEqual(MockExtractor.return_value.app.cut_list, [1, 3])
+
     def test_per_image_timeout_skips_and_continues(self):
         # Real production hang found running this at scale: one image
         # drove CPU to 1400%+ with the DB's det_score count stuck for

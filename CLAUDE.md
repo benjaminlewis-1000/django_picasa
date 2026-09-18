@@ -3915,3 +3915,59 @@ the fd-leak fix; 1,802 faces had already been safely persisted across the two ea
 attempts (both real bugs, not partial/corrupt data -- the command's own resumable design means
 nothing needed to be reset or redone). See the next entry for final results once the run
 completes.
+
+## DONE (2026-09-18, same day): a second real production hang during the det_score backfill --
+mitigated with a per-image timeout, video ruled out as the cause, and `det_score` extended to the
+video face pipeline too
+
+After the fd-leak fix above, `backfill_det_score --single-pass` hit a second, different real hang:
+1400%+ CPU with the `det_score`-populated-count in the DB completely frozen (1843, unchanged)
+across a 2-minute polling window, after only ~41 faces (~22 images) succeeded in the prior ~10
+minutes -- a genuine stall, not just a slow-but-progressing image. The process was killed (PID
+16782/16788) without identifying the specific pathological image first, since nothing in the
+command logged which file it was working on when it hung.
+
+**Investigated per the user's own question ("figure out where it got stuck. Maybe a video?")**:
+confirmed directly via the query that `backfill_det_score` only ever touches
+`Face.objects.filter(..., source_image_file__isnull=False)` -- video-sourced faces
+(`source_video_file__isnull=False`, 19,426 of them) are entirely out of scope for this command, so
+whatever hung was a genuine image, not a video. The specific file itself was never identified
+before the process was killed.
+
+**Mitigation, not a root-cause fix**: added `PER_IMAGE_TIMEOUT_SECONDS = 30` (`SIGALRM`-based,
+same pattern `face_manager/tasks.py`'s `_VideoProcessingTimeout` already established for video
+processing) wrapping each image's decode+detect call in `backfill_det_score.py`. A `_ImageTimeout`
+on any image logs `TIMEOUT on <filename> -- skipping` and counts it separately (`timed_out`, a
+new 4th bucket alongside `matched`/`unmatched`/`decode_failed`) rather than crashing or hanging the
+whole run. A single-pass detection call on a normal photo takes well under a second in practice, so
+30s is a generous margin, not a tight budget -- this has not fired even once across any of the
+resumed runs so far, consistent with the earlier hang being a genuine one-off pathological input
+rather than a systemic slowness. 1 new test (`test_per_image_timeout_skips_and_continues`, mocks
+`FaceExtractor.app.get` to sleep past the timeout, confirms the image is skipped and counted rather
+than hanging the test itself).
+
+**Video coverage, per the user's direct follow-up ("are we getting these same fields from video
+going forward?")**: confirmed `Face.kps` was already persisted by the video pipeline
+(`_set_face_box_and_thumbnail`) but `det_score` was not -- `video_face_pipeline.py`'s
+`_redetect_in_crop` already computed each candidate's own `det_score` internally (`bboxes[best,
+4]`, used via `np.argmax` to pick the best candidate for its 2-tuple `(box, kps)` return) but
+discarded the score itself rather than returning it. Extended to a 3-tuple return
+(`box, kps, det_score`); `_pool_representative_frames` carries the score into each track's
+representative-frame dict, falling back to the track's original (lighter det_500m sampling-pass)
+score when the det_10g crop-redetect fails, matching the existing box/kps fallback shape already
+there; `_set_face_box_and_thumbnail` gained a `det_score=None` parameter, set at both call sites
+(`_classify_and_pick_thumbnail`'s post-classification best-rep pick, and `process_video`'s
+provisional largest-box pick). Verified against the real `IMG_0760.MOV` fixture
+(`VideoFaceExtractorRealInferenceTests`, real ffmpeg decode + real insightface/facenet inference,
+not mocked): every produced `Face` now has a real, valid `det_score` in `(0, 1]`, confirmed via a
+new assertion in `test_real_fixture_produces_valid_face_groups`. Full fast suite: 446/446 passing.
+
+**Deployed to production same day**: code-only changes (no migration) on both `master` (`d0c5766`)
+and `backend_upgrade` (`1e39800`), `docker restart picasa_api` to pick up the bind-mounted `/code`
+changes -- confirmed live afterward (`manage.py check` clean, `face_manager.video_face_extraction`
+present in `celery inspect registered`). `backfill_det_score --single-pass` relaunched with the new
+timeout guard, resuming correctly from the 1,843 already-backfilled faces (query naturally
+re-targets only what's still NULL) -- 38,154 distinct source images / 71,246 faces queued this run
+(down from the original ~73k scoping estimate, consistent with the ongoing reclassification
+backfill continuing to flip some of this population out of `.ignore` in parallel). Progress/final
+results to be recorded once the run completes or is next checked.
