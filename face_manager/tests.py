@@ -2151,6 +2151,30 @@ class BackfillDetScoreTests(TestCase):
             call_command('backfill_det_score', '--single-pass')
         self.assertEqual(MockExtractor.return_value.app.cut_list, [1])
 
+    def test_per_image_timeout_skips_and_continues(self):
+        # Real production hang found running this at scale: one image
+        # drove CPU to 1400%+ with the DB's det_score count stuck for
+        # minutes -- no specific cause identified, but the same class of
+        # risk process_video_faces()'s own PER_VIDEO_TIMEOUT_SECONDS
+        # guards against. A pathological image must not be able to hang
+        # the whole batch indefinitely.
+        import time as time_module
+        import face_manager.management.commands.backfill_det_score as cmd_module
+        face = self._make_ignore_face([10, 10, 50, 50])
+
+        def slow_get(img):
+            time_module.sleep(2)
+            return []
+
+        with patch.object(cmd_module, 'PER_IMAGE_TIMEOUT_SECONDS', 1), \
+             patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
+            MockExtractor.return_value.app.get.side_effect = slow_get
+            call_command('backfill_det_score')
+        face.refresh_from_db()
+        self.assertIsNone(face.det_score)
+
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class FaceSaveThumbnailCheckTests(TestCase):
@@ -2416,6 +2440,12 @@ class VideoFaceExtractorRealInferenceTests(TestCase):
             self.assertTrue(os.path.exists(face.face_thumbnail.path))
             self.assertGreater(face.box_right, face.box_left)
             self.assertGreater(face.box_bottom, face.box_top)
+            # det_score (added 2026-09-18, see CLAUDE.md) is threaded
+            # through the video pipeline the same as the image one --
+            # a real, valid detection confidence, not just left NULL.
+            self.assertIsNotNone(face.det_score)
+            self.assertGreater(face.det_score, 0.0)
+            self.assertLessEqual(face.det_score, 1.0)
 
     def test_reprocessing_is_independent_not_cumulative(self):
         # Not idempotency in the "no duplicate rows" sense (there's no

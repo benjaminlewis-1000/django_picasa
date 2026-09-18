@@ -1,3 +1,4 @@
+import signal
 import time
 from collections import defaultdict
 
@@ -9,6 +10,29 @@ from django.core.management.base import BaseCommand
 import common
 from face_extract_encode import FaceExtractor
 from face_manager.models import Face, Person
+
+# Per-image hard timeout -- a real production hang was found running this
+# command at scale: one image drove CPU to 1400%+ with ZERO progress for
+# minutes (a real query, not a slow-but-progressing one -- confirmed by
+# watching the actual det_score count in the DB stop moving entirely
+# while the process kept burning CPU). No specific root cause was chased
+# (the image itself wasn't identified before this guard was added), but
+# this is the exact same class of risk face_manager/tasks.py's own
+# PER_VIDEO_TIMEOUT_SECONDS/_VideoProcessingTimeout guards against for
+# video processing -- a single pathological input (huge resolution,
+# some ONNX/NMS edge case) can otherwise hang an entire long-running
+# batch job indefinitely with nothing to show for it. A single-pass
+# detection call on a normal photo takes well under a second in
+# practice; 30s is a generous margin, not a tight budget.
+PER_IMAGE_TIMEOUT_SECONDS = 30
+
+
+class _ImageTimeout(Exception):
+    pass
+
+
+def _raise_image_timeout(signum, frame):
+    raise _ImageTimeout(f"Image processing exceeded {PER_IMAGE_TIMEOUT_SECONDS}s")
 
 
 class Command(BaseCommand):
@@ -80,20 +104,25 @@ class Command(BaseCommand):
         extractor = FaceExtractor()
         if single_pass:
             extractor.app.cut_list = [1]
-        matched = unmatched = decode_failed = 0
+        matched = unmatched = decode_failed = timed_out = 0
         t0 = time.time()
 
         for idx, (img_obj, image_faces) in enumerate(image_list):
             try:
-                img_numpy = common.open_img_oriented(img_obj.filename, as_numpy=True)
-            except Exception:
-                img_numpy = None
-            if img_numpy is None:
-                decode_failed += len(image_faces)
+                signal.signal(signal.SIGALRM, _raise_image_timeout)
+                signal.alarm(PER_IMAGE_TIMEOUT_SECONDS)
+                try:
+                    img_numpy = common.open_img_oriented(img_obj.filename, as_numpy=True)
+                    if img_numpy is None:
+                        decode_failed += len(image_faces)
+                        continue
+                    detections = extractor.app.get(img_numpy)
+                finally:
+                    signal.alarm(0)
+            except _ImageTimeout:
+                self.stdout.write(f"  TIMEOUT on {img_obj.filename} -- skipping")
+                timed_out += len(image_faces)
                 continue
-
-            try:
-                detections = extractor.app.get(img_numpy)
             except Exception:
                 decode_failed += len(image_faces)
                 continue
@@ -127,7 +156,7 @@ class Command(BaseCommand):
                     # files, ~600/38489 images) before that fix existed.
                     face.save(update_fields=['det_score', 'kps'])
 
-            if (idx + 1) % 200 == 0:
+            if (idx + 1) % 50 == 0:
                 elapsed = time.time() - t0
                 rate = (idx + 1) / elapsed
                 remaining = len(image_list) - (idx + 1)
@@ -135,11 +164,12 @@ class Command(BaseCommand):
                 self.stdout.write(
                     f"  ...{idx+1}/{len(image_list)} images ({rate:.2f} img/s, "
                     f"ETA {eta_min:.0f}min) -- matched={matched} unmatched={unmatched} "
-                    f"decode_failed={decode_failed}"
+                    f"decode_failed={decode_failed} timed_out={timed_out}"
                 )
 
         elapsed = time.time() - t0
         self.stdout.write(
             f"DONE: {len(image_list)} images, {elapsed:.0f}s. "
-            f"matched={matched} unmatched={unmatched} decode_failed={decode_failed}"
+            f"matched={matched} unmatched={unmatched} decode_failed={decode_failed} "
+            f"timed_out={timed_out}"
         )
