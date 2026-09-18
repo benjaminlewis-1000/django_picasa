@@ -39,10 +39,24 @@ class Command(BaseCommand):
         parser.add_argument('--dry-run', action='store_true')
         parser.add_argument('--limit', type=int, default=None,
                              help='Restrict to the first N source images (for testing).')
+        parser.add_argument('--single-pass', action='store_true',
+                             help=(
+                                 "Skip the PyramidalDetector's 3x3 tiled sub-detection pass "
+                                 "(cut_list=[1,3] -> [1]) -- roughly 10x fewer detection calls "
+                                 "per image, at the cost of missing some small/edge faces the "
+                                 "tiled pass would have caught (those land in 'unmatched' "
+                                 "instead of getting a score). Measured real throughput on the "
+                                 "full cut_list: ~0.10 img/s, a multi-day run for the full "
+                                 "~73k-face population -- --single-pass is the practical "
+                                 "default for a first sweep; faces left unmatched can be "
+                                 "revisited with a second, non---single-pass run later (the "
+                                 "same query naturally targets only what's still NULL)."
+                             ))
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
         limit = options['limit']
+        single_pass = options['single_pass']
 
         ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
         faces = Face.objects.filter(
@@ -64,6 +78,8 @@ class Command(BaseCommand):
         )
 
         extractor = FaceExtractor()
+        if single_pass:
+            extractor.app.cut_list = [1]
         matched = unmatched = decode_failed = 0
         t0 = time.time()
 
@@ -104,6 +120,11 @@ class Command(BaseCommand):
                     best_det = detections[best_idx]
                     face.det_score = float(best_det.det_score)
                     face.kps = FaceExtractor._flatten_kps(best_det['kps'])
+                    # update_fields here is also what keeps Face.save()
+                    # from opening (and never closing) the thumbnail file
+                    # on every one of these thousands of calls -- see its
+                    # own comment. A real crash (OSError: Too many open
+                    # files, ~600/38489 images) before that fix existed.
                     face.save(update_fields=['det_score', 'kps'])
 
             if (idx + 1) % 200 == 0:

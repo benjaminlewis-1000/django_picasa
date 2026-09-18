@@ -3859,6 +3859,59 @@ was killed almost immediately (before its first progress checkpoint, so minimal 
 9 faces had already gotten `det_score` set, reset back to NULL) once the kps request came in
 mid-run, to avoid a second, fully-redundant redetection pass over the same faces later. Restarted
 with the combined det_score+kps version once `picasa_api` was restarted anyway for the video
-timeout-retry-cap deploy above -- both landed in the same restart. Real backfill run against the
-full ~92,515-face unlabeled `.ignore` population launched same day; see the next entry for
-results once it completes.
+timeout-retry-cap deploy above -- both landed in the same restart.
+
+**Real throughput measured and found impractical for the full pyramidal detector**: ~0.10 img/s,
+ETA ~4.5 days for the ~73k-face population (dropped from 92,515 since the -0.05 reclassification
+backfill above kept flipping faces out of the unlabeled `.ignore` pool while this was being
+scoped). `PyramidalDetector`'s default `cut_list=[1,3]` runs a whole-image pass PLUS a 3x3 tiled
+sub-image pass -- 10 detection calls per image, matching the live pipeline's own accuracy exactly
+but far too slow for a one-time sweep this size. Added `--single-pass`
+(`extractor.app.cut_list = [1]`, skipping the tiled pass -- ~10x fewer calls/image) as a practical
+compromise, per the user's own framing: run the cheap single-pass sweep now, then reconsider the
+faces it leaves `unmatched` (small/edge faces only the tiled pass would have caught) separately
+later -- a cheap targeted crop-based redetection around each unmatched face's own known box
+(the same approach `reencode_missing_faces()`'s fallback path already uses) rather than a second
+full multi-tile pass over the whole image again, was discussed as the likely follow-up approach
+but not built yet.
+
+**A second real crash found and fixed while running the single-pass version at scale: a genuine
+file-descriptor leak in `Face.save()` itself**, unrelated to anything specific to this backfill --
+`OSError: [Errno 24] Too many open files` at ~600/38,726 images. Root cause: `Face.save()`'s
+thumbnail-existence check accessed `self.face_thumbnail.file.name`, which OPENS the underlying
+storage file (via `FieldFile._get_file()`) and Django never closes it automatically -- normally
+reclaimed by garbage collection between ordinary, scattered `save()` calls elsewhere in the
+codebase, but `backfill_det_score` holds every target `Face` object in memory for its whole run
+(`image_list`), so nothing is ever collected and the handles accumulate until the OS fd limit is
+hit. **Fixed at the true root, not just closed after opening**: switched the check to
+`self.face_thumbnail.path` instead of `.file.name` -- `.path` resolves the filesystem path via the
+storage backend's own path computation with NO file I/O at all (confirmed directly:
+`FileSystemStorage.path()` is pure string joining), so the check is now both cheaper AND leak-free
+for every caller, not just this one backfill command -- no need to special-case `update_fields` or
+remember to call `.close()` anywhere. (An initial, narrower fix -- skip the check entirely for an
+`update_fields` save that doesn't touch `face_thumbnail` -- was tried first and reverted once the
+user asked "shouldn't it still close when you get a brand new image?", correctly pointing out that
+fix only avoided the leak for this one narrow call shape, leaving the general `save()` path, and
+its file descriptor, exactly as leaky as before. Safe specifically because this project's storage
+backend is always local filesystem, never remote/streaming-only, where `.path` would raise
+`NotImplementedError`.)
+
+**A real, separate mistake caught and fixed mid-investigation**: while writing a regression test
+for this, `patch.object(FieldFile, '_get_file', ...)` was tried first and found to have literally
+zero effect -- `property(_get_file, _set_file, _del_file)` (Django's own `FieldFile.file`
+definition) captures the `_get_file` FUNCTION OBJECT at class-definition time, so re-patching the
+`_get_file` NAME afterward never changes what the already-built property descriptor actually
+calls. Switched to patching `django.core.files.storage.Storage.open` directly (confirmed
+`FileSystemStorage.open is Storage.open` -- inherited, unoverridden -- so this is the real,
+correct interception point matching the original crash's own traceback). `FaceSaveThumbnailCheckTests`
+(2 new tests, replacing an earlier, narrower `FaceSaveNarrowUpdateFieldsTests`): confirms no save
+shape (no `update_fields`, a narrow one, or one naming `face_thumbnail` itself) ever calls
+`Storage.open`, and that a genuinely-missing thumbnail file still correctly raises
+`ValidationError`. Full fast suite: 445/445 passing.
+
+**Deployed to production same day, no migration needed** (pure `save()` logic change, no schema
+change) -- synced to `/code` and `backend_upgrade`. Backfill relaunched with `--single-pass` and
+the fd-leak fix; 1,802 faces had already been safely persisted across the two earlier crashed
+attempts (both real bugs, not partial/corrupt data -- the command's own resumable design means
+nothing needed to be reset or redone). See the next entry for final results once the run
+completes.

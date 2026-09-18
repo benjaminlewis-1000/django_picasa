@@ -328,9 +328,20 @@ class Face(models.Model):
         if self.box_right < 0:
             raise ValidationError(f"Box right {self.box_right} is off the edge of the photo {img_w}")
 
-        if not os.path.exists(self.face_thumbnail.file.name):
+        # .path (not .file.name) deliberately -- .path resolves the
+        # filesystem path via the storage backend with no file I/O at
+        # all, while .file.name OPENS the underlying file (via FieldFile.
+        # _get_file()) and Django never closes it automatically. A caller
+        # doing many saves in one long-lived process (e.g. a backfill)
+        # would otherwise accumulate open file handles until the OS fd
+        # limit is hit (confirmed real: OSError: Too many open files at
+        # ~600 images into backfill_det_score). Safe here specifically
+        # because this project's storage backend is always local
+        # filesystem (FileSystemStorage) -- .path raises NotImplementedError
+        # on a remote/streaming-only backend, which .file.name would not.
+        if not os.path.exists(self.face_thumbnail.path):
             raise ValidationError(f"Face thumbnail image does not exist on the OS")
-            
+
         return super().save(*args, **kwargs)
 
     def remove_poss_ident(self, poss_idx):
