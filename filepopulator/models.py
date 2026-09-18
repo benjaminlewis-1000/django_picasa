@@ -911,8 +911,20 @@ class ImageFile(models.Model):
 
         for field, size in zip(thumb_fields, thumb_sizes):
 
-
-            image = self.image
+            # .copy() -- found 2026-09-18 alongside the save()
+            # decode-reuse fix: `image = self.image` was the SAME object,
+            # not a copy, and Image.thumbnail() mutates in place. So the
+            # "big" thumbnail was generated correctly from the full-
+            # resolution image, but "medium" then got generated from the
+            # already-shrunk "big" output, and "small" from the already-
+            # shrunk "medium" -- compounding lossy LANCZOS resizes
+            # instead of three independent, clean downsamples from the
+            # original. Not a crash (aspect ratio was preserved
+            # throughout, so nothing looked obviously wrong), just a
+            # real, measurable quality regression for medium/small
+            # specifically. Copying also means self.image itself is no
+            # longer left mutated/shrunk after this method runs.
+            image = self.image.copy()
 
             image.thumbnail(size, Image.LANCZOS)
 

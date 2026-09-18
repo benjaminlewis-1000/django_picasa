@@ -4257,6 +4257,20 @@ Not a correctness/crash bug (aspect ratio is preserved throughout, thumbnails st
 glance), but a real, measurable quality regression for medium/small thumbnails specifically. Not yet
 fixed or asked about -- flagged here for a future session or explicit decision.
 
-**Deployment status**: `filepopulator/models.py` (the `save()` guard) and its test are implemented
-and validated but **not yet committed or deployed** as of this write-up -- see whether a following
-entry records the commit/deploy, or check `git log -- filepopulator/models.py` directly.
+**DONE, same day: both the decode-reuse fix and the thumbnail-copy bug above fixed together, per
+the user's explicit go-ahead on both.** `_generate_thumbnail()`'s loop now does
+`image = self.image.copy()` instead of `image = self.image` -- each of the three thumbnail sizes
+is generated independently from the full-resolution image, rather than medium compounding off the
+already-shrunk big output and small compounding off medium. Verified against the same real HEIC
+fixture: dimensions correctly fit each target box (500x375/250x188/100x75 for a 4032x3024 source),
+and medium/small file sizes changed measurably from the pre-fix baseline (11670->11496 bytes,
+3000->2952 bytes) -- confirming the fix changes what actually gets generated, not just a no-op.
+A side effect, not a goal in itself: `self.image` is no longer left mutated/shrunk after
+`_generate_thumbnail()` runs, since the loop only ever mutates its own copy now. Full fast suite
+(`--parallel 8`): 451/451 passing.
+
+**Deployed to production same day**: `docker restart picasa_api` (bind-mounted `/code`, no rebuild
+needed -- pure code change, no migration). Verified live: `manage.py check` clean. The live
+`backfill_det_score` run was interrupted by the restart (as expected -- it's a foreground process,
+not a Celery task) and relaunched afterward, resuming correctly (query naturally re-targets
+whatever's still missing `det_score`).
