@@ -4113,3 +4113,66 @@ particular, given the prefork-inherits-parent-registry behavior above), should u
 structurally, rather than depending on migration-then-restart timing always being tight. Existing
 NOT-NULL-with-Python-default fields elsewhere in this codebase were not audited/retrofitted this
 session (scope was this one incident's field) -- worth a broader pass if this class of bug recurs.
+
+## Investigated (2026-09-18): what blocks `manage.py test --parallel`, both root-caused via direct
+diagnostic runs, not guessed
+
+Prompted by the user asking about test-suite runtime. `--parallel N` (Django's built-in, forks N
+worker processes via `multiprocessing`, each with its own cloned test DB) found two real, distinct
+blockers -- confirmed by actually disabling each suspected cause in turn and re-running, not
+assumed from reading code alone:
+
+1. **`api/views.py`'s `work_thread.start()`, run as an import-time side effect** (the background
+   bulk-processor thread, already documented elsewhere in this file for a different, already-fixed
+   testing gotcha). This thread opens/closes real DB connections in its own loop
+   (`connections.close_all()` whenever idle). When Django's `--parallel` forks worker processes
+   *after* Django/apps have already been set up in the parent, POSIX `fork()` semantics mean only
+   the calling thread survives in each child -- the background thread itself vanishes, but any
+   connection object it was holding gets duplicated (same underlying OS socket) across parent and
+   every forked child. Whichever side then closes or reuses that shared socket breaks all the
+   others: `InterfaceError('connection already closed')`, on effectively-random tests depending on
+   fork timing. **Confirmed directly**: temporarily disabling `work_thread.start()` (never
+   committed -- a throwaway diagnostic edit, reverted immediately after) dropped the failure count
+   from several down to 1 across the whole fast suite.
+2. **`filepopulator.tests.PhashBackfillTests.test_multiprocess_backfill_matches_single_process_result`**
+   -- this test itself calls `backfill_phash --processes 2`, which spins up its own
+   `multiprocessing.Pool`. Python's `multiprocessing` hard-blocks a daemonic process from ever
+   having children (`AssertionError: daemonic processes are not allowed to have children`) -- and
+   Django's own `--parallel` test workers are themselves daemonic processes. This is a structural
+   conflict, not a bug in either piece of code: any test that itself uses `multiprocessing.Pool`
+   fundamentally cannot run inside a `--parallel` worker, full stop. **Confirmed as the sole
+   remaining failure** once blocker #1 was worked around (447/448 passing, only this one test red).
+   Also needed `pip install tblib` to even see this real error -- without it, Django's parallel
+   runner can't pickle a worker's exception/traceback across the process boundary and reports an
+   opaque `TypeError: cannot pickle 'traceback' object` instead, no matter what the real underlying
+   failure is.
+
+**Not fixed yet, deliberately** -- both are real, structural blockers, not quick patches:
+neither fix was applied to committed code this session (the `work_thread.start()` edit was purely
+diagnostic and reverted). A real fix for #1 would need the thread to either not start at
+import-time at all (lazy-start on first real request) or be skipped under a test-detection guard;
+a real fix for #2 would need that one test to detect it's already running inside a
+`multiprocessing`-daemonic context (`multiprocessing.current_process().daemon`) and either skip
+itself or fall back to a single-process path in that case. `tblib` was installed only in the
+throwaway `picasa_api_dev_test` container for this diagnostic session, not added to
+`requirements.txt` -- would be needed permanently if `--parallel` is ever adopted for real.
+
+## DONE (2026-09-18, same day): `backfill_det_score` extended to also backfill non-`.ignore`
+faces on an already-triggered image, at no extra detect cost
+
+Per explicit request, after confirming the prior behavior directly: the command's redetect-and-
+match loop previously only ever looked at (and saved) faces with `poss_ident1=.ignore` -- a
+confirmed, already-labeled face sharing the same image as a triggering `.ignore` face was detected
+right alongside it (the detector runs against the whole image regardless) but never matched against
+or saved, since it was never in the per-image face list to begin with.
+
+**Change**: `.ignore` faces still exclusively determine WHICH images get processed (unchanged --
+this isn't a general "backfill every face everywhere" sweep, just extending what's captured on an
+image already being touched). After building the triggering set, a second query pulls every OTHER
+`Face` on those same images with `det_score__isnull=True` regardless of `poss_ident1`/
+`declared_name`, and adds them to that image's face list too -- so a confirmed person's face gets
+its `det_score`/`kps` backfilled for free the next time any `.ignore` face on the same photo needs
+processing, with zero additional detect calls. 2 new tests: a non-ignore face on a triggered image
+gets backfilled (and its `declared_name` is confirmed untouched -- only `det_score`/`kps` written);
+a non-ignore face on an image with no `.ignore` faces at all is confirmed NOT touched (no detect
+call even attempted), proving image-selection scope is unchanged.
