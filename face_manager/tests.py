@@ -2009,9 +2009,12 @@ class BackfillDetScoreTests(TestCase):
     """backfill_det_score management command: re-detects each unlabeled
     .ignore face's source image and matches the result back to the
     stored box by IOU, storing the matched detection's own det_score.
-    Mocks FaceExtractor entirely (real model loading is expensive) and
-    common.open_img_oriented (no real image decode needed) -- only the
-    command's own IOU-matching/grouping logic is under test here."""
+    Mocks _build_detection_only_detector entirely (real model loading is
+    expensive) and common.open_img_oriented (no real image decode
+    needed) -- only the command's own IOU-matching/grouping logic is
+    under test here. Uses the real FaceExtractor._flatten_kps (a pure
+    static method, cheap to call directly -- doesn't instantiate
+    FaceExtractor, so no model loading happens) rather than mocking it."""
 
     class _FakeDetection:
         def __init__(self, bbox, det_score, kps=None):
@@ -2040,19 +2043,13 @@ class BackfillDetScoreTests(TestCase):
         return face
 
     def test_matched_detection_sets_det_score_and_kps(self):
-        from face_extract_encode import FaceExtractor as RealFaceExtractor
         face = self._make_ignore_face([10, 10, 50, 50])
         fake_kps = [[15.0, 15.0], [35.0, 15.0], [25.0, 25.0], [17.0, 35.0], [33.0, 35.0]]
         fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.91, kps=fake_kps)]
         with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
                    return_value=np.zeros((100, 100, 3))), \
-             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
-            # _flatten_kps is a pure static method already covered by its
-            # own tests elsewhere -- use the real implementation here so
-            # this test exercises real list data, not a MagicMock (which
-            # would fail Face.kps' ArrayField validation on save()).
-            MockExtractor._flatten_kps = RealFaceExtractor._flatten_kps
-            MockExtractor.return_value.app.get.return_value = fake_dets
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
             call_command('backfill_det_score')
         face.refresh_from_db()
         self.assertAlmostEqual(face.det_score, 0.91, places=4)
@@ -2072,15 +2069,13 @@ class BackfillDetScoreTests(TestCase):
         # backfill command's own save() call benefits from that fix by
         # never opening the file at all, not just closing it after.
         from django.core.files.storage import Storage
-        from face_extract_encode import FaceExtractor as RealFaceExtractor
         face = self._make_ignore_face([10, 10, 50, 50])
         fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.91)]
         with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
                    return_value=np.zeros((100, 100, 3))), \
-             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor, \
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build, \
              patch.object(Storage, 'open', autospec=True) as mock_storage_open:
-            MockExtractor._flatten_kps = RealFaceExtractor._flatten_kps
-            MockExtractor.return_value.app.get.return_value = fake_dets
+            mock_build.return_value.get.return_value = fake_dets
             call_command('backfill_det_score')
         mock_storage_open.assert_not_called()
 
@@ -2090,8 +2085,8 @@ class BackfillDetScoreTests(TestCase):
         fake_dets = [self._FakeDetection([500, 500, 540, 540], 0.9)]
         with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
                    return_value=np.zeros((1000, 1000, 3))), \
-             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
-            MockExtractor.return_value.app.get.return_value = fake_dets
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
             call_command('backfill_det_score')
         face.refresh_from_db()
         self.assertIsNone(face.det_score)
@@ -2101,14 +2096,13 @@ class BackfillDetScoreTests(TestCase):
         fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.91)]
         with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
                    return_value=np.zeros((100, 100, 3))), \
-             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
-            MockExtractor.return_value.app.get.return_value = fake_dets
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
             call_command('backfill_det_score', '--dry-run')
         face.refresh_from_db()
         self.assertIsNone(face.det_score)
 
     def test_multiple_faces_on_same_image_share_one_detect_call(self):
-        from face_extract_encode import FaceExtractor as RealFaceExtractor
         face1 = self._make_ignore_face([10, 10, 50, 50])
         face2 = self._make_ignore_face([200, 200, 260, 260])
         fake_dets = [
@@ -2117,11 +2111,10 @@ class BackfillDetScoreTests(TestCase):
         ]
         with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
                    return_value=np.zeros((1000, 1000, 3))), \
-             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
-            MockExtractor._flatten_kps = RealFaceExtractor._flatten_kps
-            MockExtractor.return_value.app.get.return_value = fake_dets
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
             call_command('backfill_det_score')
-        self.assertEqual(MockExtractor.return_value.app.get.call_count, 1)
+        self.assertEqual(mock_build.return_value.get.call_count, 1)
         face1.refresh_from_db()
         face2.refresh_from_db()
         self.assertAlmostEqual(face1.det_score, 0.80, places=4)
@@ -2132,10 +2125,10 @@ class BackfillDetScoreTests(TestCase):
         face.det_score = 0.5
         face.save()
         with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented') as mock_open, \
-             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
             call_command('backfill_det_score')
         mock_open.assert_not_called()
-        MockExtractor.return_value.app.get.assert_not_called()
+        mock_build.return_value.get.assert_not_called()
 
     def test_single_pass_flag_restricts_detector_to_one_pass(self):
         # cut_list=[1,3] (the default, matching the live pipeline exactly)
@@ -2146,10 +2139,10 @@ class BackfillDetScoreTests(TestCase):
         self._make_ignore_face([10, 10, 50, 50])
         with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
                    return_value=np.zeros((100, 100, 3))), \
-             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
-            MockExtractor.return_value.app.get.return_value = []
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = []
             call_command('backfill_det_score', '--single-pass')
-        self.assertEqual(MockExtractor.return_value.app.cut_list, [1])
+        self.assertEqual(mock_build.return_value.cut_list, [1])
 
     def test_cut_list_flag_overrides_default(self):
         # Benchmarked 2026-09-18: cut_list=[1,2] matched exactly as well as
@@ -2158,19 +2151,19 @@ class BackfillDetScoreTests(TestCase):
         self._make_ignore_face([10, 10, 50, 50])
         with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
                    return_value=np.zeros((100, 100, 3))), \
-             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
-            MockExtractor.return_value.app.get.return_value = []
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = []
             call_command('backfill_det_score', '--cut-list', '1,2')
-        self.assertEqual(MockExtractor.return_value.app.cut_list, [1, 2])
+        self.assertEqual(mock_build.return_value.cut_list, [1, 2])
 
     def test_cut_list_flag_takes_precedence_over_single_pass(self):
         self._make_ignore_face([10, 10, 50, 50])
         with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
                    return_value=np.zeros((100, 100, 3))), \
-             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
-            MockExtractor.return_value.app.get.return_value = []
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = []
             call_command('backfill_det_score', '--single-pass', '--cut-list', '1,3')
-        self.assertEqual(MockExtractor.return_value.app.cut_list, [1, 3])
+        self.assertEqual(mock_build.return_value.cut_list, [1, 3])
 
     def test_per_image_timeout_skips_and_continues(self):
         # Real production hang found running this at scale: one image
@@ -2190,11 +2183,39 @@ class BackfillDetScoreTests(TestCase):
         with patch.object(cmd_module, 'PER_IMAGE_TIMEOUT_SECONDS', 1), \
              patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
                    return_value=np.zeros((100, 100, 3))), \
-             patch('face_manager.management.commands.backfill_det_score.FaceExtractor') as MockExtractor:
-            MockExtractor.return_value.app.get.side_effect = slow_get
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.side_effect = slow_get
             call_command('backfill_det_score')
         face.refresh_from_db()
         self.assertIsNone(face.det_score)
+
+    @tag("slow")
+    def test_detection_only_detector_produces_valid_real_scores(self):
+        # Real-inference sanity check, not a re-proof of equivalence --
+        # equivalence with the full FaceExtractor().app (bit-identical
+        # bbox/det_score) was already confirmed manually against a real
+        # 70-face production photo (see this method's own module docstring
+        # / CLAUDE.md, 2026-09-18): 127.9s -> 3.2s, a 39.69x speedup, with
+        # zero difference in any of the 70 detected boxes or scores. This
+        # test just confirms the detection-only detector, run for real
+        # (no mocks), produces sane det_score/kps output against a known
+        # fixture -- catches a real regression (e.g. a bad allowed_modules
+        # value silently breaking detection) without needing to reload the
+        # full multi-module detector every CI run.
+        import common
+        from face_manager.management.commands.backfill_det_score import (
+            _build_detection_only_detector,
+        )
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/has_face_tags.jpg"
+        img_numpy = common.open_img_oriented(path, as_numpy=True)
+        app = _build_detection_only_detector()
+        app.cut_list = [1, 2]
+        detections = app.get(img_numpy)
+        self.assertGreaterEqual(len(detections), 1)
+        for d in detections:
+            self.assertGreater(d.det_score, 0.0)
+            self.assertLessEqual(d.det_score, 1.0)
+            self.assertEqual(len(d['kps']), 5)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
