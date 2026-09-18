@@ -552,6 +552,13 @@ class PersonParamView(APIView):
         # fetching (wasteful for the image-sourced majority) or never
         # doing the accurate-frame swap at all.
         video_face_ids = []
+        # face_poss, page 1 only - the true total matching this exact
+        # filter (media/flagged), for the frontend's sidebar count to
+        # display while a non-default media filter is active (see
+        # imageScreen.jsx/personSidebar.jsx). None everywhere else - a
+        # real COUNT(*) query is only worth paying for once per filter
+        # change, not on every background page request.
+        total_matching = None
 
         id_key = kwargs['id']
         field = kwargs['field']
@@ -675,6 +682,8 @@ class PersonParamView(APIView):
                 faces = list(
                     Face.objects.filter(poss_query).order_by(weight_order).values_list('id', flat=True)[start:end]
                 )
+                if page == 1:
+                    total_matching = Face.objects.filter(poss_query).count()
 
             id_list = list(faces)
             video_face_ids = list(
@@ -704,7 +713,7 @@ class PersonParamView(APIView):
 
         js = {
             'num_results': len(id_list), 'type': field, 'id_list': id_list,
-            'has_more': has_more,
+            'has_more': has_more, 'total_matching': total_matching,
             'cluster_groups': cluster_groups, 'video_face_ids': video_face_ids,
         }
 
