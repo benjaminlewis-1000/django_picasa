@@ -2183,6 +2183,26 @@ class BackfillDetScoreTests(TestCase):
         mock_open.assert_not_called()
         mock_build.return_value.get.assert_not_called()
 
+    def test_all_faces_flag_widens_trigger_query_beyond_ignore(self):
+        # --all-faces (added 2026-09-20 per explicit request): a
+        # non-ignore face on an image with NO .ignore face at all should
+        # now trigger processing too, unlike the default scope (see
+        # test_non_ignore_face_on_an_untriggered_image_is_not_touched
+        # above, which confirms the OPPOSITE behavior without the flag).
+        confirmed_person = make_person("Someone Else")
+        untouched_face = make_face(
+            self.image, declared_name=confirmed_person,
+            box_left=10, box_top=10, box_right=50, box_bottom=50,
+        )
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.88)]
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_det_score', '--all-faces')
+        untouched_face.refresh_from_db()
+        self.assertAlmostEqual(untouched_face.det_score, 0.88, places=4)
+
     def test_single_pass_flag_restricts_detector_to_one_pass(self):
         # cut_list=[1,3] (the default, matching the live pipeline exactly)
         # measured at ~0.10 img/s in real production -- a multi-day run
