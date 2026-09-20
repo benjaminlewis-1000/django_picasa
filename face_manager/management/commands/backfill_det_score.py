@@ -91,7 +91,9 @@ class Command(BaseCommand):
         "and detected regardless of which face triggered it. A face whose "
         "box no longer matches any redetection is left NULL (both fields) "
         "and counted separately -- not retried automatically, since this "
-        "is a one-time sweep, not a scheduled task."
+        "is a one-time sweep, not a scheduled task. --all-faces widens the trigger "
+        "query to every face missing det_score, not just .ignore ones -- see that "
+        "flag's own help text."
     )
 
     def add_arguments(self, parser):
@@ -120,17 +122,35 @@ class Command(BaseCommand):
                                  "105/123 for [1] alone -- at roughly half the compute of [1,3]. "
                                  "'1,2' is the recommended middle ground for a first sweep."
                              ))
+        parser.add_argument('--all-faces', action='store_true',
+                             help=(
+                                 "Widen the trigger query from '.ignore faces missing det_score' "
+                                 "to 'any face missing det_score, regardless of poss_ident1/"
+                                 "declared_name'. The default (.ignore-only) scope only ever "
+                                 "touches images that happen to share a photo with an .ignore "
+                                 "face; --all-faces covers every image with any face at all. "
+                                 "Real production scope check 2026-09-19: 173,398 total images "
+                                 "have >=1 face; the .ignore-only scope only ever reached ~32k of "
+                                 "them. Substantially more images to decode+detect -- expect a "
+                                 "correspondingly longer run."
+                             ))
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
         limit = options['limit']
         single_pass = options['single_pass']
         cut_list_arg = options['cut_list']
+        all_faces = options['all_faces']
 
-        ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
-        trigger_faces = Face.objects.filter(
-            poss_ident1=ignore_person, det_score__isnull=True, source_image_file__isnull=False,
-        ).select_related('source_image_file')
+        if all_faces:
+            trigger_faces = Face.objects.filter(
+                det_score__isnull=True, source_image_file__isnull=False,
+            ).select_related('source_image_file')
+        else:
+            ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+            trigger_faces = Face.objects.filter(
+                poss_ident1=ignore_person, det_score__isnull=True, source_image_file__isnull=False,
+            ).select_related('source_image_file')
 
         by_image = defaultdict(list)
         seen_face_ids = set()
