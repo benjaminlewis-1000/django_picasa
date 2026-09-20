@@ -38,7 +38,17 @@ import traceback
 # as that call returns, which still bounds *most* realistic slow-python-
 # loop cases but isn't a hard real-time guarantee against every possible
 # blowup.
-PER_VIDEO_TIMEOUT_SECONDS = 1800
+# Raised 1800 -> 2700 (30 -> 45 min) on 2026-09-19: five real videos had
+# accumulated as face_extraction_failed, all on timeouts, and four of
+# them were short (26s-110s) clips marked failed by the OLD code path
+# before both this session's pathological-track gating
+# (ABSURD_SINGLETON_TRACK_COUNT/MIN_TRACK_LEN_SAMPLES) and the
+# timeout-retry logic existed. A longer default buys real headroom for
+# genuinely long videos and for contention-driven slowness without
+# needing per-video tuning. Longer-term the user wants a frontend
+# affordance to let specific long videos process longer rather than
+# raising the global default further.
+PER_VIDEO_TIMEOUT_SECONDS = 2700
 
 # A timeout is left unprocessed (see the timeout except branch below) so
 # a plausibly-transient one (resource contention from another concurrent
