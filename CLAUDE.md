@@ -4274,3 +4274,89 @@ needed -- pure code change, no migration). Verified live: `manage.py check` clea
 `backfill_det_score` run was interrupted by the restart (as expected -- it's a foreground process,
 not a Celery task) and relaunched afterward, resuming correctly (query naturally re-targets
 whatever's still missing `det_score`).
+
+## DONE (2026-09-21): does `det_score` help classification? Real investigation, one dead end, one
+validated combined signal -- `DET_SCORE_FLOOR`/`CANDIDATE_MARGIN_FLOOR` landed in
+`classify_unassigned()`
+
+Prompted by the user, now that the `.ignore`-only `backfill_det_score` run finished (247,381 faces
+backfilled, only 12 `.ignore` faces left unmatched) and a broader `--all-faces` run was launched
+(140,387 images / 386,059 faces queued, ~0.34 img/s, ~4.3 days ETA at kickoff).
+
+**Dead end #1: det_score does not work as a global signal.** At scale (89,994 confirmed
+`.ignore`/`.realignore` faces vs 60,932 validated real-person faces), the separation is real but
+weak and heavily overlapping (mean 0.715 vs 0.857) -- nothing like the original 24-face spot-check's
+0.58-vs-0.85 gap suggested. A threshold gate at any reasonable value either lets most junk through
+or costs too much real recall. Root cause: insightface's own detector already discards anything
+below ~0.5 confidence before a `Face` row is ever created (confirmed: **zero faces in the entire
+database have `det_score < 0.5`**) -- so there's no clean low tier to filter; the original "leaf"
+false positive (0.55) sat right at that floor, not below a separable junk tier.
+
+**Dead end #2: it doesn't correlate with the existing cohesion/span "nudge" bucket either.**
+215 of 442 people are currently nudged; aggregated across all of them, proposed-face det_score
+(mean 0.724) barely differs from the 227 non-nudged control people (0.738) -- nothing like the
+~0.22 gap the specific known-bad people (Leslie Williams, David Redd, Emma, Elder Tim Call) show
+individually. Those four are outliers within the nudged bucket, not representative of it.
+
+**Real signal found: proposed/confirmed ratio.** Correlating each person's (proposed-face-count /
+confirmed-face-count) ratio against their proposed population's mean det_score across the 42
+people with enough data: **r = -0.65**. The top of the ratio ranking is exactly the known false-
+positive magnets (Emma 1.47, Elder Tim Call 1.11, Leslie Williams 0.73, Luca Wilson 0.65, David
+Redd 0.60). One real counter-example checked deliberately: Meg Lewis has a similarly high ratio
+(0.56) but normal det_score (0.845) -- ratio alone isn't sufficient, det_score has to be genuinely
+low too.
+
+**But the user correctly flagged a structural problem with using this ratio as the actual gate**:
+it's backward-looking, computed from *already-accumulated* proposals. A gallery that's been
+manually cleared (like David Redd's earlier correction) would show a low ratio right up until the
+same bad pattern re-accumulates -- no protection for a freshly-cleared gallery or a brand-new
+person. Pivoted to a **universal, per-candidate gate instead of a per-person/ratio-conditioned
+one** -- forward-looking by construction, since it never looks at accumulated history.
+
+**Visual spot-check (this project's own established discipline, before trusting any threshold):**
+pulled 6 real low-det_score (<0.6) proposed faces for the known problem people. None were clean
+frontal faces -- back of a child's head (no face visible at all), a blurry motion-blurred profile,
+partial/angled views. Checking the "survivor" side at floor=0.6 found a genuine miss: **one
+survivor (det_score=0.627, above the floor) was not a face at all -- a photo of toy building
+blocks**, a real false positive det_score alone doesn't catch. Traced its weight_1=0.359 against
+Leslie Williams' effective threshold (0.349, a large 1,389-face gallery so barely nudged): margin
+of just 0.010 -- a "double marginal" case, weak on both axes but each barely clearing its own bar
+alone.
+
+**The real fix: combine det_score with margin-above-threshold, not det_score alone.** Computed,
+per magnet-gallery face, `margin = weight_1 - effective_threshold` for both the currently-proposed
+population and a **leave-one-out-recomputed** confirmed-correct baseline (sampling each person's
+own gallery embedding, excluding itself, computing fresh sim_99th against the rest -- since
+confirmed/declared faces don't retain a usable `weight_1`, it's cleared on confirmation). Real
+result, per person -- confirmed-correct low-margin rate vs currently-proposed low-margin rate:
+Emma 10.5%/100.0%, Leslie Williams 2.0%/85.1%, Luca Wilson 2.0%/61.6%, Elder Tim Call 24.0%/100.0%,
+David Redd 32.0%/97.7%. A huge, consistent gap across all five -- even for David Redd/Elder Tim
+Call, whose own correct matches are more often marginal than Leslie/Luca's (their galleries have
+more internal variability), the proposed population is still dramatically more marginal than their
+own confirmed baseline.
+
+**Swept a full (det_floor x margin_floor) grid against this real leave-one-out ground truth**
+(6 det_floors x 9 margin_floors = 54 combos, cut-vs-cost ratio at each). `det_floor=0.6` sits at
+the best ratio across the whole grid regardless of margin_floor -- pushing det_floor higher doesn't
+help once margin is doing its job. Margin is the real lever, peaking around 0.02-0.03 (ratio ~5.7)
+then degrading steadily past 0.05 (ratio ~4.2 by 0.06). Chose **`DET_SCORE_FLOOR=0.6`,
+`CANDIDATE_MARGIN_FLOOR=0.03`** -- cuts 78.4% of the known-bad proposed population across the 5
+galleries at a real but bounded cost (13.7% of what would-be-correct matches, recomputed fresh,
+also fall below this bar -- not lost, just reverted to `.ignore` for a human to re-confirm on
+review, same as any other correction this project has made).
+
+**Implementation** (`face_manager/assign_faces.py`): `classify_unassigned()`'s accept gate changed
+from `sim_99th > threshold` to `sim_99th - threshold >= CANDIDATE_MARGIN_FLOOR` (a real tightening,
+not just an addition), combined with a face-level (not per-candidate) `det_score >=
+DET_SCORE_FLOOR` check -- det_score is a property of the query face being classified, not of any
+one candidate, so it gates the whole face at once rather than varying per candidate row. A face
+with `det_score` still `NULL` (not yet reached by the ongoing `--all-faces` backfill) skips the
+det_score half of the gate but the margin requirement still applies unconditionally -- preserves
+forward compatibility with the backlog without silently loosening the margin tightening for it.
+4 new tests (`DetScoreMarginGateTests`): thin-margin-now-rejected (previously would have passed
+under the old `>0` gate), margin-clears-floor-with-good-det_score-accepted, good-margin-but-low-
+det_score-rejected (mirrors the real toy-blocks case), and NULL-det_score-skips-that-check-but-
+not-margin. All existing `classify_unassigned` tests re-checked by hand for margins that would fall
+in the newly-sensitive 0-0.03 zone -- none did (existing fixtures use either comfortably-positive
+or clearly-negative margins), confirmed unaffected by re-running them. Full fast suite
+(`--parallel 8`): 456/456 passing.

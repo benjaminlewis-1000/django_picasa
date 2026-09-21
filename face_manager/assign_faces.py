@@ -171,6 +171,37 @@ class faceAssigner():
         # further distance doesn't make it any more clearly not-a-match.
         self.IGNORE_WEIGHT_MARGIN_CLAMP = 0.3
 
+        # Added 2026-09-21 after a real investigation into whether
+        # Face.det_score (insightface's own detection confidence) helps
+        # classification. It does NOT work as a standalone global signal
+        # (weak separation across the whole population, and across the
+        # general cohesion/span-nudged bucket) -- but combined with
+        # CANDIDATE_MARGIN_FLOOR (below) it's a strong, validated signal
+        # for exactly the failure mode that motivated this: a barely-
+        # passing candidate (sim_99th only just above its own threshold)
+        # on a poorly-detected face (partial view, extreme angle, motion
+        # blur, or an outright non-face false detection). Real production
+        # test against 5 known problem galleries (David Redd, Leslie
+        # Williams, Emma, Elder Tim Call, Luca Wilson): confirmed-correct
+        # matches (recomputed fresh via leave-one-out) rarely land below
+        # this margin (2-32% depending on gallery, vs 62-100% of that same
+        # gallery's currently-*proposed*, unconfirmed candidates) -- see
+        # CLAUDE.md for the full investigation, including a real visual
+        # false positive (a photo of toy building blocks, not a face at
+        # all) that margin alone caught but det_score alone did not.
+        # Swept det_floor x margin_floor as a grid against real leave-one-
+        # out-recomputed ground truth: det=0.6/margin=0.03 sits right at
+        # the best cut-vs-cost ratio (~5.7), cutting 78.4% of the known-
+        # bad proposed population at a real but bounded cost (13.7% of
+        # what would-be-correct matches also fall below this bar and get
+        # reverted to .ignore -- not lost, just needing a human to
+        # re-confirm on review). A face with det_score still NULL (not
+        # yet reached by the ongoing backfill) skips this gate entirely --
+        # preserves prior behavior rather than blocking classification for
+        # the backlog.
+        self.DET_SCORE_FLOOR = 0.6
+        self.CANDIDATE_MARGIN_FLOOR = 0.03
+
         # self.bogus_date = datetime(1990, 1, 1) # Very few images before that
         # self.bogus_date_utc = time.mktime(self.bogus_date.timetuple())
         self.ignore_person = Person.objects.filter(person_name=settings.SOFT_IGNORE_NAME)[0]
@@ -626,7 +657,23 @@ class faceAssigner():
             if self.DEBUG and db_id == debug_face_id and debug_face_id is not None:
                 print("Row values: ", metrics_array[row_num, :])
 
-        possible_idcs = np.where(metrics_array[:, 0] > metrics_array[:, 1])[0]
+        # Combined det_score + margin gate -- see DET_SCORE_FLOOR/
+        # CANDIDATE_MARGIN_FLOOR's own comment in __init__ for the full
+        # investigation. det_score gates the whole face at once (it's a
+        # property of the query face being classified, not of any one
+        # candidate); margin tightens the per-candidate accept condition
+        # from "sim_99th > threshold" to "sim_99th at least
+        # CANDIDATE_MARGIN_FLOOR above threshold". A face with det_score
+        # still NULL (not yet reached by the ongoing backfill) skips the
+        # det_score half of the gate rather than being blocked outright.
+        det_score = unassigned_face.det_score
+        passes_det_score_gate = det_score is None or det_score >= self.DET_SCORE_FLOOR
+        if passes_det_score_gate:
+            possible_idcs = np.where(
+                metrics_array[:, 0] - metrics_array[:, 1] >= self.CANDIDATE_MARGIN_FLOOR
+            )[0]
+        else:
+            possible_idcs = np.array([], dtype=int)
         if self.DEBUG:
             print(possible_idcs, "poss len is", len(possible_idcs))
             print(metrics_array[possible_idcs, :])

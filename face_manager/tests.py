@@ -1187,6 +1187,118 @@ class IgnoreWeightMarginTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class DetScoreMarginGateTests(TestCase):
+    """DET_SCORE_FLOOR/CANDIDATE_MARGIN_FLOOR: added 2026-09-21 after a
+    real investigation into whether Face.det_score helps classification.
+    Combined with a tightened per-candidate margin requirement (sim_99th
+    at least CANDIDATE_MARGIN_FLOOR above threshold, not just > 0), this
+    is a validated fix for barely-passing candidates on poorly-detected
+    faces -- see CLAUDE.md for the full investigation, including a real
+    visual false positive (a photo of toy building blocks) that this
+    combined gate catches but det_score alone did not."""
+
+    def _make_face_with_single_candidate(self, similarity, gallery_size=600, det_score=None):
+        assigner = faceAssigner()
+        person = make_person(f"Candidate {similarity}-{gallery_size}-{det_score}")
+        assigner.likely_people_ids = [person.id]
+
+        query = np.zeros(512)
+        query[0] = 1.0
+        ref = query.copy()
+        ref[0] = similarity
+        ref[1] = np.sqrt(max(0.0, 1 - similarity ** 2))
+
+        assigner.embedding_dict = {person.id: np.tile(ref.reshape(512, 1), (1, gallery_size))}
+        assigner.norm_dict = {person.id: np.ones(gallery_size)}
+        assigner._build_concatenated_gallery()
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+        face = make_face(img, declared_name=blank_person)
+        face.face_encoding_512 = query.tolist()
+        face.det_score = det_score
+        face.save()
+        return assigner, face, person
+
+    def test_margin_just_above_zero_now_rejected(self):
+        # Previously accepted (margin > 0 was the whole gate); the
+        # tightened CANDIDATE_MARGIN_FLOOR (0.03) now rejects a candidate
+        # that only barely clears its threshold.
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        similarity = threshold + 0.01  # margin=0.01, below CANDIDATE_MARGIN_FLOOR=0.03
+        assigner, face, person = self._make_face_with_single_candidate(
+            similarity=similarity, det_score=0.9,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        # Falls through to the "no match" branch -- proposed person is
+        # the ignore sentinel, not the barely-passing candidate.
+        self.assertEqual(called_person_id, assigner.ignore_person_id)
+
+    def test_margin_at_floor_with_good_det_score_is_accepted(self):
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        similarity = threshold + assigner.CANDIDATE_MARGIN_FLOOR + 0.01
+        assigner, face, person = self._make_face_with_single_candidate(
+            similarity=similarity, det_score=0.9,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, person.id)
+
+    def test_good_margin_but_low_det_score_is_rejected(self):
+        # A candidate that clears the margin requirement comfortably, but
+        # on a poorly-detected face (det_score below DET_SCORE_FLOOR) --
+        # the det_score gate blocks it even though margin alone would
+        # have accepted it. Mirrors the real "toy building blocks" false
+        # positive found during the investigation.
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        similarity = threshold + 0.20  # comfortable margin
+        assigner, face, person = self._make_face_with_single_candidate(
+            similarity=similarity, det_score=0.4,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, assigner.ignore_person_id)
+
+    def test_null_det_score_skips_det_score_check_but_not_margin(self):
+        # A face not yet reached by the ongoing det_score backfill (NULL)
+        # must not be blocked by the det_score half of the gate -- but
+        # the margin requirement still applies unconditionally.
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+
+        # Comfortable margin, NULL det_score -- should still be accepted.
+        similarity = threshold + 0.20
+        assigner, face, person = self._make_face_with_single_candidate(
+            similarity=similarity, det_score=None,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        self.assertEqual(mock_set.call_args[0][0], person.id)
+
+        # Thin margin (0.01), NULL det_score -- margin gate still rejects
+        # it regardless of the missing det_score.
+        similarity2 = threshold + 0.01
+        assigner2, face2, person2 = self._make_face_with_single_candidate(
+            similarity=similarity2, det_score=None,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set2:
+            assigner2.classify_unassigned(face2)
+        mock_set2.assert_called_once()
+        self.assertEqual(mock_set2.call_args[0][0], assigner2.ignore_person_id)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class VerificationClusterGroupTests(TestCase):
     """Face.verification_cluster_group: nightly per-person complete-linkage
     clustering of confirmed-but-unverified faces, so a human reviewer can
