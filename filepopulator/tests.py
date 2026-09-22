@@ -31,10 +31,10 @@ import pillow_heif
 
 from django.core.management import call_command
 
-from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, guess_date_from_filename, VideoFile, FailedVideoFile
+from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, guess_date_from_filename, VideoFile, FailedVideoFile, DuplicateVideoFile
 # from .forms import ImageFileForm, DirectoryForm
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
-from .video_scripts import create_video_file, add_videos_from_root_dir, delete_removed_videos, _parse_exif_date
+from .video_scripts import create_video_file, add_videos_from_root_dir, delete_removed_videos, _parse_exif_date, compute_video_content_hash
 from face_manager.models import Face
 from common.open_img_oriented import apply_exif_orientation
 
@@ -2539,6 +2539,16 @@ class VideoIngestionTests(TestCase):
         # an explicit allowlist of subfolders under one shared bind mount,
         # plus PHOTO_ROOT for interspersed videos) -- confirm passing two
         # roots actually walks both, not just the first.
+        #
+        # The second root's copy is BYTE-IDENTICAL to the first (same
+        # fixture, copied verbatim) -- since content-hash-based duplicate
+        # detection now runs at ingestion, that means it's correctly
+        # recognized as a duplicate rather than given its own VideoFile
+        # row (see VideoContentHashDuplicateTests). The real thing this
+        # test needs to confirm -- that the second root was genuinely
+        # walked and its file genuinely discovered/processed, not just
+        # silently skipped -- still holds: a DuplicateVideoFile record
+        # is exactly that evidence.
         other_dir = '/tmp/video_other_root'
         os.makedirs(other_dir, exist_ok=True)
         self.addCleanup(shutil.rmtree, other_dir, ignore_errors=True)
@@ -2550,8 +2560,9 @@ class VideoIngestionTests(TestCase):
 
         add_videos_from_root_dir([self.VIDEO_DIR, other_dir])
 
-        self.assertTrue(VideoFile.objects.filter(filename=other_copy).exists())
-        self.assertEqual(VideoFile.objects.count(), len(long_enough) + 1)
+        self.assertFalse(VideoFile.objects.filter(filename=other_copy).exists())
+        self.assertTrue(DuplicateVideoFile.objects.filter(filename=other_copy).exists())
+        self.assertEqual(VideoFile.objects.count(), len(long_enough))
 
     def test_nonexistent_file_is_recorded_as_failed(self):
         create_video_file('/photos/video_samples/does_not_exist.mp4')
@@ -2608,6 +2619,61 @@ class VideoIngestionTests(TestCase):
         v = VideoFile.objects.get(filename=path)
         self.assertIsNone(v.file_size_bytes)
 
+    def test_content_hash_is_populated_on_ingest(self):
+        long_enough = self._long_enough_files()
+        if not long_enough:
+            self.skipTest("no fixture in VIDEO_DIR clears MIN_VIDEO_DURATION_SECONDS")
+        path = os.path.join(self.VIDEO_DIR, long_enough[0])
+        create_video_file(path)
+        v = VideoFile.objects.get(filename=path)
+        self.assertIsNotNone(v.content_hash)
+        self.assertEqual(v.content_hash, compute_video_content_hash(path))
+
+    def test_duplicate_content_at_new_path_is_recorded_not_reingested(self):
+        long_enough = self._long_enough_files()
+        if not long_enough:
+            self.skipTest("no fixture in VIDEO_DIR clears MIN_VIDEO_DURATION_SECONDS")
+        original_path = os.path.join(self.VIDEO_DIR, long_enough[0])
+        create_video_file(original_path)
+        original = VideoFile.objects.get(filename=original_path)
+
+        dup_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dup_dir, ignore_errors=True)
+        dup_path = os.path.join(dup_dir, 'copy_' + long_enough[0])
+        shutil.copy(original_path, dup_path)
+
+        create_video_file(dup_path)
+
+        self.assertFalse(VideoFile.objects.filter(filename=dup_path).exists())
+        dup_record = DuplicateVideoFile.objects.filter(filename=dup_path).first()
+        self.assertIsNotNone(dup_record)
+        self.assertEqual(dup_record.original_id, original.pk)
+        # No second row was created for the duplicate content.
+        self.assertEqual(VideoFile.objects.filter(content_hash=original.content_hash).count(), 1)
+
+    def test_moved_file_same_content_reuses_existing_row(self):
+        long_enough = self._long_enough_files()
+        if not long_enough:
+            self.skipTest("no fixture in VIDEO_DIR clears MIN_VIDEO_DURATION_SECONDS")
+        move_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, move_dir, ignore_errors=True)
+        original_copy = os.path.join(move_dir, 'orig_' + long_enough[0])
+        shutil.copy(os.path.join(self.VIDEO_DIR, long_enough[0]), original_copy)
+
+        create_video_file(original_copy)
+        original_pk = VideoFile.objects.get(filename=original_copy).pk
+
+        new_path = os.path.join(move_dir, 'moved_' + long_enough[0])
+        os.rename(original_copy, new_path)
+
+        create_video_file(new_path)
+
+        self.assertFalse(VideoFile.objects.filter(filename=original_copy).exists())
+        moved = VideoFile.objects.filter(filename=new_path).first()
+        self.assertIsNotNone(moved)
+        self.assertEqual(moved.pk, original_pk)
+        self.assertEqual(VideoFile.objects.count(), 1)
+
 
 class DeleteRemovedVideosTests(TestCase):
     """delete_removed_videos() -- the video-side mirror of scripts.py's
@@ -2621,21 +2687,47 @@ class DeleteRemovedVideosTests(TestCase):
     def tearDown(self):
         VideoFile.objects.all().delete()
 
-    def _a_real_fixture_copy(self):
+    def _long_enough_candidates(self):
         from django.conf import settings
         from .video_scripts import _run_ffprobe
 
+        out = []
         for filename in sorted(os.listdir(self.VIDEO_DIR)):
             src = os.path.join(self.VIDEO_DIR, filename)
             probe = _run_ffprobe(src)
             duration = float(probe.get('format', {}).get('duration', 0) or 0)
             if duration >= settings.MIN_VIDEO_DURATION_SECONDS:
-                tmp_dir = tempfile.mkdtemp()
-                self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
-                dest = os.path.join(tmp_dir, filename)
-                shutil.copy(src, dest)
-                return dest
-        self.skipTest("no fixture in VIDEO_DIR clears MIN_VIDEO_DURATION_SECONDS")
+                out.append(filename)
+        if not out:
+            self.skipTest("no fixture in VIDEO_DIR clears MIN_VIDEO_DURATION_SECONDS")
+        return out
+
+    def _a_real_fixture_copy(self):
+        # Cycles through distinct real fixtures on repeated calls (the
+        # real dev/test fixture dir has 8) so two calls in the same test
+        # produce genuinely different file content -- needed since
+        # content-hash-based duplicate detection (2026-09-22) now
+        # recognizes two byte-identical copies as the same video and
+        # only ever creates one VideoFile row for them. Falls back to
+        # appending random trailing bytes if fewer distinct fixtures
+        # exist than calls made (e.g. CI's single synthetic stub) --
+        # verified safe against a real synthetic fixture: appending
+        # bytes after a container's own real data doesn't disturb
+        # ffprobe's ability to read it.
+        candidates = self._long_enough_candidates()
+        count = getattr(self, '_fixture_copy_count', 0)
+        filename = candidates[count % len(candidates)]
+        self._fixture_copy_count = count + 1
+
+        src = os.path.join(self.VIDEO_DIR, filename)
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        dest = os.path.join(tmp_dir, filename)
+        shutil.copy(src, dest)
+        if count >= len(candidates):
+            with open(dest, 'ab') as f:
+                f.write(os.urandom(64))
+        return dest
 
     def test_delete_removed_videos_removes_vanished_rows_only(self):
         gone_path = self._a_real_fixture_copy()
@@ -2674,6 +2766,216 @@ class DeleteRemovedVideosTests(TestCase):
         self.assertFalse(VideoFile.objects.filter(pk=video.pk).exists())
         self.assertFalse(Face.objects.filter(pk=face.pk).exists())
         self.assertFalse(os.path.isfile(thumb_path))
+
+
+class VideoContentHashBackfillAndMergeTests(TestCase):
+    """backfill_video_content_hash + merge_duplicate_videofiles -- the
+    two management commands that resolve VideoFile rows ingested BEFORE
+    content-hash-based duplicate detection existed (see
+    VideoContentHashDuplicateTests above, which covers the same
+    protection at ingestion time going forward). Real motivating case
+    (2026-09-22): 5 Face rows all turned out to be the same real frame
+    because 5 differently-named files were confirmed byte-for-byte
+    identical, each independently face-extracted.
+
+    Builds rows directly (not via create_video_file(), which now
+    prevents this scenario from recurring) to simulate the pre-existing
+    contamination these commands are meant to clean up."""
+
+    VIDEO_DIR = '/photos/video_samples'
+
+    def tearDown(self):
+        VideoFile.objects.all().delete()
+
+    def _a_real_fixture_copy(self):
+        from django.conf import settings
+        from .video_scripts import _run_ffprobe
+
+        for filename in sorted(os.listdir(self.VIDEO_DIR)):
+            src = os.path.join(self.VIDEO_DIR, filename)
+            probe = _run_ffprobe(src)
+            duration = float(probe.get('format', {}).get('duration', 0) or 0)
+            if duration >= settings.MIN_VIDEO_DURATION_SECONDS:
+                tmp_dir = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+                dest = os.path.join(tmp_dir, filename)
+                shutil.copy(src, dest)
+                return dest
+        self.skipTest("no fixture in VIDEO_DIR clears MIN_VIDEO_DURATION_SECONDS")
+
+    def _pre_content_hash_video(self, path):
+        # Ingest normally (populates content_hash going forward), then
+        # strip it back off -- simulates a row that predates the field,
+        # without duplicating all of create_video_file()'s own field
+        # population logic here.
+        create_video_file(path)
+        video = VideoFile.objects.get(filename=path)
+        VideoFile.objects.filter(pk=video.pk).update(content_hash=None)
+        video.refresh_from_db()
+        return video
+
+    def _ingest(self, path):
+        create_video_file(path)
+        return VideoFile.objects.get(filename=path)
+
+    def _make_duplicate_row(self, path, primary, isProcessed=False):
+        # Bypasses create_video_file()'s own (now-live) duplicate
+        # detection deliberately -- constructs a second real row
+        # directly, the same shape a row ingested BEFORE this feature
+        # existed would have: identical content_hash/dimensions, a
+        # genuinely different path that's still really on disk. This is
+        # exactly the pre-existing contamination merge_duplicate_
+        # videofiles exists to clean up.
+        return VideoFile.objects.create(
+            filename=path, directory=primary.directory,
+            width=primary.width, height=primary.height,
+            duration_seconds=primary.duration_seconds,
+            content_hash=primary.content_hash, isProcessed=isProcessed,
+        )
+
+    def _attach_face(self, video, person=None):
+        from face_manager.models import Person
+        if person is None:
+            person, _ = Person.objects.get_or_create(person_name="VideoContentHashMergeTests Person")
+        face = Face(
+            source_video_file=video, declared_name=person,
+            box_left=1, box_top=1,
+            box_right=min(40, video.width - 1), box_bottom=min(40, video.height - 1),
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.save()
+        return face
+
+    def test_backfill_populates_content_hash(self):
+        path = self._a_real_fixture_copy()
+        video = self._pre_content_hash_video(path)
+        self.assertIsNone(video.content_hash)
+
+        from django.core.management import call_command
+        call_command('backfill_video_content_hash')
+
+        video.refresh_from_db()
+        self.assertEqual(video.content_hash, compute_video_content_hash(path))
+
+    def test_backfill_dry_run_makes_no_changes(self):
+        path = self._a_real_fixture_copy()
+        video = self._pre_content_hash_video(path)
+
+        from django.core.management import call_command
+        call_command('backfill_video_content_hash', '--dry-run')
+
+        video.refresh_from_db()
+        self.assertIsNone(video.content_hash)
+
+    def test_backfill_skips_file_vanished_from_disk(self):
+        path = self._a_real_fixture_copy()
+        video = self._pre_content_hash_video(path)
+        os.remove(path)
+
+        from django.core.management import call_command
+        call_command('backfill_video_content_hash')
+
+        video.refresh_from_db()
+        self.assertIsNone(video.content_hash)
+
+    def test_merge_transfers_faces_and_deletes_unprocessed_duplicate(self):
+        # Two rows, same real content, only the primary has been
+        # face-processed -- the safe case: merge should keep the
+        # processed one, transfer nothing (the duplicate has no faces of
+        # its own), and delete the duplicate row.
+        path_a = self._a_real_fixture_copy()
+        primary = self._ingest(path_a)
+        path_b = path_a + '.dup.mp4'
+        shutil.copy(path_a, path_b)
+        self.addCleanup(lambda: os.path.exists(path_b) and os.remove(path_b))
+        duplicate = self._make_duplicate_row(path_b, primary, isProcessed=False)
+        VideoFile.objects.filter(pk=primary.pk).update(isProcessed=True)
+        primary.refresh_from_db()
+        face = self._attach_face(primary)
+
+        from django.core.management import call_command
+        call_command('merge_duplicate_videofiles', '--yes')
+
+        self.assertFalse(VideoFile.objects.filter(pk=duplicate.pk).exists())
+        self.assertTrue(VideoFile.objects.filter(pk=primary.pk).exists())
+        self.assertTrue(Face.objects.filter(pk=face.pk, source_video_file=primary).exists())
+
+    def test_merge_transfers_faces_from_unprocessed_duplicate_onto_primary(self):
+        # The duplicate itself has a stray face (e.g. hand-added, or from
+        # some other path never marking isProcessed) -- confirm it's
+        # really transferred, not silently dropped.
+        path_a = self._a_real_fixture_copy()
+        primary = self._ingest(path_a)
+        VideoFile.objects.filter(pk=primary.pk).update(isProcessed=True)
+        primary.refresh_from_db()
+        path_b = path_a + '.dup.mp4'
+        shutil.copy(path_a, path_b)
+        self.addCleanup(lambda: os.path.exists(path_b) and os.remove(path_b))
+        duplicate = self._make_duplicate_row(path_b, primary, isProcessed=False)
+        stray_face = self._attach_face(duplicate)
+
+        from django.core.management import call_command
+        call_command('merge_duplicate_videofiles', '--yes')
+
+        self.assertFalse(VideoFile.objects.filter(pk=duplicate.pk).exists())
+        stray_face.refresh_from_db()
+        self.assertEqual(stray_face.source_video_file_id, primary.pk)
+
+    def test_merge_leaves_both_processed_duplicates_unresolved(self):
+        # Both rows already independently face-extracted -- exactly the
+        # real, risky case this command deliberately refuses to
+        # auto-merge (would risk silently duplicating Face rows).
+        path_a = self._a_real_fixture_copy()
+        video_a = self._ingest(path_a)
+        VideoFile.objects.filter(pk=video_a.pk).update(isProcessed=True)
+        video_a.refresh_from_db()
+        path_b = path_a + '.dup.mp4'
+        shutil.copy(path_a, path_b)
+        self.addCleanup(lambda: os.path.exists(path_b) and os.remove(path_b))
+        video_b = self._make_duplicate_row(path_b, video_a, isProcessed=True)
+        face_a = self._attach_face(video_a)
+        face_b = self._attach_face(video_b)
+
+        from django.core.management import call_command
+        call_command('merge_duplicate_videofiles', '--yes')
+
+        self.assertTrue(VideoFile.objects.filter(pk=video_a.pk).exists())
+        self.assertTrue(VideoFile.objects.filter(pk=video_b.pk).exists())
+        self.assertTrue(Face.objects.filter(pk=face_a.pk).exists())
+        self.assertTrue(Face.objects.filter(pk=face_b.pk).exists())
+
+    def test_merge_dry_run_makes_no_changes(self):
+        path_a = self._a_real_fixture_copy()
+        primary = self._ingest(path_a)
+        VideoFile.objects.filter(pk=primary.pk).update(isProcessed=True)
+        primary.refresh_from_db()
+        path_b = path_a + '.dup.mp4'
+        shutil.copy(path_a, path_b)
+        self.addCleanup(lambda: os.path.exists(path_b) and os.remove(path_b))
+        duplicate = self._make_duplicate_row(path_b, primary, isProcessed=False)
+
+        from django.core.management import call_command
+        call_command('merge_duplicate_videofiles', '--dry-run')
+
+        self.assertTrue(VideoFile.objects.filter(pk=primary.pk).exists())
+        self.assertTrue(VideoFile.objects.filter(pk=duplicate.pk).exists())
+
+    def test_merge_rerun_finds_nothing(self):
+        path_a = self._a_real_fixture_copy()
+        primary = self._ingest(path_a)
+        VideoFile.objects.filter(pk=primary.pk).update(isProcessed=True)
+        primary.refresh_from_db()
+        path_b = path_a + '.dup.mp4'
+        shutil.copy(path_a, path_b)
+        self.addCleanup(lambda: os.path.exists(path_b) and os.remove(path_b))
+        self._make_duplicate_row(path_b, primary, isProcessed=False)
+
+        from django.core.management import call_command
+        call_command('merge_duplicate_videofiles', '--yes')
+        self.assertEqual(VideoFile.objects.count(), 1)
+
+        call_command('merge_duplicate_videofiles', '--yes')
+        self.assertEqual(VideoFile.objects.count(), 1)
 
 
 class ParseExifVideoDateTests(unittest.TestCase):
