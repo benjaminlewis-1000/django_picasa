@@ -37,6 +37,17 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   (0 attached faces) were deleted. `Christine Funeral.mpg` (164.8min) and
   `dad_life_stories_fireside.mp4` (45.1min) are currently untouched since the whole folder is out
   of scan scope now regardless.
+- **809 duplicate-content video groups (1,743 `VideoFile` rows) cannot be auto-merged** --
+  `merge_duplicate_videofiles --dry-run` (2026-09-22) found ALL 809 groups already have 2+ copies
+  independently face-extracted, so the command's safe-merge case (at most one copy processed)
+  never applies. This is the systemic version of the original "5 duplicate Face rows from the same
+  frame" report. Needs a real cross-video Face-dedup design (match by timestamp overlap +
+  embedding similarity) or a simpler accept-some-loss policy -- not scoped, see the dated
+  "content-hash-based video duplicate detection" write-up below for the options considered.
+  Ingestion-time duplicate prevention is already deployed and stops the backlog from growing
+  further, but does nothing for these 1,743 already-existing rows. Also still pending: a
+  `picasa_api` restart to actually arm that ingestion-time prevention in the live Celery worker
+  (deferred to the next natural break past the long-running `backfill_det_score --all-faces` job).
 
 **Bigger, deliberately unscoped features:**
 - Slideshow metadata overlay (photo date + location shown alongside the image).
@@ -4448,13 +4459,47 @@ a file with junk bytes appended after its own real data identically to the unmod
 this fallback, since it's already excluded by `MIN_VIDEO_DURATION_SECONDS` before either test
 helper's copy logic ever runs). Full `filepopulator` fast suite (`--parallel 4`): 130/130 passing.
 
-**Not yet run against production**: `backfill_video_content_hash` (the real ~70-minute full-library
-backfill) and `merge_duplicate_videofiles` haven't been run against the live `picasa_api` database
-yet -- ingestion-time prevention is code-complete and tested but not yet deployed/migrated either.
-Deploy is being sequenced around the currently-running `backfill_det_score --all-faces` process
-(same established practice as every other same-day deploy in this file: avoid an unnecessary
-`picasa_api` restart while a long-running foreground process is mid-flight, unless the change
-itself requires one). The original 5-face report (1093652/1119799/1093914/1109430/1115468) will
-be resolved by running `merge_duplicate_videofiles` once deployed -- expected to land in the
-"unresolved" bucket (both copies already independently face-processed), needing the human-review
-step this project already relies on elsewhere rather than an automatic merge.
+**Deployed and run against production the same day.** Migration applied live (`filepopulator.0015`,
+additive, no restart needed). `backfill_video_content_hash` run for real against the full library,
+detached (`docker exec -d`), running concurrently with the already-in-progress
+`backfill_det_score --all-faces` with no contention (confirmed: MD5 hashing is I/O-bound/single-
+core, a completely different resource profile than the ONNX-inference jobs that caused real
+contention/swap-thrashing earlier this session). **Result: 6,995/6,995 videos hashed, 0 missing
+from disk, 6,626s (~110 min) wall time -- found 809 duplicate content_hash groups covering 1,743
+VideoFile rows.**
+
+**Real, important finding from the `merge_duplicate_videofiles --dry-run` that followed: 0 of the
+809 groups are safe to auto-merge -- ALL 809 landed in the "unresolved" bucket.** Root cause,
+not a bug in the command: the video face-extraction backfill (`video_face_extraction`, running
+for weeks per this file's own earlier write-ups) has already processed nearly this entire
+library, so the "safe" case this command was designed for (at most one copy of a duplicate group
+already face-processed) essentially never applies at this point -- almost every duplicate pair
+already has BOTH copies independently face-extracted. This confirms the original 5-face report
+(1093652/1119799/1093914/1109430/1115468) wasn't a one-off glitch; it's one visible instance of a
+systemic pattern across the whole library. Ingestion-time prevention (already deployed in code,
+see above) stops this from growing further, but the existing 1,743 contaminated rows / 809 groups
+are NOT yet cleaned up -- `merge_duplicate_videofiles` as built cannot safely touch them.
+
+**Open decision for a future session, not yet resolved:** what to do with the 809 already-both-
+processed duplicate groups. Options identified but not evaluated in depth: (a) build a real
+cross-video Face-dedup step for exactly this case -- match `Face` rows between the two videos by
+timestamp-range overlap + embedding similarity (same shape as this project's own image-side
+`dedupe_overlapping_faces`/`merge_duplicate_imagefiles`, but keyed on video timestamps instead of
+image-frame IOU), then keep one side's matched pairs and transfer/delete the rest; (b) just pick
+one video per group as primary, delete the `Face` rows on the others outright (simpler, but loses
+any face that was independently tagged/validated on the losing copy -- the same real risk
+`merge_duplicate_imagefiles.py`'s own docstring flagged for the analogous image case, where 1,190
+of 5,009 transferred faces turned out to be already-validated human work); (c) leave the 809
+groups alone -- redundant `Face` rows for the same real moments are not wrong, just wasteful
+(duplicate storage, duplicate review-queue entries) -- lower priority than options (a)/(b) unless
+the redundancy is causing a real annoyance (e.g. the mobile/frontend review flow surfacing the
+same face twice). **No further action taken this session** -- this needs its own scoping pass,
+not a decision made in the closing minutes of an already-very-long session.
+
+**Still pending, unrelated to the above**: `picasa_api` restart to arm ingestion-time duplicate
+prevention in the live Celery worker (code is deployed and correct, but the long-running
+`backfill_det_score --all-faces` process means the restart is still deliberately deferred to the
+next natural break, per this file's established practice) -- until that restart, a **newly
+ingested** duplicate video would still get its own row rather than being caught (the *existing*
+809-group backlog above is unaffected by this either way, since it predates the fix regardless of
+when the restart happens).
