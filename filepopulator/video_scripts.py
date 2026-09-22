@@ -29,10 +29,18 @@ import pytz
 from django.conf import settings
 from django.utils import timezone
 
-from .models import Directory, FailedVideoFile, VideoFile, VIDEO_EXTENSION_REGEX, guess_date_from_filename
+from .models import (
+    Directory, DuplicateVideoFile, FailedVideoFile, VideoFile, VIDEO_EXTENSION_REGEX,
+    guess_date_from_filename,
+)
 
 FFPROBE_TIMEOUT_SECONDS = 30
 EXIFTOOL_TIMEOUT_SECONDS = 30
+
+# Chunked read size for _compute_content_hash() -- large enough to keep
+# per-chunk Python overhead negligible, small enough not to matter for
+# memory on even the biggest real files in this library (~3.5GB).
+_CONTENT_HASH_CHUNK_BYTES = 8 * 1024 * 1024
 
 EXIFTOOL_FIELDS = [
     '-CreateDate', '-DateTimeOriginal',
@@ -144,12 +152,35 @@ def _get_video_date_taken(file_path, exif):
     return timezone.now(), False
 
 
+def compute_video_content_hash(file_path):
+    """Real MD5 of the file's actual bytes, not just its path (see
+    VideoFile.content_hash's own docstring for the real-world duplicate
+    case this exists to catch). Benchmarked 2026-09-22 against real
+    production video files: ~130-138 MB/s -- ~70 minutes for the entire
+    542GB library, confirmed cheap enough to run unconditionally on
+    every newly-ingested video, not just as a one-time backfill.
+
+    Unlike ImageFile.pixel_hash (an MD5 of decoded PIXEL data, verified
+    against actual pixel arrays before trusting a match -- see
+    _pixel_arrays_match()), this hashes the raw file bytes directly, so
+    a match here already IS byte-for-byte file identity -- no separate
+    content-verification step is needed the way pixel_hash needed one."""
+    hash_md5 = hashlib.md5()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(_CONTENT_HASH_CHUNK_BYTES), b''):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
 def create_video_file(file_path):
     """Create or update a VideoFile row for file_path. Mirrors
-    create_image_file()'s shape but without pixel-hash-based duplicate
-    detection (see VideoFile.file_hash's own docstring -- not worth the
-    cost of decoding a whole video just to hash it) and without
-    thumbnail/face-detection work, which are later phases."""
+    create_image_file()'s shape, including real content-based duplicate
+    detection (via compute_video_content_hash(), added 2026-09-22 --
+    see VideoFile.content_hash's own docstring for why: real duplicate
+    video files were found being independently face-extracted, each
+    producing its own set of Face rows for the same real moment) --
+    but still without thumbnail/face-detection work, which are later
+    phases."""
 
     probe = _run_ffprobe(file_path)
     if probe is None:
@@ -192,13 +223,50 @@ def create_video_file(file_path):
 
     codec = video_stream.get('codec_name')
 
+    existing_same_path = VideoFile.objects.filter(filename=file_path).first()
+    content_hash = compute_video_content_hash(file_path)
+
+    if existing_same_path is not None:
+        # Re-ingesting the same path (e.g. its mtime changed) -- never a
+        # "duplicate" of itself, just the normal update-in-place flow.
+        video = existing_same_path
+    else:
+        # A genuinely new path -- check whether its content already
+        # exists elsewhere in the library before creating anything.
+        content_matches = list(
+            VideoFile.objects.filter(content_hash=content_hash).exclude(content_hash__isnull=True)
+        )
+        still_present = [v for v in content_matches if os.path.exists(v.filename)]
+        if still_present:
+            # Real duplicate: identical bytes already ingested at
+            # another, still-present path. Record and stop -- mirrors
+            # create_image_file()'s pixel_hash duplicate branch,
+            # including the bug that branch had to fix (never fall
+            # through to also creating a full row for the duplicate).
+            DuplicateVideoFile.objects.create(filename=file_path, original=still_present[0])
+            settings.LOGGER.info(
+                f"Video {file_path} is a content-duplicate of "
+                f"{still_present[0].filename} -- recorded, not re-ingested."
+            )
+            return
+
+        moved_candidates = [v for v in content_matches if not os.path.exists(v.filename)]
+        if moved_candidates:
+            # Same content, but the row's old path is gone -- this is a
+            # move/rename, not a duplicate. Reuse the existing row (and
+            # its Face rows/thumbnails) instead of creating a fresh one.
+            video = moved_candidates[0]
+            video.filename = file_path
+        else:
+            video = VideoFile(filename=file_path)
+
     exif = _run_exiftool(file_path)
     date_taken, date_taken_valid = _get_video_date_taken(file_path, exif)
 
     directory_path = os.path.dirname(file_path)
     directory, _ = Directory.objects.get_or_create(dir_path=directory_path)
 
-    video = VideoFile.objects.filter(filename=file_path).first() or VideoFile(filename=file_path)
+    video.content_hash = content_hash
     video.directory = directory
     video.width = width
     video.height = height

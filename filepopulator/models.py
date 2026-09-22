@@ -1108,6 +1108,19 @@ class VideoFile(models.Model):
     # single still image).
     file_hash = models.CharField(max_length=64, null=False, default=-1)
 
+    # Real content hash (MD5 of the raw file bytes, not a decoded-frame
+    # hash -- see create_video_file()) -- distinct from file_hash above,
+    # which only ever hashes the file PATH. Added 2026-09-22 after real
+    # duplicate video files (identical bytes at different paths) were
+    # found to be independently face-extracted, producing duplicate Face
+    # rows for the same real moment. Benchmarked before building this:
+    # ~130-138 MB/s real MD5 throughput, ~70 minutes to hash the entire
+    # 542GB production library -- confirmed cheap, unlike a pixel/frame-
+    # level comparison would be. Nullable since every pre-existing row
+    # predates this field (see backfill_video_content_hash); populated
+    # for every new video going forward by create_video_file().
+    content_hash = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+
     thumbnail_big = models.ImageField(upload_to=thumbnail_big_path, editable=False, default=None)
     thumbnail_medium = models.ImageField(upload_to=thumbnail_med_path, editable=False, default=None)
     thumbnail_small = models.ImageField(upload_to=thumbnail_small_path, editable=False, default=None)
@@ -1226,6 +1239,26 @@ class VideoFile(models.Model):
                 pass
 
         super(VideoFile, self).delete()
+
+
+class DuplicateVideoFile(models.Model):
+    """Mirrors DuplicateFile (the image-side equivalent) exactly, for the
+    same reason: create_video_file() records a path here instead of
+    creating a second VideoFile row once its content_hash matches an
+    already-ingested video that's still present on disk. on_delete=
+    CASCADE is the actual point of `original`, same as DuplicateFile's
+    own docstring explains -- if the primary VideoFile is later deleted
+    (e.g. the file vanished from disk and delete_removed_videos() ran),
+    this record should go with it, freeing the surviving duplicate path
+    to be genuinely re-ingested rather than permanently blocked."""
+    filename = models.CharField(max_length=1024)
+    original = models.ForeignKey(
+        'VideoFile', on_delete=models.CASCADE, null=True, blank=True,
+        related_name='duplicates',
+    )
+
+    def __str__(self):
+        return f"DuplicateVideoFile({self.filename})"
 
 
 class SimilarImagePair(models.Model):

@@ -4360,3 +4360,101 @@ not-margin. All existing `classify_unassigned` tests re-checked by hand for marg
 in the newly-sensitive 0-0.03 zone -- none did (existing fixtures use either comfortably-positive
 or clearly-negative margins), confirmed unaffected by re-running them. Full fast suite
 (`--parallel 8`): 456/456 passing.
+
+## DONE (2026-09-22): real content-hash-based video duplicate detection built, after tracing 5
+near-identical Face rows back to genuinely duplicate video files
+
+Triggered by a real user report: Faces 1093652, 1119799, 1093914, 1109430, and 1115468 all looked
+like the same face from the same video frame. Confirmed via real MD5 content hashing (not
+assumed from filenames/paths) that 5 differently-named video files at different paths were
+byte-for-byte identical (`3b467ed727d1ee00e7899457121bf900`) -- each had been independently
+face-extracted, producing near-duplicate `Face` rows for the same real moment. Broader scope
+check found this wasn't a one-off: grouping the production video library by file size found 819
+same-size groups covering 1,765 `VideoFile` rows.
+
+**Real MD5 throughput benchmarked before committing to anything** (per this project's own
+established empirical-validation discipline): ~130-138 MB/s against real production video files
+(measured on a 47.8MB and a 3.5GB file). Library-wide size distribution: n=6,995, mean=77.5MB,
+median=47.8MB, p99=474.8MB, max=3.53GB, **total 542.1GB** -- at measured throughput, hashing the
+entire library end to end is ~70 minutes. Confirmed cheap, same conclusion `VideoFile.file_hash`'s
+own pre-existing docstring had already reached for a *decode*-based approach ("not worth the cost
+of decoding a whole video just to hash it") -- a plain content-byte MD5 is a completely different,
+much cheaper cost profile than that, closer to `ImageFile.pixel_hash`'s own per-file cost.
+
+**`VideoFile.content_hash`** (nullable, indexed `CharField`, migration `filepopulator.0015`) --
+real MD5 of the raw file bytes, distinct from the pre-existing `file_hash` (filename-only, used
+only to build thumbnail paths, unrelated to content identity). Unlike `ImageFile.pixel_hash` (an
+MD5 of *decoded pixel data*, which needed `_pixel_arrays_match()` as a second, real verification
+step before trusting a match -- a pixel-hash collision between two genuinely different photos is
+at least conceivable), a `content_hash` match on raw file bytes already **is** byte-for-byte file
+identity by construction -- no second verification step is needed.
+
+**`DuplicateVideoFile`** mirrors `DuplicateFile` (the image-side equivalent) exactly, including
+the same `original` FK with `on_delete=CASCADE` -- if the primary `VideoFile` is later deleted
+(e.g. `delete_removed_videos()` runs after its file vanishes), the duplicate record goes with it,
+freeing the surviving duplicate path to be genuinely re-ingested rather than permanently blocked
+from ever getting its own row.
+
+**Ingestion-time prevention, `create_video_file()`** (`filepopulator/video_scripts.py`): computes
+`content_hash` for every newly-discovered path (after the cheap ffprobe/duration-exclusion checks,
+before the more expensive exiftool call, so an already-known duplicate skips that cost too), then
+mirrors `create_image_file()`'s own three-way branch on the image side -- same *path* already has a
+row (normal update-in-place, never a duplicate of itself); same *content* exists at another,
+still-present path (record a `DuplicateVideoFile` and return, mirroring `create_image_file()`'s own
+historical missing-return bug being deliberately avoided here from day one -- never fall through to
+also creating a full row for the duplicate); same content but the other row's path is gone (a
+move/rename, not a duplicate -- reuse the existing row, including its `Face` rows/thumbnails,
+instead of creating a fresh one, same as the image side's own "moved" handling).
+
+**Two new management commands**, mirroring the existing image-side `merge_duplicate_imagefiles.py`
+pattern (`--dry-run`/`--yes`):
+- `backfill_video_content_hash` -- one-time backfill of `content_hash` for every row that predates
+  the field (time-based progress checkpoints, not row-count-based, since a full run spans videos
+  from tiny clips to 3.5GB files). Reports duplicate group counts found at the end; does not merge
+  anything itself.
+- `merge_duplicate_videofiles` -- resolves `VideoFile` rows already sharing a `content_hash` (the
+  pre-existing contamination from before this feature existed). For each duplicate group: if **at
+  most one** row has `isProcessed=True` (already face-extracted), it's safe -- pick a primary
+  (processed > file still exists on disk > more attached faces > lowest id, in that priority
+  order), transfer any `Face` rows from the others onto it, and delete the others (`VideoFile.
+  delete()` already cleans up thumbnails and cascades `Face`-thumbnail cleanup). If **more than
+  one** row in a group is already processed, merging risks silently duplicating that group's
+  `Face` rows onto the primary (two independent extraction runs over identical content won't in
+  general land on identical boxes/timestamps the way a same-frame image duplicate does) -- left
+  alone entirely and reported as unresolved, same discipline this project already uses for the
+  equivalent ambiguous image-duplicate case (`merge_duplicate_imagefiles.py`'s own "unresolved,
+  no primary found" handling). This is exactly the real motivating case: the 5 near-identical
+  Face rows all trace back to a duplicate-content group where every copy had already been
+  independently face-extracted -- this command will correctly flag that specific group as
+  unresolved rather than guess at how to reconcile the 5 rows automatically.
+
+**Testing**: 3 new tests in `VideoIngestionTests` (content_hash populated on ingest; a
+byte-identical copy at a new path is recorded as a `DuplicateVideoFile`, not re-ingested; a
+byte-identical file at a NEW path with the OLD path gone is treated as a move, reusing the
+existing row) plus a new `VideoContentHashBackfillAndMergeTests` class (7 tests: backfill
+populates/dry-run/skips-vanished-file; merge transfers faces from an unprocessed duplicate onto a
+processed primary; merge leaves a both-processed group alone; merge dry-run no-op; merge re-run
+finds nothing). Two **pre-existing** tests broke as a direct, correct consequence of this feature
+and were fixed, not worked around: `test_multiple_roots_are_all_walked` used to copy the same
+fixture into a second root and assert it became its own `VideoFile` row -- now correctly a
+`DuplicateVideoFile` instead (rewritten to assert that); `DeleteRemovedVideosTests`'s
+`_a_real_fixture_copy()` helper deterministically returned a copy of the *same* fixture file on
+every call, so two calls in one test (needing two independently-tracked rows) now collide as
+duplicates -- fixed by cycling through the real dev/test fixture directory's 8 distinct real
+files on repeated calls, falling back to appending random trailing bytes if fewer distinct
+fixtures exist than calls made (verified safe against a real synthetic fixture -- ffprobe reads
+a file with junk bytes appended after its own real data identically to the unmodified original,
+`probe_score: 100` either way -- though CI's own single 1s synthetic stub never actually exercises
+this fallback, since it's already excluded by `MIN_VIDEO_DURATION_SECONDS` before either test
+helper's copy logic ever runs). Full `filepopulator` fast suite (`--parallel 4`): 130/130 passing.
+
+**Not yet run against production**: `backfill_video_content_hash` (the real ~70-minute full-library
+backfill) and `merge_duplicate_videofiles` haven't been run against the live `picasa_api` database
+yet -- ingestion-time prevention is code-complete and tested but not yet deployed/migrated either.
+Deploy is being sequenced around the currently-running `backfill_det_score --all-faces` process
+(same established practice as every other same-day deploy in this file: avoid an unnecessary
+`picasa_api` restart while a long-running foreground process is mid-flight, unless the change
+itself requires one). The original 5-face report (1093652/1119799/1093914/1109430/1115468) will
+be resolved by running `merge_duplicate_videofiles` once deployed -- expected to land in the
+"unresolved" bucket (both copies already independently face-processed), needing the human-review
+step this project already relies on elsewhere rather than an automatic merge.
