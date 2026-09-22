@@ -2921,10 +2921,29 @@ class VideoContentHashBackfillAndMergeTests(TestCase):
         stray_face.refresh_from_db()
         self.assertEqual(stray_face.source_video_file_id, primary.pk)
 
-    def test_merge_leaves_both_processed_duplicates_unresolved(self):
-        # Both rows already independently face-extracted -- exactly the
-        # real, risky case this command deliberately refuses to
-        # auto-merge (would risk silently duplicating Face rows).
+    def _attach_face_at(self, video, first, last, person=None, validated=False,
+                         embedding=None, kps=None, det_score=None):
+        from face_manager.models import Person
+        if person is None:
+            person, _ = Person.objects.get_or_create(person_name=settings.SOFT_IGNORE_NAME)
+        face = Face(
+            source_video_file=video, declared_name=person, validated=validated,
+            box_left=1, box_top=1,
+            box_right=min(40, video.width - 1), box_bottom=min(40, video.height - 1),
+            video_first_timestamp_seconds=first, video_last_timestamp_seconds=last,
+            face_encoding_512=embedding, kps=kps, det_score=det_score,
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.save()
+        return face
+
+    def test_merge_resolves_both_processed_duplicates_keeping_unmatched_faces(self):
+        # Both rows already independently face-extracted, and the two
+        # faces have no timestamps at all (can't be matched) -- this
+        # used to be left alone entirely ("unresolved"); now the videos
+        # still merge, and since the faces can't be confidently matched
+        # to each other, BOTH survive (transferred onto the primary),
+        # never silently discarded.
         path_a = self._a_real_fixture_copy()
         video_a = self._ingest(path_a)
         VideoFile.objects.filter(pk=video_a.pk).update(isProcessed=True)
@@ -2940,9 +2959,63 @@ class VideoContentHashBackfillAndMergeTests(TestCase):
         call_command('merge_duplicate_videofiles', '--yes')
 
         self.assertTrue(VideoFile.objects.filter(pk=video_a.pk).exists())
-        self.assertTrue(VideoFile.objects.filter(pk=video_b.pk).exists())
-        self.assertTrue(Face.objects.filter(pk=face_a.pk).exists())
-        self.assertTrue(Face.objects.filter(pk=face_b.pk).exists())
+        self.assertFalse(VideoFile.objects.filter(pk=video_b.pk).exists())
+        self.assertTrue(Face.objects.filter(pk=face_a.pk, source_video_file=video_a).exists())
+        face_b.refresh_from_db()
+        self.assertEqual(face_b.source_video_file_id, video_a.pk)
+
+    def test_merge_dedupes_matched_faces_keeping_the_labeled_survivor(self):
+        # Same real span on both copies (the deterministic-pipeline
+        # case this feature was actually built for) -- one copy's face
+        # is a real, declared identification; the other is just
+        # .ignore. The declared one must survive, not be discarded
+        # because the un-labeled copy happened to live on the primary.
+        from face_manager.models import Person
+        path_a = self._a_real_fixture_copy()
+        video_a = self._ingest(path_a)
+        VideoFile.objects.filter(pk=video_a.pk).update(isProcessed=True)
+        video_a.refresh_from_db()
+        path_b = path_a + '.dup.mp4'
+        shutil.copy(path_a, path_b)
+        self.addCleanup(lambda: os.path.exists(path_b) and os.remove(path_b))
+        video_b = self._make_duplicate_row(path_b, video_a, isProcessed=True)
+
+        real_person, _ = Person.objects.get_or_create(person_name="Test Real Person")
+        ignore_face = self._attach_face_at(video_a, 10.0, 12.0)
+        labeled_face = self._attach_face_at(video_b, 10.0, 12.0, person=real_person)
+
+        from django.core.management import call_command
+        call_command('merge_duplicate_videofiles', '--yes')
+
+        self.assertFalse(Face.objects.filter(pk=ignore_face.pk).exists())
+        labeled_face.refresh_from_db()
+        self.assertEqual(labeled_face.source_video_file_id, video_a.pk)
+        self.assertEqual(labeled_face.declared_name.person_name, "Test Real Person")
+        self.assertEqual(Face.objects.filter(source_video_file=video_a).count(), 1)
+
+    def test_merge_keeps_faces_whose_timestamps_dont_match_as_distinct(self):
+        # Two faces at clearly different points in the clip -- these are
+        # two different real detections (or the same person appearing
+        # twice), not a duplicate pair, and must both survive.
+        path_a = self._a_real_fixture_copy()
+        video_a = self._ingest(path_a)
+        VideoFile.objects.filter(pk=video_a.pk).update(isProcessed=True)
+        video_a.refresh_from_db()
+        path_b = path_a + '.dup.mp4'
+        shutil.copy(path_a, path_b)
+        self.addCleanup(lambda: os.path.exists(path_b) and os.remove(path_b))
+        video_b = self._make_duplicate_row(path_b, video_a, isProcessed=True)
+
+        face_early = self._attach_face_at(video_a, 1.0, 2.0)
+        face_late = self._attach_face_at(video_b, 40.0, 41.0)
+
+        from django.core.management import call_command
+        call_command('merge_duplicate_videofiles', '--yes')
+
+        self.assertTrue(Face.objects.filter(pk=face_early.pk, source_video_file=video_a).exists())
+        face_late.refresh_from_db()
+        self.assertEqual(face_late.source_video_file_id, video_a.pk)
+        self.assertEqual(Face.objects.filter(source_video_file=video_a).count(), 2)
 
     def test_merge_dry_run_makes_no_changes(self):
         path_a = self._a_real_fixture_copy()
@@ -2976,6 +3049,110 @@ class VideoContentHashBackfillAndMergeTests(TestCase):
 
         call_command('merge_duplicate_videofiles', '--yes')
         self.assertEqual(VideoFile.objects.count(), 1)
+
+
+class MatchDuplicateVideoFacesTests(unittest.TestCase):
+    """Unit tests for merge_duplicate_videofiles.match_duplicate_video_faces
+    and _survivor_key -- pure functions, no DB access needed. See that
+    command's module docstring for the real motivating case (5 Face rows
+    from 5 byte-identical video copies, matched by near-exact timestamp
+    since the extraction pipeline is deterministic over identical input
+    bytes)."""
+
+    def _face(self, first, last, embedding=None):
+        return {'first': first, 'last': last, 'embedding': embedding}
+
+    def test_close_timestamps_match(self):
+        from filepopulator.management.commands.merge_duplicate_videofiles import (
+            match_duplicate_video_faces,
+        )
+        primary = [self._face(10.0, 12.0)]
+        other = [self._face(10.001, 12.002)]
+        matches = match_duplicate_video_faces(primary, other)
+        self.assertEqual(matches, [(0, 0)])
+
+    def test_timestamps_too_far_apart_do_not_match(self):
+        from filepopulator.management.commands.merge_duplicate_videofiles import (
+            match_duplicate_video_faces,
+        )
+        primary = [self._face(10.0, 12.0)]
+        other = [self._face(40.0, 41.0)]
+        matches = match_duplicate_video_faces(primary, other)
+        self.assertEqual(matches, [])
+
+    def test_missing_timestamps_never_match(self):
+        # A face with no timestamps at all (e.g. a hand-added test/stub
+        # row) can't be confidently matched -- must stay unmatched
+        # rather than guessed at.
+        from filepopulator.management.commands.merge_duplicate_videofiles import (
+            match_duplicate_video_faces,
+        )
+        primary = [self._face(None, None)]
+        other = [self._face(None, None)]
+        matches = match_duplicate_video_faces(primary, other)
+        self.assertEqual(matches, [])
+
+    def test_close_timestamps_but_dissimilar_embeddings_do_not_match(self):
+        # Same instant, but the embeddings disagree -- guards against
+        # two different real people who happen to overlap in time
+        # within tolerance. Near-orthogonal 3-d vectors for clarity.
+        from filepopulator.management.commands.merge_duplicate_videofiles import (
+            match_duplicate_video_faces,
+        )
+        primary = [self._face(10.0, 12.0, embedding=[1.0, 0.0, 0.0])]
+        other = [self._face(10.0, 12.0, embedding=[0.0, 1.0, 0.0])]
+        matches = match_duplicate_video_faces(primary, other)
+        self.assertEqual(matches, [])
+
+    def test_close_timestamps_and_similar_embeddings_do_match(self):
+        from filepopulator.management.commands.merge_duplicate_videofiles import (
+            match_duplicate_video_faces,
+        )
+        primary = [self._face(10.0, 12.0, embedding=[1.0, 0.0, 0.0])]
+        other = [self._face(10.0, 12.0, embedding=[0.99, 0.01, 0.0])]
+        matches = match_duplicate_video_faces(primary, other)
+        self.assertEqual(matches, [(0, 0)])
+
+    def test_optimal_assignment_picks_the_correct_pairing_not_first_match(self):
+        # Two primary faces, two other faces, each clearly closer in
+        # time to a DIFFERENT one of the two -- confirms the matcher
+        # solves the whole matrix at once rather than greedily grabbing
+        # whichever pair it sees first.
+        from filepopulator.management.commands.merge_duplicate_videofiles import (
+            match_duplicate_video_faces,
+        )
+        primary = [self._face(10.0, 12.0), self._face(50.0, 52.0)]
+        other = [self._face(50.05, 52.05), self._face(10.05, 12.05)]
+        matches = match_duplicate_video_faces(primary, other)
+        self.assertEqual(set(matches), {(0, 1), (1, 0)})
+
+    def test_survivor_key_prefers_validated(self):
+        from filepopulator.management.commands.merge_duplicate_videofiles import _survivor_key
+        validated = {'id': 2, 'validated': True, 'person_name': '.ignore', 'has_kps': False, 'has_det_score': False}
+        unvalidated = {'id': 1, 'validated': False, 'person_name': 'Real Name', 'has_kps': True, 'has_det_score': True}
+        self.assertLess(_survivor_key(validated), _survivor_key(unvalidated))
+
+    def test_survivor_key_prefers_real_label_over_ignore(self):
+        # The real motivating case: a genuine person name must beat
+        # .ignore even though .ignore isn't the blank sentinel either.
+        from filepopulator.management.commands.merge_duplicate_videofiles import _survivor_key
+        labeled = {'id': 2, 'validated': False, 'person_name': 'Emily Wilson', 'has_kps': False, 'has_det_score': False}
+        ignored = {'id': 1, 'validated': False, 'person_name': '.ignore', 'has_kps': True, 'has_det_score': True}
+        self.assertLess(_survivor_key(labeled), _survivor_key(ignored))
+
+    def test_survivor_key_prefers_kps_then_det_score_then_lowest_id(self):
+        from filepopulator.management.commands.merge_duplicate_videofiles import _survivor_key
+        has_kps = {'id': 5, 'validated': False, 'person_name': '.ignore', 'has_kps': True, 'has_det_score': False}
+        no_kps = {'id': 1, 'validated': False, 'person_name': '.ignore', 'has_kps': False, 'has_det_score': True}
+        self.assertLess(_survivor_key(has_kps), _survivor_key(no_kps))
+
+        has_det_score = {'id': 5, 'validated': False, 'person_name': '.ignore', 'has_kps': False, 'has_det_score': True}
+        no_det_score = {'id': 1, 'validated': False, 'person_name': '.ignore', 'has_kps': False, 'has_det_score': False}
+        self.assertLess(_survivor_key(has_det_score), _survivor_key(no_det_score))
+
+        lower_id = {'id': 1, 'validated': False, 'person_name': '.ignore', 'has_kps': False, 'has_det_score': False}
+        higher_id = {'id': 2, 'validated': False, 'person_name': '.ignore', 'has_kps': False, 'has_det_score': False}
+        self.assertLess(_survivor_key(lower_id), _survivor_key(higher_id))
 
 
 class ParseExifVideoDateTests(unittest.TestCase):
