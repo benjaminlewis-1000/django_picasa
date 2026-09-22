@@ -37,17 +37,10 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   (0 attached faces) were deleted. `Christine Funeral.mpg` (164.8min) and
   `dad_life_stories_fireside.mp4` (45.1min) are currently untouched since the whole folder is out
   of scan scope now regardless.
-- **809 duplicate-content video groups (1,743 `VideoFile` rows) cannot be auto-merged** --
-  `merge_duplicate_videofiles --dry-run` (2026-09-22) found ALL 809 groups already have 2+ copies
-  independently face-extracted, so the command's safe-merge case (at most one copy processed)
-  never applies. This is the systemic version of the original "5 duplicate Face rows from the same
-  frame" report. Needs a real cross-video Face-dedup design (match by timestamp overlap +
-  embedding similarity) or a simpler accept-some-loss policy -- not scoped, see the dated
-  "content-hash-based video duplicate detection" write-up below for the options considered.
-  Ingestion-time duplicate prevention is already deployed and stops the backlog from growing
-  further, but does nothing for these 1,743 already-existing rows. Also still pending: a
-  `picasa_api` restart to actually arm that ingestion-time prevention in the live Celery worker
-  (deferred to the next natural break past the long-running `backfill_det_score --all-faces` job).
+- Still pending (unrelated to the item above, which is now resolved): a `picasa_api` restart to
+  actually arm ingestion-time video-duplicate prevention in the live Celery worker (deferred to
+  the next natural break past the long-running `backfill_det_score --all-faces` job, still running
+  as of 2026-09-22).
 
 **Bigger, deliberately unscoped features:**
 - Slideshow metadata overlay (photo date + location shown alongside the image).
@@ -4503,3 +4496,86 @@ next natural break, per this file's established practice) -- until that restart,
 ingested** duplicate video would still get its own row rather than being caught (the *existing*
 809-group backlog above is unaffected by this either way, since it predates the fix regardless of
 when the restart happens).
+
+## DONE (2026-09-22, same day): the 809-group backlog above resolved -- `merge_duplicate_videofiles`
+extended to dedupe Face rows across already-both-processed duplicate copies via timestamp +
+embedding matching, run for real against production
+
+Follow-up to the write-up above, same day. The 809 "unresolved" groups all had multiple copies
+already independently face-extracted, which `merge_duplicate_videofiles` deliberately refused to
+touch (real risk: two independent extraction runs over identical content don't in general produce
+identical boxes/timestamps the way a same-image duplicate-face pair does). Investigated the real
+motivating 5-copy group (`content_hash 3b467ed7...`, video ids 1006/1039/3425/4422/5167) directly
+before designing anything: because the video bytes are byte-identical, the extraction pipeline is
+fully deterministic over them -- all 5 copies independently produced exactly 7 `Face` rows each,
+with `video_first_timestamp_seconds`/`video_last_timestamp_seconds` matching **to 15 decimal
+places** across copies. This makes timestamp closeness an extremely reliable (not just
+heuristic) signal for "this is the same real face across copies" -- confirmed further by one
+copy (video 5167) carrying a real declared name ("Emily Wilson") on a span the other 4 copies had
+left as `.ignore`, exactly the "don't lose an assigned face" case that motivated this work.
+
+**Fix, in `merge_duplicate_videofiles.py`**: every duplicate-content group is now resolved
+uniformly (the old "safe" vs. "unresolved" split is gone -- it's strictly a special case of the
+same general algorithm). For each group: pick a primary the same way as before, then for each
+other copy, match its `Face` rows against the primary's CURRENT `Face` rows via optimal bipartite
+assignment (`scipy.linear_sum_assignment`) on timestamp closeness (cost = |first_a-first_b| +
+|last_a-last_b|, ~0.5s tolerance -- generous given the real gap is ~0), with a cosine-similarity
+floor on the embeddings (>=0.5) as a safety veto against two different real people who happen to
+overlap in time within tolerance. A face is never force-matched: `linear_sum_assignment` finds the
+single best overall pairing, but any pair whose cost exceeds tolerance (or fails the embedding
+floor) is rejected afterward -- the same "optimal assignment, then filter" pattern
+`face_extract_encode.py` already uses for reconciling existing vs. freshly-detected image faces.
+
+For each matched pair, the **survivor** (kept; the loser is deleted via `Face.delete()`, cleaning
+up its thumbnail) is chosen by the same preference this project already uses for the equivalent
+same-image duplicate-face case (`dedupe_overlapping_faces.py`): validated > has a real label > has
+`kps` > has `det_score` > lowest id -- **refined here**: the existing preference only checked
+`declared_name != BLANK_FACE_NAME`, which would have let `.ignore` tie with a real name (`.ignore`
+also isn't the blank sentinel); fixed to check `declared_name not in settings.IGNORED_NAMES`
+instead, so a genuine person name always outranks a mere `.ignore`/`.realignore` -- confirmed this
+mattered directly against the real Emily Wilson case. Any face **not** matched to anything on the
+other side -- a detection only one copy's extraction run happened to find -- is never discarded,
+only transferred onto the primary.
+
+**Testing**: a new pure-function unit test class (`MatchDuplicateVideoFacesTests`, no DB) covering
+close-timestamp matches, too-far-apart rejections, missing-timestamp faces never matching (can't
+be confidently matched, so must stay separate), the embedding floor rejecting a close-timestamp
+but dissimilar pair, optimal assignment picking the objectively correct pairing across a 2x2
+matrix rather than a greedy first-match, and the `_survivor_key` ordering (validated > real label
+over `.ignore` > kps > det_score > lowest id) tested individually. The old
+`test_merge_leaves_both_processed_duplicates_unresolved` test (no longer true) was replaced with
+tests confirming: unmatched faces from a both-processed group both survive (transferred, not
+discarded); a matched pair correctly keeps the labeled survivor over the `.ignore` copy; faces at
+clearly different timestamps are correctly kept as distinct. Full `filepopulator` (141/141) and
+`face_manager` (138/138) fast suites passing.
+
+**Validated against real production data before running for real** -- per this project's own
+established empirical-validation discipline. `--dry-run` against the real 809 groups: 4,120
+matched pairs, 1,683 faces transferred (kept as distinct), 934 duplicate `VideoFile` rows to
+delete. Spot-checked two real groups by pulling actual thumbnail files (via `docker exec ... |
+base64`, since `docker cp` writes through a filesystem view this session's sandboxed shell can't
+see -- the same workaround this file has already noted elsewhere): the Emily Wilson match, and a
+second, previously-unchecked 2-copy group. In every case the matched pair's thumbnail files came
+back **byte-identical** (same file size, same visual content) -- about as strong a confirmation as
+visual inspection can give, since it proves the two `Face` rows really do trace back to the exact
+same decoded frame. One spot-checked pair turned out to be pre-existing detector false positives
+(a hand, a doll's face) -- not something this change causes or fixes, but correctly deduped to one
+copy rather than doubled, which is still the right outcome.
+
+**Run for real against production 2026-09-22**: exactly matched the dry-run (4,120 duplicate
+`Face` rows deleted, 1,683 transferred, 934 duplicate `VideoFile` rows deleted). Verified
+afterward: a follow-up `--dry-run` finds 0 remaining groups; `manage.py check` clean; the Emily
+Wilson face (1119802) confirmed still attached to its group's primary video (1006) with its real
+declared name intact, and the duplicate video (5167) confirmed gone. This closes out the
+809-group backlog item above -- the only remaining related open item is the already-noted
+`picasa_api` restart to arm ingestion-time prevention for newly-ingested duplicates, still
+deferred past the in-progress `backfill_det_score --all-faces` run.
+
+**Process note**: built and tested on `backend_upgrade` per this file's own working-convention
+rule, then merged into `master` (a real `git merge`, not an exploratory edit) to let `picasa_api`
+pick up the code for the production dry-run/real-run -- confirmed before merging that `master`'s
+pre-existing content for both changed files was byte-identical to `backend_upgrade`'s pre-edit
+content (the merge conflict `git merge` reported was purely a merge-base bookkeeping artifact from
+this project's dual-branch-parity workflow, not a real divergence), and that master's separate,
+unrelated uncommitted local changes (`api/views.py`, `scratch_reclassify_magnets.py`) were left
+untouched throughout.
