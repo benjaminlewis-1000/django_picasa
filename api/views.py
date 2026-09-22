@@ -443,6 +443,13 @@ class PersonListView(APIView):
                 ).count()
                 p_dict['num_possibilities_video'] = max(0, p_dict['num_possibilities_video'] - num_flagged_video)
                 p_dict['num_possibilities_image'] = max(0, p_dict['num_possibilities'] - p_dict['num_possibilities_video'])
+                # Frontend's "Confirm from" media filter (personSidebar.jsx)
+                # needs the "Flagged for review" row's own count split the
+                # same way the main possibility count already is - reuses
+                # num_flagged_video computed just above rather than a new
+                # query.
+                p_dict['num_review_flagged_video'] = num_flagged_video
+                p_dict['num_review_flagged_image'] = num_flagged - num_flagged_video
                 # Backs the verify screen's "Flagged & unverified"
                 # subordinate row - faces already confirmed to .ignore,
                 # not yet verified, that were ALSO flagged at some point
@@ -460,6 +467,8 @@ class PersonListView(APIView):
                 p_dict['num_unverified_faces'] = max(0, p_dict['num_unverified_faces'] - num_flagged_unverified)
             else:
                 p_dict['num_review_flagged'] = 0
+                p_dict['num_review_flagged_video'] = 0
+                p_dict['num_review_flagged_image'] = 0
                 p_dict['num_review_flagged_unverified'] = 0
 
             result_list.append(p_dict)
