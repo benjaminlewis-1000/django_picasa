@@ -273,6 +273,7 @@ def create_video_file(file_path):
     video.duration_seconds = duration
     video.codec = codec
     video.field_order = video_stream.get('field_order', 'unknown')
+    video.color_transfer = video_stream.get('color_transfer', 'unknown')
     video.camera_make = exif.get('Make')
     video.camera_model = exif.get('Model')
     try:
