@@ -1154,6 +1154,26 @@ class VideoFile(models.Model):
     # backfill_video_color_transfer management command).
     color_transfer = models.CharField(max_length=16, null=True, blank=True)
 
+    # ffprobe_info()'s own already-computed target width for non-square-
+    # pixel ("anamorphic") source video -- cached for the same reason as
+    # field_order/color_transfer above (the fast on-demand viewer needs
+    # this without an extra ffprobe call per request). Confirmed real,
+    # 2026-09-23: old digitized NTSC/VHS-era .mpg content is commonly
+    # coded at e.g. 352x480 with sample_aspect_ratio=20:11 -- the TRUE
+    # display shape is 4:3, not the raw 352:480 grid; decoding without
+    # correcting for this comes out visibly squished horizontally. 0
+    # means "checked, square pixels, no correction needed" (distinct
+    # from NULL, "not yet checked" -- a real target width is never 0);
+    # see video_face_pipeline.py's ffprobe_info()/build_vf_filter() for
+    # why this is a separate opt-in value rather than folded into the
+    # plain width field the way rotation-correction is (unlike rotation,
+    # which ffmpeg's raw pipe applies automatically regardless of any
+    # explicit filter, this only takes effect if a caller also applies
+    # the matching scale filter). Nullable for rows ingested before this
+    # field existed; those fall back to a live ffprobe call (see
+    # backfill_video_sar management command).
+    sar_scale_width = models.IntegerField(null=True, blank=True)
+
     # Raw file size on disk (os.path.getsize()), unlike ImageFile which has
     # no equivalent field -- added specifically to help size the Phase 5
     # transcode pipeline's disk footprint (see CLAUDE.md).

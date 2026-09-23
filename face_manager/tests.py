@@ -2282,7 +2282,7 @@ class RetonemapHdrVideoThumbnailsTests(TestCase):
                 yield self._frame(50 if abs(t - 2.0) < 0.01 else 10)
 
         with patch(f'{self.CMD}.ffprobe_info',
-                   return_value=(100, 100, 1.0, 'progressive', 0, 'smpte2084')), \
+                   return_value=(100, 100, 1.0, 'progressive', 0, 'smpte2084', None)), \
              patch(f'{self.CMD}.ffmpeg_frame_iterator', side_effect=fake_iterator):
             call_command('retonemap_hdr_video_thumbnails', '--yes')
 
@@ -2304,7 +2304,7 @@ class RetonemapHdrVideoThumbnailsTests(TestCase):
             old_bytes = fh.read()
 
         with patch(f'{self.CMD}.ffprobe_info',
-                   return_value=(100, 100, 1.0, 'progressive', 0, 'bt709')), \
+                   return_value=(100, 100, 1.0, 'progressive', 0, 'bt709', None)), \
              patch(f'{self.CMD}.ffmpeg_frame_iterator') as mock_iterator:
             call_command('retonemap_hdr_video_thumbnails', '--yes')
 
@@ -2329,7 +2329,7 @@ class RetonemapHdrVideoThumbnailsTests(TestCase):
                 yield self._frame(50 if abs(t - 2.0) < 0.01 else 10)
 
         with patch(f'{self.CMD}.ffprobe_info',
-                   return_value=(100, 100, 1.0, 'progressive', 0, 'smpte2084')), \
+                   return_value=(100, 100, 1.0, 'progressive', 0, 'smpte2084', None)), \
              patch(f'{self.CMD}.ffmpeg_frame_iterator', side_effect=fake_iterator):
             call_command('retonemap_hdr_video_thumbnails', '--dry-run')
 
@@ -2348,12 +2348,176 @@ class RetonemapHdrVideoThumbnailsTests(TestCase):
             yield self._frame(50)
 
         with patch(f'{self.CMD}.ffprobe_info',
-                   return_value=(100, 100, 1.0, 'progressive', 0, 'smpte2084')), \
+                   return_value=(100, 100, 1.0, 'progressive', 0, 'smpte2084', None)), \
              patch(f'{self.CMD}.ffmpeg_frame_iterator', side_effect=fake_iterator):
             call_command('retonemap_hdr_video_thumbnails', '--yes')
 
         with open(face.face_thumbnail.path, 'rb') as fh:
             self.assertEqual(fh.read(), old_bytes)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class RedetectSarAffectedVideosTests(TestCase):
+    """redetect_sar_affected_videos management command -- reconciles a
+    fresh full-redetect pass (VideoFaceExtractor mocked entirely; real
+    ONNX inference is covered by VideoFaceExtractorRealInferenceTests
+    elsewhere) against a video's existing Face rows. A matched face must
+    keep its identity but get fresh geometry/embedding; an unmatched
+    candidate becomes a new unclassified face; an unmatched existing
+    face is left completely untouched."""
+
+    CMD = 'face_manager.management.commands.redetect_sar_affected_videos'
+
+    def _make_video(self, path, sar_scale_width=640, width=352, height=480):
+        from filepopulator.models import Directory, VideoFile
+        directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(path))
+        return VideoFile.objects.create(
+            filename=path, directory=directory, width=width, height=height,
+            duration_seconds=30, isProcessed=True, sar_scale_width=sar_scale_width,
+        )
+
+    def _make_person(self, name):
+        person, created = Person.objects.get_or_create(person_name=name)
+        if created:
+            person.highlight_img.save(f"{name}.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
+        return person
+
+    def _make_face(self, video, person, embedding, first=1.0, last=2.0, validated=False):
+        face = Face(
+            declared_name=person, source_video_file=video, validated=validated,
+            box_left=1, box_top=1, box_right=40, box_bottom=40,
+            video_first_timestamp_seconds=first, video_last_timestamp_seconds=last,
+            face_encoding_512=embedding,
+        )
+        face.face_thumbnail.save(
+            "thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False,
+        )
+        face.save()
+        return face
+
+    def _emb(self, direction, dim=512):
+        v = [0.0] * dim
+        v[direction] = 1.0
+        return v
+
+    def _candidate(self, embedding, box=(1, 1, 40, 40), first_sample=10, last_sample=20):
+        import numpy as np
+        rep = {'box': box, 'kps': [1.0] * 10, 'det_score': 0.9, 'frame_idx': 0, 'emb_if': embedding}
+        return {
+            'centroid': np.array(embedding),
+            'provisional': rep,
+            'pooled_reps': [rep],
+            'first_sample': first_sample,
+            'last_sample': last_sample,
+        }
+
+    def _fake_extractor(self, candidates, blank_person, fps=30.0):
+        import numpy as np
+        mock_extractor = MagicMock()
+        mock_extractor.blank_face_person = blank_person
+        mock_extractor._compute_candidate_groups.return_value = (fps, {0: np.zeros((10, 10, 3), dtype=np.uint8)}, candidates)
+        mock_extractor._clamp_to_duration.side_effect = lambda video, seconds, label: seconds
+
+        def fake_set_box(face, frame, box, kps, timestamp_seconds, det_score=None):
+            face.box_left, face.box_top, face.box_right, face.box_bottom = box
+            face.kps = list(kps)
+            face.det_score = det_score
+            face.video_thumbnail_frame_seconds = timestamp_seconds
+            face.face_thumbnail.save(
+                "redetect_thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False,
+            )
+        mock_extractor._set_face_box_and_thumbnail.side_effect = fake_set_box
+        mock_extractor._classify_and_pick_thumbnail.return_value = None
+        return mock_extractor
+
+    def test_matched_face_keeps_identity_gets_fresh_geometry(self):
+        from filepopulator.models import VideoFile
+        video = self._make_video('/videos/sar_test/a.mpg')
+        person = self._make_person('Redetect Test Person')
+        blank = self._make_person(settings.BLANK_FACE_NAME)
+        old_embedding = self._emb(0)
+        face = self._make_face(video, person, old_embedding, validated=True)
+        old_box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
+
+        new_embedding = self._emb(0)  # same direction -- should match
+        new_embedding[0] = 0.99  # slightly different, still a clear match
+        candidates = [self._candidate(new_embedding, box=(5, 5, 55, 55))]
+
+        with patch(f'{self.CMD}.VideoFaceExtractor', return_value=self._fake_extractor(candidates, blank)):
+            call_command('redetect_sar_affected_videos', '--yes')
+
+        face.refresh_from_db()
+        self.assertEqual(face.declared_name_id, person.id)
+        self.assertTrue(face.validated)
+        self.assertNotEqual((face.box_left, face.box_top, face.box_right, face.box_bottom), old_box)
+        self.assertEqual((face.box_left, face.box_top, face.box_right, face.box_bottom), (5, 5, 55, 55))
+        self.assertAlmostEqual(face.face_encoding_512[0], new_embedding[0], places=3)
+        self.assertEqual(Face.objects.filter(source_video_file=video).count(), 1)
+
+    def test_unmatched_candidate_becomes_new_unclassified_face(self):
+        video = self._make_video('/videos/sar_test/b.mpg')
+        person = self._make_person('Redetect Existing Person')
+        blank = self._make_person(settings.BLANK_FACE_NAME)
+        self._make_face(video, person, self._emb(0))
+
+        # Completely different embedding direction -- a genuinely new face.
+        candidates = [self._candidate(self._emb(5), box=(2, 2, 42, 42))]
+
+        with patch(f'{self.CMD}.VideoFaceExtractor', return_value=self._fake_extractor(candidates, blank)):
+            call_command('redetect_sar_affected_videos', '--yes')
+
+        self.assertEqual(Face.objects.filter(source_video_file=video).count(), 2)
+        new_face = Face.objects.filter(source_video_file=video).exclude(declared_name=person).get()
+        self.assertEqual(new_face.declared_name_id, blank.id)
+
+    def test_unmatched_existing_face_left_completely_untouched(self):
+        video = self._make_video('/videos/sar_test/c.mpg')
+        person = self._make_person('Redetect Untouched Person')
+        blank = self._make_person(settings.BLANK_FACE_NAME)
+        face = self._make_face(video, person, self._emb(0), validated=True)
+        old_box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
+        old_embedding = list(face.face_encoding_512)
+
+        candidates = [self._candidate(self._emb(7))]  # no real match
+
+        with patch(f'{self.CMD}.VideoFaceExtractor', return_value=self._fake_extractor(candidates, blank)):
+            call_command('redetect_sar_affected_videos', '--yes')
+
+        face.refresh_from_db()
+        self.assertEqual((face.box_left, face.box_top, face.box_right, face.box_bottom), old_box)
+        self.assertEqual(list(face.face_encoding_512), old_embedding)
+        self.assertEqual(face.declared_name_id, person.id)
+        self.assertTrue(face.validated)
+        # Plus the genuinely new candidate, created separately.
+        self.assertEqual(Face.objects.filter(source_video_file=video).count(), 2)
+
+    def test_dry_run_makes_no_changes(self):
+        video = self._make_video('/videos/sar_test/d.mpg')
+        person = self._make_person('Redetect Dry Run Person')
+        blank = self._make_person(settings.BLANK_FACE_NAME)
+        face = self._make_face(video, person, self._emb(0))
+        old_box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
+
+        candidates = [self._candidate(self._emb(0))]
+
+        with patch(f'{self.CMD}.VideoFaceExtractor', return_value=self._fake_extractor(candidates, blank)):
+            call_command('redetect_sar_affected_videos', '--dry-run')
+
+        face.refresh_from_db()
+        self.assertEqual((face.box_left, face.box_top, face.box_right, face.box_bottom), old_box)
+        self.assertEqual(Face.objects.filter(source_video_file=video).count(), 1)
+
+    def test_non_sar_video_is_not_selected(self):
+        video = self._make_video('/videos/sar_test/e.mp4', sar_scale_width=0)
+        person = self._make_person('Redetect Square Pixel Person')
+        blank = self._make_person(settings.BLANK_FACE_NAME)
+        self._make_face(video, person, self._emb(0))
+
+        with patch(f'{self.CMD}.VideoFaceExtractor') as MockExtractorCls:
+            call_command('redetect_sar_affected_videos', '--yes')
+
+        MockExtractorCls.assert_not_called()
+        self.assertEqual(Face.objects.filter(source_video_file=video).count(), 1)
 
 
 class VideoFaceIOUTrackingTests(unittest.TestCase):
@@ -2863,6 +3027,66 @@ class VideoFaceUnionMergeTests(unittest.TestCase):
         final = _union_merge_groups(3, grouping)
         self.assertEqual(final[0], final[1])
         self.assertNotEqual(final[0], final[2])
+
+
+class MatchRedetectCandidatesTests(unittest.TestCase):
+    """match_redetect_candidates_to_existing_faces: reconciles a fresh
+    full-redetect pass (e.g. after fixing a video's aspect-ratio decode)
+    against that video's existing Face rows, so confirmed identifications
+    survive even though the redetect's own boundaries won't exactly
+    reproduce the original pass's. See CLAUDE.md's 2026-09-23 write-up."""
+
+    def _emb(self, direction, dim=8):
+        v = np.zeros(dim)
+        v[direction] = 1.0
+        return v
+
+    def test_matching_embeddings_pair_up(self):
+        from video_face_pipeline import match_redetect_candidates_to_existing_faces
+        existing = [{'embedding': self._emb(0)}, {'embedding': self._emb(1)}]
+        candidates = [{'embedding': self._emb(1)}, {'embedding': self._emb(0)}]
+        matches = match_redetect_candidates_to_existing_faces(existing, candidates)
+        self.assertEqual(set(matches), {(0, 1), (1, 0)})
+
+    def test_dissimilar_embedding_stays_unmatched(self):
+        from video_face_pipeline import match_redetect_candidates_to_existing_faces
+        existing = [{'embedding': self._emb(0)}]
+        candidates = [{'embedding': self._emb(1)}]  # orthogonal -- cos_sim=0
+        matches = match_redetect_candidates_to_existing_faces(existing, candidates)
+        self.assertEqual(matches, [])
+
+    def test_more_candidates_than_existing_leaves_extras_unmatched(self):
+        from video_face_pipeline import match_redetect_candidates_to_existing_faces
+        existing = [{'embedding': self._emb(0)}]
+        candidates = [{'embedding': self._emb(0)}, {'embedding': self._emb(1)}]
+        matches = match_redetect_candidates_to_existing_faces(existing, candidates)
+        self.assertEqual(matches, [(0, 0)])
+        matched_candidate_idcs = {j for _, j in matches}
+        self.assertNotIn(1, matched_candidate_idcs)  # the new, unmatched face
+
+    def test_more_existing_than_candidates_leaves_extras_unmatched(self):
+        from video_face_pipeline import match_redetect_candidates_to_existing_faces
+        existing = [{'embedding': self._emb(0)}, {'embedding': self._emb(1)}]
+        candidates = [{'embedding': self._emb(0)}]
+        matches = match_redetect_candidates_to_existing_faces(existing, candidates)
+        self.assertEqual(matches, [(0, 0)])
+        matched_existing_idcs = {i for i, _ in matches}
+        self.assertNotIn(1, matched_existing_idcs)  # left alone, not deleted
+
+    def test_empty_either_side_returns_no_matches(self):
+        from video_face_pipeline import match_redetect_candidates_to_existing_faces
+        self.assertEqual(match_redetect_candidates_to_existing_faces([], [{'embedding': self._emb(0)}]), [])
+        self.assertEqual(match_redetect_candidates_to_existing_faces([{'embedding': self._emb(0)}], []), [])
+
+    def test_never_force_matches_below_the_floor(self):
+        # Two existing, two candidates, but only ONE real match -- the
+        # optimal assignment must not force the second (bad) pairing
+        # just because it's "the best of what's left".
+        from video_face_pipeline import match_redetect_candidates_to_existing_faces
+        existing = [{'embedding': self._emb(0)}, {'embedding': self._emb(2)}]
+        candidates = [{'embedding': self._emb(0)}, {'embedding': self._emb(3)}]
+        matches = match_redetect_candidates_to_existing_faces(existing, candidates)
+        self.assertEqual(matches, [(0, 0)])
 
 
 class VideoFaceTrimmedCentroidTests(unittest.TestCase):

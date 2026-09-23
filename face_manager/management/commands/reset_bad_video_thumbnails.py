@@ -96,7 +96,7 @@ class Command(BaseCommand):
             field_order = video.field_order
             if field_order is None:
                 try:
-                    _, _, _, field_order, _rotation, _color_transfer = ffprobe_info(video.filename)
+                    _, _, _, field_order, _rotation, _color_transfer, _sar_scale_width = ffprobe_info(video.filename)
                 except Exception:
                     field_order = 'unknown'
 

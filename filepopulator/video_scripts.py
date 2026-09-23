@@ -274,6 +274,22 @@ def create_video_file(file_path):
     video.codec = codec
     video.field_order = video_stream.get('field_order', 'unknown')
     video.color_transfer = video_stream.get('color_transfer', 'unknown')
+    # Mirrors video_face_pipeline.py's ffprobe_info() own SAR-correction
+    # computation (a separate ffprobe-parsing code path, same as
+    # field_order/color_transfer above) -- 0 means "checked, square
+    # pixels", distinct from the field's own NULL default ("not yet
+    # checked").
+    sar = video_stream.get('sample_aspect_ratio', '1:1')
+    sar_num, _, sar_den = sar.partition(':')
+    try:
+        sar_ratio = float(sar_num) / float(sar_den) if sar_den and float(sar_den) != 0 else 1.0
+    except ValueError:
+        sar_ratio = 1.0
+    if sar_ratio != 1.0:
+        corrected = round(width * sar_ratio)
+        video.sar_scale_width = corrected + (corrected % 2)
+    else:
+        video.sar_scale_width = 0
     video.camera_make = exif.get('Make')
     video.camera_model = exif.get('Model')
     try:

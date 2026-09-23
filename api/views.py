@@ -1167,7 +1167,9 @@ def _extract_video_face_frame(face):
         # (2026-09-09): the two disagree in sign for real files (e.g.
         # cached 270 vs. this call's 90), silently rotating the wrong
         # direction if the cached field were used here instead.
-        width, height, avg_fps, probed_field_order, rotation, color_transfer = ffprobe_info(video.filename)
+        width, height, avg_fps, probed_field_order, rotation, color_transfer, sar_scale_width = (
+            ffprobe_info(video.filename)
+        )
     except Exception:
         return None
     if field_order is None:
@@ -1188,7 +1190,8 @@ def _extract_video_face_frame(face):
         arr = extract_frame_near_timestamp(
             video.filename, face.video_thumbnail_frame_seconds, avg_fps,
             field_order, rotation, box, reference_bgr,
-            width=width, height=height, color_transfer=color_transfer,
+            width=(sar_scale_width or width), height=height, color_transfer=color_transfer,
+            sar_scale_width=sar_scale_width,
         )
     except Exception:
         return None
@@ -1217,20 +1220,25 @@ def _extract_video_face_frame_fast(face):
         return None
     field_order = video.field_order
     color_transfer = video.color_transfer
-    if field_order is None or color_transfer is None:
+    sar_scale_width = video.sar_scale_width
+    if field_order is None or color_transfer is None or sar_scale_width is None:
         from video_face_pipeline import ffprobe_info
         try:
-            _, _, _, probed_field_order, _rotation, probed_color_transfer = ffprobe_info(video.filename)
+            _, _, _, probed_field_order, _rotation, probed_color_transfer, probed_sar_scale_width = (
+                ffprobe_info(video.filename)
+            )
         except Exception:
             return None
         if field_order is None:
             field_order = probed_field_order
         if color_transfer is None:
             color_transfer = probed_color_transfer
+        if sar_scale_width is None:
+            sar_scale_width = probed_sar_scale_width or 0
     from video_face_pipeline import build_vf_filter
     cmd = ['ffmpeg', '-v', 'error',
            '-ss', str(face.video_thumbnail_frame_seconds), '-i', video.filename]
-    vf_filter = build_vf_filter(field_order, color_transfer)
+    vf_filter = build_vf_filter(field_order, color_transfer, sar_scale_width=sar_scale_width or None)
     if vf_filter:
         cmd += ['-vf', vf_filter]
     cmd += ['-frames:v', '1', '-f', 'image2', '-q:v', '2', 'pipe:1']

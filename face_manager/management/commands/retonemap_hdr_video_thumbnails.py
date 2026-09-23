@@ -69,7 +69,7 @@ class Command(BaseCommand):
             if color_transfer is None:
                 uncached += 1
                 try:
-                    _, _, _, _, _, color_transfer = ffprobe_info(video.filename)
+                    _, _, _, _, _, color_transfer, _sar_scale_width = ffprobe_info(video.filename)
                 except Exception as e:
                     self.stdout.write(f"  ffprobe failed for {video.filename}: {e}")
                     continue
@@ -116,7 +116,9 @@ class Command(BaseCommand):
             # shape -- the plain cached dimensions would be wrong for a
             # rotated video.
             try:
-                width, height, fps, probed_field_order, _rotation, color_transfer = ffprobe_info(video.filename)
+                width, height, fps, probed_field_order, _rotation, color_transfer, _sar_scale_width = (
+                    ffprobe_info(video.filename)
+                )
             except Exception as e:
                 self.stdout.write(f"  ffprobe failed for {video.filename}: {e}")
                 unresolved += len(faces)

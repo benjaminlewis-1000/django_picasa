@@ -290,6 +290,57 @@ def _filter_short_tracks(tracks, min_len=MIN_TRACK_LEN_SAMPLES,
     return [t for t in tracks if len(t['frames']) >= min_len]
 
 
+# A reasonably conservative floor for "this is the same real person",
+# consistent with the embedding-similarity floors used elsewhere in
+# this codebase for a similar purpose (e.g. merge_duplicate_videofiles'
+# EMBEDDING_COS_FLOOR). Chosen deliberately over a tighter value: a full
+# redetect's centroid won't be bit-identical to the original detection's
+# (different pool of representative frames, now from corrected-geometry
+# decode), so this needs headroom a byte-identical-content comparison
+# doesn't.
+CANDIDATE_MATCH_SIMILARITY_FLOOR = 0.5
+
+
+def match_redetect_candidates_to_existing_faces(existing_faces, candidates,
+                                                 similarity_floor=CANDIDATE_MATCH_SIMILARITY_FLOOR):
+    """Reconciles a fresh full-redetect pass (e.g. after fixing a video's
+    decode geometry) against that SAME video's already-existing Face
+    rows, so a human-confirmed identification never gets silently
+    dropped just because the redetect's own track/cluster boundaries
+    don't exactly reproduce the original pass's.
+
+    existing_faces / candidates: list of dicts, each with an 'embedding'
+    (1-D array-like). Matched via optimal bipartite assignment (cost =
+    1 - cosine similarity, so linear_sum_assignment's minimization finds
+    the single best overall pairing across the whole matrix at once --
+    same "optimal assignment, then filter" pattern used throughout this
+    project, e.g. face_extract_encode.py's IOU reconciliation and
+    merge_duplicate_videofiles' cross-video face matching) -- any pair
+    below similarity_floor is rejected afterward, never force-matched.
+
+    Returns a list of (existing_index, candidate_index) pairs. Any
+    index absent from every pair is unmatched: an unmatched existing
+    face should be left alone (never silently mutated/deleted -- it may
+    be a real identification the redetect didn't happen to reproduce);
+    an unmatched candidate is a genuinely new detection the caller
+    should create as a fresh, unclassified Face."""
+    n, m = len(existing_faces), len(candidates)
+    if n == 0 or m == 0:
+        return []
+
+    cost = np.empty((n, m))
+    for i, ex in enumerate(existing_faces):
+        for j, cand in enumerate(candidates):
+            cost[i, j] = 1.0 - cos_sim(ex['embedding'], cand['embedding'])
+
+    rows, cols = linear_sum_assignment(cost)
+    matches = []
+    for i, j in zip(rows, cols):
+        if (1.0 - cost[i, j]) >= similarity_floor:
+            matches.append((int(i), int(j)))
+    return matches
+
+
 # ---------------------------------------------------------------------------
 # Video I/O helpers
 # ---------------------------------------------------------------------------
@@ -297,13 +348,44 @@ def _filter_short_tracks(tracks, min_len=MIN_TRACK_LEN_SAMPLES,
 def ffprobe_info(path):
     out = subprocess.run(
         ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-         '-show_entries', 'stream=width,height,r_frame_rate,avg_frame_rate,field_order,color_transfer',
+         '-show_entries',
+         'stream=width,height,r_frame_rate,avg_frame_rate,field_order,color_transfer,sample_aspect_ratio',
          '-show_entries', 'stream_side_data=rotation', '-of', 'json', path],
         capture_output=True, text=True,
     )
     data = json.loads(out.stdout)
     stream = data['streams'][0]
     width, height = stream['width'], stream['height']
+    # Non-square pixels (common on old digitized NTSC/VHS-era .mpg
+    # content -- confirmed real, 2026-09-23: a real Pre_camcorder file
+    # is coded at 352x480 with sample_aspect_ratio=20:11, meaning the
+    # TRUE display shape is 4:3, not the raw 352:480 grid). Deliberately
+    # NOT folded into the returned width the way rotation is below:
+    # ffmpeg's raw pipe applies ROTATION automatically regardless of
+    # any explicit -vf filter, so silently returning rotation-corrected
+    # dimensions is always safe. Non-square-pixel correction is the
+    # opposite -- it only takes effect if the caller ALSO applies the
+    # build_vf_filter(..., sar_scale_width=...) scale filter. Silently
+    # "correcting" width here without that guarantee would hand callers
+    # that don't apply the filter (e.g. backfill_video_real_fps.py,
+    # which only counts frames) a width that doesn't match what
+    # ffmpeg's raw pipe actually outputs -- corrupting the reshape, not
+    # just looking wrong. So this is exposed as a separate, explicit
+    # opt-in value instead: sar_scale_width is None for square-pixel
+    # video, else the exact target width a caller must BOTH use for
+    # reshaping AND pass to build_vf_filter's scale filter together.
+    # "0:1" is ffprobe's own convention for "not specified", treated
+    # the same as "1:1" (no correction).
+    sar = stream.get('sample_aspect_ratio', '1:1')
+    sar_num, _, sar_den = sar.partition(':')
+    try:
+        sar_ratio = float(sar_num) / float(sar_den) if sar_den and float(sar_den) != 0 else 1.0
+    except ValueError:
+        sar_ratio = 1.0
+    sar_scale_width = None
+    if sar_ratio != 1.0:
+        corrected = round(width * sar_ratio)
+        sar_scale_width = corrected + (corrected % 2)  # keep it even
     # avg_frame_rate (real nb_frames/duration) rather than r_frame_rate
     # (the container's declared NOMINAL rate) -- confirmed via a real
     # 2026-09-09 survey these can differ substantially and in ways that
@@ -330,7 +412,7 @@ def ffprobe_info(path):
             rotation = int(sd['rotation'])
     if rotation in (90, -90, 270, -270):
         width, height = height, width
-    return width, height, fps, field_order, rotation, color_transfer
+    return width, height, fps, field_order, rotation, color_transfer, sar_scale_width
 
 
 # HDR (PQ/HDR10 or HLG) source video, decoded via a naive pixel-format
@@ -359,16 +441,29 @@ def is_hdr_transfer(color_transfer):
     return color_transfer in HDR_COLOR_TRANSFERS
 
 
-def build_vf_filter(field_order, color_transfer=None):
-    """Combines the existing conditional deinterlace filter with the
-    conditional HDR tone-map filter into the single -vf chain ffmpeg
-    expects (comma-joined), or None if neither applies. Order matters:
-    deinterlace first (operates on the source's native pixel format),
-    tone-map second (needs a full frame, not fields, to convert
-    correctly)."""
+def build_vf_filter(field_order, color_transfer=None, sar_scale_width=None):
+    """Combines the existing conditional deinterlace filter, an optional
+    non-square-pixel correction, and the conditional HDR tone-map filter
+    into the single -vf chain ffmpeg expects (comma-joined), or None if
+    none apply. sar_scale_width is ffprobe_info()'s own already-computed
+    exact target width (or None if the source has square pixels) --
+    passed as a literal number, not a dynamic ffmpeg expression like
+    scale=iw*sar, so the actual decoded frame width is GUARANTEED to
+    match what ffprobe_info() told its caller to use for reshaping the
+    raw pixel buffer (a mismatch there would corrupt every frame, not
+    just look wrong). `ih` (ffmpeg's own "input height" reference) keeps
+    height unchanged without needing it passed in separately; setsar=1
+    marks the output as now-square-pixel so nothing downstream
+    re-applies the correction. Order: deinterlace first (operates on
+    the source's native pixel format), then the SAR scale (pure
+    geometry, order relative to tone-map doesn't matter since they
+    affect different aspects of the frame -- kept before tone-map for
+    "fix geometry, then color" readability), then tone-map last."""
     filters = []
     if field_order not in ('progressive', 'unknown'):
         filters.append('yadif=0')
+    if sar_scale_width is not None:
+        filters.append(f'scale={sar_scale_width}:ih,setsar=1')
     if is_hdr_transfer(color_transfer):
         filters.append(HDR_TONEMAP_FILTER)
     return ','.join(filters) if filters else None
@@ -447,7 +542,7 @@ def _frame_seconds(pts, time_base, start_seconds):
 
 def _extract_frame_near_timestamp_ffmpeg(path, target_seconds, avg_fps, field_order,
                                           box, reference_bgr, window_seconds, width, height,
-                                          color_transfer):
+                                          color_transfer, sar_scale_width=None):
     """HDR-source variant of extract_frame_near_timestamp()'s search --
     used instead of the PyAV path below because PyAV's own bundled
     libavfilter build (confirmed 2026-09-22: av.filter.Filter('zscale')
@@ -462,7 +557,7 @@ def _extract_frame_near_timestamp_ffmpeg(path, target_seconds, avg_fps, field_or
     trusting any single seek/index computation), just a different frame
     source. Only reached for HDR-tagged videos; every other video keeps
     using the PyAV path below, completely unchanged."""
-    vf_filter = build_vf_filter(field_order, color_transfer)
+    vf_filter = build_vf_filter(field_order, color_transfer, sar_scale_width=sar_scale_width)
 
     def scan(seek_seconds):
         best_arr, best_diff = None, None
@@ -493,7 +588,8 @@ def _extract_frame_near_timestamp_ffmpeg(path, target_seconds, avg_fps, field_or
 
 def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rotation,
                                   box, reference_bgr, window_seconds=0.5,
-                                  width=None, height=None, color_transfer=None):
+                                  width=None, height=None, color_transfer=None,
+                                  sar_scale_width=None):
     """On-demand exact-frame retrieval for the video-face "full context"
     viewer (api/views.py's _extract_video_face_frame) -- NOT used by the
     main extraction pipeline itself, which already reads frames
@@ -555,7 +651,7 @@ def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rot
     if is_hdr_transfer(color_transfer):
         return _extract_frame_near_timestamp_ffmpeg(
             path, target_seconds, avg_fps, field_order, box, reference_bgr,
-            window_seconds, width, height, color_transfer,
+            window_seconds, width, height, color_transfer, sar_scale_width,
         )
 
     container = av.open(path)
@@ -584,13 +680,29 @@ def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rot
 
         def scan_from_current_position():
             graph = None
-            if field_order not in ('progressive', 'unknown'):
+            needs_deinterlace = field_order not in ('progressive', 'unknown')
+            needs_sar_fix = sar_scale_width is not None
+            if needs_deinterlace or needs_sar_fix:
+                # scale IS available in PyAV's own bundled libavfilter
+                # build (confirmed 2026-09-22 -- unlike zscale, which
+                # HDR tone-mapping needs and PyAV lacks), so non-square-
+                # pixel correction can stay on this path rather than
+                # needing the ffmpeg-subprocess dispatch HDR requires.
                 graph = av.filter.Graph()
                 buf = graph.add_buffer(template=stream)
-                yadif = graph.add('yadif', 'mode=0')
-                buf.link_to(yadif)
+                last = buf
+                if needs_deinterlace:
+                    yadif = graph.add('yadif', 'mode=0')
+                    last.link_to(yadif)
+                    last = yadif
+                if needs_sar_fix:
+                    scale = graph.add('scale', f'{sar_scale_width}:ih')
+                    last.link_to(scale)
+                    setsar = graph.add('setsar', '1')
+                    scale.link_to(setsar)
+                    last = setsar
                 sink = graph.add('buffersink')
-                yadif.link_to(sink)
+                last.link_to(sink)
                 graph.configure()
 
             best_arr = None
@@ -982,13 +1094,29 @@ class VideoFaceExtractor(object):
         face.face_thumbnail.save(thumb_filename, ContentFile(temp_thumb.read()), save=False)
         temp_thumb.close()
 
-    def process_video(self, video_obj: VideoFile):
-        """Runs the full pipeline for one VideoFile and creates one Face
-        row per final union-merge group. Returns the list of created
-        Face objects."""
+    def _compute_candidate_groups(self, video_obj: VideoFile):
+        """The full detect->track->cluster->union-merge pipeline for one
+        VideoFile, stopping short of any DB write -- factored out of
+        process_video() (2026-09-23, see CLAUDE.md's aspect-ratio
+        write-up) so a reconciliation-based backfill (matching fresh
+        candidates against a video's EXISTING Face rows, rather than
+        blindly creating new ones) can reuse the identical computation
+        without duplicating it. Pure refactor: process_video() below
+        calls this and does exactly what it always did with the result.
+
+        Returns (fps, frame_pixels, candidates) -- fps and frame_pixels
+        are needed by callers to resolve a candidate's provisional
+        frame/timestamps into real values; candidates is a list of
+        dicts, each: centroid (np.ndarray), provisional (the pooled rep
+        dict backing the provisional thumbnail), pooled_reps (all pooled
+        reps for the group, needed by _classify_and_pick_thumbnail),
+        first_sample/last_sample (raw sample indices, divide by fps for
+        seconds). Empty list if the video has no usable tracks at all."""
         video_path = video_obj.filename
-        width, height, fps, field_order, _rotation, color_transfer = ffprobe_info(video_path)
-        vf_filter = build_vf_filter(field_order, color_transfer)
+        width, height, fps, field_order, _rotation, color_transfer, sar_scale_width = ffprobe_info(video_path)
+        vf_filter = build_vf_filter(field_order, color_transfer, sar_scale_width=sar_scale_width)
+        if sar_scale_width is not None:
+            width = sar_scale_width
 
         tracks, stride, total_frames, frame_cache, cache_capped = self._detect_and_track(
             video_path, width, height, fps, vf_filter
@@ -1010,7 +1138,7 @@ class VideoFaceExtractor(object):
             )
 
         if not tracks:
-            return []
+            return fps, [], []
 
         # real_fps (actual decoded frame count / the video's own known
         # duration) replaces ffprobe's fps for every frame-index-to-
@@ -1064,7 +1192,7 @@ class VideoFaceExtractor(object):
         for ti, gid in final_group_of.items():
             groups.setdefault(gid, []).append(ti)
 
-        created = []
+        candidates = []
         for members in groups.values():
             pooled_reps = [rep for m in members for rep in tracks[m]['reps']]
             if not pooled_reps:
@@ -1077,10 +1205,32 @@ class VideoFaceExtractor(object):
                 l, t, r, b = rep['box']
                 return max(0, r - l) * max(0, b - t)
             provisional = max(pooled_reps, key=_box_area)
-            provisional_frame = frame_pixels[provisional['frame_idx']]
 
             first_sample = min(tracks[m]['span'][0] for m in members)
             last_sample = max(tracks[m]['span'][1] for m in members)
+
+            candidates.append({
+                'centroid': centroid,
+                'provisional': provisional,
+                'pooled_reps': pooled_reps,
+                'first_sample': first_sample,
+                'last_sample': last_sample,
+            })
+
+        return fps, frame_pixels, candidates
+
+    def process_video(self, video_obj: VideoFile):
+        """Runs the full pipeline for one VideoFile and creates one Face
+        row per final union-merge group. Returns the list of created
+        Face objects."""
+        fps, frame_pixels, candidates = self._compute_candidate_groups(video_obj)
+        if not candidates:
+            return []
+
+        created = []
+        for cand in candidates:
+            provisional = cand['provisional']
+            provisional_frame = frame_pixels[provisional['frame_idx']]
 
             face = Face()
             face.source_video_file = video_obj
@@ -1088,12 +1238,12 @@ class VideoFaceExtractor(object):
             face.dateTakenUTC = video_obj.dateTakenUTC
             face.reencoded = True
             face.written_to_photo_metadata = False
-            face.face_encoding_512 = centroid.tolist()
+            face.face_encoding_512 = cand['centroid'].tolist()
             face.video_first_timestamp_seconds = self._clamp_to_duration(
-                video_obj, first_sample / fps, 'video_first_timestamp_seconds'
+                video_obj, cand['first_sample'] / fps, 'video_first_timestamp_seconds'
             )
             face.video_last_timestamp_seconds = self._clamp_to_duration(
-                video_obj, last_sample / fps, 'video_last_timestamp_seconds'
+                video_obj, cand['last_sample'] / fps, 'video_last_timestamp_seconds'
             )
             self._set_face_box_and_thumbnail(
                 face, provisional_frame, provisional['box'], provisional['kps'],
@@ -1101,7 +1251,7 @@ class VideoFaceExtractor(object):
             )
             face.save()
 
-            self._classify_and_pick_thumbnail(face, pooled_reps, frame_pixels, fps)
+            self._classify_and_pick_thumbnail(face, cand['pooled_reps'], frame_pixels, fps)
             created.append(face)
 
         return created

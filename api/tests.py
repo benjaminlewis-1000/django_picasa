@@ -2573,12 +2573,18 @@ class ExtractVideoFaceFrameFastHdrTests(TestCase):
     pixel-format conversion with no tone-mapping comes out visibly
     washed-out/desaturated."""
 
-    def _make_video_face(self, field_order, color_transfer):
+    def _make_video_face(self, field_order, color_transfer, sar_scale_width=0):
+        # sar_scale_width defaults to 0 ("checked, square pixels", the
+        # cached-and-clean case) rather than None ("not yet cached") --
+        # tests that specifically want the ffprobe fallback triggered
+        # (e.g. test_missing_cached_color_transfer_falls_back_to_ffprobe)
+        # pass sar_scale_width=None explicitly.
         directory = Directory.objects.create(dir_path="/videos/hdr_fast_test")
         video = VideoFile.objects.create(
             filename="/videos/hdr_fast_test/a.mp4", directory=directory,
             width=100, height=100, duration_seconds=30, isProcessed=True,
             field_order=field_order, color_transfer=color_transfer,
+            sar_scale_width=sar_scale_width,
         )
         person, created = Person.objects.get_or_create(person_name="Test Person")
         if created:
@@ -2624,18 +2630,18 @@ class ExtractVideoFaceFrameFastHdrTests(TestCase):
         self.assertNotIn('-vf', cmd)
 
     def test_missing_cached_color_transfer_falls_back_to_ffprobe(self):
-        # A row ingested before the color_transfer field existed --
-        # field_order IS cached, color_transfer isn't (both None here
-        # for simplicity), so the live ffprobe_info() call must fill in
-        # BOTH from a single call, not silently skip tone-mapping.
+        # A row ingested before color_transfer/sar_scale_width existed --
+        # all three cached fields None here for simplicity, so the live
+        # ffprobe_info() call must fill in all of them from a single
+        # call, not silently skip tone-mapping.
         from api.views import _extract_video_face_frame_fast
-        face = self._make_video_face(field_order=None, color_transfer=None)
+        face = self._make_video_face(field_order=None, color_transfer=None, sar_scale_width=None)
 
         fake_result = mock.MagicMock(returncode=0, stdout=_tiny_jpeg_bytes())
         with mock.patch('api.views.subprocess.run', return_value=fake_result) as mock_run, \
              mock.patch(
                  'video_face_pipeline.ffprobe_info',
-                 return_value=(100, 100, 30.0, 'progressive', 0, 'smpte2084'),
+                 return_value=(100, 100, 30.0, 'progressive', 0, 'smpte2084', None),
              ) as mock_ffprobe:
             _extract_video_face_frame_fast(face)
 
