@@ -1550,13 +1550,32 @@ class filteredImagesView(APIView):
                 obj = ImageFile.objects.filter(p_query).exclude(face__declared_name__person_name='Charlotte Lewis').distinct().order_by('dateTaken').values_list('id', 'dateTaken')
 
         ids = list(([o[0] for o in obj]))
-        dates = list(([o[1].isoformat() for o in obj]))
-        
-        zip_list = list(zip(ids, dates))
-            
+
         js = {'url_keys': ids}
         if 'full_data' in params.keys():
-            js['full_data'] = zip_list
+            # Slideshow frontend's date/location overlay - a second,
+            # separate query (rather than folding this into the query
+            # above) so the common no-full_data path never pays for the
+            # geocode join. Keyed by id (not a list) for O(1) frontend
+            # lookups per image.
+            meta_rows = ImageFile.objects.filter(id__in=ids).values(
+                'id', 'dateTaken', 'geocode__nearest_metro_name', 'geocode__locality'
+            )
+            full_data = {}
+            for row in meta_rows:
+                # nearest_metro_name is the human-reviewed, recognizable
+                # pick (e.g. "Seattle") - preferred over the raw precise
+                # locality (e.g. "Bothell"), which is only a fallback for
+                # coordinates the metro backfill hasn't covered yet.
+                # Omit location entirely (rather than sending an empty
+                # string) when there's no geocode row for this image at
+                # all.
+                location = row['geocode__nearest_metro_name'] or row['geocode__locality'] or None
+                full_data[row['id']] = {
+                    'date': row['dateTaken'].isoformat() if row['dateTaken'] else None,
+                    'location': location,
+                }
+            js['full_data'] = full_data
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 
