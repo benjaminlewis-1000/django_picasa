@@ -53,17 +53,36 @@ class Command(BaseCommand):
         videos = list(VideoFile.objects.filter(isProcessed=True, face__isnull=False).distinct())
         self.stdout.write(f"Checking {len(videos)} processed video(s) with faces for HDR tagging...")
 
+        # Uses the cached VideoFile.color_transfer field (a plain DB
+        # query) rather than an ffprobe subprocess call per video --
+        # this step alone used to mean re-opening every processed video
+        # in the library just to check its tag. Only rows that predate
+        # the cached field (color_transfer still NULL) pay for a live
+        # ffprobe call here; run backfill_video_color_transfer first to
+        # avoid that entirely. The per-HDR-video ffprobe call below
+        # (for fps, which isn't cached anywhere) is unavoidable either
+        # way, but only paid for the actual HDR subset, not every video.
         hdr_videos = []
+        uncached = 0
         for video in videos:
-            try:
-                width, height, fps, field_order, _rotation, color_transfer = ffprobe_info(video.filename)
-            except Exception as e:
-                self.stdout.write(f"  ffprobe failed for {video.filename}: {e}")
-                continue
+            color_transfer = video.color_transfer
+            if color_transfer is None:
+                uncached += 1
+                try:
+                    _, _, _, _, _, color_transfer = ffprobe_info(video.filename)
+                except Exception as e:
+                    self.stdout.write(f"  ffprobe failed for {video.filename}: {e}")
+                    continue
             if is_hdr_transfer(color_transfer):
-                hdr_videos.append((video, width, height, fps, field_order, color_transfer))
+                hdr_videos.append(video)
 
-        total_faces = sum(Face.objects.filter(source_video_file=v).count() for v, *_ in hdr_videos)
+        if uncached:
+            self.stdout.write(
+                f"  ({uncached} row(s) had no cached color_transfer -- consider running "
+                f"backfill_video_color_transfer first to avoid the live ffprobe fallback)"
+            )
+
+        total_faces = sum(Face.objects.filter(source_video_file=v).count() for v in hdr_videos)
         self.stdout.write(f"{len(hdr_videos)} HDR-tagged video(s), {total_faces} face(s) total.")
 
         if not hdr_videos:
@@ -80,13 +99,29 @@ class Command(BaseCommand):
 
         regenerated = 0
         unresolved = 0
-        for vi, (video, width, height, fps, field_order, color_transfer) in enumerate(hdr_videos, start=1):
+        for vi, video in enumerate(hdr_videos, start=1):
             video_start = time.time()
             faces = list(
                 Face.objects.filter(source_video_file=video, video_thumbnail_frame_seconds__isnull=False)
             )
             if not faces:
                 continue
+
+            # One ffprobe call per HDR video -- unavoidable (fps isn't
+            # cached anywhere on VideoFile), but this is now only paid
+            # for the actual HDR subset, not every processed video.
+            # width/height come from THIS call (not VideoFile.width/
+            # height) since ffprobe_info() already rotation-corrects
+            # them to match ffmpeg_frame_iterator's raw-pipe output
+            # shape -- the plain cached dimensions would be wrong for a
+            # rotated video.
+            try:
+                width, height, fps, probed_field_order, _rotation, color_transfer = ffprobe_info(video.filename)
+            except Exception as e:
+                self.stdout.write(f"  ffprobe failed for {video.filename}: {e}")
+                unresolved += len(faces)
+                continue
+            field_order = video.field_order or probed_field_order
 
             vf_filter = build_vf_filter(field_order, color_transfer)
             targets = sorted({f.video_thumbnail_frame_seconds for f in faces})
