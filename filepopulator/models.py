@@ -1140,6 +1140,20 @@ class VideoFile(models.Model):
     # backfill_video_field_order management command for a one-time catch-up).
     field_order = models.CharField(max_length=16, null=True, blank=True)
 
+    # ffprobe's color_transfer tag ('smpte2084'/'arib-std-b67' for real
+    # HDR content, 'bt709'/'unknown'/etc. otherwise) -- cached at
+    # ingestion time for the same reason as field_order above: the
+    # latency-sensitive fast on-demand frame viewer
+    # (api/views.py's _extract_video_face_frame_fast) needs to know
+    # whether to apply HDR tone-mapping without an extra ffprobe call
+    # per request. See video_face_pipeline.py's HDR_COLOR_TRANSFERS for
+    # why this matters -- naive HDR pixel-format conversion (no
+    # tone-mapping) comes out badly washed-out (confirmed 2026-09-22,
+    # see CLAUDE.md). Nullable for rows ingested before this field
+    # existed; those fall back to a live ffprobe call (see
+    # backfill_video_color_transfer management command).
+    color_transfer = models.CharField(max_length=16, null=True, blank=True)
+
     # Raw file size on disk (os.path.getsize()), unlike ImageFile which has
     # no equivalent field -- added specifically to help size the Phase 5
     # transcode pipeline's disk footprint (see CLAUDE.md).

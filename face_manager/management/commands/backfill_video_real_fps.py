@@ -71,7 +71,7 @@ class Command(BaseCommand):
         for video in videos.iterator():
             checked += 1
             try:
-                width, height, ffprobe_fps, _field_order, _rotation = ffprobe_info(video.filename)
+                width, height, ffprobe_fps, _field_order, _rotation, _color_transfer = ffprobe_info(video.filename)
                 real_frame_count = _count_real_frames(video.filename, width, height)
             except Exception as e:
                 self.stdout.write(f'  video {video.id} ({video.filename}): failed to check -- {e}')

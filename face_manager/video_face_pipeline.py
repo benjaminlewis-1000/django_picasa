@@ -297,7 +297,7 @@ def _filter_short_tracks(tracks, min_len=MIN_TRACK_LEN_SAMPLES,
 def ffprobe_info(path):
     out = subprocess.run(
         ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-         '-show_entries', 'stream=width,height,r_frame_rate,avg_frame_rate,field_order',
+         '-show_entries', 'stream=width,height,r_frame_rate,avg_frame_rate,field_order,color_transfer',
          '-show_entries', 'stream_side_data=rotation', '-of', 'json', path],
         capture_output=True, text=True,
     )
@@ -323,13 +323,55 @@ def ffprobe_info(path):
     avg_fps = float(avg_num) / float(avg_den) if float(avg_den) else 0
     fps = avg_fps if avg_fps > 0 else r_fps
     field_order = stream.get('field_order', 'unknown')
+    color_transfer = stream.get('color_transfer', 'unknown')
     rotation = 0
     for sd in stream.get('side_data_list', []):
         if 'rotation' in sd:
             rotation = int(sd['rotation'])
     if rotation in (90, -90, 270, -270):
         width, height = height, width
-    return width, height, fps, field_order, rotation
+    return width, height, fps, field_order, rotation, color_transfer
+
+
+# HDR (PQ/HDR10 or HLG) source video, decoded via a naive pixel-format
+# conversion with no tone-mapping, comes out badly washed-out/desaturated
+# -- confirmed directly (2026-09-22, see CLAUDE.md): a real phone-shot
+# clip tagged color_transfer=smpte2084/color_primaries=bt2020 produced a
+# visibly flat, grey-toned frame via the plain bgr24 raw pipe, while the
+# exact same frame run through zscale(linear)->tonemap->zscale(bt709)
+# came out with correct skin tones/saturation/contrast. ~18% of this
+# library's phone-sourced videos are HDR-tagged (75% of ones from
+# mid-2025 onward), so this isn't a rare edge case.
+HDR_COLOR_TRANSFERS = ('smpte2084', 'arib-std-b67')
+
+# hable is a standard, well-behaved filmic tonemap operator; npl=100
+# (nominal peak luminance) and desat=0 (no extra desaturation beyond
+# what the tonemap curve itself does) were the values validated visually
+# against the real motivating clip -- not swept/tuned further since the
+# result already looked correct there.
+HDR_TONEMAP_FILTER = (
+    'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,'
+    'tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p'
+)
+
+
+def is_hdr_transfer(color_transfer):
+    return color_transfer in HDR_COLOR_TRANSFERS
+
+
+def build_vf_filter(field_order, color_transfer=None):
+    """Combines the existing conditional deinterlace filter with the
+    conditional HDR tone-map filter into the single -vf chain ffmpeg
+    expects (comma-joined), or None if neither applies. Order matters:
+    deinterlace first (operates on the source's native pixel format),
+    tone-map second (needs a full frame, not fields, to convert
+    correctly)."""
+    filters = []
+    if field_order not in ('progressive', 'unknown'):
+        filters.append('yadif=0')
+    if is_hdr_transfer(color_transfer):
+        filters.append(HDR_TONEMAP_FILTER)
+    return ','.join(filters) if filters else None
 
 
 def ffmpeg_frame_iterator(path, width, height, vf_filter=None, seek_seconds=0):
@@ -403,8 +445,55 @@ def _frame_seconds(pts, time_base, start_seconds):
     return float(pts * time_base) - start_seconds
 
 
+def _extract_frame_near_timestamp_ffmpeg(path, target_seconds, avg_fps, field_order,
+                                          box, reference_bgr, window_seconds, width, height,
+                                          color_transfer):
+    """HDR-source variant of extract_frame_near_timestamp()'s search --
+    used instead of the PyAV path below because PyAV's own bundled
+    libavfilter build (confirmed 2026-09-22: av.filter.Filter('zscale')
+    raises "no filter zscale") doesn't have the zscale filter the HDR
+    tone-map chain needs, even though the system ffmpeg CLI does (built
+    with --enable-libzimg). Rather than reimplementing PQ/HLG EOTF math
+    in numpy, this shells out to the same ffmpeg_frame_iterator() raw
+    pipe the main extraction pipeline already uses, with the same
+    build_vf_filter() chain, and does the identical "decode every frame
+    in a window, keep whichever one's box-crop best matches the stored
+    reference" search as the PyAV path -- same accuracy properties (not
+    trusting any single seek/index computation), just a different frame
+    source. Only reached for HDR-tagged videos; every other video keeps
+    using the PyAV path below, completely unchanged."""
+    vf_filter = build_vf_filter(field_order, color_transfer)
+
+    def scan(seek_seconds):
+        best_arr, best_diff = None, None
+        n = 0
+        for frame in ffmpeg_frame_iterator(path, width, height, vf_filter=vf_filter, seek_seconds=seek_seconds):
+            t = seek_seconds + n / avg_fps
+            n += 1
+            if t > target_seconds + window_seconds:
+                break
+            if t < target_seconds - window_seconds:
+                continue
+            crop = VideoFaceExtractor._square_thumbnail(frame, box)
+            d = _mean_abs_pixel_diff(crop, reference_bgr)
+            if d is not None and (best_diff is None or d < best_diff):
+                best_diff, best_arr = d, frame.copy()
+        return best_arr
+
+    seek_seconds = max(0.0, target_seconds - window_seconds)
+    best_arr = scan(seek_seconds)
+    if best_arr is None and seek_seconds > 0:
+        # Same fallback as the PyAV path's own WMV/ASF seek-overshoot fix
+        # (2026-09-11) -- ffmpeg's fast -ss-before--i seek can also land
+        # well past the target window on some files; retry with a full
+        # sequential decode from the start rather than trusting it twice.
+        best_arr = scan(0)
+    return best_arr
+
+
 def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rotation,
-                                  box, reference_bgr, window_seconds=0.5):
+                                  box, reference_bgr, window_seconds=0.5,
+                                  width=None, height=None, color_transfer=None):
     """On-demand exact-frame retrieval for the video-face "full context"
     viewer (api/views.py's _extract_video_face_frame) -- NOT used by the
     main extraction pipeline itself, which already reads frames
@@ -453,7 +542,22 @@ def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rot
     trusting the seek a second time. This is strictly a fallback (only
     paid for the rare case where the seek-based scan already found
     nothing), not a general slowdown.
+
+    HDR-tagged sources (color_transfer=smpte2084/arib-std-b67) are
+    dispatched to _extract_frame_near_timestamp_ffmpeg() instead, since
+    tone-mapping them needs the zscale filter, which PyAV's own bundled
+    libavfilter build doesn't have (see that function's docstring).
+    width/height are only used on that path -- required there (raw
+    ffmpeg_frame_iterator() pipe needs to know the frame size), unused
+    on the PyAV path below, which gets dimensions from the container
+    itself.
     """
+    if is_hdr_transfer(color_transfer):
+        return _extract_frame_near_timestamp_ffmpeg(
+            path, target_seconds, avg_fps, field_order, box, reference_bgr,
+            window_seconds, width, height, color_transfer,
+        )
+
     container = av.open(path)
     try:
         stream = container.streams.video[0]
@@ -883,9 +987,8 @@ class VideoFaceExtractor(object):
         row per final union-merge group. Returns the list of created
         Face objects."""
         video_path = video_obj.filename
-        width, height, fps, field_order, _rotation = ffprobe_info(video_path)
-        deinterlace = field_order not in ('progressive', 'unknown')
-        vf_filter = 'yadif=0' if deinterlace else None
+        width, height, fps, field_order, _rotation, color_transfer = ffprobe_info(video_path)
+        vf_filter = build_vf_filter(field_order, color_transfer)
 
         tracks, stride, total_frames, frame_cache, cache_capped = self._detect_and_track(
             video_path, width, height, fps, vf_filter

@@ -2560,3 +2560,86 @@ class CleanupStaleUploadsTaskTests(ApiTestCase):
             self.assertFalse(os.path.exists(session_chunk_dir))
             self.assertTrue(UploadSession.objects.filter(pk=fresh_session.pk).exists())
         shutil.rmtree(chunk_dir, ignore_errors=True)
+
+
+@override_settings(MEDIA_ROOT="/tmp/api_test_media")
+class ExtractVideoFaceFrameFastHdrTests(TestCase):
+    """_extract_video_face_frame_fast() (api/views.py) must include the
+    HDR tone-map filter for an HDR-tagged video's face, using the
+    cached VideoFile.field_order/color_transfer when present (this
+    "fast" path exists specifically to avoid an ffprobe call per
+    request) and falling back to a live ffprobe_info() call only when
+    either is missing. See CLAUDE.md's 2026-09-22 write-up -- naive HDR
+    pixel-format conversion with no tone-mapping comes out visibly
+    washed-out/desaturated."""
+
+    def _make_video_face(self, field_order, color_transfer):
+        directory = Directory.objects.create(dir_path="/videos/hdr_fast_test")
+        video = VideoFile.objects.create(
+            filename="/videos/hdr_fast_test/a.mp4", directory=directory,
+            width=100, height=100, duration_seconds=30, isProcessed=True,
+            field_order=field_order, color_transfer=color_transfer,
+        )
+        person, created = Person.objects.get_or_create(person_name="Test Person")
+        if created:
+            person.highlight_img.save("p.jpg", ContentFile(_tiny_jpeg_bytes()), save=True)
+        face = Face(
+            declared_name=person, source_video_file=video,
+            box_left=1, box_top=1, box_right=40, box_bottom=40,
+            video_thumbnail_frame_seconds=1.5,
+        )
+        face.face_thumbnail.save(
+            "face_thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False
+        )
+        face.save()
+        return face
+
+    def test_cached_hdr_transfer_adds_tonemap_filter_with_no_ffprobe_call(self):
+        from api.views import _extract_video_face_frame_fast
+        face = self._make_video_face(field_order='progressive', color_transfer='smpte2084')
+
+        fake_result = mock.MagicMock(returncode=0, stdout=_tiny_jpeg_bytes())
+        with mock.patch('api.views.subprocess.run', return_value=fake_result) as mock_run, \
+             mock.patch('video_face_pipeline.ffprobe_info') as mock_ffprobe:
+            _extract_video_face_frame_fast(face)
+
+        mock_ffprobe.assert_not_called()
+        cmd = mock_run.call_args[0][0]
+        self.assertIn('-vf', cmd)
+        vf_value = cmd[cmd.index('-vf') + 1]
+        self.assertIn('tonemap', vf_value)
+        self.assertNotIn('yadif', vf_value)
+
+    def test_cached_non_hdr_transfer_has_no_tonemap_filter(self):
+        from api.views import _extract_video_face_frame_fast
+        face = self._make_video_face(field_order='progressive', color_transfer='bt709')
+
+        fake_result = mock.MagicMock(returncode=0, stdout=_tiny_jpeg_bytes())
+        with mock.patch('api.views.subprocess.run', return_value=fake_result) as mock_run, \
+             mock.patch('video_face_pipeline.ffprobe_info') as mock_ffprobe:
+            _extract_video_face_frame_fast(face)
+
+        mock_ffprobe.assert_not_called()
+        cmd = mock_run.call_args[0][0]
+        self.assertNotIn('-vf', cmd)
+
+    def test_missing_cached_color_transfer_falls_back_to_ffprobe(self):
+        # A row ingested before the color_transfer field existed --
+        # field_order IS cached, color_transfer isn't (both None here
+        # for simplicity), so the live ffprobe_info() call must fill in
+        # BOTH from a single call, not silently skip tone-mapping.
+        from api.views import _extract_video_face_frame_fast
+        face = self._make_video_face(field_order=None, color_transfer=None)
+
+        fake_result = mock.MagicMock(returncode=0, stdout=_tiny_jpeg_bytes())
+        with mock.patch('api.views.subprocess.run', return_value=fake_result) as mock_run, \
+             mock.patch(
+                 'video_face_pipeline.ffprobe_info',
+                 return_value=(100, 100, 30.0, 'progressive', 0, 'smpte2084'),
+             ) as mock_ffprobe:
+            _extract_video_face_frame_fast(face)
+
+        mock_ffprobe.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        vf_value = cmd[cmd.index('-vf') + 1]
+        self.assertIn('tonemap', vf_value)
