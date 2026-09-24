@@ -37,6 +37,24 @@
 #     mutated/deleted, in case it's a real identification the redetect
 #     didn't happen to reproduce. Reported by name if it has a real
 #     declared_name, so these are easy to find for manual review.
+# Real, reproduced 2026-09-23: video pk 88 (a tiny 5.6s clip -- 2 tracks,
+# ~3s of actual per-frame work when isolated and re-measured) took over
+# 10 CPU-hours during a real dry-run here, while backfill_det_score's
+# own detector was running concurrently. Same class of issue this
+# project already hit and documented for the scheduled video_face_
+# extraction task itself (2026-09-17: "several short, completely normal
+# videos timed out purely because a concurrent CPU-heavy backfill was
+# running") -- confirmed real memory pressure at the time (2.4GB
+# resident in swap), plausibly severe thrashing under three concurrent
+# ONNX-heavy processes, not a logic bug in this file (re-running the
+# exact same video in isolation, with the SAME concurrent jobs still
+# running, completed in ~3s). Reuses the scheduled task's own timeout
+# machinery rather than duplicating it, but -- since this is a one-time
+# backfill run by hand, not a recurring scheduled task -- just skips a
+# timed-out video and reports it, rather than tracking a persistent
+# retry count/permanent-failure field the way the real-time pipeline
+# does; re-run the command later to retry anything skipped this way.
+import signal
 import time
 
 from django.conf import settings
@@ -44,6 +62,7 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 
 from face_manager.models import Face
+from face_manager.tasks import PER_VIDEO_TIMEOUT_SECONDS, _VideoProcessingTimeout, _raise_video_timeout
 from filepopulator.models import VideoFile
 from video_face_pipeline import VideoFaceExtractor, match_redetect_candidates_to_existing_faces
 
@@ -86,13 +105,25 @@ class Command(BaseCommand):
 
         extractor = VideoFaceExtractor()
 
-        total_matched = total_new = total_unmatched_old = total_failed = 0
+        total_matched = total_new = total_unmatched_old = total_failed = total_timed_out = 0
         for vi, video in enumerate(videos, start=1):
             video_start = time.time()
             existing, skipped = self._existing_dicts(video)
 
             try:
-                fps, frame_pixels, candidates = extractor._compute_candidate_groups(video)
+                signal.signal(signal.SIGALRM, _raise_video_timeout)
+                signal.alarm(PER_VIDEO_TIMEOUT_SECONDS)
+                try:
+                    fps, frame_pixels, candidates = extractor._compute_candidate_groups(video)
+                finally:
+                    signal.alarm(0)
+            except _VideoProcessingTimeout as e:
+                total_timed_out += 1
+                self.stdout.write(
+                    f"  [{vi}/{len(videos)}] {video.filename}: timed out ({e}) -- "
+                    f"skipped, re-run this command later to retry"
+                )
+                continue
             except Exception as e:
                 total_failed += 1
                 self.stdout.write(f"  [{vi}/{len(videos)}] {video.filename}: redetect failed: {e}")
@@ -176,5 +207,5 @@ class Command(BaseCommand):
         verb = "Would match" if dry_run else "Matched"
         self.stdout.write(
             f"{verb} {total_matched}, new {total_new}, unmatched-old {total_unmatched_old}, "
-            f"failed {total_failed} (out of {len(videos)} video(s))."
+            f"failed {total_failed}, timed out {total_timed_out} (out of {len(videos)} video(s))."
         )

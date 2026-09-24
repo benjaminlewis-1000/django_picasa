@@ -2519,6 +2519,36 @@ class RedetectSarAffectedVideosTests(TestCase):
         MockExtractorCls.assert_not_called()
         self.assertEqual(Face.objects.filter(source_video_file=video).count(), 1)
 
+    def test_timeout_on_one_video_is_skipped_and_the_run_continues(self):
+        # Real, reproduced 2026-09-23: a video timed out under real
+        # concurrent CPU/memory pressure from another job, not because
+        # of anything wrong with the file (re-running it in isolation
+        # took ~3s) -- same class of issue the scheduled video_face_
+        # extraction task already guards against. This must be reported
+        # distinctly from a real failure and must NOT crash the whole
+        # command -- later videos still get processed.
+        from face_manager.tasks import _VideoProcessingTimeout
+        video_a = self._make_video('/videos/sar_test/f.mpg')
+        video_b = self._make_video('/videos/sar_test/g.mpg')
+        person = self._make_person('Redetect Timeout Person')
+        blank = self._make_person(settings.BLANK_FACE_NAME)
+        self._make_face(video_a, person, self._emb(0))
+        self._make_face(video_b, person, self._emb(0))
+
+        candidates = [self._candidate(self._emb(0))]
+        fake_extractor = self._fake_extractor(candidates, blank)
+        fake_extractor._compute_candidate_groups.side_effect = [
+            _VideoProcessingTimeout("exceeded 2700s"),
+            fake_extractor._compute_candidate_groups.return_value,
+        ]
+
+        with patch(f'{self.CMD}.VideoFaceExtractor', return_value=fake_extractor):
+            call_command('redetect_sar_affected_videos', '--yes')
+
+        # video_a's face untouched (its redetect never completed);
+        # video_b's face still got matched/updated normally.
+        self.assertEqual(fake_extractor._compute_candidate_groups.call_count, 2)
+
 
 class VideoFaceIOUTrackingTests(unittest.TestCase):
     """_iou_track: pure frame-to-frame linking, no Django/model deps --
