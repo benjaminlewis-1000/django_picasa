@@ -40,7 +40,7 @@ psycopg2-binary==2.9.12
 # explicitly since this file pins every resolved dependency, same
 # reasoning as ExifRead/piexif above.
 PyWavelets==1.9.0
-PyJWT==2.13.0
+PyJWT==2.15.0
 python-crontab==3.3.0
 python-dateutil==2.9.0.post0
 pytz==2026.3.post1
