@@ -1406,16 +1406,27 @@ class KeyedImageView(APIView):
         # resolution and access-key/auth check above rather than a
         # separate endpoint, and returns before the (comparatively
         # expensive) decode/resize/redraw below since nothing past this
-        # point is needed for a date lookup.
+        # point is needed for a date lookup. Also returns the full file
+        # path (same `filename` field the image decode below actually
+        # opens) for the frontend's filename label - bundled into this
+        # same param/response rather than a separate one, since the
+        # frontend always wants both together and the source object is
+        # already loaded here either way.
         if params.get('date', '').lower() == 'true':
             if image_type in ('face_array', 'face_source'):
                 src = face.source_image_file or face.source_video_file
                 date_taken = src.dateTaken if src is not None else None
+                filename = src.filename if src is not None else None
             elif image_type in ('slideshow', 'full_big', 'full_medium', 'full_small'):
                 date_taken = img_obj.dateTaken
+                filename = img_obj.filename
             else:
                 date_taken = None
-            js = {'date_taken': date_taken.isoformat() if date_taken else None}
+                filename = None
+            js = {
+                'date_taken': date_taken.isoformat() if date_taken else None,
+                'filename': filename,
+            }
             return HttpResponse(json.dumps(js), content_type='application/json')
 
         if image_type == 'face_source' and face.source_video_file_id is not None:
