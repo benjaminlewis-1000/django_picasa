@@ -11,7 +11,7 @@ import zlib
 import hashlib
 import os
 import binascii
-from datetime import datetime
+from datetime import datetime, timedelta
 from textwrap import wrap # for splitting string
 import os
 import shutil
@@ -649,13 +649,15 @@ class ImageFileTests(TestCase):
         self.assertTrue(os.path.isfile(first_item[0].thumbnail_big.path))
         self.assertFalse(first_item[0].isProcessed)
 
-    def test_delete_photos(self): ### CHECKED ### 
+    def test_delete_photos(self): ### CHECKED ###
 
         # Case: We want to delete random photos from the file system, then run
-        # the function that cleans that up (delete_removed_photos) and 
-        # check that they were, in fact, completely removed from the database. 
-        # Expected outcome: files removed from disk will not show up in the 
-        # database, but other files will still be there. 
+        # the function that cleans that up (delete_removed_photos) and
+        # check that they were, in fact, completely removed from the database
+        # -- once MISSING_FILE_GRACE_PERIOD has elapsed (see
+        # DeleteRemovedPhotosGracePeriodTests for the two-phase behavior
+        # itself; this test just confirms the eventual end state, for
+        # continuity with its own long-standing name/intent).
         for good in self.goodFiles:
             create_image_file(good)
 
@@ -668,6 +670,13 @@ class ImageFileTests(TestCase):
         for n in range(num_to_remove):
             os.remove(self.goodFiles[n])
 
+        delete_removed_photos()
+        # First pass only flags them as missing -- not deleted yet.
+        self.assertEqual(ImageFile.objects.count(), before_len)
+        # Backdate past the grace period, as if they'd been missing a while.
+        ImageFile.objects.filter(filename__in=self.goodFiles[:num_to_remove]).update(
+            missing_since=timezone.now() - settings.MISSING_FILE_GRACE_PERIOD - timedelta(minutes=1)
+        )
         delete_removed_photos()
 
         # Test length of database
@@ -999,6 +1008,83 @@ class ImageFileTests(TestCase):
         # Once free again, a normal run still works.
         add_from_root_dir(self.tmp_valid_dir)
         self.assertGreater(ImageFile.objects.count(), 0)
+
+
+class DeleteRemovedPhotosGracePeriodTests(TestCase):
+    """ImageFile.missing_since / delete_removed_photos()'s grace period,
+    added 2026-10-05 after a real incident: a bulk move (hundreds of
+    files, source deleted before the destination copies were all visible
+    to the same scan cycle) raced the old immediate-delete behavior,
+    permanently losing rows -- and their tagged Face rows -- before a
+    later scan's own move-detection (pixel_hash match + old file gone)
+    ever got a chance to run. See CLAUDE.md's 2026-10-05 write-up."""
+
+    def setUp(self):
+        self.validation_dir = settings.FILEPOPULATOR_VAL_DIRECTORY
+        self.tmp_valid_dir = '/tmp/img_validation_grace'
+        if os.path.exists(self.tmp_valid_dir):
+            shutil.rmtree(self.tmp_valid_dir)
+        shutil.copytree(self.validation_dir, self.tmp_valid_dir)
+
+        self.good_dir = os.path.join(self.tmp_valid_dir, 'naming', 'good')
+        self.goodFiles = []
+        for root, dirs, files in os.walk(self.good_dir):
+            for fname in files:
+                self.goodFiles.append(os.path.join(root, fname))
+        assert len(self.goodFiles) >= 2, 'Need at least 2 real fixture files for these tests.'
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_valid_dir, ignore_errors=True)
+
+    def test_first_missing_scan_flags_but_does_not_delete(self):
+        gone_path = self.goodFiles[0]
+        create_image_file(gone_path)
+        self.assertIsNone(ImageFile.objects.get(filename=gone_path).missing_since)
+
+        os.remove(gone_path)
+        delete_removed_photos()
+
+        row = ImageFile.objects.get(filename=gone_path)
+        self.assertIsNotNone(row.missing_since)
+
+    def test_still_missing_past_grace_period_is_deleted(self):
+        gone_path = self.goodFiles[0]
+        create_image_file(gone_path)
+        os.remove(gone_path)
+
+        ImageFile.objects.filter(filename=gone_path).update(
+            missing_since=timezone.now() - settings.MISSING_FILE_GRACE_PERIOD - timedelta(minutes=1)
+        )
+        delete_removed_photos()
+
+        self.assertFalse(ImageFile.objects.filter(filename=gone_path).exists())
+
+    def test_missing_within_grace_period_is_not_yet_deleted(self):
+        gone_path = self.goodFiles[0]
+        create_image_file(gone_path)
+        os.remove(gone_path)
+
+        ImageFile.objects.filter(filename=gone_path).update(
+            missing_since=timezone.now() - timedelta(hours=1)
+        )
+        delete_removed_photos()
+
+        self.assertTrue(ImageFile.objects.filter(filename=gone_path).exists())
+
+    def test_file_reappearing_clears_missing_since(self):
+        # Simulates the real race this was built for: a file goes missing
+        # (e.g. mid-move), gets flagged, then the destination copy is
+        # recognized as a move and this row's path/content is updated --
+        # at which point the file backing this row exists again, and the
+        # next scan should self-heal the flag rather than leave it stale.
+        path = self.goodFiles[0]
+        create_image_file(path)
+        ImageFile.objects.filter(filename=path).update(missing_since=timezone.now())
+
+        delete_removed_photos()
+
+        row = ImageFile.objects.get(filename=path)
+        self.assertIsNone(row.missing_since)
 
 
 class DirectoryTests(TestCase):
@@ -2730,6 +2816,10 @@ class DeleteRemovedVideosTests(TestCase):
         return dest
 
     def test_delete_removed_videos_removes_vanished_rows_only(self):
+        # Two-phase behavior (see VideoFile.missing_since's own comment):
+        # a vanished file is flagged, not deleted, on the first pass that
+        # notices it, and only actually deleted once it's been missing
+        # longer than MISSING_FILE_GRACE_PERIOD.
         gone_path = self._a_real_fixture_copy()
         create_video_file(gone_path)
         self.assertTrue(VideoFile.objects.filter(filename=gone_path).exists())
@@ -2739,9 +2829,37 @@ class DeleteRemovedVideosTests(TestCase):
 
         os.remove(gone_path)
         delete_removed_videos()
+        self.assertTrue(VideoFile.objects.filter(filename=gone_path).exists())
+        self.assertIsNotNone(VideoFile.objects.get(filename=gone_path).missing_since)
+
+        VideoFile.objects.filter(filename=gone_path).update(
+            missing_since=timezone.now() - settings.MISSING_FILE_GRACE_PERIOD - timedelta(minutes=1)
+        )
+        delete_removed_videos()
 
         self.assertFalse(VideoFile.objects.filter(filename=gone_path).exists())
         self.assertTrue(VideoFile.objects.filter(filename=staying_path).exists())
+
+    def test_delete_removed_videos_within_grace_period_is_not_yet_deleted(self):
+        gone_path = self._a_real_fixture_copy()
+        create_video_file(gone_path)
+        os.remove(gone_path)
+
+        VideoFile.objects.filter(filename=gone_path).update(
+            missing_since=timezone.now() - timedelta(hours=1)
+        )
+        delete_removed_videos()
+
+        self.assertTrue(VideoFile.objects.filter(filename=gone_path).exists())
+
+    def test_delete_removed_videos_reappearing_clears_missing_since(self):
+        path = self._a_real_fixture_copy()
+        create_video_file(path)
+        VideoFile.objects.filter(filename=path).update(missing_since=timezone.now())
+
+        delete_removed_videos()
+
+        self.assertIsNone(VideoFile.objects.get(filename=path).missing_since)
 
     def test_delete_removed_videos_cleans_up_attached_face_and_thumbnail(self):
         from face_manager.models import Person
@@ -2761,6 +2879,9 @@ class DeleteRemovedVideosTests(TestCase):
         self.assertTrue(os.path.isfile(thumb_path))
 
         os.remove(gone_path)
+        VideoFile.objects.filter(pk=video.pk).update(
+            missing_since=timezone.now() - settings.MISSING_FILE_GRACE_PERIOD - timedelta(minutes=1)
+        )
         delete_removed_videos()
 
         self.assertFalse(VideoFile.objects.filter(pk=video.pk).exists())

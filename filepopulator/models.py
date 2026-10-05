@@ -480,6 +480,17 @@ class ImageFile(models.Model):
     image_load_failed = models.BooleanField(default=False)
     image_load_error = models.TextField(null=True, blank=True)
 
+    # Set the first time a scan finds this row's file missing from disk;
+    # cleared the moment it's seen present again. delete_removed_photos()
+    # only actually deletes a row once this has been continuously set for
+    # longer than settings.MISSING_FILE_GRACE_PERIOD, rather than on the
+    # first missing scan -- a bulk move (source deleted, destination not
+    # yet visible to that same scan cycle) used to race this, permanently
+    # losing the row (and any tagged Face rows) before the destination
+    # copy was ever discovered. See the 2026-10-05 incident write-up in
+    # CLAUDE.md for the real data loss this caused.
+    missing_since = models.DateTimeField(null=True, blank=True)
+
     # 64-bit perceptual hash (imagehash.phash), stored as a signed bigint
     # -- the same bit pattern numpy's int64 uses, so comparison code can
     # load this column straight into a numpy array with no conversion.
@@ -1218,6 +1229,10 @@ class VideoFile(models.Model):
 
     video_load_failed = models.BooleanField(default=False)
     video_load_error = models.TextField(null=True, blank=True)
+
+    # Same grace-period tracking as ImageFile.missing_since -- see that
+    # field's own comment for the real incident that motivated this.
+    missing_since = models.DateTimeField(null=True, blank=True)
 
     # Set by face_manager.tasks.process_video_faces() when
     # VideoFaceExtractor.process_video() raises for this video -- a

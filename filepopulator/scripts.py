@@ -579,12 +579,32 @@ def check_file_mods():
         print("Finished checking file mod times!")
 
 def delete_removed_photos():
+    # Doesn't delete a row the first time its file is found missing --
+    # see ImageFile.missing_since's own comment and
+    # settings.MISSING_FILE_GRACE_PERIOD for why (a real incident,
+    # 2026-10-05: a bulk move raced this, permanently losing rows -- and
+    # their tagged Face rows -- before a later scan's own move-detection
+    # ever got a chance to run).
     all_photos = ImageFile.objects.all()
+    now = timezone.now()
 
     for each_photo in all_photos:
         filepath = each_photo.filename
         if not os.path.isfile(filepath):
-            each_photo.delete()
+            if each_photo.missing_since is None:
+                # .update(), not .save() -- save() unconditionally
+                # re-decodes the image (ImageFile.save()'s own
+                # _init_image() call) when self.image isn't already
+                # populated on this instance, which would crash trying
+                # to open a file that -- the whole reason we're here --
+                # no longer exists.
+                ImageFile.objects.filter(pk=each_photo.pk).update(missing_since=now)
+            elif now - each_photo.missing_since >= settings.MISSING_FILE_GRACE_PERIOD:
+                each_photo.delete()
+        elif each_photo.missing_since is not None:
+            # Reappeared (or was never really gone -- e.g. a transiently
+            # unmounted drive) before the grace period elapsed.
+            ImageFile.objects.filter(pk=each_photo.pk).update(missing_since=None)
 
     # ImageFile.objects.all().delete()
 

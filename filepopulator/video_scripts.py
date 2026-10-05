@@ -378,7 +378,24 @@ def delete_removed_videos():
     DVD-rip .avi moved out of the library, 2026-09-15). Uses .delete()
     per-instance (not a bulk queryset .delete()) so VideoFile.delete()'s
     own override runs -- cleans up the video's thumbnails and its Face
-    rows' thumbnails too, not just the DB rows."""
+    rows' thumbnails too, not just the DB rows.
+
+    Doesn't delete a row the first time its file is found missing -- see
+    VideoFile.missing_since's own comment and
+    settings.MISSING_FILE_GRACE_PERIOD for why (the same real incident
+    that motivated the image-side equivalent, 2026-10-05: a bulk move
+    raced this, permanently losing rows -- and their tagged Face rows --
+    before a later scan's own move-detection ever got a chance to run)."""
+    now = timezone.now()
     for video in VideoFile.objects.all():
         if not os.path.isfile(video.filename):
-            video.delete()
+            if video.missing_since is None:
+                # .update(), not .save() -- matches the image-side
+                # equivalent's own reasoning (avoid any save()-triggered
+                # side effects on a row whose file doesn't exist), even
+                # though VideoFile has no custom save() override today.
+                VideoFile.objects.filter(pk=video.pk).update(missing_since=now)
+            elif now - video.missing_since >= settings.MISSING_FILE_GRACE_PERIOD:
+                video.delete()
+        elif video.missing_since is not None:
+            VideoFile.objects.filter(pk=video.pk).update(missing_since=None)

@@ -694,6 +694,18 @@ FILEPOPULATOR_SERVER_VIDEO_DIRS = VIDEO_ROOTS + [PHOTO_ROOT]
 # cheaper to (repeatedly, harmlessly) rule out than a normal one.
 MIN_VIDEO_DURATION_SECONDS = 3
 
+# How long a row's file can be missing from disk before
+# delete_removed_photos()/delete_removed_videos() actually deletes it,
+# rather than deleting the moment a single scan finds it gone. A bulk
+# move (source deleted, destination not yet visible to that same scan
+# cycle -- e.g. a large transfer over a slower connection) used to race
+# this, permanently losing the row -- and any tagged Face rows -- before
+# a later scan's own move-detection (pixel_hash match + old file gone)
+# ever got a chance to run. 24 hours is comfortably longer than any
+# plausible bulk move, while still cleaning up a genuinely-deleted file
+# within a day. See CLAUDE.md's 2026-10-05 incident write-up.
+MISSING_FILE_GRACE_PERIOD = timedelta(hours=24)
+
 # api/upload_views.py -- authenticated user-facing upload endpoint.
 # Deliberately generous defaults (easy to lower later once real usage
 # patterns are known) rather than a tight guess now that could block a
