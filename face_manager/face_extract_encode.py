@@ -262,22 +262,46 @@ class FaceExtractor(object):
                 if n_existing == 0 and n_detect == 0:
                     # There is nothing to do here.
 
+                    # img_obj.save() unconditionally re-decodes the image
+                    # and regenerates all 3 thumbnails (ImageFile.save(),
+                    # filepopulator/models.py) -- the image's own pixel
+                    # content never changes here, only isProcessed, so a
+                    # bulk .update() (bypassing the overridden save())
+                    # does the same thing at a fraction of the cost.
+                    # Real incident, 2026-10-05: this redundant decode+
+                    # thumbnail-regen, paid once per image regardless of
+                    # face count, was confirmed (via a bounded, externally
+                    # RSS-monitored reproduction against the real
+                    # pipeline) to cost ~50-65MB of real, never-reclaimed
+                    # RSS per image -- glibc's malloc arena fragmenting
+                    # from repeated large, variably-sized native libjpeg/
+                    # PIL buffers that never get returned to the OS, not a
+                    # Python-level leak (invisible to tracemalloc). This
+                    # number lines up almost exactly with the real
+                    # production OOM (~27GB over ~500 images processed in
+                    # one long-lived celery worker run, ~54MB/image).
+                    ImageFile.objects.filter(pk=img_obj.pk).update(isProcessed=True)
                     img_obj.isProcessed = True
-                    img_obj.save()
                     continue
 
                 if n_existing == 0 and n_detect > 0:
                     for det_face_obj in detected_faces:
                         self.add_new_face(det_face_obj, img_obj, img_numpy)
 
+                    # See the comment on the n_existing==0/n_detect==0
+                    # branch above -- same reasoning.
+                    ImageFile.objects.filter(pk=img_obj.pk).update(isProcessed=True)
                     img_obj.isProcessed = True
-                    img_obj.save()
                     continue
 
                 if n_detect == 0:
                     # Existing faces, but nothing detected this run at all.
                     self.update_list_of_no_matching_detects(existing_faces)
-                    img_obj.save()
+                    # No img_obj field actually changes in this branch --
+                    # the real isProcessed=True save happens once, below,
+                    # after this if/else. This save() call used to exist
+                    # here too, paying the full redundant decode+thumbnail
+                    # cost (see above) for literally no state change.
 
                 else:
                     # Both existing Face rows and fresh detections are
@@ -339,15 +363,23 @@ class FaceExtractor(object):
                     if unmatched_existing:
                         self.update_list_of_no_matching_detects(unmatched_existing)
 
-                    img_obj.save()
+                    # No img_obj field actually changes in this branch
+                    # either -- same reasoning as the n_detect==0 branch
+                    # above; the real isProcessed=True save happens once,
+                    # below.
 
                 # Get the number of faces associated with this object
                 img_faces = Face.objects.filter(source_image_file = img_obj)
                 # print(len(img_faces), len(detected_faces))
                 assert len(img_faces) >= len(detected_faces), f"{len(img_faces)} is not >= {len(detected_faces)}"
 
+                # See the comment on the n_existing==0/n_detect==0 branch
+                # above -- .update() avoids save()'s redundant decode+
+                # thumbnail-regen; img_obj.isProcessed is still set on the
+                # in-memory instance so the assert below (and anything
+                # else inspecting this instance afterward) sees it.
+                ImageFile.objects.filter(pk=img_obj.pk).update(isProcessed=True)
                 img_obj.isProcessed = True
-                img_obj.save()
                 # Assert that the image isProcessed flag is set
                 assert img_obj.isProcessed == True, 'Image isProcessed flag was not set'
 
