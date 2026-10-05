@@ -15,6 +15,9 @@ only buried in a session's own narrative further down.** Full detail/context for
 the dated write-up elsewhere in this file (search for a distinctive word from the bullet).
 
 **Open questions / follow-ups:**
+- Check whether `ImageFile.thumbnail_big`/`_medium`/`_small` (and the corresponding on-disk
+  directories/files) are all still actually used/needed, both on the frontend-consumption side and
+  in the database schema itself -- added 2026-10-05 as a side-quest TODO, not yet investigated.
 - No automated "did last night's backup actually run" freshness check exists — the current
   restore-testing only validates a backup file once it's promoted into weekly retention, which
   says nothing about a night the backup silently never ran at all (this has already happened
