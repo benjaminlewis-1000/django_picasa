@@ -45,8 +45,12 @@ class FaceExtractor(object):
     # starts with a fresh, empty arena) while paying the reload cost
     # only once every REINIT_DETECTOR_EVERY_N_IMAGES images, not on
     # every single call -- the standard mitigation for this class of
-    # long-lived-ML-session memory growth.
-    REINIT_DETECTOR_EVERY_N_IMAGES = 200
+    # long-lived-ML-session memory growth. Set conservatively low (not
+    # just past the point the 150-image test showed real growth) since
+    # reload cost is small relative to per-image detection time and the
+    # downside of reinitializing too often is minor, while the downside
+    # of too rarely is a repeat of this incident.
+    REINIT_DETECTOR_EVERY_N_IMAGES = 25
 
     def __init__(self):
         super(FaceExtractor, self).__init__()
