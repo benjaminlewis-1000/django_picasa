@@ -59,6 +59,19 @@ services:
     networks:
       - traefik_proxy
     restart: always
+    # Real incident, 2026-10-05: a celery worker running face_extraction
+    # grew to 55GB+ RSS (no container limit existed to stop it), twice --
+    # the second time exhausting the whole host's memory AND its 8GB
+    # swap, requiring a manual kill. Caps this container's own cgroup at
+    # 32GB RAM with zero additional swap allowance (memswap_limit equal
+    # to mem_limit, not double it, which is Docker's default when only
+    # mem_limit is set) -- a runaway process now gets OOM-killed within
+    # this container's own cgroup well before it can take down the host
+    # or other services sharing it. 32GB is a deliberate ceiling, not a
+    # measured requirement -- normal operation uses nowhere near this;
+    # revisit if a legitimate workload ever needs more.
+    mem_limit: 32g
+    memswap_limit: 32g
 #    labels:
 #
 #      - "traefik.enable=true"
