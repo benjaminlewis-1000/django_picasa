@@ -152,7 +152,10 @@ services:
       # crond silently ignores a crontab not owned by root, and a bind
       # mount would keep it owned by whatever this file's host owner is).
       - ${DJANGO_FILES_ROOT}/dockerize/weekly_vacuum_swap.py:/etc/periodic/weekly_vacuum_swap.py
-      - /mnt/fast_storage/appdata/django_picasa/backups:/backup
+      # Consolidated under a shared backups root alongside this host's
+      # other services' backups (2026-10-05) -- was
+      # /mnt/fast_storage/appdata/django_picasa/backups.
+      - /mnt/fast_storage/backups/picasa:/backup
       # Lets weekly_vacuum_swap.py stop/start/exec picasa_api directly --
       # this is the standard Docker-outside-of-Docker pattern. Security
       # tradeoff worth knowing: anything that can run arbitrary commands
