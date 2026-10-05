@@ -55,7 +55,15 @@ celery -A picasa worker -l INFO -c 20 --max-tasks-per-child 3 -n worker  & # --u
 # connection can easily take several minutes just to receive the request
 # body, well past the 30s default. 10 minutes is a starting point, not a
 # hard ceiling verified against real large-file uploads yet.
-gunicorn -b 0.0.0.0:8000 --workers 4 --threads 8 --worker-class gthread --timeout 600 picasa.wsgi &
+#
+# --access-logfile - --error-logfile - (both to stdout, captured by
+# `docker logs`): added 2026-10-05 after investigating a real memory-
+# growth incident -- gunicorn's own workers had grown substantially
+# (~106MB -> ~910MB RSS each) with no way to confirm whether real traffic
+# was the cause, since access logging was never enabled (gunicorn's
+# default is no access log at all). Needed going forward for exactly this
+# kind of investigation.
+gunicorn -b 0.0.0.0:8000 --workers 4 --threads 8 --worker-class gthread --timeout 600 --access-logfile - --error-logfile - picasa.wsgi &
 
 
 
