@@ -23,20 +23,41 @@ from scipy.optimize import linear_sum_assignment
 
 class FaceExtractor(object):
     """docstring for FaceExtractor"""
+
+    # Real incident, 2026-10-05: a single find_and_encode_faces() run
+    # (one long-lived celery task, self.app loaded once and reused for
+    # every image in the whole unprocessed backlog -- no per-task bound
+    # like video_face_extraction's max_runtime_seconds) grew to 55GB+
+    # RSS and OOM-killed the host, twice. Root-caused to onnxruntime's
+    # CPU memory arena, which grows to the largest allocation ever seen
+    # by a session and never shrinks back down for that session's
+    # lifetime -- confirmed empirically against 150 real images of
+    # varying resolution (step-function RSS growth tracking new largest-
+    # seen images, never retreating). insightface's own model_zoo
+    # hardcodes sess_options=None when constructing each ONNX
+    # InferenceSession, so there's no supported way to configure the
+    # arena away through FaceAnalysis's own API. Globally disabling the
+    # arena (monkey-patching onnxruntime.InferenceSession) was tried and
+    # measurably stops the growth, but at a severe, real throughput cost
+    # (every allocation becomes a real malloc/free instead of reusing a
+    # pool) -- not worth it as a blanket fix. Periodically rebuilding the
+    # detector instead bounds the SAME arena growth (a fresh session
+    # starts with a fresh, empty arena) while paying the reload cost
+    # only once every REINIT_DETECTOR_EVERY_N_IMAGES images, not on
+    # every single call -- the standard mitigation for this class of
+    # long-lived-ML-session memory growth.
+    REINIT_DETECTOR_EVERY_N_IMAGES = 200
+
     def __init__(self):
         super(FaceExtractor, self).__init__()
 
-        face_analysis = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])  # Use 'CUDAExecutionProvider' for GPU
-        # self.app = FaceAnalysis(name='antelopev2', providers=['CPUExecutionProvider'])  # Use 'CUDAExecutionProvider' for GPU
-        face_analysis.prepare(ctx_id=-1)  # ctx_id=-1 for CPU, 0 for GPU
-        
         self.IOU_thresh = 0.3
-        self.iou_function = bops.distance_box_iou 
+        self.iou_function = bops.distance_box_iou
         self.blank_face_person = Person.objects.get(person_name = settings.BLANK_FACE_NAME)
 
-        self.app = PyramidalDetector(detector = face_analysis, iou_thresh = self.IOU_thresh)
+        self.app = self._build_detector()
 
-        # Based on code at: 
+        # Based on code at:
         # https://github.com/deepinsight/insightface/blob/2a78baec428354883e0cda39c54b555a5ed8358a/cpp-package/inspireface/cpp/inspireface/include/inspireface/data_type.h#L285
         self.gender_map = {1: 'M', 0: 'F'}
 
@@ -48,6 +69,19 @@ class FaceExtractor(object):
         # known box for a fresh single-pass detection. Matches the value
         # validated experimentally against real production faces.
         self.reencode_crop_margin_mult = 0.6
+
+    @staticmethod
+    def _build_detector():
+        """Builds a fresh PyramidalDetector(FaceAnalysis). Pulled out of
+        __init__ so find_and_encode_faces()'s long-running loop can call
+        it again periodically (see REINIT_DETECTOR_EVERY_N_IMAGES's own
+        comment) to bound onnxruntime's CPU memory arena growth -- a
+        fresh InferenceSession starts with a fresh, empty arena, and the
+        old detector (and its arena) gets garbage collected once nothing
+        references it anymore."""
+        face_analysis = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])  # Use 'CUDAExecutionProvider' for GPU
+        face_analysis.prepare(ctx_id=-1)  # ctx_id=-1 for CPU, 0 for GPU
+        return PyramidalDetector(detector=face_analysis, iou_thresh=0.3)
 
     @staticmethod
     def _flatten_kps(kps):
@@ -143,7 +177,19 @@ class FaceExtractor(object):
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Family Pictures/2008/2008 July/100_4251.JPG')
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Misc Picture/Old Phone/20150123_201221.jpg')
 
-        for img_obj in unprocessed_imgs:
+        for processed_count, img_obj in enumerate(unprocessed_imgs):
+
+            if processed_count > 0 and processed_count % self.REINIT_DETECTOR_EVERY_N_IMAGES == 0:
+                # Bounds onnxruntime's CPU memory arena growth (see
+                # REINIT_DETECTOR_EVERY_N_IMAGES's own comment) -- drop
+                # the old detector before building the new one so it's
+                # not briefly held twice during the rebuild.
+                self.app = None
+                self.app = self._build_detector()
+                settings.LOGGER.debug(
+                    f"find_and_encode_faces(): reinitialized detector after "
+                    f"{processed_count} images this run."
+                )
 
             source_file = img_obj.filename
             print(source_file)
