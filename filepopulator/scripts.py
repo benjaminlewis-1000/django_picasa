@@ -25,6 +25,18 @@ def delete_old_thumbnails(instance):
     os.remove(instance.thumbnail_big.path)
     os.remove(instance.thumbnail_medium.path)
     os.remove(instance.thumbnail_small.path)
+    # Also clear the field values, not just the files on disk -- found
+    # 2026-10-05 alongside ImageFile.save()'s new "skip thumbnail
+    # regeneration if already populated" guard (see that method's own
+    # comment): leaving these fields pointing at a name whose file no
+    # longer exists made the guard wrongly think this instance already
+    # had valid thumbnails and skip regenerating them, even though this
+    # function was called specifically because they need to be rebuilt
+    # (the file moved, so its file_hash-derived thumbnail filename needs
+    # to change too).
+    instance.thumbnail_big = None
+    instance.thumbnail_medium = None
+    instance.thumbnail_small = None
 
 def instance_clean_and_save(instance, record_failure=True):
     """Returns (success, error_message); error_message is None on success.

@@ -1004,7 +1004,37 @@ class ImageFile(models.Model):
         else:
             self._refresh_file_hash()
 
-        if not self._generate_thumbnail():
+        # Only regenerate thumbnails when this instance doesn't already
+        # have all three -- found 2026-10-05 while root-causing a real
+        # production OOM: every caller that just needs to flip a status
+        # field on an already-ingested image (face_extract_encode.py's
+        # find_and_encode_faces(), in particular) was unconditionally
+        # paying for a full re-decode + 3x resize + 3x JPEG-encode + 3x
+        # disk write on every single save(), even though the file's pixel
+        # content never changed and the existing thumbnails were still
+        # perfectly valid. Measured directly (a bounded, externally RSS-
+        # monitored reproduction against the real pipeline): ~50-65MB of
+        # real, never-reclaimed RSS per image -- glibc's malloc arena
+        # fragmenting from repeated large, variably-sized native libjpeg/
+        # PIL buffers that never get returned to the OS (invisible to
+        # tracemalloc, since it's not a Python-level leak). That number
+        # lines up almost exactly with a real incident (~27GB over ~500
+        # images in one long-lived celery worker run, ~54MB/image).
+        #
+        # Safe for every real caller, not just this one, because the two
+        # cases are distinguishable by construction, not by a DB lookup:
+        # a genuinely NEW or orientation-changed ImageFile (both
+        # constructed fresh via ImageFile(filename=...), never fetched
+        # from the DB -- see create_image_file() in filepopulator/
+        # scripts.py) has empty thumbnail fields on the instance
+        # regardless of what any old DB row with the same pk might still
+        # have on disk, so this still correctly regenerates for those.
+        # An instance that was actually fetched from the DB (the common
+        # case for a status-only update like find_and_encode_faces()'s)
+        # already has all three fields populated from that fetch, so this
+        # correctly skips the redundant work for exactly that case.
+        has_all_thumbnails = bool(self.thumbnail_big) and bool(self.thumbnail_medium) and bool(self.thumbnail_small)
+        if not has_all_thumbnails and not self._generate_thumbnail():
             raise Exception('Could not create thumbnail - is the file type valid?')
         super(ImageFile, self).save(*args, **kwargs)
 
