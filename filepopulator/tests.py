@@ -33,7 +33,7 @@ from django.core.management import call_command
 
 from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, guess_date_from_filename, VideoFile, FailedVideoFile, DuplicateVideoFile
 # from .forms import ImageFileForm, DirectoryForm
-from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
+from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods, delete_old_thumbnails
 from .video_scripts import create_video_file, add_videos_from_root_dir, delete_removed_videos, _parse_exif_date, compute_video_content_hash
 from face_manager.models import Face
 from common.open_img_oriented import apply_exif_orientation
@@ -1320,6 +1320,42 @@ class OrientationChangeReprocessTests(TestCase):
         self.assertEqual(ImageFile.objects.filter(filename=path).count(), 1)
         img.refresh_from_db()
         self.assertFalse(img.isProcessed)
+
+
+class DeleteOldThumbnailsTests(TestCase):
+    """Real incident, 2026-10-06: a restored-from-backup database can
+    reference thumbnail files that no longer exist on disk (regenerated
+    or cleaned up since the backup was taken). os.remove() raising
+    FileNotFoundError used to abort delete_old_thumbnails() entirely --
+    this is purely opportunistic cleanup, so a missing file should be a
+    no-op, not a crash that blocks the caller's own move/reprocess logic
+    from ever running."""
+
+    def test_missing_thumbnail_file_does_not_raise(self):
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/naming/good/1.JPG"
+        create_image_file(path)
+        img = ImageFile.objects.get(filename=path)
+
+        # Simulate exactly the real scenario: the field still points at a
+        # name, but the file itself is already gone.
+        os.remove(img.thumbnail_big.path)
+
+        delete_old_thumbnails(img)  # must not raise
+
+        self.assertIsNone(img.thumbnail_big.name)
+        self.assertIsNone(img.thumbnail_medium.name)
+        self.assertIsNone(img.thumbnail_small.name)
+
+    def test_still_deletes_files_that_do_exist(self):
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/naming/good/1.JPG"
+        create_image_file(path)
+        img = ImageFile.objects.get(filename=path)
+        medium_path = img.thumbnail_medium.path
+        self.assertTrue(os.path.isfile(medium_path))
+
+        delete_old_thumbnails(img)
+
+        self.assertFalse(os.path.isfile(medium_path))
 
 
 @override_settings(MEDIA_ROOT='/tmp/filepopulator_test_media')

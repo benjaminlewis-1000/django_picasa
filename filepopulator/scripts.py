@@ -22,9 +22,18 @@ import time
 import traceback
 
 def delete_old_thumbnails(instance):
-    os.remove(instance.thumbnail_big.path)
-    os.remove(instance.thumbnail_medium.path)
-    os.remove(instance.thumbnail_small.path)
+    # Real incident, 2026-10-06: a restored-from-backup database can
+    # reference thumbnail files that no longer exist on disk (regenerated
+    # or cleaned up since the backup was taken) -- os.remove() raising
+    # FileNotFoundError here used to abort the whole move/reprocess
+    # attempt for that file before instance_clean_and_save() ever ran,
+    # even though this is purely opportunistic cleanup: if the old file
+    # is already gone, there's nothing to clean up, and that's fine.
+    for thumb_field in (instance.thumbnail_big, instance.thumbnail_medium, instance.thumbnail_small):
+        try:
+            os.remove(thumb_field.path)
+        except FileNotFoundError:
+            pass
     # Also clear the field values, not just the files on disk -- found
     # 2026-10-05 alongside ImageFile.save()'s new "skip thumbnail
     # regeneration if already populated" guard (see that method's own
