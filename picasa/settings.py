@@ -220,6 +220,10 @@ SITE_ID = 1
 ACCOUNT_DEFAULT_HTTP_PROTOCOL = 'https'
 
 MIDDLEWARE = [
+    # First in the chain deliberately -- rejects obvious vulnerability-
+    # scanner paths (see block_scanners.py's own comment) before CORS,
+    # session, auth, or URL resolution even run.
+    'picasa.block_scanners.BlockScannerPathsMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     # 'picasa.custom_cors.LocalNetworkCorsMiddleware',
