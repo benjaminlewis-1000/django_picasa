@@ -2891,6 +2891,69 @@ class BackfillDetScoreTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class BackfillMissingFaceThumbnailsTests(TestCase):
+    """backfill_missing_face_thumbnails management command: real
+    incident, 2026-10-06 -- a restored-from-backup database referenced
+    thumbnail files that no longer existed on disk. Re-crops from the
+    already-stored box (no re-detection) using a real fixture and a real
+    decode, rather than mocking -- this command's whole point is pure
+    cropping math against real pixel data, so there's nothing to usefully
+    mock here."""
+
+    def setUp(self):
+        self.image = make_image()
+        self.person = make_person("Someone Real")
+
+    def test_missing_thumbnail_is_regenerated_from_the_stored_box(self):
+        face = make_face(self.image, declared_name=self.person)
+        old_name = face.face_thumbnail.name
+        os.remove(face.face_thumbnail.path)
+
+        call_command('backfill_missing_face_thumbnails')
+
+        face.refresh_from_db()
+        self.assertTrue(os.path.isfile(face.face_thumbnail.path))
+        # A fresh save() with the same filename-derivation inputs can
+        # coincidentally reuse the same name if nothing else on disk
+        # collides -- what actually matters is that a real file exists
+        # now, not that the name necessarily changed.
+        self.assertIsNotNone(face.face_thumbnail.name)
+        # Classification fields must be untouched.
+        self.assertEqual(face.declared_name_id, self.person.id)
+
+    def test_existing_thumbnail_is_left_untouched(self):
+        face = make_face(self.image, declared_name=self.person)
+        original_name = face.face_thumbnail.name
+        original_mtime = os.path.getmtime(face.face_thumbnail.path)
+
+        call_command('backfill_missing_face_thumbnails')
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_thumbnail.name, original_name)
+        self.assertEqual(os.path.getmtime(face.face_thumbnail.path), original_mtime)
+
+    def test_dry_run_does_not_write(self):
+        face = make_face(self.image, declared_name=self.person)
+        os.remove(face.face_thumbnail.path)
+
+        call_command('backfill_missing_face_thumbnails', '--dry-run')
+
+        face.refresh_from_db()
+        self.assertFalse(os.path.isfile(face.face_thumbnail.path))
+
+    def test_decode_failure_is_counted_not_fatal(self):
+        face = make_face(self.image, declared_name=self.person)
+        os.remove(face.face_thumbnail.path)
+        with patch(
+            'face_manager.management.commands.backfill_missing_face_thumbnails.common.open_img_oriented',
+            side_effect=OSError('simulated decode failure'),
+        ):
+            call_command('backfill_missing_face_thumbnails')  # must not raise
+        face.refresh_from_db()
+        self.assertFalse(os.path.isfile(face.face_thumbnail.path))
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class FaceSaveThumbnailCheckTests(TestCase):
     """Face.save()'s thumbnail-existence check uses .path (a pure
     filesystem-path computation via the storage backend), not
