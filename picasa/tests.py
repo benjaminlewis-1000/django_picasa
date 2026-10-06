@@ -197,3 +197,43 @@ class BlockScannerPathsMiddlewareTests(TestCase):
         response = self.middleware(self.factory.get('/api/'))
         self.assertTrue(self.sentinel_called)
         self.assertEqual(response.status_code, 200)
+
+
+class MallocTrimMiddlewareTests(TestCase):
+    """Real incident, 2026-10-05: see malloc_trim_middleware.py's own
+    comment -- real mobile-app traffic against api/views.py's
+    KeyedImageView (face_array/face_source) accumulates native-buffer
+    memory the same way the batch face-extraction pipeline did."""
+
+    def test_calls_get_response_and_returns_its_response_unchanged(self):
+        from picasa.malloc_trim_middleware import MallocTrimMiddleware
+        from django.http import HttpResponse
+
+        sentinel_response = HttpResponse('ok', status=201)
+        calls = []
+
+        def get_response(request):
+            calls.append(request)
+            return sentinel_response
+
+        middleware = MallocTrimMiddleware(get_response)
+        request = RequestFactory().get('/anything/')
+        response = middleware(request)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(response, sentinel_response)
+        self.assertEqual(response.status_code, 201)
+
+    def test_survives_a_missing_libc_gracefully(self):
+        from picasa import malloc_trim_middleware
+
+        original_libc = malloc_trim_middleware._libc
+        malloc_trim_middleware._libc = None
+        try:
+            middleware = malloc_trim_middleware.MallocTrimMiddleware(
+                lambda request: __import__('django.http', fromlist=['HttpResponse']).HttpResponse('ok')
+            )
+            response = middleware(RequestFactory().get('/anything/'))
+            self.assertEqual(response.status_code, 200)
+        finally:
+            malloc_trim_middleware._libc = original_libc
