@@ -161,3 +161,39 @@ class SettingsSanityTests(TestCase):
         # not a sliding inactivity timeout - see picasa/settings.py's
         # comment on SESSION_COOKIE_AGE for the full explanation.
         self.assertTrue(settings.SESSION_SAVE_EVERY_REQUEST)
+
+
+class BlockScannerPathsMiddlewareTests(TestCase):
+    """Real incident, 2026-10-05: see block_scanners.py's own comment.
+
+    Exercises the middleware directly (RequestFactory + a sentinel
+    get_response) rather than through the full URL dispatch -- this app
+    requires auth on every real view by default (see
+    SettingsSanityTests.test_api_default_permission_requires_authentication
+    above), so going through self.client would conflate "my middleware
+    blocked this" with "DRF's own permission check blocked this."
+    """
+
+    def setUp(self):
+        from picasa.block_scanners import BlockScannerPathsMiddleware
+        self.factory = RequestFactory()
+        self.sentinel_called = False
+
+        def sentinel_get_response(request):
+            self.sentinel_called = True
+            from django.http import HttpResponse
+            return HttpResponse('ok')
+
+        self.middleware = BlockScannerPathsMiddleware(sentinel_get_response)
+
+    def test_php_style_paths_are_rejected_without_reaching_the_view(self):
+        for path in ('/wp-signup.php', '/xmlrpc.php', '/adminfuns.PHP', '/foo.php7'):
+            self.sentinel_called = False
+            response = self.middleware(self.factory.get(path))
+            self.assertEqual(response.status_code, 403, path)
+            self.assertFalse(self.sentinel_called, path)
+
+    def test_ordinary_paths_reach_the_real_view(self):
+        response = self.middleware(self.factory.get('/api/'))
+        self.assertTrue(self.sentinel_called)
+        self.assertEqual(response.status_code, 200)
