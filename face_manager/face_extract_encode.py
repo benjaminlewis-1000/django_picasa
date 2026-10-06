@@ -5,6 +5,7 @@ from django.db.models import Q
 from face_manager.models import Person, Face
 from filepopulator.models import ImageFile
 from insightface.app import FaceAnalysis
+import ctypes
 import django
 from django.core.files.base import ContentFile
 from insightface.data import get_image as ins_get_image
@@ -13,13 +14,44 @@ from pyramidal_detector import PyramidalDetector
 import common
 import cv2
 import hashlib
-import insightface 
+import insightface
 import numpy as np
 import os
 import time
 import torch
 import torchvision.ops.boxes as bops
 from scipy.optimize import linear_sum_assignment
+
+# Real incident, 2026-10-05: even after fixing the dominant cause of a
+# ~25.8GB OOM (ImageFile.save()'s redundant thumbnail regeneration -- see
+# REINIT_DETECTOR_EVERY_N_IMAGES's own comment on FaceExtractor), a
+# smaller residual per-image growth remained (~20-25MB/image, confirmed
+# via a bounded, externally RSS-monitored reproduction against the real
+# pipeline) -- likely cv2.imencode()/PIL/onnxruntime native buffers that
+# glibc's malloc arena never returns to the OS on its own, the same class
+# of fragmentation as the thumbnail-regen bug, just from genuinely-needed
+# work (new Face thumbnails) rather than redundant work. Calling
+# malloc_trim(0) once per image eliminated it completely in the same
+# reproduction (60 real images: ~90MB total growth, often *zero* net
+# growth across many consecutive images including several with 5-7+
+# faces) -- glibc's own documented mechanism for returning freed-but-
+# retained heap memory to the OS, general-purpose (not specific to any
+# one native library), and cheap enough to call after every image rather
+# than only periodically. try/except guards against this not being glibc
+# (e.g. a different libc on some future base image) -- purely a memory-
+# usage optimization, never something correctness should depend on.
+try:
+    _libc = ctypes.CDLL('libc.so.6')
+except OSError:
+    _libc = None
+
+
+def _trim_malloc_arena():
+    if _libc is not None:
+        try:
+            _libc.malloc_trim(0)
+        except Exception:
+            pass
 
 class FaceExtractor(object):
     """docstring for FaceExtractor"""
@@ -194,6 +226,13 @@ class FaceExtractor(object):
                     f"find_and_encode_faces(): reinitialized detector after "
                     f"{processed_count} images this run."
                 )
+
+            # Runs once per iteration (so it always covers the PREVIOUS
+            # image's native allocations, regardless of which exit path
+            # that image took -- continue, fall-through, or an exception
+            # caught further down) -- see _trim_malloc_arena()'s own
+            # comment for why this is needed at all.
+            _trim_malloc_arena()
 
             source_file = img_obj.filename
             print(source_file)
