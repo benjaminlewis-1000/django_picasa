@@ -224,6 +224,11 @@ MIDDLEWARE = [
     # scanner paths (see block_scanners.py's own comment) before CORS,
     # session, auth, or URL resolution even run.
     'picasa.block_scanners.BlockScannerPathsMiddleware',
+    # Also first (not last) deliberately -- Django's middleware list is
+    # outermost-first, so a middleware listed first runs its own post-
+    # response code LAST, right before the response leaves this process
+    # (see malloc_trim_middleware.py's own comment for why this matters).
+    'picasa.malloc_trim_middleware.MallocTrimMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     # 'picasa.custom_cors.LocalNetworkCorsMiddleware',
