@@ -17,9 +17,6 @@ only buried in a session's own narrative further down.** Full detail/context for
 the dated write-up elsewhere in this file (search for a distinctive word from the bullet).
 
 **Open questions / follow-ups:**
-- Check whether `ImageFile.thumbnail_big`/`_medium`/`_small` (and the corresponding on-disk
-  directories/files) are all still actually used/needed, both on the frontend-consumption side and
-  in the database schema itself -- added 2026-10-05 as a side-quest TODO, not yet investigated.
 - No automated "did last night's backup actually run" freshness check exists — the current
   restore-testing only validates a backup file once it's promoted into weekly retention, which
   says nothing about a night the backup silently never ran at all (this has already happened
@@ -46,6 +43,45 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   actually arm ingestion-time video-duplicate prevention in the live Celery worker (deferred to
   the next natural break past the long-running `backfill_det_score --all-faces` job, still running
   as of 2026-09-22).
+
+## DONE (2026-10-08): removed `thumbnail_big`/`thumbnail_medium` (zero real consumers, 28.4GB
+reclaimed)
+
+Closed the side-quest TODO (added 2026-10-05): checked every real client this backend serves
+(`dev_facewire`/`facewires_frontend`, `net_slideshow`, `PhotoVerify`) and found **zero** references
+to `thumbnail_big`/`thumbnail_medium` or the `full_big`/`full_medium` API types anywhere -- every
+"show me the full photo" path already goes through `KeyedImageView`'s `slideshow` type (live-
+resizes the original file) instead, confirmed via an explicit comment in `dev_facewire`'s own
+`gallery.jsx` explaining exactly that choice. On the video side these fields were never even
+populated (`VideoFile`'s Phase 2 thumbnailing was never built) -- 0 of 6,120 videos had them set.
+Real cost of keeping them: **21GB (`thumbnails_big`) + 7.4GB (`thumbnails_med`) = 28.4GB**, growing
+with every new photo, plus two extra resize+encode+write operations on every single `ImageFile`
+save (on top of the compounding-resize bug already fixed 2026-09-18).
+
+**Removed**: both model fields (`ImageFile` and `VideoFile`, migration `filepopulator.0019`);
+generation in `_generate_thumbnail()` (now only produces `thumbnail_small`); the `full_big`/
+`full_medium` `KeyedImageView` types and their branches (`api/views.py`); the two fields from
+`api/serializers.py`'s `ImageFileSerializer`/`ImageSummarySerializer`; the big/medium handling in
+`delete_old_thumbnails()`/`instance_clean_and_save()`'s existence asserts/`ImageFile.delete()`/
+`VideoFile.delete()` (`filepopulator/scripts.py`, `filepopulator/models.py`); Django admin's
+`thumbnail_big`-based preview (`filepopulator/admin.py`), switched to `thumbnail_small` instead
+(100px instead of 500px -- not part of the real review workflow, that's all frontend, just an
+admin-page convenience). `thumbnail_small`/`full_small` are completely untouched (still the one
+real consumer, the Folders tab's grid view).
+
+**Migration structure, deliberate**: `thumbnail_big_path`/`thumbnail_med_path` (the `upload_to`
+callables) are kept in `models.py`, unused by any current field, specifically because migrations
+`0001` and `0007` serialize a direct reference to them -- removing the functions would break a
+from-scratch `migrate` (fresh CI/dev database replaying the full history) the moment it reached
+either of those historical migrations. The actual file deletion (reclaiming the 28.4GB) is a
+`RunPython` step *inside* migration `0019` itself, run before the `RemoveField` operations, using
+the historical model state (which still has the fields at that point in the migration graph) --
+deliberately not a separate management command, since that would have needed coordinating "run
+this against the old code, then deploy the new code, then migrate" across a confusing window
+instead of one atomic, self-contained migration.
+
+Full fast suite (`--parallel 8`): 482/483 passing (one pre-existing, unrelated flaky video-ingestion
+test, confirmed flaky independent of this change by running it alone twice).
 
 **Bigger, deliberately unscoped features:**
 - Slideshow metadata overlay (photo date + location shown alongside the image).

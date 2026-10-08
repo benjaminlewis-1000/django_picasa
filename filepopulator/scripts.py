@@ -29,22 +29,20 @@ def delete_old_thumbnails(instance):
     # attempt for that file before instance_clean_and_save() ever ran,
     # even though this is purely opportunistic cleanup: if the old file
     # is already gone, there's nothing to clean up, and that's fine.
-    for thumb_field in (instance.thumbnail_big, instance.thumbnail_medium, instance.thumbnail_small):
+    for thumb_field in (instance.thumbnail_small,):
         try:
             os.remove(thumb_field.path)
         except FileNotFoundError:
             pass
-    # Also clear the field values, not just the files on disk -- found
+    # Also clear the field value, not just the file on disk -- found
     # 2026-10-05 alongside ImageFile.save()'s new "skip thumbnail
     # regeneration if already populated" guard (see that method's own
-    # comment): leaving these fields pointing at a name whose file no
+    # comment): leaving this field pointing at a name whose file no
     # longer exists made the guard wrongly think this instance already
-    # had valid thumbnails and skip regenerating them, even though this
-    # function was called specifically because they need to be rebuilt
+    # had a valid thumbnail and skip regenerating it, even though this
+    # function was called specifically because it needs to be rebuilt
     # (the file moved, so its file_hash-derived thumbnail filename needs
     # to change too).
-    instance.thumbnail_big = None
-    instance.thumbnail_medium = None
     instance.thumbnail_small = None
 
 def instance_clean_and_save(instance, record_failure=True):
@@ -103,12 +101,6 @@ def instance_clean_and_save(instance, record_failure=True):
             return False, str(e)
         settings.LOGGER.debug(f"Saved file {file_path} to database")
 
-        assert os.path.isfile(instance.thumbnail_big.path), \
-            'Thumbnail {} wasn''t generated for {}.'.\
-            format(instance.thumbnail_big.name, file_path)
-        assert os.path.isfile(instance.thumbnail_medium.path), \
-            'Thumbnail {} wasn''t generated for {}.'.\
-            format(instance.thumbnail_medium.name, file_path)
         assert os.path.isfile(instance.thumbnail_small.path), \
             'Thumbnail {} wasn''t generated for {}.'.\
             format(instance.thumbnail_small.name, file_path)

@@ -96,8 +96,6 @@ def make_preexisting_image_row(path):
     image = ImageFile(
         filename=path,
         directory=directory,
-        thumbnail_big="",
-        thumbnail_medium="",
         thumbnail_small="",
         width=100,
         height=100,
@@ -1915,7 +1913,7 @@ class MergeDuplicateImageFilesTests(TestCase):
             filename=dup_filename, directory=directory,
             pixel_hash=primary.pixel_hash, file_hash=primary.file_hash,
             width=primary.width, height=primary.height, isProcessed=False,
-            thumbnail_big='', thumbnail_medium='', thumbnail_small='',
+            thumbnail_small='',
         )])
         dup = ImageFile.objects.get(filename=dup_filename)
         DuplicateFile.objects.create(filename=dup_filename)
@@ -1958,7 +1956,7 @@ class MergeDuplicateImageFilesTests(TestCase):
             filename='/tmp/orphan_dup.jpg', directory=directory,
             pixel_hash='no_matching_hash_at_all', file_hash='x',
             width=10, height=10, isProcessed=False,
-            thumbnail_big='', thumbnail_medium='', thumbnail_small='',
+            thumbnail_small='',
         )])
         DuplicateFile.objects.create(filename='/tmp/orphan_dup.jpg')
 
