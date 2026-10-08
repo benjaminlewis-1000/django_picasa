@@ -186,16 +186,10 @@ class ImageFileTests(TestCase):
             # Filenames are different and thumbnails were saved properly.
             self.assertNotEqual(obj1.filename, obj2.filename )
             self.assertNotEqual(obj1.id, obj2.id )
-            self.assertNotEqual(obj1.thumbnail_big.path, obj2.thumbnail_big.path )
-            self.assertNotEqual(obj1.thumbnail_medium.path, obj2.thumbnail_medium.path )
             self.assertNotEqual(obj1.thumbnail_small.path, obj2.thumbnail_small.path )
 
-            # Check that all the thumbnails were created properly.
-            self.assertTrue(os.path.isfile(obj1.thumbnail_big.path))
-            self.assertTrue(os.path.isfile(obj1.thumbnail_medium.path))
+            # Check that the thumbnail was created properly.
             self.assertTrue(os.path.isfile(obj1.thumbnail_small.path))
-            self.assertTrue(os.path.isfile(obj2.thumbnail_big.path))
-            self.assertTrue(os.path.isfile(obj2.thumbnail_medium.path))
             self.assertTrue(os.path.isfile(obj2.thumbnail_small.path))
 
         # Do the two types of test.
@@ -352,7 +346,7 @@ class ImageFileTests(TestCase):
             filename=preexisting_dup_path, directory=seeded.directory,
             pixel_hash=seeded.pixel_hash, file_hash=seeded.file_hash,
             width=seeded.width, height=seeded.height, isProcessed=False,
-            thumbnail_big='', thumbnail_medium='', thumbnail_small='',
+            thumbnail_small='',
         )])
 
         newest_dup_path = os.path.join(os.path.dirname(original), 'newest_dup.jpg')
@@ -399,8 +393,7 @@ class ImageFileTests(TestCase):
             fullname = allObjects[num].filename
             # Assert: thumbnails created, filename is in the good files list. 
             self.assertTrue(allObjects[num].filename in self.goodFiles)
-            self.assertTrue(os.path.isfile(allObjects[num].thumbnail_big.path))
-            self.assertTrue(os.path.isfile(allObjects[num].thumbnail_medium.path))
+            self.assertTrue(os.path.isfile(allObjects[num].thumbnail_small.path))
             self.assertTrue(os.path.isfile(allObjects[num].thumbnail_small.path))
             allFiles.append(fullname)
 
@@ -434,7 +427,7 @@ class ImageFileTests(TestCase):
 
         # Get the data from the first addition of the dest_file
         first_item = ImageFile.objects.filter(filename=dest_file)
-        thumbnail1 = first_item[0].thumbnail_big.path
+        thumbnail1 = first_item[0].thumbnail_small.path
         id1 = first_item[0].id
         self.assertTrue(os.path.isfile(thumbnail1))
 
@@ -444,7 +437,7 @@ class ImageFileTests(TestCase):
 
         # Get the data from the second data addition. 
         second_item = ImageFile.objects.filter(filename=dest_file)
-        thumbnail2 = second_item[0].thumbnail_big.path
+        thumbnail2 = second_item[0].thumbnail_small.path
         id2 = second_item[0].id
 
         # Thumbnail paths aren't the same, IDs aren't the same,
@@ -560,11 +553,9 @@ class ImageFileTests(TestCase):
         # Test that in this case, isProcessed was preserved. 
         self.assertTrue(new_ref[0].isProcessed)
 
-        self.assertTrue(os.path.isfile(new_ref[0].thumbnail_big.path))
-        self.assertTrue(os.path.isfile(new_ref[0].thumbnail_medium.path))
         self.assertTrue(os.path.isfile(new_ref[0].thumbnail_small.path))
-        self.assertFalse(os.path.isfile(orig_data.thumbnail_big.path))
-        self.assertFalse(os.path.isfile(orig_data.thumbnail_medium.path))
+        self.assertTrue(os.path.isfile(new_ref[0].thumbnail_small.path))
+        self.assertFalse(os.path.isfile(orig_data.thumbnail_small.path))
         self.assertFalse(os.path.isfile(orig_data.thumbnail_small.path))
 
         self.assertEqual(orig_data.id, new_ref[0].id)
@@ -614,8 +605,8 @@ class ImageFileTests(TestCase):
         self.assertTrue(f3_data.isProcessed)
         # Check that IDs are the same
         self.assertEqual(f1_data.id, f3_data.id)
-        self.assertTrue(os.path.isfile(f3_data.thumbnail_big.path))
-        self.assertFalse(os.path.isfile(f1_data.thumbnail_big.path))
+        self.assertTrue(os.path.isfile(f3_data.thumbnail_small.path))
+        self.assertFalse(os.path.isfile(f1_data.thumbnail_small.path))
 
         self.assertTrue(os.path.isfile(f3_data.filename))
         self.assertFalse(os.path.isfile(f1_data.filename))
@@ -646,7 +637,7 @@ class ImageFileTests(TestCase):
         self.assertEqual(ImageFile.objects.filter(filename=path2).count(), 0)
         self.assertTrue(DuplicateFile.objects.filter(filename=path2).exists())
 
-        self.assertTrue(os.path.isfile(first_item[0].thumbnail_big.path))
+        self.assertTrue(os.path.isfile(first_item[0].thumbnail_small.path))
         self.assertFalse(first_item[0].isProcessed)
 
     def test_delete_photos(self): ### CHECKED ###
@@ -760,8 +751,7 @@ class ImageFileTests(TestCase):
         file = self.goodFiles[0]
         create_image_file(file)
         f_data = ImageFile.objects.filter(filename = file)[0]
-        self.assertTrue(os.path.isfile(f_data.thumbnail_big.path))
-        self.assertTrue(os.path.isfile(f_data.thumbnail_medium.path))
+        self.assertTrue(os.path.isfile(f_data.thumbnail_small.path))
         self.assertTrue(os.path.isfile(f_data.thumbnail_small.path))
 
     def test_move_id_stay_same(self): ### CHECKED ###
@@ -907,7 +897,7 @@ class ImageFileTests(TestCase):
         self.assertEqual(first_file_data.filename, rot_data.filename)
         self.assertFalse(rot_data.isProcessed)
         self.assertNotEqual(first_file_data.pixel_hash, rot_data.pixel_hash)
-        self.assertNotEqual(first_file_data.thumbnail_big.path, rot_data.thumbnail_big.path)
+        self.assertNotEqual(first_file_data.thumbnail_small.path, rot_data.thumbnail_small.path)
 
 
     # def test_directories(self):
@@ -1087,6 +1077,230 @@ class DeleteRemovedPhotosGracePeriodTests(TestCase):
         self.assertIsNone(row.missing_since)
 
 
+class MovedFileFaceContinuityTests(TestCase):
+    """Real incident, 2026-10-08: a photo that moved several times over
+    months ended up with its validated Face classifications permanently
+    separated from the file's current location. Investigation found the
+    pixel_hash-based "same photo, just moved" reuse branch in
+    create_image_file() never once linked any of this file's relocations,
+    across its whole history -- every move created a brand-new row with
+    fresh, unvalidated detections, while the old row (and its validated
+    faces) was left behind at a now-nonexistent path. The exact root cause
+    of why the hash lookup never matched in that specific case was never
+    fully pinned down (no filesystem-history data available to check what
+    was really on disk at each past point in time) -- these tests instead
+    cover the full range of ways create_image_file()/delete_removed_photos()
+    *should* behave for a move, so a regression here is caught going
+    forward even without a confirmed repro of the original failure."""
+
+    def setUp(self):
+        self.validation_dir = settings.FILEPOPULATOR_VAL_DIRECTORY
+        self.tmp_valid_dir = '/tmp/img_validation_move_continuity'
+        if os.path.exists(self.tmp_valid_dir):
+            shutil.rmtree(self.tmp_valid_dir)
+        shutil.copytree(self.validation_dir, self.tmp_valid_dir)
+
+        self.good_dir = os.path.join(self.tmp_valid_dir, 'naming', 'good')
+        self.goodFiles = []
+        for root, dirs, files in os.walk(self.good_dir):
+            for fname in files:
+                self.goodFiles.append(os.path.join(root, fname))
+        assert len(self.goodFiles) >= 2, 'Need at least 2 real fixture files for these tests.'
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_valid_dir, ignore_errors=True)
+
+    def _attach_validated_face(self, img, person_name='Moved File Continuity Test Person'):
+        from face_manager.models import Person
+        person, _ = Person.objects.get_or_create(person_name=person_name)
+        face = Face(
+            source_image_file=img,
+            declared_name=person,
+            validated=True,
+            box_left=1, box_top=1,
+            box_right=min(40, img.width - 1), box_bottom=min(40, img.height - 1),
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.save()
+        return face
+
+    def test_clean_move_in_one_scan_cycle_preserves_validated_face(self):
+        # The simple, working case: old file gone and new file present by
+        # the time a single create_image_file() call discovers the new
+        # path -- the single-match reuse branch should rename the existing
+        # row in place, carrying its validated Face along with it.
+        old_path = self.goodFiles[0]
+        create_image_file(old_path)
+        img = ImageFile.objects.get(filename=old_path)
+        old_id = img.id
+        face = self._attach_validated_face(img)
+
+        new_path = os.path.join(self.tmp_valid_dir, 'moved.jpg')
+        shutil.move(old_path, new_path)
+        create_image_file(new_path)
+
+        self.assertFalse(ImageFile.objects.filter(filename=old_path).exists())
+        moved = ImageFile.objects.get(filename=new_path)
+        self.assertEqual(moved.id, old_id)
+        face.refresh_from_db()
+        self.assertEqual(face.source_image_file_id, moved.id)
+        self.assertTrue(face.validated)
+        self.assertEqual(face.declared_name.person_name, 'Moved File Continuity Test Person')
+
+    def test_move_discovered_while_old_row_still_flagged_missing_preserves_face(self):
+        # The row was already flagged missing_since by an earlier
+        # delete_removed_photos() pass (even one well past the grace
+        # period -- a scan simply hasn't gotten around to deleting it yet)
+        # but hasn't actually been deleted. The new path is then
+        # discovered -- create_image_file()'s hash lookup doesn't filter
+        # on missing_since at all, so this should still reuse the row and
+        # preserve the face, regardless of how overdue the grace period
+        # is. This is the behavior that matters most going forward: as
+        # long as add_from_root_dir() (which discovers new paths) runs
+        # before delete_removed_photos() actually deletes the row in the
+        # same or an earlier cycle, a move stays linked.
+        old_path = self.goodFiles[0]
+        create_image_file(old_path)
+        img = ImageFile.objects.get(filename=old_path)
+        old_id = img.id
+        face = self._attach_validated_face(img)
+
+        new_path = os.path.join(self.tmp_valid_dir, 'moved.jpg')
+        shutil.move(old_path, new_path)
+
+        # Simulate an earlier scan having already flagged this row missing,
+        # well past the grace period, without yet deleting it.
+        ImageFile.objects.filter(pk=old_id).update(
+            missing_since=timezone.now() - settings.MISSING_FILE_GRACE_PERIOD - timedelta(days=30)
+        )
+
+        create_image_file(new_path)
+
+        moved = ImageFile.objects.get(filename=new_path)
+        self.assertEqual(moved.id, old_id)
+        face.refresh_from_db()
+        self.assertEqual(face.source_image_file_id, moved.id)
+        self.assertTrue(face.validated)
+
+        # And the stale missing_since should self-heal on the next pass,
+        # now that the row's file genuinely exists again at the new path.
+        delete_removed_photos()
+        moved.refresh_from_db()
+        self.assertIsNone(moved.missing_since)
+
+    def test_old_row_already_deleted_before_new_path_discovered_loses_face_history(self):
+        # The known, accepted gap: if delete_removed_photos() actually
+        # deletes the old row (grace period genuinely expired) in a scan
+        # cycle that completes *before* the new path is ever discovered --
+        # i.e. the two halves of a move are more than one full cycle
+        # apart, each handled by a separate add_from_root_dir()/
+        # delete_removed_photos() pairing -- the link is gone for good.
+        # The next discovery of the new path creates a brand-new row with
+        # no face history. This test exists to make that limitation
+        # explicit and regression-checked, not to assert it's acceptable
+        # forever.
+        old_path = self.goodFiles[0]
+        create_image_file(old_path)
+        img = ImageFile.objects.get(filename=old_path)
+        old_id = img.id
+        self._attach_validated_face(img)
+
+        new_path = os.path.join(self.tmp_valid_dir, 'moved.jpg')
+        shutil.move(old_path, new_path)
+
+        # Old row already past its grace period, and a scan cycle actually
+        # runs delete_removed_photos() -- with the new path NOT yet
+        # discovered (simulating it landing in a later, separate cycle).
+        ImageFile.objects.filter(pk=old_id).update(
+            missing_since=timezone.now() - settings.MISSING_FILE_GRACE_PERIOD - timedelta(minutes=1)
+        )
+        delete_removed_photos()
+        self.assertFalse(ImageFile.objects.filter(pk=old_id).exists())
+        self.assertFalse(Face.objects.filter(source_image_file_id=old_id).exists())
+
+        # Only now does a later cycle discover the new path.
+        create_image_file(new_path)
+        moved = ImageFile.objects.get(filename=new_path)
+        self.assertNotEqual(moved.id, old_id)
+        self.assertEqual(Face.objects.filter(source_image_file=moved).count(), 0)
+
+    def test_two_rows_share_hash_one_missing_one_present_reuses_only_the_missing_one(self):
+        # Reproduces the contaminated state actually found in production:
+        # two live ImageFile rows ended up sharing one pixel_hash (one
+        # orphaned at a dead path, one real). This isn't something
+        # create_image_file() can produce on its own -- its own duplicate
+        # check prevents it -- so it's constructed directly here, the same
+        # way the real contamination must have arisen outside this
+        # function's own normal control flow. A third path with the same
+        # content should correctly reuse/rename the row whose file is
+        # missing, and must never touch the row whose file is still
+        # genuinely present.
+        present_path = self.goodFiles[0]
+        create_image_file(present_path)
+        present_row = ImageFile.objects.get(filename=present_path)
+        present_face = self._attach_validated_face(present_row, person_name='Present Row Person')
+
+        orphan_path = os.path.join(self.tmp_valid_dir, 'orphan_source.jpg')
+        shutil.copy(present_path, orphan_path)
+        orphan_row = ImageFile.objects.create(
+            filename=orphan_path,
+            directory=present_row.directory,
+            pixel_hash=present_row.pixel_hash,
+            file_hash=present_row.file_hash,
+            width=present_row.width,
+            height=present_row.height,
+            orientation=present_row.orientation,
+            dateAdded=timezone.now(),
+            dateModified=timezone.now(),
+        )
+        orphan_face = self._attach_validated_face(orphan_row, person_name='Orphan Row Person')
+        # The orphan's own file is now gone -- it was only ever a stand-in
+        # to get two live rows sharing a hash; what matters is that its
+        # *file* is missing while the other row's file remains present.
+        os.remove(orphan_path)
+
+        new_path = os.path.join(self.tmp_valid_dir, 'reunited.jpg')
+        shutil.copy(present_path, new_path)
+        create_image_file(new_path)
+
+        # The orphan row should have been renamed/reused -- its face
+        # travels with it.
+        self.assertFalse(ImageFile.objects.filter(pk=orphan_row.pk, filename=orphan_path).exists())
+        reused = ImageFile.objects.get(filename=new_path)
+        self.assertEqual(reused.id, orphan_row.id)
+        orphan_face.refresh_from_db()
+        self.assertEqual(orphan_face.source_image_file_id, reused.id)
+
+        # The genuinely-present row must be completely untouched.
+        present_row.refresh_from_db()
+        self.assertEqual(present_row.filename, present_path)
+        self.assertTrue(os.path.exists(present_path))
+        present_face.refresh_from_db()
+        self.assertEqual(present_face.source_image_file_id, present_row.id)
+
+    def test_duplicate_recorded_not_reused_when_old_file_still_present(self):
+        # A true copy (not a move): the original file is still on disk at
+        # scan time. The new path should be recorded as a DuplicateFile
+        # pointing at the original, not given its own ImageFile row --
+        # confirms this case (what the investigation suspected might
+        # explain the "overwriting a subset" comment) stays safe and
+        # doesn't fabricate a second real row either.
+        original_path = self.goodFiles[0]
+        create_image_file(original_path)
+        original = ImageFile.objects.get(filename=original_path)
+        face = self._attach_validated_face(original)
+
+        copy_path = os.path.join(self.tmp_valid_dir, 'copy.jpg')
+        shutil.copy(original_path, copy_path)
+        create_image_file(copy_path)
+
+        self.assertFalse(ImageFile.objects.filter(filename=copy_path).exists())
+        self.assertTrue(DuplicateFile.objects.filter(filename=copy_path, original=original).exists())
+        self.assertTrue(os.path.exists(original_path))
+        face.refresh_from_db()
+        self.assertEqual(face.source_image_file_id, original.id)
+
+
 class DirectoryTests(TestCase):
     @override_settings(MEDIA_ROOT='/tmp')
 
@@ -1161,7 +1375,7 @@ class DirectoryDateFallbackTests(TestCase):
         obj = ImageFile(
             filename=filename,
             directory=directory,
-            thumbnail_big="", thumbnail_medium="", thumbnail_small="",
+            thumbnail_small="",
             pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
             file_hash=binascii.hexlify(os.urandom(16)).decode(),
             width=10, height=10,
@@ -1338,24 +1552,22 @@ class DeleteOldThumbnailsTests(TestCase):
 
         # Simulate exactly the real scenario: the field still points at a
         # name, but the file itself is already gone.
-        os.remove(img.thumbnail_big.path)
+        os.remove(img.thumbnail_small.path)
 
         delete_old_thumbnails(img)  # must not raise
 
-        self.assertIsNone(img.thumbnail_big.name)
-        self.assertIsNone(img.thumbnail_medium.name)
         self.assertIsNone(img.thumbnail_small.name)
 
     def test_still_deletes_files_that_do_exist(self):
         path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/naming/good/1.JPG"
         create_image_file(path)
         img = ImageFile.objects.get(filename=path)
-        medium_path = img.thumbnail_medium.path
-        self.assertTrue(os.path.isfile(medium_path))
+        small_path = img.thumbnail_small.path
+        self.assertTrue(os.path.isfile(small_path))
 
         delete_old_thumbnails(img)
 
-        self.assertFalse(os.path.isfile(medium_path))
+        self.assertFalse(os.path.isfile(small_path))
 
 
 @override_settings(MEDIA_ROOT='/tmp/filepopulator_test_media')
@@ -1532,7 +1744,7 @@ class HeicIngestionTests(TestCase):
             self.assertEqual(img.orientation, 1)
             self.assertGreater(img.width, 0)
             self.assertGreater(img.height, 0)
-            self.assertTrue(os.path.isfile(img.thumbnail_big.path))
+            self.assertTrue(os.path.isfile(img.thumbnail_small.path))
 
     def test_add_from_root_dir_discovers_heic_files(self):
         # Regression test for a fixed bug: add_from_root_dir() used to
@@ -1586,7 +1798,7 @@ class HeicIngestionTests(TestCase):
         # relative to the raw (unrotated) decode.
         self.assertEqual(img.width, raw_height)
         self.assertEqual(img.height, raw_width)
-        self.assertTrue(os.path.isfile(img.thumbnail_big.path))
+        self.assertTrue(os.path.isfile(img.thumbnail_small.path))
 
     def test_all_orientation_codes_round_trip_correctly_on_real_photos(self):
         # Broader validation for the same fix as
@@ -1676,7 +1888,7 @@ class HeicIngestionTests(TestCase):
 
         self.assertFalse(FailedImageFile.objects.filter(filename=path).exists())
         obj = ImageFile.objects.get(filename=path)
-        self.assertTrue(os.path.isfile(obj.thumbnail_big.path))
+        self.assertTrue(os.path.isfile(obj.thumbnail_small.path))
 
     def test_save_does_not_redecode_when_image_already_populated(self):
         # Real perf bug found 2026-09-18 while profiling why this test
@@ -1732,7 +1944,7 @@ class NormalizeNullIslandGpsTests(TestCase):
         obj = ImageFile(
             filename=filename,
             directory=directory,
-            thumbnail_big="", thumbnail_medium="", thumbnail_small="",
+            thumbnail_small="",
             pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
             file_hash=binascii.hexlify(os.urandom(16)).decode(),
             width=10, height=10,
@@ -1896,7 +2108,7 @@ class BackfillGeocodingTests(TestCase):
         obj = ImageFile(
             filename=filename,
             directory=directory,
-            thumbnail_big="", thumbnail_medium="", thumbnail_small="",
+            thumbnail_small="",
             pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
             file_hash=binascii.hexlify(os.urandom(16)).decode(),
             width=10, height=10,
@@ -2232,7 +2444,7 @@ class SimilarityTests(TestCase):
         obj = ImageFile(
             filename=filename,
             directory=directory,
-            thumbnail_big="", thumbnail_medium="", thumbnail_small="",
+            thumbnail_small="",
             pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
             file_hash=binascii.hexlify(os.urandom(16)).decode(),
             width=10, height=10,
@@ -2379,14 +2591,14 @@ class PhashBackfillTests(TestCase):
     def test_does_not_touch_pixel_hash_or_thumbnails(self):
         obj = self._ingest_real_image('1.JPG')
         original_pixel_hash = obj.pixel_hash
-        original_thumb = obj.thumbnail_big.name
+        original_thumb = obj.thumbnail_small.name
         ImageFile.objects.filter(id=obj.id).update(phash=None)
 
         call_command('backfill_phash')
 
         obj.refresh_from_db()
         self.assertEqual(obj.pixel_hash, original_pixel_hash)
-        self.assertEqual(obj.thumbnail_big.name, original_thumb)
+        self.assertEqual(obj.thumbnail_small.name, original_thumb)
 
     def test_multiprocess_backfill_matches_single_process_result(self):
         obj_a = self._ingest_real_image('1.JPG')

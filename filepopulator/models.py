@@ -277,6 +277,15 @@ class Directory(models.Model):
             self.first_datesec = int(first_date)
             self.first_datetime = datetime.fromtimestamp(self.first_datesec, pytz.utc)
     
+# Neither of these is referenced by any current field (thumbnail_big/
+# thumbnail_medium were removed 2026-10-08) -- kept anyway because
+# migrations 0001 and 0007 serialize their upload_to as a direct reference
+# to filepopulator.models.thumbnail_big_path/thumbnail_med_path, resolved
+# by Python import when those migration files actually run. Deleting
+# these functions would break a from-scratch `migrate` (a fresh CI/dev
+# database replaying the full migration history) the moment it reaches
+# either of those historical migrations, even though no live code path
+# uses them anymore.
 def thumbnail_big_path(instance, filename):
     first_dir = filename[:2]
     second_dir = filename[2]
@@ -415,12 +424,13 @@ class ImageFile(models.Model):
 
     full_res_path = models.CharField(max_length=1024, null=True, default=None)
 
-    # Thumbnails 
-    # thumbnail_big = models.ImageField(upload_to='thumbnails_big', editable=False, default=None)
-    # thumbnail_medium = models.ImageField(upload_to='thumbnails_med', editable=False, default=None)
-    # thumbnail_small = models.ImageField(upload_to='thumbnails_small', editable=False, default=None)
-    thumbnail_big = models.ImageField(upload_to=thumbnail_big_path, editable=False, default=None)
-    thumbnail_medium = models.ImageField(upload_to=thumbnail_med_path, editable=False, default=None)
+    # thumbnail_big/thumbnail_medium removed 2026-10-08 (migration
+    # filepopulator.0019) -- zero real consumers across every frontend/
+    # mobile client (checked directly: dev_facewire, facewires_frontend,
+    # net_slideshow, PhotoVerify). Every "show me the full photo" path
+    # goes through the slideshow KeyedImageView type (live-resizes the
+    # original) instead. See CLAUDE.md for the full writeup, including the
+    # 28.4GB on-disk reclaim.
     thumbnail_small = models.ImageField(upload_to=thumbnail_small_path, editable=False, default=None)
 
     # square_thumbnail = models.ImageField(upload_to='square_thumbnails')
@@ -905,10 +915,13 @@ class ImageFile(models.Model):
         #     print("Couldn't open")  
         #     return False
 
-        thumb_fields = [self.thumbnail_big, self.thumbnail_medium, self.thumbnail_small]
-        thumb_sizes = [settings.FILEPOPULATOR_THUMBNAIL_SIZE_BIG, \
-                        settings.FILEPOPULATOR_THUMBNAIL_SIZE_MEDIUM, \
-                        settings.FILEPOPULATOR_THUMBNAIL_SIZE_SMALL]
+        # Only thumbnail_small is still generated -- thumbnail_big/
+        # thumbnail_medium removed 2026-10-08 (zero real consumers, see
+        # the field comment above). Kept as single-element lists (rather
+        # than collapsing the loop below) so this reads as a direct,
+        # minimal diff from the prior three-size version.
+        thumb_fields = [self.thumbnail_small]
+        thumb_sizes = [settings.FILEPOPULATOR_THUMBNAIL_SIZE_SMALL]
 
         # JPEG (FTYPE below) can't encode an alpha channel or a palette --
         # found via a real production HEIC file that decoded to RGBA mode
@@ -1033,7 +1046,7 @@ class ImageFile(models.Model):
         # case for a status-only update like find_and_encode_faces()'s)
         # already has all three fields populated from that fetch, so this
         # correctly skips the redundant work for exactly that case.
-        has_all_thumbnails = bool(self.thumbnail_big) and bool(self.thumbnail_medium) and bool(self.thumbnail_small)
+        has_all_thumbnails = bool(self.thumbnail_small)
         if not has_all_thumbnails and not self._generate_thumbnail():
             raise Exception('Could not create thumbnail - is the file type valid?')
         super(ImageFile, self).save(*args, **kwargs)
@@ -1067,16 +1080,8 @@ class ImageFile(models.Model):
         # file = ImageFile.objects.filter(id=self.id)
         # os.remove(file[0].thumbnail_small.path)
         try:
-            os.remove(self.thumbnail_big.path)
-        except Exception as e: 
-            pass
-        try:
-            os.remove(self.thumbnail_medium.path)
-        except Exception as e: 
-            pass
-        try:
             os.remove(self.thumbnail_small.path)
-        except Exception as e: 
+        except Exception as e:
             pass
         super(ImageFile, self).delete()
 
@@ -1162,8 +1167,10 @@ class VideoFile(models.Model):
     # for every new video going forward by create_video_file().
     content_hash = models.CharField(max_length=64, null=True, blank=True, db_index=True)
 
-    thumbnail_big = models.ImageField(upload_to=thumbnail_big_path, editable=False, default=None)
-    thumbnail_medium = models.ImageField(upload_to=thumbnail_med_path, editable=False, default=None)
+    # thumbnail_big/thumbnail_medium removed 2026-10-08 (migration
+    # filepopulator.0019) -- never populated in the first place (Phase 2
+    # video thumbnailing was never built), same removal as ImageFile's
+    # equivalent fields. See CLAUDE.md.
     thumbnail_small = models.ImageField(upload_to=thumbnail_small_path, editable=False, default=None)
 
     duration_seconds = models.FloatField(default=0)
@@ -1311,11 +1318,10 @@ class VideoFile(models.Model):
         for face in Face.objects.filter(source_video_file=self):
             face.delete()
 
-        for thumb in (self.thumbnail_big, self.thumbnail_medium, self.thumbnail_small):
-            try:
-                os.remove(thumb.path)
-            except Exception:
-                pass
+        try:
+            os.remove(self.thumbnail_small.path)
+        except Exception:
+            pass
 
         super(VideoFile, self).delete()
 

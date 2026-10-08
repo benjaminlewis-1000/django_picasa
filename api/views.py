@@ -1276,11 +1276,16 @@ class KeyedImageView(APIView):
           fetch at all; every other face_source request is unaffected by
           `fast` (image-sourced faces have no video path to begin with).
         slideshow: key type: image. Gets a reduced resolution image for the slideshow.
-        full_big/medium/small: key type: image. Gets the corresponding thumbnail image.
+        full_small: key type: image. Gets the pre-generated small thumbnail
+          (used by the Folders tab's grid view). full_big/full_medium were
+          removed 2026-10-08 -- zero real consumers across every frontend/
+          mobile client; every "show me the full photo" path goes through
+          slideshow (live-resized from the original) instead. See
+          CLAUDE.md.
         '''
 
         params = self.request.query_params
-        valid_types = ['face_highlight', 'face_array', 'face_source', 'slideshow', 'full_big', 'full_medium', 'full_small']
+        valid_types = ['face_highlight', 'face_array', 'face_source', 'slideshow', 'full_small']
         
         def err_404(message=""):
             msg_start = f'Invalid request. Url is of format (/keyed_image/<type>/?id=<int>&access_key=<string>). Valid types include {valid_types}. \n\n'
@@ -1389,14 +1394,9 @@ class KeyedImageView(APIView):
                     height = settings.DEFAULT_RESOLUTION_HEIGHT
 
                 width = 1920 / 1080 * height
-            elif image_type in ['full_big', 'full_medium', 'full_small']:
+            elif image_type == 'full_small':
                 img_obj = getAndCheckID('image', id_key)
-                if image_type == 'full_big':
-                    image = img_obj.thumbnail_big
-                elif image_type == 'full_medium':
-                    image = img_obj.thumbnail_medium
-                elif image_type == 'full_small':
-                    image = img_obj.thumbnail_small
+                image = img_obj.thumbnail_small
                     
         except:
             return err_404(f'Bad id for object of type {image_type}')
@@ -1417,7 +1417,7 @@ class KeyedImageView(APIView):
                 src = face.source_image_file or face.source_video_file
                 date_taken = src.dateTaken if src is not None else None
                 filename = src.filename if src is not None else None
-            elif image_type in ('slideshow', 'full_big', 'full_medium', 'full_small'):
+            elif image_type in ('slideshow', 'full_small'):
                 date_taken = img_obj.dateTaken
                 filename = img_obj.filename
             else:

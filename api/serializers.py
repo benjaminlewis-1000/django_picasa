@@ -77,7 +77,7 @@ class ImageFileSerializer(serializers.HyperlinkedModelSerializer):
         fields = ['url', 'id', 'filename', 'pixel_hash', 'file_hash', 'camera_make', 'camera_model', \
                   'flash_info', 'exposure_num', 'exposure_denom', 'focal_num', 'focal_denom', \
                   'fnumber_num', 'fnumber_denom', 'iso_value', 'light_source', 'gps_lat_decimal', \
-                  'gps_lon_decimal', 'thumbnail_big', 'thumbnail_medium', 'thumbnail_small', \
+                  'gps_lon_decimal', 'thumbnail_small', \
                   'full_res_path',  'exposure', 'directory', 'dateTaken', 'tags', 'description', 'isProcessed', \
                   'parsed_date', 'face_set']
 
@@ -86,7 +86,7 @@ class ImageSummarySerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
 
         model = ImageFile
-        fields = ['url', 'filename', 'thumbnail_big', 'thumbnail_medium', 'thumbnail_small', \
+        fields = ['url', 'filename', 'thumbnail_small', \
                   'directory']
 
       

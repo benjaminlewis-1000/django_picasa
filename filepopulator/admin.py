@@ -5,12 +5,12 @@ import admin_thumbnails
 
 from .models import ImageFile, Directory
 
-# Set the thumbnail style for the image files, with
-# a width of 500px. We define the thumbnail_big
-# field as the one that is shown in the admin panel.
-# We omit the medium and small thumbnails since
-# that would be redundant.
-admin_thumbnails.ADMIN_THUMBNAIL_STYLE = {'display': 'block', 'width': '500px', 'height': 'auto'}
+# Set the thumbnail style for the image files. thumbnail_big/medium were
+# removed 2026-10-08 (zero real consumers -- see CLAUDE.md); the admin
+# preview now uses thumbnail_small (100x100) instead -- smaller than the
+# old 500px preview, but this isn't part of the real review workflow
+# (that's all frontend), just an admin-page convenience.
+admin_thumbnails.ADMIN_THUMBNAIL_STYLE = {'display': 'block', 'width': '100px', 'height': 'auto'}
 
 # Define how the list of all of the file objects will look.
 def obj_filename(obj):
@@ -21,9 +21,9 @@ def directory_names(obj):
     return obj.dir_path
 directory_names.short_description = "Folder"
 
-# Use a decorator to say that the thumbnail should be
-# thumbnail-big. Other thumbnails are redundant and smaller.
-@admin_thumbnails.thumbnail('thumbnail_big')
+# Use a decorator to say that the thumbnail should be thumbnail_small
+# (the only thumbnail size still generated -- see above).
+@admin_thumbnails.thumbnail('thumbnail_small')
 class ImageFileAdmin(admin.ModelAdmin):
 
     # Set the value for fields that are empty.
@@ -39,7 +39,7 @@ class ImageFileAdmin(admin.ModelAdmin):
     # Set basic and advanced options.
     fieldsets = (
         (None, {
-            'fields': ('filename', 'directory', 'thumbnail_big_thumbnail', 'dateAdded', \
+            'fields': ('filename', 'directory', 'thumbnail_small_thumbnail', 'dateAdded', \
             	'dateModified', 'dateTaken', 'dateTakenValid', 'width', 'height', 'orientation')
         }),
 
