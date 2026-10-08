@@ -277,25 +277,12 @@ class Directory(models.Model):
             self.first_datesec = int(first_date)
             self.first_datetime = datetime.fromtimestamp(self.first_datesec, pytz.utc)
     
-# Neither of these is referenced by any current field (thumbnail_big/
-# thumbnail_medium were removed 2026-10-08) -- kept anyway because
-# migrations 0001 and 0007 serialize their upload_to as a direct reference
-# to filepopulator.models.thumbnail_big_path/thumbnail_med_path, resolved
-# by Python import when those migration files actually run. Deleting
-# these functions would break a from-scratch `migrate` (a fresh CI/dev
-# database replaying the full migration history) the moment it reaches
-# either of those historical migrations, even though no live code path
-# uses them anymore.
-def thumbnail_big_path(instance, filename):
-    first_dir = filename[:2]
-    second_dir = filename[2]
-    return f"thumbnails_big/{first_dir}/{second_dir}/{filename}"
-
-def thumbnail_med_path(instance, filename):
-    first_dir = filename[:2]
-    second_dir = filename[2]
-    return f"thumbnails_med/{first_dir}/{second_dir}/{filename}"
-
+# thumbnail_big_path/thumbnail_med_path removed 2026-10-08 along with the
+# fields they served (thumbnail_big/thumbnail_medium -- zero real
+# consumers, see CLAUDE.md). Migrations 0001 and 0007 each got their own
+# frozen local copy of these two functions (so their historical
+# `upload_to=` references no longer need to resolve against this module)
+# rather than leaving the functions here unused forever.
 def thumbnail_small_path(instance, filename):
     first_dir = filename[:2]
     second_dir = filename[2]

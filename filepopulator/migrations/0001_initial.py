@@ -9,6 +9,27 @@ import filepopulator.models
 from django.db import migrations, models
 
 
+# Frozen local copies of thumbnail_big_path/thumbnail_med_path, added
+# 2026-10-08 when those functions were deleted from filepopulator/
+# models.py (the fields they served, ImageFile/VideoFile.thumbnail_big/
+# thumbnail_medium, were removed in migration 0019 -- zero real
+# consumers, see CLAUDE.md). This migration's own `operations` list is a
+# plain Python literal evaluated at import time, so it needs *some*
+# importable callable to point `upload_to` at regardless of whether the
+# live models.py still defines one -- copied here rather than left
+# dangling in models.py forever, since this field is long gone by the
+# time any fresh database finishes migrating anyway.
+def thumbnail_big_path(instance, filename):
+    first_dir = filename[:2]
+    second_dir = filename[2]
+    return f"thumbnails_big/{first_dir}/{second_dir}/{filename}"
+
+def thumbnail_med_path(instance, filename):
+    first_dir = filename[:2]
+    second_dir = filename[2]
+    return f"thumbnails_med/{first_dir}/{second_dir}/{filename}"
+
+
 class Migration(migrations.Migration):
 
     initial = True
@@ -44,8 +65,8 @@ class Migration(migrations.Migration):
                 ('pixel_hash', models.CharField(default=-1, max_length=64)),
                 ('file_hash', models.CharField(default=-1, max_length=64)),
                 ('full_res_path', models.CharField(default=None, max_length=1024, null=True)),
-                ('thumbnail_big', models.ImageField(default=None, editable=False, upload_to=filepopulator.models.thumbnail_big_path)),
-                ('thumbnail_medium', models.ImageField(default=None, editable=False, upload_to=filepopulator.models.thumbnail_med_path)),
+                ('thumbnail_big', models.ImageField(default=None, editable=False, upload_to=thumbnail_big_path)),
+                ('thumbnail_medium', models.ImageField(default=None, editable=False, upload_to=thumbnail_med_path)),
                 ('thumbnail_small', models.ImageField(default=None, editable=False, upload_to=filepopulator.models.thumbnail_small_path)),
                 ('camera_make', models.CharField(blank=True, max_length=64, null=True)),
                 ('camera_model', models.CharField(blank=True, max_length=64, null=True)),
