@@ -391,6 +391,23 @@ def create_image_file(file_path):
                 for stale_face in Face.objects.filter(source_image_file=exist_photo):
                     stale_face.delete()
 
+                # Capture the OLD thumbnail file's path before exist_photo
+                # gets reassigned to new_photo below -- that fresh instance
+                # has no thumbnail_small set, so save() generates a brand
+                # new file under a new random name, which would silently
+                # orphan this old one if nothing ever deleted it. Found
+                # 2026-10-08 while root-causing a real 436K-file orphaned-
+                # thumbnail backlog -- this exact branch was the single
+                # biggest source of it (every orientation-change event,
+                # not a rare case). Only deleted once the new save
+                # actually succeeds -- see the pixel-hash-changed branch
+                # below for the same "keep the old file until the
+                # replacement is confirmed good" reasoning.
+                try:
+                    old_thumbnail_path = exist_photo.thumbnail_small.path
+                except ValueError:
+                    old_thumbnail_path = None
+
                 # Regression fix: new_photo was constructed via
                 # ImageFile(filename=file_path) with no pk, so
                 # `exist_photo = new_photo` followed by .save() performed
@@ -413,7 +430,12 @@ def create_image_file(file_path):
                 exist_photo.dateAdded = timezone.now()
                 exist_photo.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
                 exist_photo.isProcessed = False
-                instance_clean_and_save(exist_photo)
+                saved, _error = instance_clean_and_save(exist_photo)
+                if saved and old_thumbnail_path:
+                    try:
+                        os.remove(old_thumbnail_path)
+                    except FileNotFoundError:
+                        pass
                 return
         else:
             # The pixel hash changed -- normally means the file was

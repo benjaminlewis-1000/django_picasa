@@ -336,6 +336,26 @@ class FaceViewSetTests(ApiTestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_set_as_person_thumbnail_deletes_the_old_highlight_file(self):
+        # Real incident, 2026-10-08: this endpoint reassigns
+        # person.highlight_img.save(...) on an EXISTING person -- Django's
+        # FieldFile never deletes the file it's replacing, so every time
+        # someone picked a new representative photo for a person, the old
+        # highlight file was silently orphaned. Found while root-causing a
+        # real orphaned-file backlog (323 of 1238 face_highlights files,
+        # ~26%, were exactly this).
+        person = self.face.declared_name
+        old_highlight_path = person.highlight_img.path
+        self.assertTrue(os.path.isfile(old_highlight_path))
+
+        resp = self.client.put(f"/api/faces/{self.face.id}/set_as_person_thumbnail/")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertFalse(os.path.isfile(old_highlight_path))
+        person.refresh_from_db()
+        self.assertTrue(os.path.isfile(person.highlight_img.path))
+        self.assertNotEqual(person.highlight_img.path, old_highlight_path)
+
     def test_reject_association_model_method_still_works_directly(self):
         # Face.reject_association() is still live -- bulk_thread()'s
         # close_assigned branch calls it to decline a possible-match
