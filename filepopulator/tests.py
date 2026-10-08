@@ -1301,6 +1301,154 @@ class MovedFileFaceContinuityTests(TestCase):
         self.assertEqual(face.source_image_file_id, original.id)
 
 
+@override_settings(MEDIA_ROOT='/tmp/cleanup_orphaned_media_test')
+class CleanupOrphanedMediaFilesTests(TestCase):
+    """cleanup_orphaned_media_files, added 2026-10-08 alongside the
+    thumbnail_big/thumbnail_medium removal -- those two directories are
+    now entirely dead (every file in them is an orphan by definition,
+    since no field references them anymore), and checking confirmed the
+    *other* thumbnail directories (thumbnails_small, shared by ImageFile/
+    VideoFile; face_thumbnails; face_highlights) have real, substantial
+    pre-existing orphan backlogs too (re-processing/restore incidents
+    leaving behind files a row no longer points to)."""
+
+    def setUp(self):
+        self.media_root = settings.MEDIA_ROOT
+        if os.path.exists(self.media_root):
+            shutil.rmtree(self.media_root)
+        os.makedirs(self.media_root)
+        self.old_time = time.time() - 48 * 3600  # comfortably past the 24h default
+
+    def tearDown(self):
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def _write_file(self, rel_path, content=b'x', mtime=None):
+        full_path = os.path.join(self.media_root, rel_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, 'wb') as f:
+            f.write(content)
+        if mtime is not None:
+            os.utime(full_path, (mtime, mtime))
+        return full_path
+
+    def test_thumbnails_big_and_med_are_wiped_unconditionally(self):
+        # No field references these directories at all anymore -- every
+        # file in them is orphaned by construction, regardless of any DB
+        # state.
+        big_path = self._write_file('thumbnails_big/ab/c/old.jpg', mtime=self.old_time)
+        med_path = self._write_file('thumbnails_med/ab/c/old.jpg', mtime=self.old_time)
+
+        call_command('cleanup_orphaned_media_files')
+
+        self.assertFalse(os.path.exists(big_path))
+        self.assertFalse(os.path.exists(med_path))
+
+    def test_thumbnails_small_referenced_by_imagefile_is_kept(self):
+        rel_path = 'thumbnails_small/ab/c/kept.jpg'
+        full_path = self._write_file(rel_path, mtime=self.old_time)
+        directory, _ = Directory.objects.get_or_create(dir_path='/tmp/co_test')
+        ImageFile.objects.bulk_create([ImageFile(
+            filename='/tmp/co_test/a.jpg', directory=directory,
+            thumbnail_small=rel_path,
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=10, height=10,
+        )])
+
+        call_command('cleanup_orphaned_media_files')
+
+        self.assertTrue(os.path.exists(full_path))
+
+    def test_thumbnails_small_orphan_is_deleted(self):
+        orphan_path = self._write_file('thumbnails_small/ab/c/orphan.jpg', mtime=self.old_time)
+
+        call_command('cleanup_orphaned_media_files')
+
+        self.assertFalse(os.path.exists(orphan_path))
+
+    def test_thumbnails_small_referenced_by_videofile_is_kept(self):
+        rel_path = 'thumbnails_small/ab/c/kept_video.jpg'
+        full_path = self._write_file(rel_path, mtime=self.old_time)
+        directory, _ = Directory.objects.get_or_create(dir_path='/tmp/co_test_video')
+        VideoFile.objects.bulk_create([VideoFile(
+            filename='/tmp/co_test_video/a.mp4', directory=directory,
+            thumbnail_small=rel_path,
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=10, height=10,
+        )])
+
+        call_command('cleanup_orphaned_media_files')
+
+        self.assertTrue(os.path.exists(full_path))
+
+    def test_face_thumbnail_referenced_kept_orphan_deleted(self):
+        from face_manager.models import Person
+
+        kept_rel = 'face_thumbnails/ab/c/kept.jpg'
+        orphan_rel = 'face_thumbnails/ab/c/orphan.jpg'
+        kept_path = self._write_file(kept_rel, mtime=self.old_time)
+        orphan_path = self._write_file(orphan_rel, mtime=self.old_time)
+
+        directory, _ = Directory.objects.get_or_create(dir_path='/tmp/co_test_face')
+        img = ImageFile(
+            filename='/tmp/co_test_face/a.jpg', directory=directory,
+            thumbnail_small='',
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=10, height=10,
+        )
+        ImageFile.objects.bulk_create([img])
+        person, _ = Person.objects.get_or_create(person_name='Cleanup Orphan Test Person')
+        Face.objects.bulk_create([Face(
+            source_image_file=img, declared_name=person,
+            face_thumbnail=kept_rel,
+            box_left=1, box_top=1, box_right=5, box_bottom=5,
+        )])
+
+        call_command('cleanup_orphaned_media_files')
+
+        self.assertTrue(os.path.exists(kept_path))
+        self.assertFalse(os.path.exists(orphan_path))
+
+    def test_person_highlight_referenced_kept_orphan_deleted(self):
+        from face_manager.models import Person
+
+        kept_rel = 'face_highlights/a/kept.jpg'
+        orphan_rel = 'face_highlights/a/orphan.jpg'
+        kept_path = self._write_file(kept_rel, mtime=self.old_time)
+        orphan_path = self._write_file(orphan_rel, mtime=self.old_time)
+
+        Person.objects.filter(person_name='Cleanup Highlight Test Person').delete()
+        Person.objects.bulk_create([Person(
+            person_name='Cleanup Highlight Test Person', highlight_img=kept_rel,
+        )])
+
+        call_command('cleanup_orphaned_media_files')
+
+        self.assertTrue(os.path.exists(kept_path))
+        self.assertFalse(os.path.exists(orphan_path))
+
+    def test_recently_modified_orphan_is_not_deleted(self):
+        # Guards against the real race: a thumbnail file lands on disk
+        # moments before its owning row's save() actually commits -- a
+        # file that looks unreferenced in a query that ran a moment ago
+        # could just be mid-flight, not a genuine orphan.
+        recent_orphan = self._write_file('thumbnails_small/ab/c/brand_new.jpg')  # mtime = now
+
+        call_command('cleanup_orphaned_media_files')
+
+        self.assertTrue(os.path.exists(recent_orphan))
+
+    def test_dry_run_deletes_nothing(self):
+        big_path = self._write_file('thumbnails_big/ab/c/old.jpg', mtime=self.old_time)
+        orphan_path = self._write_file('thumbnails_small/ab/c/orphan.jpg', mtime=self.old_time)
+
+        call_command('cleanup_orphaned_media_files', '--dry-run')
+
+        self.assertTrue(os.path.exists(big_path))
+        self.assertTrue(os.path.exists(orphan_path))
+
+
 class DirectoryTests(TestCase):
     @override_settings(MEDIA_ROOT='/tmp')
 
