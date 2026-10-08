@@ -611,6 +611,16 @@ CELERY_BEAT_SCHEDULE = {
         # jobs above/below.
         'schedule': crontab(minute='15', hour='1'),
     },
+   'cleanup_orphaned_media': {
+        'task': 'filepopulator.cleanup_orphaned_media',
+        # Weekly, not daily -- this walks every file across 5 real media
+        # directories (a real backlog of 1.5M+ orphaned files found
+        # 2026-10-08), far heavier than a per-row check. Orphans only
+        # accumulate slowly from normal activity, so weekly is plenty.
+        # Sunday 4am: clear of db_picasa's daily backup (2am) and the
+        # first-Monday-3am weekly vacuum-swap.
+        'schedule': crontab(minute='0', hour='4', day_of_week='0'),
+    },
   'classify_unlabeled': {
       'task': 'face_manager.assign_faces',
       'schedule': crontab( minute = '0', hour='*'),
