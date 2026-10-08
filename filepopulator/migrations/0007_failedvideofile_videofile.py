@@ -8,6 +8,20 @@ import filepopulator.models
 from django.db import migrations, models
 
 
+# Frozen local copies of thumbnail_big_path/thumbnail_med_path -- see
+# 0001_initial.py's identical comment for why these are duplicated here
+# rather than imported from models.py.
+def thumbnail_big_path(instance, filename):
+    first_dir = filename[:2]
+    second_dir = filename[2]
+    return f"thumbnails_big/{first_dir}/{second_dir}/{filename}"
+
+def thumbnail_med_path(instance, filename):
+    first_dir = filename[:2]
+    second_dir = filename[2]
+    return f"thumbnails_med/{first_dir}/{second_dir}/{filename}"
+
+
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -32,8 +46,8 @@ class Migration(migrations.Migration):
                 ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
                 ('filename', models.CharField(db_index=True, max_length=1024, validators=[django.core.validators.RegexValidator(message='Filename must be a supported video format', regex='\\.(?:[mM][pP]4|[mM][oO][vV]|[mM][pP][gG]|[aA][vV][iI]|[mM]2[tT][sS]|[mM][tT][sS]|[wW][mM][vV]|3[gG][pP][pP]?|[mM]4[vV]|[mM][kK][vV])$')])),
                 ('file_hash', models.CharField(default=-1, max_length=64)),
-                ('thumbnail_big', models.ImageField(default=None, editable=False, upload_to=filepopulator.models.thumbnail_big_path)),
-                ('thumbnail_medium', models.ImageField(default=None, editable=False, upload_to=filepopulator.models.thumbnail_med_path)),
+                ('thumbnail_big', models.ImageField(default=None, editable=False, upload_to=thumbnail_big_path)),
+                ('thumbnail_medium', models.ImageField(default=None, editable=False, upload_to=thumbnail_med_path)),
                 ('thumbnail_small', models.ImageField(default=None, editable=False, upload_to=filepopulator.models.thumbnail_small_path)),
                 ('duration_seconds', models.FloatField(default=0)),
                 ('width', models.IntegerField(validators=[django.core.validators.MinValueValidator(1)])),
