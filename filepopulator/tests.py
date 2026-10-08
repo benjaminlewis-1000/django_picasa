@@ -1717,6 +1717,33 @@ class OrientationChangeReprocessTests(TestCase):
         img.refresh_from_db()
         self.assertFalse(img.isProcessed)
 
+    def test_orientation_change_deletes_the_old_thumbnail_file(self):
+        # Real incident, 2026-10-08: this branch reassigns exist_photo to
+        # a freshly-constructed instance (no thumbnail_small set), so
+        # save() generates a brand-new thumbnail file under a new random
+        # name -- the OLD one was never deleted, silently orphaning it.
+        # Found while root-causing a real 436K-file orphaned-thumbnail
+        # backlog; this exact branch was the single biggest source of it.
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/naming/good/1.JPG"
+        create_image_file(path)
+        img = ImageFile.objects.get(filename=path)
+        old_thumbnail_path = img.thumbnail_small.path
+        self.assertTrue(os.path.isfile(old_thumbnail_path))
+
+        from datetime import timedelta
+        ImageFile.objects.filter(pk=img.pk).update(
+            orientation=img.orientation + 1,
+            isProcessed=True,
+            dateModified=img.dateModified - timedelta(days=1),
+        )
+
+        create_image_file(path)
+
+        self.assertFalse(os.path.isfile(old_thumbnail_path))
+        new_img = ImageFile.objects.get(filename=path)
+        self.assertTrue(os.path.isfile(new_img.thumbnail_small.path))
+        self.assertNotEqual(new_img.thumbnail_small.path, old_thumbnail_path)
+
 
 class DeleteOldThumbnailsTests(TestCase):
     """Real incident, 2026-10-06: a restored-from-backup database can

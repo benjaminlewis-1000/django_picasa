@@ -3216,6 +3216,68 @@ class VideoFaceTrimmedCentroidTests(unittest.TestCase):
         np.testing.assert_allclose(centroid, expected)
 
 
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class VideoFaceSetBoxAndThumbnailOrphanTests(TestCase):
+    """_set_face_box_and_thumbnail() is called a second time, on the same
+    already-saved Face, when _classify_and_pick_thumbnail() re-picks a
+    better representative frame after a confident gallery match. Django's
+    FieldFile never deletes the file it's replacing on a plain
+    reassignment -- found 2026-10-08 while root-causing a real 188K-file
+    orphaned-face-thumbnail backlog. Uses object.__new__() to skip
+    VideoFaceExtractor.__init__()'s real ONNX/facenet model loading
+    entirely, since the method under test touches none of those models
+    -- pure box math + file I/O."""
+
+    def setUp(self):
+        from video_face_pipeline import VideoFaceExtractor
+        from filepopulator.models import Directory, VideoFile
+        self.extractor = object.__new__(VideoFaceExtractor)
+
+        directory = Directory.objects.create(dir_path='/tmp/video_orphan_test')
+        self.video = VideoFile.objects.create(
+            filename='/tmp/video_orphan_test/a.mp4', directory=directory,
+            width=320, height=240, duration_seconds=10.0,
+        )
+        self.blank_person, _ = Person.objects.get_or_create(person_name=settings.BLANK_FACE_NAME)
+        self.face = Face(
+            source_video_file=self.video, declared_name=self.blank_person,
+            box_left=1, box_top=1, box_right=50, box_bottom=50,
+        )
+        self.frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+    def test_second_call_deletes_the_first_calls_thumbnail_file(self):
+        # First call -- matches the real pipeline's own order (see
+        # _set_face_box_and_thumbnail's docstring on
+        # _classify_and_pick_thumbnail): the thumbnail is set once before
+        # the Face row is ever saved to the DB (Face.save() itself
+        # requires a thumbnail to already be attached), then the row is
+        # saved for real, standing in for "an already-saved Face row".
+        self.extractor._set_face_box_and_thumbnail(
+            self.face, self.frame, (10, 10, 60, 60), kps=[[0, 0]] * 5,
+        )
+        self.face.save()
+        first_thumbnail_path = self.face.face_thumbnail.path
+        self.assertTrue(os.path.isfile(first_thumbnail_path))
+
+        # Second call -- the real re-pick path.
+        self.extractor._set_face_box_and_thumbnail(
+            self.face, self.frame, (20, 20, 70, 70), kps=[[0, 0]] * 5,
+        )
+
+        self.assertFalse(os.path.isfile(first_thumbnail_path))
+        second_thumbnail_path = self.face.face_thumbnail.path
+        self.assertTrue(os.path.isfile(second_thumbnail_path))
+        self.assertNotEqual(first_thumbnail_path, second_thumbnail_path)
+
+    def test_first_call_on_a_fresh_face_does_not_error(self):
+        # No prior thumbnail exists yet -- must be a clean no-op, not a
+        # crash trying to delete something that was never there.
+        self.extractor._set_face_box_and_thumbnail(
+            self.face, self.frame, (10, 10, 60, 60), kps=[[0, 0]] * 5,
+        )
+        self.assertTrue(os.path.isfile(self.face.face_thumbnail.path))
+
+
 @tag("slow")
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class VideoFaceExtractorRealInferenceTests(TestCase):

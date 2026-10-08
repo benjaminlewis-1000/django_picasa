@@ -1086,6 +1086,21 @@ class VideoFaceExtractor(object):
                 face.source_video_file, timestamp_seconds, 'video_thumbnail_frame_seconds'
             )
 
+        # This is called a second time, on the same already-saved `face`,
+        # by _classify_and_pick_thumbnail() when a confident gallery match
+        # re-picks a better representative frame -- Django's FieldFile
+        # never deletes the file it's replacing on a plain reassignment,
+        # and the new save gets its own random-suffixed name (the
+        # provisional and re-picked frames don't share deterministic
+        # filenames), so the first call's thumbnail file would otherwise
+        # be silently orphaned. Found 2026-10-08 while root-causing a
+        # real 188K-file orphaned-face-thumbnail backlog. No-op on the
+        # first call (nothing saved yet).
+        try:
+            old_thumbnail_path = face.face_thumbnail.path
+        except ValueError:
+            old_thumbnail_path = None
+
         thumbnail = self._square_thumbnail(frame, box)
         is_success, buffer_img = cv2.imencode('.jpg', thumbnail)
         temp_thumb = BytesIO(buffer_img)
@@ -1093,6 +1108,12 @@ class VideoFaceExtractor(object):
         thumb_filename = f'video{face.source_video_file_id}_group_{face.id or "new"}.jpg'
         face.face_thumbnail.save(thumb_filename, ContentFile(temp_thumb.read()), save=False)
         temp_thumb.close()
+
+        if old_thumbnail_path:
+            try:
+                os.remove(old_thumbnail_path)
+            except FileNotFoundError:
+                pass
 
     def _compute_candidate_groups(self, video_obj: VideoFile):
         """The full detect->track->cluster->union-merge pipeline for one

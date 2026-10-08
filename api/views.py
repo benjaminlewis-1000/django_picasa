@@ -1013,11 +1013,30 @@ class FaceViewSet(viewsets.ModelViewSet):
         face = self.get_object()
         person = face.declared_name
 
+        # Capture the OLD highlight file's path before overwriting it --
+        # Django's FieldFile never deletes the file it's replacing on a
+        # plain reassignment, so every time someone picks a new
+        # representative photo for a person, the old one was silently
+        # orphaned. Found 2026-10-08 while root-causing a real orphaned-
+        # file backlog (323 of 1238 face_highlights files, ~26%, were
+        # exactly this).
+        try:
+            old_highlight_path = person.highlight_img.path
+        except ValueError:
+            old_highlight_path = None
+
         # print(person.person_name)
         filename, person_content_file = self.highlight_from_face(face, person.person_name)
-        person.highlight_img.save(filename, person_content_file) 
+        person.highlight_img.save(filename, person_content_file)
 
         person.save()
+
+        if old_highlight_path:
+            try:
+                os.remove(old_highlight_path)
+            except FileNotFoundError:
+                pass
+
         js = {'success': True}
         return HttpResponse(json.dumps(js), content_type='application/json')
 
