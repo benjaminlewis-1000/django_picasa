@@ -1448,6 +1448,40 @@ class CleanupOrphanedMediaFilesTests(TestCase):
         self.assertTrue(os.path.exists(big_path))
         self.assertTrue(os.path.exists(orphan_path))
 
+    def test_scheduled_task_deletes_orphans_and_respects_the_lock(self):
+        from filepopulator.tasks import cleanup_orphaned_media
+
+        orphan_path = self._write_file('thumbnails_big/ab/c/old.jpg', mtime=self.old_time)
+        cleanup_orphaned_media()
+        self.assertFalse(os.path.exists(orphan_path))
+
+        # While another session holds the advisory lock, the task must
+        # do nothing at all -- same contract as add_from_root_dir()'s own
+        # lock (see test_add_from_root_dir_skips_entirely_when_lock_already_held
+        # for why a genuinely separate connection is needed here, not
+        # another `with advisory_lock` on Django's own test connection).
+        second_orphan = self._write_file('thumbnails_big/ab/c/second.jpg', mtime=self.old_time)
+        cfg = connection.settings_dict
+        other = psycopg2.connect(
+            dbname=cfg['NAME'], user=cfg['USER'], password=cfg['PASSWORD'],
+            host=cfg['HOST'] or 'localhost', port=cfg['PORT'] or 5432,
+        )
+        other.autocommit = True
+        self.addCleanup(other.close)
+        key = zlib.crc32(b'filepopulator.cleanup_orphaned_media')
+        with other.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", [key])
+            self.assertTrue(cur.fetchone()[0])
+
+            cleanup_orphaned_media()
+            self.assertTrue(os.path.exists(second_orphan))
+
+            cur.execute("SELECT pg_advisory_unlock(%s)", [key])
+
+        # Once free again, a normal run still works.
+        cleanup_orphaned_media()
+        self.assertFalse(os.path.exists(second_orphan))
+
 
 class DirectoryTests(TestCase):
     @override_settings(MEDIA_ROOT='/tmp')

@@ -9,7 +9,7 @@ from celery import shared_task
 import time
 import os
 # import scripts
-from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods
+from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods, cleanup_orphaned_media_files
 from .video_scripts import add_videos_from_root_dir, delete_removed_videos
 
 if not settings.configured:
@@ -118,3 +118,18 @@ def find_similar_images():
 
     from .similarity import run_similarity_check
     run_similarity_check(limit=2000, log=settings.LOGGER.debug)
+
+@shared_task(ignore_result=True, name='filepopulator.cleanup_orphaned_media')
+def cleanup_orphaned_media():
+    # Weekly, not hourly/daily -- this walks every file in 5 real media
+    # directories (1.5M+ files found in the real backlog this was built
+    # to clear, 2026-10-08), not a cheap per-row check. Orphans accumulate
+    # slowly from normal reprocessing/move/restore activity, so a weekly
+    # sweep is plenty to keep the backlog from quietly rebuilding, without
+    # needing to run anywhere near as often as the hourly tasks above.
+    import common
+    with common.advisory_lock('filepopulator.cleanup_orphaned_media') as acquired:
+        if not acquired:
+            settings.LOGGER.debug("cleanup_orphaned_media already running, exiting.")
+            return
+        cleanup_orphaned_media_files(dry_run=False, min_age_hours=24.0, log=settings.LOGGER.info)
