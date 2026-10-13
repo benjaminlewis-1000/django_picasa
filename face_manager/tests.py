@@ -3012,6 +3012,128 @@ class BackfillDetScoreTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class BackfillVideoDetScoreTests(TestCase):
+    """backfill_video_det_score management command: re-extracts the
+    exact frame a video face's thumbnail/box came from, redetects in a
+    padded crop, and only trusts the result if it actually overlaps
+    (IOU >= 0.3) the already-stored box. Mocks VideoFaceExtractor
+    entirely (real model loading), plus ffprobe_info and
+    extract_frame_near_timestamp (real video decode) -- only the
+    command's own IOU-matching/counting logic is under test here."""
+
+    CMD_MODULE = 'face_manager.management.commands.backfill_video_det_score'
+
+    def setUp(self):
+        from filepopulator.models import Directory, VideoFile
+        directory, _ = Directory.objects.get_or_create(dir_path='/tmp/video_det_backfill_test')
+        self.video = VideoFile.objects.create(
+            filename='/tmp/video_det_backfill_test/a.mp4', directory=directory,
+            width=320, height=240, duration_seconds=10.0,
+        )
+        self.blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+
+    def _make_video_face(self, box=(10, 10, 50, 50)):
+        face = Face(
+            source_video_file=self.video, declared_name=self.blank_person,
+            box_left=box[0], box_top=box[1], box_right=box[2], box_bottom=box[3],
+            video_thumbnail_frame_seconds=1.5, det_score=None,
+        )
+        face.face_thumbnail.save(
+            "thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False
+        )
+        face.save()
+        return face
+
+    def _ffprobe_return(self):
+        # (width, height, avg_fps, field_order, rotation, color_transfer, sar_scale_width)
+        return (320, 240, 30.0, 'progressive', 0, None, None)
+
+    def test_matched_detection_sets_det_score(self):
+        face = self._make_video_face(box=(10, 10, 50, 50))
+        fake_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info', return_value=self._ffprobe_return()), \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=fake_frame):
+            MockExtractor.return_value._redetect_in_crop.return_value = (
+                [10, 10, 50, 50], [[0, 0]] * 5, 0.87,
+            )
+            call_command('backfill_video_det_score')
+
+        face.refresh_from_db()
+        self.assertAlmostEqual(face.det_score, 0.87)
+
+    def test_low_iou_match_is_rejected(self):
+        face = self._make_video_face(box=(10, 10, 50, 50))
+        fake_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info', return_value=self._ffprobe_return()), \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=fake_frame):
+            # Redetected box is far away -- essentially zero overlap.
+            MockExtractor.return_value._redetect_in_crop.return_value = (
+                [200, 200, 240, 240], [[0, 0]] * 5, 0.95,
+            )
+            call_command('backfill_video_det_score')
+
+        face.refresh_from_db()
+        self.assertIsNone(face.det_score)
+
+    def test_no_frame_extracted_skips(self):
+        face = self._make_video_face()
+
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info', return_value=self._ffprobe_return()), \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=None):
+            call_command('backfill_video_det_score')
+
+        face.refresh_from_db()
+        self.assertIsNone(face.det_score)
+
+    def test_no_detection_in_crop_skips(self):
+        face = self._make_video_face()
+        fake_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info', return_value=self._ffprobe_return()), \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=fake_frame):
+            MockExtractor.return_value._redetect_in_crop.return_value = None
+            call_command('backfill_video_det_score')
+
+        face.refresh_from_db()
+        self.assertIsNone(face.det_score)
+
+    def test_dry_run_does_not_save(self):
+        face = self._make_video_face(box=(10, 10, 50, 50))
+        fake_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info', return_value=self._ffprobe_return()), \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=fake_frame):
+            MockExtractor.return_value._redetect_in_crop.return_value = (
+                [10, 10, 50, 50], [[0, 0]] * 5, 0.87,
+            )
+            call_command('backfill_video_det_score', '--dry-run')
+
+        face.refresh_from_db()
+        self.assertIsNone(face.det_score)
+
+    def test_face_with_existing_det_score_is_excluded(self):
+        face = self._make_video_face()
+        Face.objects.filter(pk=face.pk).update(det_score=0.75)
+        fake_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info', return_value=self._ffprobe_return()) as mock_ffprobe, \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=fake_frame):
+            call_command('backfill_video_det_score')
+            mock_ffprobe.assert_not_called()
+
+        face.refresh_from_db()
+        self.assertAlmostEqual(face.det_score, 0.75)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class BackfillMissingFaceThumbnailsTests(TestCase):
     """backfill_missing_face_thumbnails management command: real
     incident, 2026-10-06 -- a restored-from-backup database referenced
