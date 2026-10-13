@@ -1295,6 +1295,129 @@ class DetScoreMarginGateTests(TestCase):
         mock_set2.assert_called_once()
         self.assertEqual(mock_set2.call_args[0][0], assigner2.ignore_person_id)
 
+    def _make_video_face_with_single_candidate(self, similarity, gallery_size=600, det_score=None):
+        # Same shape as _make_face_with_single_candidate, but the query
+        # face is video-sourced -- needed to exercise VIDEO_DET_SCORE_FLOOR
+        # and the video sub-gallery boost, neither of which a plain
+        # image-sourced query ever touches.
+        from filepopulator.models import Directory, VideoFile
+
+        assigner = faceAssigner()
+        person = make_person(f"VideoCandidate {similarity}-{gallery_size}-{det_score}")
+        assigner.likely_people_ids = [person.id]
+
+        query = np.zeros(512)
+        query[0] = 1.0
+        ref = query.copy()
+        ref[0] = similarity
+        ref[1] = np.sqrt(max(0.0, 1 - similarity ** 2))
+
+        assigner.embedding_dict = {person.id: np.tile(ref.reshape(512, 1), (1, gallery_size))}
+        assigner.norm_dict = {person.id: np.ones(gallery_size)}
+        assigner._build_concatenated_gallery()
+
+        directory, _ = Directory.objects.get_or_create(dir_path='/tmp/video_classify_test')
+        video = VideoFile.objects.create(
+            filename='/tmp/video_classify_test/a.mp4', directory=directory,
+            width=320, height=240, duration_seconds=10.0,
+        )
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        face = Face(
+            declared_name=blank_person, source_video_file=video,
+            box_left=1, box_top=1, box_right=40, box_bottom=40,
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.face_encoding_512 = query.tolist()
+        face.det_score = det_score
+        face.save()
+        return assigner, face, person
+
+    def test_video_query_uses_video_det_score_floor_not_image_floor(self):
+        # det_score=0.55 sits between VIDEO_DET_SCORE_FLOOR (0.5, passes)
+        # and the image-calibrated DET_SCORE_FLOOR (0.6, would fail) --
+        # must be accepted for a video query specifically because the
+        # lower, video-calibrated floor applies.
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        similarity = threshold + 0.20
+        assigner, face, person = self._make_video_face_with_single_candidate(
+            similarity=similarity, det_score=0.55,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        self.assertEqual(mock_set.call_args[0][0], person.id)
+
+    def test_image_query_at_same_det_score_still_uses_image_floor(self):
+        # Sanity check: the exact same det_score (0.55) on an IMAGE query
+        # still gets rejected -- confirms this is a video-specific floor,
+        # not an accidental global loosening.
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        similarity = threshold + 0.20
+        assigner, face, person = self._make_face_with_single_candidate(
+            similarity=similarity, det_score=0.55,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        self.assertEqual(mock_set.call_args[0][0], assigner.ignore_person_id)
+
+    def test_video_subgallery_boosts_a_candidate_above_threshold_for_video_query(self):
+        # Full-gallery similarity sits below the margin floor on its own;
+        # the SAME candidate's video-only sub-gallery scores it high
+        # enough to clear -- a video query should be accepted via that
+        # boost. CANDIDATE_MARGIN_FLOOR/DET_SCORE_FLOOR values are
+        # deliberately generous here (det_score=0.9, well above either
+        # floor) to isolate the sub-gallery boost itself.
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        below_margin = threshold + 0.01  # fails CANDIDATE_MARGIN_FLOOR on its own
+        above_margin = threshold + 0.20
+
+        assigner, face, person = self._make_video_face_with_single_candidate(
+            similarity=below_margin, det_score=0.9,
+        )
+
+        query = np.array(face.face_encoding_512)
+        video_ref = query.copy()
+        video_ref[0] = above_margin
+        video_ref[1] = np.sqrt(max(0.0, 1 - above_margin ** 2))
+        assigner.video_embedding_dict = {person.id: np.tile(video_ref.reshape(512, 1), (1, assigner.MIN_VIDEO_SUBGALLERY_SIZE))}
+        assigner.video_norm_dict = {person.id: np.ones(assigner.MIN_VIDEO_SUBGALLERY_SIZE)}
+        assigner._build_video_concatenated_gallery()
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        self.assertEqual(mock_set.call_args[0][0], person.id)
+
+    def test_video_subgallery_does_not_affect_image_query(self):
+        # Same boosted video sub-gallery as above, but the query itself
+        # is image-sourced -- must be completely ignored, keeping the
+        # already-tuned image classification path untouched.
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        below_margin = threshold + 0.01
+        above_margin = threshold + 0.20
+
+        assigner, face, person = self._make_face_with_single_candidate(
+            similarity=below_margin, det_score=0.9,
+        )
+
+        query = np.array(face.face_encoding_512)
+        video_ref = query.copy()
+        video_ref[0] = above_margin
+        video_ref[1] = np.sqrt(max(0.0, 1 - above_margin ** 2))
+        assigner.video_embedding_dict = {person.id: np.tile(video_ref.reshape(512, 1), (1, assigner.MIN_VIDEO_SUBGALLERY_SIZE))}
+        assigner.video_norm_dict = {person.id: np.ones(assigner.MIN_VIDEO_SUBGALLERY_SIZE)}
+        assigner._build_video_concatenated_gallery()
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        self.assertEqual(mock_set.call_args[0][0], assigner.ignore_person_id)
+
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class VerificationClusterGroupTests(TestCase):
