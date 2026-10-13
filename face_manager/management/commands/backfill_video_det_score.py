@@ -41,6 +41,13 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument('--dry-run', action='store_true')
         parser.add_argument('--limit', type=int, default=None)
+        parser.add_argument(
+            '--ignore-only', action='store_true',
+            help='Only process faces currently declared .ignore/.realignore -- lets a '
+                 'reclassification pass follow much sooner than waiting on the full '
+                 'backlog (which also includes faces already correctly declared to a '
+                 'real person, and ones still genuinely unassigned).',
+        )
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
@@ -50,6 +57,8 @@ class Command(BaseCommand):
             source_video_file__isnull=False, det_score__isnull=True,
             video_thumbnail_frame_seconds__isnull=False,
         ).select_related('source_video_file').order_by('source_video_file_id')
+        if options['ignore_only']:
+            qs = qs.filter(declared_name__person_name__in=['.ignore', '.realignore'])
         if limit:
             qs = qs[:limit]
 

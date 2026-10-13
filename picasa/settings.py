@@ -646,18 +646,25 @@ CELERY_BEAT_SCHEDULE = {
        'schedule': crontab(minute='0', hour='*/3'),
        'kwargs': {'max_runtime_seconds': 9000},
    },
-   # 'classify_unlabeled_all_weekly': {
-   #     'task': 'face_manager.assign_faces',
-   #     # This schedule should be sufficient to
-   #     # break race conditions with the more frequent
-   #     # task, which executes every 5 minutes. That
-   #     # should have very little to do on a run-to-run basis,
-   #     # so it should finish quickly and be done by the 
-   #     # time that minute 4 comes along and asks to 
-   #     # reclassify all of the faces. 
-   #     'schedule': crontab( minute = '4', hour='1', day_of_week=1),
-   #     'args': (True, ), # Reassign all faces. 
-   # },
+   'classify_unlabeled_all_weekly': {
+       'task': 'face_manager.assign_faces',
+       # Re-enabled 2026-10-13, per the video-classification investigation:
+       # the hourly 'classify_unlabeled' task (args=(False,)) only ever
+       # considers a face with poss_ident1 still NULL -- once ANY
+       # suggestion lands (including a soft .ignore proposal), it's
+       # skipped forever by that path. redo_all=True re-evaluates every
+       # face whose declared_name is still the blank sentinel regardless
+       # of its current poss_ident1, which is what actually lets gallery
+       # growth, threshold recalibrations (e.g. VIDEO_DET_SCORE_FLOOR/the
+       # video sub-gallery boost), and det_score backfill progress ever
+       # flip an existing soft .ignore proposal. NOTE: this still does
+       # NOT reach a face already hard-declared .ignore/.realignore
+       # (declared_name itself, not just poss_ident1) -- that population
+       # needs its own deliberate one-off reclassification pass, same as
+       # the earlier -0.05 threshold reclassification work.
+       'schedule': crontab( minute = '4', hour='1', day_of_week=1),
+       'args': (True, ), # Reassign all faces.
+   },
 
 
 }
