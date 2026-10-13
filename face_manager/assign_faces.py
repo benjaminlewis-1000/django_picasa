@@ -202,6 +202,30 @@ class faceAssigner():
         self.DET_SCORE_FLOOR = 0.6
         self.CANDIDATE_MARGIN_FLOOR = 0.03
 
+        # Added 2026-10-13 after a real investigation (prompted by the
+        # user noticing video faces miss classification much more often
+        # than image faces): video's detector (det_500m, a lighter model
+        # than the image pipeline's multi-scale PyramidalDetector) runs a
+        # systematically lower det_score even for genuinely good faces --
+        # confirmed against the user's own "flagged for review" set (video
+        # faces a human specifically flagged as "might actually be
+        # someone" after being auto-.ignore'd): p10=0.517, median=0.608,
+        # vs. the image-calibrated 0.6 floor above rejecting 47% of that
+        # trusted-positive population outright. A separate, lower floor
+        # for video queries keeps the same gate's intent (reject garbage/
+        # non-face detections) without applying an image-calibrated bar
+        # to a structurally different detector's score distribution.
+        self.VIDEO_DET_SCORE_FLOOR = 0.5
+
+        # How many of a candidate's own video-sourced faces are needed
+        # before their video-only sub-gallery is trusted as its own
+        # comparison target for a video-sourced query (see
+        # video_embedding_dict/_build_video_concatenated_gallery()) --
+        # below this, a tiny sample is no more reliable than noise (same
+        # reasoning as the >=3 floor used elsewhere in this file for
+        # cohesion/span stats).
+        self.MIN_VIDEO_SUBGALLERY_SIZE = 3
+
         # self.bogus_date = datetime(1990, 1, 1) # Very few images before that
         # self.bogus_date_utc = time.mktime(self.bogus_date.timetuple())
         self.ignore_person = Person.objects.filter(person_name=settings.SOFT_IGNORE_NAME)[0]
@@ -227,6 +251,15 @@ class faceAssigner():
         # faceAssigner built without going through load_encodings() (unit
         # tests that set embedding_dict/norm_dict directly).
         self.threshold_dict = {}
+
+        # Same fallback reasoning, for the video-only sub-gallery (see
+        # MIN_VIDEO_SUBGALLERY_SIZE below) -- an empty video_gallery_offsets
+        # with a zero-width all_video_embeddings means a video-sourced
+        # query just never finds a video sub-gallery match, same as
+        # before this feature existed.
+        self.video_gallery_offsets = {}
+        self.all_video_embeddings = np.zeros((512, 0))
+        self.all_video_norms = np.zeros(0)
 
         ########################################################
         # Map people to the likely earliest date they showed up in images,
@@ -328,6 +361,11 @@ class faceAssigner():
         self.embedding_dict = {}
         self.norm_dict = {}
         self.threshold_dict = {}
+        # Per-person video-only sub-gallery (see MIN_VIDEO_SUBGALLERY_SIZE
+        # and _build_video_concatenated_gallery()) -- only populated for
+        # candidates with enough video-sourced faces to trust.
+        self.video_embedding_dict = {}
+        self.video_norm_dict = {}
 
         cache_is_valid = False
         if os.path.exists(self.ENCODINGS_PKL_FILE) and not reload_pkl_file:
@@ -337,13 +375,14 @@ class faceAssigner():
             cached_date = combo_dict.get('built_date')
             today = datetime.now().date()
 
-            # 'threshold_dict' missing means this cache predates the
+            # 'threshold_dict'/'video_embedding_dict' missing means this
+            # cache predates the
             # cohesion/span nudge -- force a full rebuild rather than
             # silently falling back to the flat bucket threshold for
             # every candidate (which is what a plain .get() default would
             # do), since that's exactly the un-nudged behavior this
             # feature exists to replace.
-            has_threshold_dict = 'threshold_dict' in combo_dict
+            has_threshold_dict = 'threshold_dict' in combo_dict and 'video_embedding_dict' in combo_dict
 
             if has_threshold_dict and cached_date is not None and (today - cached_date).days < self.CACHE_MAX_AGE_DAYS:
                 cache_is_valid = True
@@ -356,13 +395,15 @@ class faceAssigner():
                 else:
                     print("Daily cache check: face data changed since last build -- rebuilding full cache.")
             else:
-                print("Cache predates the cohesion/span threshold nudge -- rebuilding full cache.")
+                print("Cache predates the cohesion/span threshold nudge or video sub-gallery -- rebuilding full cache.")
 
             if cache_is_valid:
                 self.candidate_dict = combo_dict['candidate_dict']
                 self.embedding_dict = combo_dict['embedding_dict']
                 self.norm_dict = combo_dict['norm_dict']
                 self.threshold_dict = combo_dict['threshold_dict']
+                self.video_embedding_dict = combo_dict['video_embedding_dict']
+                self.video_norm_dict = combo_dict['video_norm_dict']
 
         changed = not cache_is_valid
 
@@ -383,9 +424,9 @@ class faceAssigner():
 
             person_data = Face.objects \
                 .filter(faces_person & long_encoded & has_long)
-            data = person_data.values_list('id', 'face_encoding_512', 'dateTakenUTC')
+            data = person_data.values_list('id', 'face_encoding_512', 'dateTakenUTC', 'source_video_file_id')
 
-            df = pd.DataFrame(data, columns=['id', 'face_encoding_512', 'dateTakenUTC'])
+            df = pd.DataFrame(data, columns=['id', 'face_encoding_512', 'dateTakenUTC', 'source_video_file_id'])
 
             cmp_embedding = np.array(df['face_encoding_512'].tolist())
             norm_list = np.linalg.norm(cmp_embedding, axis=1)
@@ -393,6 +434,22 @@ class faceAssigner():
             assert self.embedding_dict[face_id].shape[0] == 512
             assert self.embedding_dict[face_id].shape[1] == len(norm_list)
             self.norm_dict[face_id] = norm_list
+
+            # Video-only sub-gallery for this person (see
+            # MIN_VIDEO_SUBGALLERY_SIZE's own comment in __init__) -- lets
+            # a video-sourced query compare against same-source-type
+            # exemplars too, where video-vs-video similarity for a
+            # genuine match runs measurably higher than video-vs-image
+            # (real investigation, 2026-10-13: 0.677 vs 0.597 mean,
+            # leave-one-out against 52 validated video faces -- see
+            # CLAUDE.md). Only kept when there's enough of them to trust.
+            video_mask = df['source_video_file_id'].notna().to_numpy()
+            if video_mask.sum() >= self.MIN_VIDEO_SUBGALLERY_SIZE:
+                self.video_embedding_dict[face_id] = cmp_embedding[video_mask].T
+                self.video_norm_dict[face_id] = norm_list[video_mask]
+            else:
+                self.video_embedding_dict.pop(face_id, None)
+                self.video_norm_dict.pop(face_id, None)
 
             # Per-person threshold nudge -- see THRESHOLD_NUDGE_REFERENCE_N's
             # own comment (in __init__) for the full investigation this
@@ -442,6 +499,8 @@ class faceAssigner():
                         'embedding_dict': self.embedding_dict,
                         'norm_dict': self.norm_dict,
                         'threshold_dict': self.threshold_dict,
+                        'video_embedding_dict': self.video_embedding_dict,
+                        'video_norm_dict': self.video_norm_dict,
                         'built_date': datetime.now().date(),
                         'signature': self._current_face_data_signature()}
             try:
@@ -451,6 +510,7 @@ class faceAssigner():
                 os.remove(self.ENCODINGS_PKL_FILE)
 
         self._build_concatenated_gallery()
+        self._build_video_concatenated_gallery()
         self._build_person_cache()
 
         print(f"Dataframe preloading: {time.time() - ss:.2f} seconds")
@@ -497,6 +557,35 @@ class faceAssigner():
         else:
             self.all_embeddings = np.zeros((512, 0))
             self.all_norms = np.zeros(0)
+
+    def _build_video_concatenated_gallery(self):
+        """Same technique as _build_concatenated_gallery(), over
+        video_embedding_dict instead -- only the (smaller) subset of
+        candidates with a trusted video-only sub-gallery (see
+        MIN_VIDEO_SUBGALLERY_SIZE) end up with an entry in
+        video_gallery_offsets. classify_unassigned() checks membership
+        there before ever computing anything against this gallery, so an
+        image-sourced query (which never consults this at all) pays zero
+        extra cost."""
+        person_ids = list(self.video_embedding_dict.keys())
+        self.video_gallery_offsets = {}
+        cursor = 0
+        embedding_chunks = []
+        norm_chunks = []
+        for person_id in person_ids:
+            embeddings = self.video_embedding_dict[person_id]
+            n = embeddings.shape[1]
+            self.video_gallery_offsets[person_id] = (cursor, cursor + n)
+            embedding_chunks.append(embeddings)
+            norm_chunks.append(self.video_norm_dict[person_id])
+            cursor += n
+
+        if embedding_chunks:
+            self.all_video_embeddings = np.concatenate(embedding_chunks, axis=1)
+            self.all_video_norms = np.concatenate(norm_chunks)
+        else:
+            self.all_video_embeddings = np.zeros((512, 0))
+            self.all_video_norms = np.zeros(0)
 
     def execute(self, redo_all: bool = False) -> None:
         """
@@ -637,11 +726,39 @@ class faceAssigner():
         # slice is then just cheap array indexing via gallery_offsets.
         all_similarity = (query_encoding @ self.all_embeddings) / (self.all_norms * query_encoding_norm)
 
+        # Video-sourced query: also compare against each candidate's
+        # video-only sub-gallery, where one exists (see
+        # MIN_VIDEO_SUBGALLERY_SIZE/_build_video_concatenated_gallery()).
+        # Computed once here (zero cost for an image-sourced query, which
+        # never touches this) rather than per-candidate below.
+        is_video_query = unassigned_face.source_video_file_id is not None
+        all_video_similarity = None
+        if is_video_query and self.all_video_embeddings.shape[1] > 0:
+            all_video_similarity = (
+                query_encoding @ self.all_video_embeddings
+            ) / (self.all_video_norms * query_encoding_norm)
+
         for row_num, db_id in enumerate(candidate_ids):
             lo, hi = self.gallery_offsets[db_id]
             similarity = all_similarity[lo:hi]
 
             sim_99th = np.percentile(similarity, 99)
+
+            # Take whichever of "this candidate's full gallery" or "this
+            # candidate's video-only exemplars" scores this query higher
+            # -- real investigation, 2026-10-13 (see
+            # VIDEO_DET_SCORE_FLOOR's comment): video-vs-video similarity
+            # for a genuine match runs measurably higher than video-vs-
+            # image, so a video query gets an extra, same-source-type
+            # path to clear the SAME threshold rather than a lowered bar.
+            # Never applies to an image-sourced query (all_video_similarity
+            # stays None), so the already-tuned image classification path
+            # is completely unaffected.
+            if all_video_similarity is not None and db_id in self.video_gallery_offsets:
+                v_lo, v_hi = self.video_gallery_offsets[db_id]
+                video_sim_99th = np.percentile(all_video_similarity[v_lo:v_hi], 99)
+                sim_99th = max(sim_99th, video_sim_99th)
+
             # threshold_dict (built in load_encodings(), see its own
             # comment) already includes the size-only bucket threshold
             # PLUS the per-person cohesion/span nudge -- falls back to the
@@ -666,8 +783,12 @@ class faceAssigner():
         # CANDIDATE_MARGIN_FLOOR above threshold". A face with det_score
         # still NULL (not yet reached by the ongoing backfill) skips the
         # det_score half of the gate rather than being blocked outright.
+        # A video-sourced query uses VIDEO_DET_SCORE_FLOOR instead of the
+        # image-calibrated DET_SCORE_FLOOR -- see that setting's own
+        # comment for why the same absolute bar doesn't transfer.
         det_score = unassigned_face.det_score
-        passes_det_score_gate = det_score is None or det_score >= self.DET_SCORE_FLOOR
+        effective_det_floor = self.VIDEO_DET_SCORE_FLOOR if is_video_query else self.DET_SCORE_FLOOR
+        passes_det_score_gate = det_score is None or det_score >= effective_det_floor
         if passes_det_score_gate:
             possible_idcs = np.where(
                 metrics_array[:, 0] - metrics_array[:, 1] >= self.CANDIDATE_MARGIN_FLOOR
