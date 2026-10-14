@@ -3217,6 +3217,47 @@ class VideoIngestionTests(TestCase):
         self.assertEqual(moved.pk, original_pk)
         self.assertEqual(VideoFile.objects.count(), 1)
 
+    def test_stale_duplicate_record_is_wiped_when_content_at_path_changes(self):
+        # Real gap found 2026-10-14 (video move-robustness review): unlike
+        # create_image_file(), create_video_file() had no guard for "a
+        # stale DuplicateVideoFile record already sits at this exact
+        # path" -- if that path's real content later genuinely changes,
+        # the old record would just sit there stale, pointing at
+        # whatever used to be the "original". Not a data-loss risk (no
+        # VideoFile row ever coexists with a live DuplicateVideoFile at
+        # the same path), just confusing bookkeeping left unresolved.
+        long_enough = self._long_enough_files()
+        if len(long_enough) < 2:
+            self.skipTest("need at least 2 distinct real fixtures in VIDEO_DIR")
+
+        work_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work_dir, ignore_errors=True)
+        original_path = os.path.join(work_dir, 'orig_' + long_enough[0])
+        shutil.copy(os.path.join(self.VIDEO_DIR, long_enough[0]), original_path)
+        create_video_file(original_path)
+        original = VideoFile.objects.get(filename=original_path)
+
+        # Record it as a duplicate of `original`, matching the real
+        # shape of the stale-bookkeeping scenario.
+        changing_path = os.path.join(work_dir, 'changing_' + long_enough[0])
+        shutil.copy(original_path, changing_path)
+        create_video_file(changing_path)
+        self.assertTrue(DuplicateVideoFile.objects.filter(filename=changing_path).exists())
+
+        # The real content at that path now genuinely changes.
+        os.remove(changing_path)
+        shutil.copy(os.path.join(self.VIDEO_DIR, long_enough[1]), changing_path)
+
+        create_video_file(changing_path)
+
+        # The stale duplicate record is gone (wiped, not left pointing at
+        # the wrong "original" forever) -- and a later rescan of this
+        # same path can genuinely ingest it fresh.
+        self.assertFalse(DuplicateVideoFile.objects.filter(filename=changing_path).exists())
+        self.assertFalse(VideoFile.objects.filter(filename=changing_path).exists())
+        create_video_file(changing_path)
+        self.assertTrue(VideoFile.objects.filter(filename=changing_path).exists())
+
 
 class DeleteRemovedVideosTests(TestCase):
     """delete_removed_videos() -- the video-side mirror of scripts.py's
