@@ -21,8 +21,6 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   restore-testing only validates a backup file once it's promoted into weekly retention, which
   says nothing about a night the backup silently never ran at all (this has already happened
   once, caught only because the user happened to notice a file hadn't shrunk).
-- A manual override tool for nearest-metro geocoding mismatches is wanted but not scoped (needs
-  both a frontend UI and a backend endpoint/storage design).
 - A looser classification threshold specifically for faces with `.ignore` already in their reject
   list was brainstormed but never validated or built.
 - The ~8 real multi-hour digitized-tape videos (2000.mpg, Christine Funeral.mpg, etc., up to
@@ -39,11 +37,24 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   (0 attached faces) were deleted. `Christine Funeral.mpg` (164.8min) and
   `dad_life_stories_fireside.mp4` (45.1min) are currently untouched since the whole folder is out
   of scan scope now regardless.
-- Still pending (unrelated to the item above, which is now resolved): a `picasa_api` restart to
-  actually arm ingestion-time video-duplicate prevention in the live Celery worker (deferred to
-  the next natural break past the long-running `backfill_det_score --all-faces` job, still running
-  as of 2026-09-22).
-
+- Video-face classification investigation (2026-10-13/14, not yet written up in the dated
+  narrative below -- just living in session transcripts so far): `VIDEO_DET_SCORE_FLOOR`/video
+  sub-gallery boost added to `assign_faces.py`; `backfill_video_det_score` built and run (71%
+  recovered, 28,936/40,789); `classify_unlabeled_all_weekly` re-enabled; a full `redo_all=True`
+  reclassification run completed (confident video proposals 3,015 -> 8,149). Still open from
+  that investigation:
+  - The lower-`det_thresh`/wider-`pad_pct` retry pass on the ~11,853 video faces still missing
+    `det_score` -- built (`--det-thresh`/`--pad-pct` flags) and bench-tested, but deliberately
+    not run at scale (every score it would recover is, by construction, below
+    `VIDEO_DET_SCORE_FLOOR`, so it only replaces an uninformed NULL-skip with an honest gate
+    block -- more principled, not something that unblocks more faces).
+  - `Face.mobile_review_hidden` never gets cleared once a face reaches a final declared state
+    (confirmed to a real person, or hard-confirmed `.ignore`/`.realignore`) -- found via all 811
+    "flagged for review, no proposal" video faces turning out to already be fully resolved, just
+    stuck showing up in the review queue. Fix identified (clear the flag whenever `declared_name`
+    changes away from the blank sentinel), not built -- user declined for now.
+  - 1,378 flagged-for-review video faces still sit on an `.ignore` proposal even after the
+    reclassification run above -- not investigated further.
 ## DONE (2026-10-08): removed `thumbnail_big`/`thumbnail_medium` (zero real consumers, 28.4GB
 reclaimed)
 
@@ -86,11 +97,13 @@ test, confirmed flaky independent of this change by running it alone twice).
 **Bigger, deliberately unscoped features:**
 - Slideshow metadata overlay (photo date + location shown alongside the image).
 - Video support — Phase 0 (infra) and Phase 1 (`VideoFile` model + ingestion) landed 2026-09-07.
-  Phase 3 (face detection/clustering) has a full agreed design as of 2026-09-08 (one `Face` row
-  per union-merge group, insightface+facenet dual clustering, gallery-classification-first
-  assignment) plus its runtime dependency (`facenet-pytorch`) already added and deployed to
-  production -- schema/migration/pipeline code itself not yet written. Phases 2/4/5
-  (thumbnailing, API, transcode) not started. See the dated write-ups below for the full design.
+  Phase 3 (face detection/clustering) was designed 2026-09-08 and built/deployed the same day
+  (schema, `video_face_pipeline.py`, the `video_face_extraction` task) -- this bullet previously
+  said the schema/pipeline code was "not yet written," which stopped being true the same day it
+  was written; corrected 2026-10-14. Phase 3's own classification quality has had substantial
+  further work since (det_score floor, video sub-gallery boost, backfills -- see the quick
+  index above). Phases 2/4/5 (thumbnailing, API, transcode) genuinely not started. See the dated
+  write-ups below for the full design.
 
 **Frontend (out of scope for this repo — no visibility into that codebase from here):**
 - "Mark image for deletion" button for the slideshow.
@@ -2273,14 +2286,16 @@ ideas, so a future session doesn't have to redo this from scratch:
   `db_picasa`'s `postgres_bak.sh`/`prune_backups.py`) go stale on any edit that replaces the file
   rather than editing in place (this session's own `Write` tool does this) -- needs
   `docker compose up -d --force-recreate <service>`, not a plain restart, to actually pick up.
-- **Open TODOs, not yet started** (see entries below): the manual-override tool for nearest-metro
-  mismatches; HEIC non-1-orientation handling (currently fails loudly, found via a real user
-  photo); `assign_faces.py`'s small-batch (`<=100` unassigned faces) `embedding_dict`
-  `AttributeError`, confirmed live, contained but not fixed; whether to null `face_encoding_512`
-  for `.ignore`/`.realignore` faces (~552MB, explicitly deferred by the user); the 29 known
-  duplicate `ImageFile` rows from before this session's dedup fix, still not cleaned up.
+  (Historical note: this spot used to list 4 "not yet started" items -- HEIC non-1-orientation
+  handling, assign_faces.py's small-batch embedding_dict AttributeError, nulling
+  face_encoding_512 for .ignore/.realignore, and the 29 duplicate ImageFile rows. Checked
+  2026-10-14: all 4 were actually resolved elsewhere in this file's later dated entries, just
+  never crossed off here -- exactly the kind of staleness the quick index at the top of this
+  file exists to prevent. Removed rather than left stale.)
 
-- **TODO: manual override tool for nearest-metro geocoding mismatches.** The nearest-metro
+- **RESOLVED elsewhere (2026-10-14): manual override tool for nearest-metro geocoding
+  mismatches.** Built outside this repo (frontend + whatever backend surface it needed) -- not
+  this backend's concern anymore. Original problem description kept below for context only.
   fallback (`filepopulator/geocode.py`'s `find_nearest_metro()`) picks the *largest* populated
   place within the nearest qualifying radius band, not the most globally recognizable one --
   spot-checked real production data 2026-08-27 and found a handful of cases where that diverges
