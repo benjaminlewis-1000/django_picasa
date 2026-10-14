@@ -182,6 +182,29 @@ def create_video_file(file_path):
     but still without thumbnail/face-detection work, which are later
     phases."""
 
+    # If this exact path was previously recorded as a content-duplicate
+    # of some other video, wipe that bookkeeping and start fresh --
+    # mirrors create_image_file()'s own top-of-function guard. Without
+    # this, a path whose real content later genuinely changes (the file
+    # at this path was replaced) would just leave the old
+    # DuplicateVideoFile record sitting there stale, pointing at
+    # whatever used to be the "original" -- never wrong in a way that
+    # loses data (a VideoFile row is never created at a path with a
+    # live DuplicateVideoFile record, so there's nothing to clean up on
+    # that side), but confusing bookkeeping left unresolved otherwise.
+    stale_duplicates = DuplicateVideoFile.objects.filter(filename=file_path)
+    if stale_duplicates.exists():
+        # Per-instance delete, not a bulk queryset delete -- shouldn't
+        # normally find anything here (a VideoFile row and a
+        # DuplicateVideoFile record are mutually exclusive at the same
+        # path), but if it ever does, VideoFile.delete()'s own override
+        # (Face/thumbnail cleanup) needs to actually run.
+        for stale_video in VideoFile.objects.filter(filename=file_path):
+            stale_video.delete()
+        for dupe in stale_duplicates:
+            dupe.delete()
+        return
+
     probe = _run_ffprobe(file_path)
     if probe is None:
         _record_video_failure(file_path, "ffprobe could not read this file")
