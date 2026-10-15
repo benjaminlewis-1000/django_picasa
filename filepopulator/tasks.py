@@ -10,7 +10,7 @@ import time
 import os
 # import scripts
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods, cleanup_orphaned_media_files
-from .video_scripts import add_videos_from_root_dir, delete_removed_videos
+from .video_scripts import add_videos_from_root_dir, delete_removed_videos, transcode_pending_videos
 
 if not settings.configured:
     settings.configure()
@@ -133,3 +133,20 @@ def cleanup_orphaned_media():
             settings.LOGGER.debug("cleanup_orphaned_media already running, exiting.")
             return
         cleanup_orphaned_media_files(dry_run=False, min_age_hours=24.0, log=settings.LOGGER.info)
+
+@shared_task(ignore_result=True, name='filepopulator.transcode_videos')
+def transcode_videos(max_runtime_seconds=None):
+    # Phase 5 (transcode pipeline), added 2026-10-15. Daily, not every
+    # few hours like video_face_extraction -- ffmpeg's own re-encode is
+    # just as CPU-heavy as the ONNX/torch inference that task does, and
+    # trying to interleave two CPU-saturating tasks on a tight cycle
+    # isn't worth the complexity; a capped daily window makes steady
+    # progress through the one-time backlog without needing to dodge
+    # video_face_extraction's near-continuous 3h/2.5h-active cycle.
+    import common
+    with common.advisory_lock('filepopulator.transcode_videos') as acquired:
+        if not acquired:
+            settings.LOGGER.debug("Video transcode already running, exiting.")
+            return
+        done, failed = transcode_pending_videos(max_runtime_seconds=max_runtime_seconds)
+        settings.LOGGER.info(f"Video transcode: {done} done, {failed} failed.")

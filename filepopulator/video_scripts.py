@@ -22,6 +22,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 
 import common
@@ -422,3 +423,116 @@ def delete_removed_videos():
                 video.delete()
         elif video.missing_since is not None:
             VideoFile.objects.filter(pk=video.pk).update(missing_since=None)
+
+
+# Phase 5 (transcode pipeline), added 2026-10-15 -- targeting a
+# Raspberry Pi viewer with no hardware HEVC decode, so HEVC is treated
+# the same as any other non-web-native codec, not special-cased for
+# Safari the way it would be for a general-browser audience.
+TRANSCODE_TIMEOUT_SECONDS = 3600
+TRANSCODE_CRF = 23
+TRANSCODE_PRESET = 'medium'
+
+
+def _sharded_transcode_path(content_hash):
+    """Mirrors the thumbnail_*_path() sharding convention (filepopulator/
+    models.py) -- avoids one huge flat directory. Keyed by content_hash,
+    not VideoFile.id: the same real bytes always land at the same
+    output path regardless of which row currently references them, so a
+    move/re-ingest (create_video_file()'s own move-reuse branch) never
+    needs to redo a transcode that already exists."""
+    return os.path.join(content_hash[:2], content_hash[2], f'{content_hash}.mp4')
+
+
+def transcode_video(video):
+    """Transcodes one VideoFile to H.264/AAC/mp4 under
+    settings.VIDEO_TRANSCODE_ROOT. Mutates the row via .update() (not
+    .save(), matching this file's own established reasoning -- no
+    custom save() override exists on VideoFile today, but this avoids
+    ever needing to care). Never raises -- records transcode_failed/
+    _error instead, same convention as face_extraction_failed/_error."""
+    if not video.content_hash:
+        VideoFile.objects.filter(pk=video.pk).update(
+            transcode_failed=True, transcode_error="No content_hash computed yet.",
+        )
+        return
+
+    rel_path = _sharded_transcode_path(video.content_hash)
+    out_path = os.path.join(settings.VIDEO_TRANSCODE_ROOT, rel_path)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    # Write to a .tmp sibling and rename into place at the end -- a
+    # crash/kill mid-encode must never leave a half-written file at the
+    # real path looking like a finished transcode.
+    tmp_path = out_path + '.tmp'
+    cmd = [
+        'ffmpeg', '-y', '-i', video.filename,
+        '-c:v', 'libx264', '-crf', str(TRANSCODE_CRF), '-preset', TRANSCODE_PRESET,
+        '-vf', 'setsar=1',
+        '-c:a', 'aac',
+        '-movflags', '+faststart',
+        tmp_path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=TRANSCODE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        VideoFile.objects.filter(pk=video.pk).update(
+            transcode_failed=True,
+            transcode_error=f"ffmpeg timed out after {TRANSCODE_TIMEOUT_SECONDS}s",
+        )
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return
+
+    if result.returncode != 0 or not os.path.isfile(tmp_path):
+        VideoFile.objects.filter(pk=video.pk).update(
+            transcode_failed=True, transcode_error=(result.stderr or '')[-2000:],
+        )
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return
+
+    os.replace(tmp_path, out_path)
+    VideoFile.objects.filter(pk=video.pk).update(
+        transcoded_path=rel_path, transcode_failed=False, transcode_error=None,
+    )
+
+
+def transcode_pending_videos(limit=None, max_runtime_seconds=None):
+    """Transcodes every VideoFile whose codec isn't web-native and
+    hasn't been transcoded (or already failed) yet. Deliberately simple
+    -- one video at a time, serially -- since ffmpeg's own re-encode
+    already saturates available CPU on its own (same reasoning this
+    project already settled on for ONNX/numpy work: process-level
+    parallelism just oversubscribes the same cores).
+
+    max_runtime_seconds, if given, stops the loop between videos once
+    elapsed wall time exceeds it -- same convention as
+    face_manager.tasks.process_video_faces(), used to run this in
+    bounded daily windows rather than one long pass."""
+    qs = VideoFile.objects.exclude(codec__in=settings.WEB_NATIVE_CODECS).filter(
+        transcoded_path__isnull=True, transcode_failed=False,
+    ).order_by('id')
+    if limit:
+        qs = qs[:limit]
+
+    done = failed = 0
+    start_time = time.time()
+    for video in qs.iterator(chunk_size=20):
+        if max_runtime_seconds is not None and (time.time() - start_time) >= max_runtime_seconds:
+            settings.LOGGER.debug(
+                f"Video transcode: time budget ({max_runtime_seconds}s) reached, stopping between videos."
+            )
+            break
+        transcode_video(video)
+        if VideoFile.objects.filter(pk=video.pk, transcode_failed=True).exists():
+            failed += 1
+        else:
+            done += 1
+    return done, failed
