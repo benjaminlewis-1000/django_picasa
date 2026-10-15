@@ -1300,10 +1300,44 @@ class VideoFile(models.Model):
     # needed at all.
     transcoded_path = models.CharField(max_length=1024, null=True, blank=True)
     transcode_failed = models.BooleanField(default=False)
+
+    # Phase 4 (slideshow serving), added 2026-10-15. Mirrors
+    # ImageFile.full_res_path exactly -- the ORIGINAL file's direct,
+    # authenticated Apache URL (not the transcoded output; see
+    # serializers for the playback_url logic that picks between the
+    # two). Computed in create_video_file() at ingest/update time, not
+    # a property, so it survives being read via a plain .values_list()
+    # the same way full_res_path does. Files under PHOTO_ROOT
+    # (interspersed videos) resolve to the existing /full_res mount;
+    # everything else resolves to the new /video_original mount (see
+    # apache_config/vhost.conf and docker-compose.yaml) since VIDEO_ROOT
+    # itself was never reachable through Apache before this.
+    playback_path = models.CharField(max_length=1024, null=True, blank=True)
     transcode_error = models.TextField(null=True, blank=True)
 
     def __str__(self):
         return self.filename
+
+    def get_playback_url(self):
+        """Phase 4 (slideshow serving). The single source of truth for
+        which URL a video should actually be played from -- the
+        serializer and filteredImagesView both call this rather than
+        each re-deriving the same transcoded-vs-original-vs-not-ready
+        logic. Never stored, unlike playback_path (the ORIGINAL file's
+        URL, fixed once at ingestion): which of these two URLs is
+        correct changes the moment transcode_video() fills in
+        transcoded_path, with no VideoFile.save() call of its own after
+        that to recompute a stored field from."""
+        if self.transcoded_path:
+            return (
+                'https://' + os.environ['MEDIA_DOMAIN'] + '/video_transcoded/'
+                + self.transcoded_path
+            )
+        if self.codec in settings.WEB_NATIVE_CODECS:
+            return self.playback_path
+        # Needs transcoding and isn't done yet -- nothing playable to
+        # offer right now.
+        return None
 
     def delete(self):
         # Same fix as ImageFile.delete() above, mirrored for video:

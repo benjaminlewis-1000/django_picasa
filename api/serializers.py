@@ -10,6 +10,7 @@ from rest_framework import serializers
 import datetime
 import dateutil.parser
 import json
+import os
 from django.db.models import Q, Sum
 
 
@@ -89,7 +90,42 @@ class ImageSummarySerializer(serializers.HyperlinkedModelSerializer):
         fields = ['url', 'filename', 'thumbnail_small', \
                   'directory']
 
-      
+
+class VideoFileSerializer(serializers.HyperlinkedModelSerializer):
+    """Phase 4 (slideshow serving). Mirrors ImageFileSerializer's shape
+    where the concept overlaps (parsed_date, directory, thumbnail), plus
+    video-specific fields the frontend needs to decide what/whether to
+    play. playback_url is computed, not stored -- see get_playback_url's
+    own comment for why it can't just be VideoFile.playback_path
+    directly."""
+
+    parsed_date = serializers.SerializerMethodField()
+    playback_url = serializers.SerializerMethodField()
+    ready = serializers.SerializerMethodField()
+
+    def get_parsed_date(self, obj):
+        first_date = obj.dateTaken
+        return {'year': first_date.year,
+                'month': first_date.month,
+                'day': first_date.day,
+                'hour': first_date.hour,
+                'minute': first_date.minute,
+                'sec': first_date.second}
+
+    def get_ready(self, obj):
+        return obj.get_playback_url() is not None
+
+    def get_playback_url(self, obj):
+        return obj.get_playback_url()
+
+    class Meta:
+
+        model = VideoFile
+        fields = ['url', 'id', 'filename', 'directory', 'dateTaken', 'parsed_date', \
+                  'duration_seconds', 'width', 'height', 'rotation', 'codec', \
+                  'thumbnail_small', 'playback_url', 'ready', 'isProcessed']
+
+
 class DirectorySerializer(QueryFieldsMixin, serializers.HyperlinkedModelSerializer):
     
     # The ForeignKey in the ImageFile that points to directory needs to have

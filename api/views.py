@@ -16,7 +16,7 @@ from django.shortcuts import render
 from django_filters.rest_framework import DjangoFilterBackend
 from face_manager.models import Person, Face
 from face_manager.live_counts import compute_live_face_counts
-from filepopulator.models import ImageFile, Directory
+from filepopulator.models import ImageFile, Directory, VideoFile
 from io import BytesIO
 from PIL import Image, ExifTags, ImageDraw
 from queue import Queue
@@ -274,6 +274,27 @@ class ImageViewSet(FiltersMixin, viewsets.ModelViewSet):
     ordering_fields = ('id', 'filename')
     ordering = ('id')
     
+    filter_mappings = {
+        'id': 'id',
+        'filename': 'filename__icontains',
+    }
+
+
+class VideoViewSet(FiltersMixin, viewsets.ModelViewSet):
+    """Phase 4 (slideshow serving) -- mirrors ImageViewSet. Slideshow-
+    reachable (not just IsAuthenticated) since the slideshow client has
+    no session auth, same reasoning as filteredImagesView/KeyedImageView
+    below."""
+    permission_classes = (HasSlideshowKeyOrAuthenticated,)
+
+    queryset = VideoFile.objects.all()
+    serializer_class = api_ser.VideoFileSerializer
+
+    filter_backends = (filters.OrderingFilter,)
+
+    ordering_fields = ('id', 'filename')
+    ordering = ('id')
+
     filter_mappings = {
         'id': 'id',
         'filename': 'filename__icontains',
@@ -1535,19 +1556,26 @@ class filteredImagesView(APIView):
         params = self.request.query_params
         print(params)
 
+        # video_query mirrors p_query but built against VideoFile's own
+        # reverse 'face' relation (source_video_file, not
+        # source_image_file) -- same person/year filters, since
+        # Face.declared_name is orthogonal to image-vs-video (see
+        # CLAUDE.md's Phase 3 design note).
         if len(params.keys()) == 0 : # or 'people' not in params.keys():
             # Return all objects!
             obj = ImageFile.objects.all().order_by('dateTaken').values_list('id', 'dateTaken')
+            video_obj = VideoFile.objects.all().order_by('dateTaken').values_list('id', 'dateTaken')
             # return render_404(request, "No parameters were passed. Must pass a combination of 'people', 'year_start', 'year_end'...")
         else:
             p_query = None
             years_query = None
+            video_years_query = None
             if 'people' in params.keys():
                 people = params['people'].split(',')
                 if len(people) > 0:
                     people_query = Q(face__declared_name__person_name=people[0])
                 for p in people[1:]:
-                    people_query = people_query | Q(face__declared_name__person_name=p) 
+                    people_query = people_query | Q(face__declared_name__person_name=p)
 
                 # people_query = (people_query) & ~Q(face__declared_name__person_name='Charlotte Lewis')
                 if p_query is None:
@@ -1556,25 +1584,40 @@ class filteredImagesView(APIView):
             if 'year_start' in params.keys():
                 year_start = int(params['year_start'])
                 year_start_query = Q(face__source_image_file__dateTaken__year__gte = year_start)
+                video_year_start_query = Q(face__source_video_file__dateTaken__year__gte = year_start)
                 if years_query is None:
                     years_query = year_start_query
+                    video_years_query = video_year_start_query
                 else:
                     years_query = years_query & year_start_query
+                    video_years_query = video_years_query & video_year_start_query
 
             if 'year_end' in params.keys():
                 year_end = int(params['year_end'])
                 year_end_query = Q(face__source_image_file__dateTaken__year__lte = year_end)
+                video_year_end_query = Q(face__source_video_file__dateTaken__year__lte = year_end)
                 if years_query is None:
                     years_query = year_end_query
+                    video_years_query = video_year_end_query
                 else:
                     years_query = years_query & year_end_query
-            
+                    video_years_query = video_years_query & video_year_end_query
+
 
             if p_query is None:
                 p_query = years_query
+                video_query = video_years_query
             else:
                 if years_query is not None:
                     p_query = p_query | years_query
+                # 'people' filters against Face.declared_name, which is
+                # source-agnostic -- the same people_query works
+                # unchanged against VideoFile's own reverse 'face'
+                # relation, no video-specific rebuild needed for that
+                # half.
+                video_query = people_query if 'people' in params.keys() else None
+                if video_years_query is not None:
+                    video_query = video_query | video_years_query if video_query is not None else video_years_query
 
             print(p_query)
             if p_query is None:
@@ -1584,12 +1627,18 @@ class filteredImagesView(APIView):
                 # no-params case above, rather than calling
                 # ImageFile.objects.filter(None), which raises TypeError.
                 obj = ImageFile.objects.all().order_by('dateTaken').values_list('id', 'dateTaken')
+                video_obj = VideoFile.objects.all().order_by('dateTaken').values_list('id', 'dateTaken')
             else:
                 obj = ImageFile.objects.filter(p_query).exclude(face__declared_name__person_name='Charlotte Lewis').distinct().order_by('dateTaken').values_list('id', 'dateTaken')
+                if video_query is None:
+                    video_obj = VideoFile.objects.none()
+                else:
+                    video_obj = VideoFile.objects.filter(video_query).exclude(face__declared_name__person_name='Charlotte Lewis').distinct().order_by('dateTaken').values_list('id', 'dateTaken')
 
         ids = list(([o[0] for o in obj]))
+        video_ids = list(([o[0] for o in video_obj]))
 
-        js = {'url_keys': ids}
+        js = {'url_keys': ids, 'video_keys': video_ids}
         if 'full_data' in params.keys():
             # Slideshow frontend's date/location overlay - a second,
             # separate query (rather than folding this into the query
@@ -1614,6 +1663,35 @@ class filteredImagesView(APIView):
                     'location': location,
                 }
             js['full_data'] = full_data
+
+            # video_data mirrors full_data, plus the fields a frontend
+            # needs to actually play a video (image entries never need
+            # these -- the plain 'slideshow' keyed_image type already
+            # handles resizing/serving for images; a video's playback
+            # URL is served directly by Apache instead, see
+            # VideoFileSerializer.get_playback_url).
+            # select_related('geocode'), not .values() -- get_playback_url()
+            # needs a real model instance (see VideoFile.get_playback_url's
+            # own comment for why this is the single source of truth
+            # shared with VideoFileSerializer, rather than re-deriving the
+            # transcoded-vs-original-vs-not-ready logic a second time here).
+            video_rows = VideoFile.objects.filter(id__in=video_ids).select_related('geocode')
+            video_data = {}
+            for video in video_rows:
+                location = None
+                if video.geocode is not None:
+                    location = video.geocode.nearest_metro_name or video.geocode.locality or None
+                playback_url = video.get_playback_url()
+                video_data[video.id] = {
+                    'date': video.dateTaken.isoformat() if video.dateTaken else None,
+                    'location': location,
+                    'duration_seconds': video.duration_seconds,
+                    'width': video.width,
+                    'height': video.height,
+                    'playback_url': playback_url,
+                    'ready': playback_url is not None,
+                }
+            js['video_data'] = video_data
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 

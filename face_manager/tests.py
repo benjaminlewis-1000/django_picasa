@@ -3132,6 +3132,36 @@ class BackfillVideoDetScoreTests(TestCase):
         face.refresh_from_db()
         self.assertAlmostEqual(face.det_score, 0.75)
 
+    def test_det_thresh_override_applied_to_detector(self):
+        face = self._make_video_face()
+        fake_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info', return_value=self._ffprobe_return()), \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=fake_frame):
+            mock_instance = MockExtractor.return_value
+            mock_instance.det10g_model.det_thresh = 0.5
+            mock_instance._redetect_in_crop.return_value = ([10, 10, 50, 50], [[0, 0]] * 5, 0.35)
+            call_command('backfill_video_det_score', '--det-thresh', '0.3')
+            self.assertEqual(mock_instance.det10g_model.det_thresh, 0.3)
+
+        face.refresh_from_db()
+        self.assertAlmostEqual(face.det_score, 0.35)
+
+    def test_pad_pct_override_passed_through(self):
+        face = self._make_video_face(box=(10, 10, 50, 50))
+        fake_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info', return_value=self._ffprobe_return()), \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=fake_frame):
+            mock_instance = MockExtractor.return_value
+            mock_instance._redetect_in_crop.return_value = ([10, 10, 50, 50], [[0, 0]] * 5, 0.9)
+            call_command('backfill_video_det_score', '--pad-pct', '1.2')
+            mock_instance._redetect_in_crop.assert_called_once_with(
+                fake_frame, (10, 10, 50, 50), pad_pct=1.2,
+            )
+
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class BackfillMissingFaceThumbnailsTests(TestCase):
