@@ -228,6 +228,11 @@ services:
       # picasa_api writes to it). Needs a matching <Directory> block in
       # vhost.conf for Basic Auth, same as /media and /full_res.
       - ${VIDEO_TRANSCODE_ROOT}:/var/www/video_transcoded:ro
+      # Serves original (not-yet/never-transcoded) video files directly
+      # -- VIDEO_ROOT itself was never reachable through Apache before
+      # Phase 4 (slideshow serving); needs this plus a matching
+      # <Directory> block in vhost.conf for Basic Auth.
+      - ${VIDEO_ROOT}:/var/www/video_original:ro
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/000-default.config:/etc/apache2/sites-enabled/000-default.conf
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/vhost.conf:/usr/local/apache2/conf/extra/httpd-vhosts.conf
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/apache_pwd.pwd:/usr/local/apache2/.htpasswd 
