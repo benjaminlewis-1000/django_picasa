@@ -471,6 +471,13 @@ def transcode_video(video):
         '-vf', 'setsar=1',
         '-c:a', 'aac',
         '-movflags', '+faststart',
+        # Real bug found via a live smoke test (2026-10-15): ffmpeg
+        # infers the output container from the filename's extension by
+        # default, and the .tmp suffix (needed for the atomic-rename
+        # safety above) isn't a format it recognizes -- "Unable to
+        # choose an output format". -f mp4 makes the format explicit
+        # regardless of what the path's own extension looks like.
+        '-f', 'mp4',
         tmp_path,
     ]
     try:
