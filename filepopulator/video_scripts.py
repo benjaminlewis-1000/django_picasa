@@ -438,7 +438,7 @@ TRANSCODE_TIMEOUT_SECONDS = 3600
 # more encode time for meaningfully better compression at the same CRF
 # is worth it. Both picked 2026-10-15; see CLAUDE.md for the real-file
 # CRF 23 vs 28 comparison this was validated against.
-TRANSCODE_CRF = 28
+TRANSCODE_CRF = 33
 TRANSCODE_PRESET = 'slow'
 
 
