@@ -49,6 +49,14 @@ services:
       # application code does. Host directory is created if missing.
       - ${PHOTO_ROOT}/aggregated/uploaded:/photos_upload
       - ${VIDEO_ROOT}:/videos:ro
+      # Dedicated read-write mount for the transcode pipeline
+      # (filepopulator/video_scripts.py's transcode_video()) -- own
+      # mount, not the read-only VIDEO_ROOT above, same reasoning as
+      # /photos_upload: the ingestion scanner (VIDEO_ROOTS, settings.py)
+      # can never wander into this directory even by accident, since
+      # it's a genuinely separate mount point, not just "outside the
+      # allowlist." Host directory already exists.
+      - ${VIDEO_TRANSCODE_ROOT}:/video_transcoded
       - ${TEST_PHOTOS_FILEPOPULATE}:/test_imgs_filepopulate
       - ${MEDIA_FILES_LOCATION}:/media
       - ${LOG_LOCATION}:/var/log/picasa
@@ -216,6 +224,10 @@ services:
       - ${MEDIA_FILES_LOCATION}:/var/www/media:ro
       - ${HOST_STATIC_LOCATION}:/var/www/static:ro
       - ${PHOTO_ROOT}:/var/www/full_res:ro
+      # Serves the transcode pipeline's output -- read-only here (only
+      # picasa_api writes to it). Needs a matching <Directory> block in
+      # vhost.conf for Basic Auth, same as /media and /full_res.
+      - ${VIDEO_TRANSCODE_ROOT}:/var/www/video_transcoded:ro
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/000-default.config:/etc/apache2/sites-enabled/000-default.conf
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/vhost.conf:/usr/local/apache2/conf/extra/httpd-vhosts.conf
       - ${DJANGO_FILES_ROOT}/dockerize/apache_config/apache_pwd.pwd:/usr/local/apache2/.htpasswd 
