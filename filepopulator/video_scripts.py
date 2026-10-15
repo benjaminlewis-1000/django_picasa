@@ -173,6 +173,25 @@ def compute_video_content_hash(file_path):
     return hash_md5.hexdigest()
 
 
+def compute_video_playback_path(file_path):
+    """VideoFile.playback_path's computation, extracted so
+    backfill_video_playback_path (for rows ingested before this field
+    existed) can reuse the exact same logic rather than a second copy
+    that could drift. Mirrors ImageFile._init_image()'s own
+    full_res_path computation. PHOTO_ROOT-rooted paths (videos
+    interspersed in the photo tree) use the existing /full_res Apache
+    mount; everything else (the real VIDEO_ROOT library) uses the new
+    /video_original mount -- VIDEO_ROOT itself was never reachable
+    through Apache before Phase 4 (slideshow serving)."""
+    if file_path.startswith(settings.PHOTO_ROOT):
+        rel = file_path.replace(settings.PHOTO_ROOT, '')
+        mount = '/full_res'
+    else:
+        rel = file_path.replace(settings.VIDEO_ROOT, '')
+        mount = '/video_original'
+    return 'https://' + os.environ['MEDIA_DOMAIN'] + mount + rel.replace(' ', '%20')
+
+
 def create_video_file(file_path):
     """Create or update a VideoFile row for file_path. Mirrors
     create_image_file()'s shape, including real content-based duplicate
@@ -341,20 +360,7 @@ def create_video_file(file_path):
     except OSError:
         video.file_size_bytes = None
 
-    # Mirrors ImageFile._init_image()'s own full_res_path computation.
-    # PHOTO_ROOT-rooted paths (videos interspersed in the photo tree)
-    # use the existing /full_res Apache mount; everything else (the
-    # real VIDEO_ROOT library) uses the new /video_original mount --
-    # VIDEO_ROOT itself was never reachable through Apache before this.
-    if file_path.startswith(settings.PHOTO_ROOT):
-        rel = file_path.replace(settings.PHOTO_ROOT, '')
-        mount = '/full_res'
-    else:
-        rel = file_path.replace(settings.VIDEO_ROOT, '')
-        mount = '/video_original'
-    video.playback_path = (
-        'https://' + os.environ['MEDIA_DOMAIN'] + mount + rel.replace(' ', '%20')
-    )
+    video.playback_path = compute_video_playback_path(file_path)
 
     video.save()
 

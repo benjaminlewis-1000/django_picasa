@@ -3823,6 +3823,59 @@ class VideoContentHashBackfillAndMergeTests(TestCase):
         self.assertEqual(VideoFile.objects.count(), 1)
 
 
+class VideoPlaybackPathTests(TestCase):
+    """compute_video_playback_path() (the single source of truth for
+    VideoFile.playback_path, shared between create_video_file() and
+    backfill_video_playback_path) and the backfill command itself --
+    see Phase 4's "slideshow serving" write-up in CLAUDE.md."""
+
+    def tearDown(self):
+        VideoFile.objects.all().delete()
+
+    @override_settings(PHOTO_ROOT='/photos', VIDEO_ROOT='/videos')
+    def test_photo_root_path_uses_full_res_mount(self):
+        from .video_scripts import compute_video_playback_path
+        url = compute_video_playback_path('/photos/some dir/clip.mp4')
+        self.assertIn('/full_res/some%20dir/clip.mp4', url)
+        self.assertNotIn('video_original', url)
+
+    @override_settings(PHOTO_ROOT='/photos', VIDEO_ROOT='/videos')
+    def test_video_root_path_uses_video_original_mount(self):
+        from .video_scripts import compute_video_playback_path
+        url = compute_video_playback_path('/videos/Our_Home_Videos/clip.mp4')
+        self.assertIn('/video_original/Our_Home_Videos/clip.mp4', url)
+
+    def _bare_video(self, filename):
+        directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(filename))
+        return VideoFile.objects.create(
+            filename=filename, directory=directory, width=100, height=100,
+            playback_path=None,
+        )
+
+    def test_backfill_populates_missing_playback_path(self):
+        video = self._bare_video('/videos/Our_Home_Videos/clip1.mp4')
+        self.assertIsNone(video.playback_path)
+
+        call_command('backfill_video_playback_path')
+
+        video.refresh_from_db()
+        self.assertIsNotNone(video.playback_path)
+        self.assertIn('video_original', video.playback_path)
+
+    def test_backfill_dry_run_does_not_write(self):
+        video = self._bare_video('/videos/Our_Home_Videos/clip2.mp4')
+        call_command('backfill_video_playback_path', '--dry-run')
+        video.refresh_from_db()
+        self.assertIsNone(video.playback_path)
+
+    def test_backfill_skips_already_populated_rows(self):
+        video = self._bare_video('/videos/Our_Home_Videos/clip3.mp4')
+        VideoFile.objects.filter(pk=video.pk).update(playback_path='https://example.com/already/set.mp4')
+        call_command('backfill_video_playback_path')
+        video.refresh_from_db()
+        self.assertEqual(video.playback_path, 'https://example.com/already/set.mp4')
+
+
 class MatchDuplicateVideoFacesTests(unittest.TestCase):
     """Unit tests for merge_duplicate_videofiles.match_duplicate_video_faces
     and _survivor_key -- pure functions, no DB access needed. See that
