@@ -11,6 +11,7 @@ import zlib
 import hashlib
 import os
 import binascii
+import subprocess
 from datetime import datetime, timedelta
 from textwrap import wrap # for splitting string
 import os
@@ -3257,6 +3258,158 @@ class VideoIngestionTests(TestCase):
         self.assertFalse(VideoFile.objects.filter(filename=changing_path).exists())
         create_video_file(changing_path)
         self.assertTrue(VideoFile.objects.filter(filename=changing_path).exists())
+
+
+@override_settings(VIDEO_TRANSCODE_ROOT='/tmp/video_transcode_test')
+class TranscodeVideoTests(TestCase):
+    """Phase 5 (transcode pipeline), added 2026-10-15. Mocks subprocess.run
+    entirely (real ffmpeg encoding is slow and this is about the
+    control-flow/bookkeeping around it, not ffmpeg itself) -- a fake
+    success writes a dummy file at the expected .tmp path (since the
+    real code checks os.path.isfile() on it) before returning
+    returncode=0."""
+
+    def setUp(self):
+        from .video_scripts import _sharded_transcode_path
+        self.transcode_root = settings.VIDEO_TRANSCODE_ROOT
+        if os.path.exists(self.transcode_root):
+            shutil.rmtree(self.transcode_root)
+        os.makedirs(self.transcode_root)
+        self._sharded_transcode_path = _sharded_transcode_path
+
+    def tearDown(self):
+        shutil.rmtree(self.transcode_root, ignore_errors=True)
+        VideoFile.objects.all().delete()
+
+    _UNSET = object()
+
+    def _make_video(self, codec='hevc', content_hash=_UNSET, **overrides):
+        directory, _ = Directory.objects.get_or_create(dir_path='/tmp/transcode_test_videos')
+        if content_hash is self._UNSET:
+            content_hash = binascii.hexlify(os.urandom(16)).decode()
+        defaults = dict(
+            filename=f'/tmp/transcode_test_videos/{overrides.pop("name", "a")}.mp4',
+            directory=directory, width=320, height=240, duration_seconds=10.0,
+            codec=codec, content_hash=content_hash,
+        )
+        defaults.update(overrides)
+        return VideoFile.objects.create(**defaults)
+
+    def _fake_success(self, tmp_path_arg_index=-1):
+        def side_effect(cmd, **kwargs):
+            tmp_path = cmd[tmp_path_arg_index]
+            with open(tmp_path, 'wb') as f:
+                f.write(b'fake mp4 bytes')
+            return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+        return side_effect
+
+    def test_successful_transcode_sets_path_and_clears_failure_state(self):
+        from .video_scripts import transcode_video
+        video = self._make_video()
+
+        with mock.patch('filepopulator.video_scripts.subprocess.run', side_effect=self._fake_success()):
+            transcode_video(video)
+
+        video.refresh_from_db()
+        self.assertFalse(video.transcode_failed)
+        self.assertIsNone(video.transcode_error)
+        self.assertIsNotNone(video.transcoded_path)
+        expected_rel = self._sharded_transcode_path(video.content_hash)
+        self.assertEqual(video.transcoded_path, expected_rel)
+        out_path = os.path.join(self.transcode_root, expected_rel)
+        self.assertTrue(os.path.isfile(out_path))
+        # The .tmp sibling was renamed away, not left behind.
+        self.assertFalse(os.path.isfile(out_path + '.tmp'))
+
+    def test_ffmpeg_nonzero_exit_marks_failed(self):
+        from .video_scripts import transcode_video
+        video = self._make_video()
+
+        with mock.patch('filepopulator.video_scripts.subprocess.run') as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess([], 1, stdout='', stderr='real ffmpeg error output')
+            transcode_video(video)
+
+        video.refresh_from_db()
+        self.assertTrue(video.transcode_failed)
+        self.assertIn('real ffmpeg error output', video.transcode_error)
+        self.assertIsNone(video.transcoded_path)
+
+    def test_ffmpeg_timeout_marks_failed(self):
+        from .video_scripts import transcode_video
+        video = self._make_video()
+
+        with mock.patch('filepopulator.video_scripts.subprocess.run') as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd='ffmpeg', timeout=3600)
+            transcode_video(video)
+
+        video.refresh_from_db()
+        self.assertTrue(video.transcode_failed)
+        self.assertIn('timed out', video.transcode_error)
+
+    def test_missing_content_hash_fails_without_calling_ffmpeg(self):
+        from .video_scripts import transcode_video
+        video = self._make_video(content_hash=None)
+
+        with mock.patch('filepopulator.video_scripts.subprocess.run') as mock_run:
+            transcode_video(video)
+            mock_run.assert_not_called()
+
+        video.refresh_from_db()
+        self.assertTrue(video.transcode_failed)
+
+    def test_pending_videos_skips_native_codecs(self):
+        from .video_scripts import transcode_pending_videos
+        native = self._make_video(codec='h264', name='native')
+        needs_it = self._make_video(codec='hevc', name='needs_it')
+
+        with mock.patch('filepopulator.video_scripts.subprocess.run', side_effect=self._fake_success()):
+            done, failed = transcode_pending_videos()
+
+        native.refresh_from_db()
+        needs_it.refresh_from_db()
+        self.assertIsNone(native.transcoded_path)
+        self.assertIsNotNone(needs_it.transcoded_path)
+        self.assertEqual((done, failed), (1, 0))
+
+    def test_pending_videos_skips_already_done_or_failed(self):
+        from .video_scripts import transcode_pending_videos
+        already_done = self._make_video(codec='hevc', name='done', transcoded_path='xx/y/already.mp4')
+        already_failed = self._make_video(codec='hevc', name='failed', transcode_failed=True)
+
+        with mock.patch('filepopulator.video_scripts.subprocess.run') as mock_run:
+            done, failed = transcode_pending_videos()
+            mock_run.assert_not_called()
+
+        self.assertEqual((done, failed), (0, 0))
+
+    def test_max_runtime_seconds_stops_between_videos(self):
+        from .video_scripts import transcode_pending_videos
+        self._make_video(codec='hevc', name='first')
+        self._make_video(codec='hevc', name='second')
+
+        with mock.patch('filepopulator.video_scripts.subprocess.run', side_effect=self._fake_success()):
+            done, failed = transcode_pending_videos(max_runtime_seconds=0)
+
+        self.assertEqual((done, failed), (0, 0))
+
+    def test_sharded_path_matches_thumbnail_style_convention(self):
+        from .video_scripts import _sharded_transcode_path
+        content_hash = 'abcdef0123456789'
+        rel = _sharded_transcode_path(content_hash)
+        self.assertEqual(rel, os.path.join('ab', 'c', 'abcdef0123456789.mp4'))
+
+    def test_deleting_video_removes_transcoded_file(self):
+        from .video_scripts import transcode_video
+        video = self._make_video()
+        with mock.patch('filepopulator.video_scripts.subprocess.run', side_effect=self._fake_success()):
+            transcode_video(video)
+        video.refresh_from_db()
+        out_path = os.path.join(self.transcode_root, video.transcoded_path)
+        self.assertTrue(os.path.isfile(out_path))
+
+        video.delete()
+
+        self.assertFalse(os.path.isfile(out_path))
 
 
 class DeleteRemovedVideosTests(TestCase):

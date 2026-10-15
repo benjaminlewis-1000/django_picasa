@@ -1288,6 +1288,20 @@ class VideoFile(models.Model):
     # a NOT NULL violation. See CLAUDE.md for the full incident.
     face_extraction_timeout_count = models.IntegerField(default=0, db_default=0)
 
+    # Phase 5 (transcode pipeline), added 2026-10-15. Whether a video
+    # NEEDS transcoding at all isn't a stored flag -- it's derived from
+    # `codec` above against WEB_NATIVE_CODECS (settings.py) at query/
+    # serve time, same reasoning as not storing a redundant "is this a
+    # duplicate" boolean elsewhere in this codebase. transcoded_path is
+    # relative to settings.VIDEO_TRANSCODE_ROOT (its own dedicated
+    # read-write mount, deliberately separate from the read-only
+    # VIDEO_ROOT video library mount -- see that setting's own comment),
+    # NULL meaning "not transcoded yet" regardless of whether it's
+    # needed at all.
+    transcoded_path = models.CharField(max_length=1024, null=True, blank=True)
+    transcode_failed = models.BooleanField(default=False)
+    transcode_error = models.TextField(null=True, blank=True)
+
     def __str__(self):
         return self.filename
 
@@ -1309,6 +1323,12 @@ class VideoFile(models.Model):
             os.remove(self.thumbnail_small.path)
         except Exception:
             pass
+
+        if self.transcoded_path:
+            try:
+                os.remove(os.path.join(settings.VIDEO_TRANSCODE_ROOT, self.transcoded_path))
+            except Exception:
+                pass
 
         super(VideoFile, self).delete()
 

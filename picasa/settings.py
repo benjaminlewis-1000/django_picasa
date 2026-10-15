@@ -68,6 +68,14 @@ if in_docker:
     # code itself does or doesn't check.
     UPLOAD_STAGING_DIR = '/photos_upload'
     VIDEO_ROOT = '/videos'
+    # Deliberately its own read-write bind mount (docker-compose.yaml),
+    # not the existing read-only VIDEO_ROOT mount -- same reasoning as
+    # UPLOAD_STAGING_DIR above. The transcode task needs to write here;
+    # VIDEO_ROOT must never be writable from this container, and this
+    # being a genuinely separate mount point means the ingestion scanner
+    # (which only ever walks VIDEO_ROOTS below) can't wander into it even
+    # by accident, not just "isn't in the allowlist."
+    VIDEO_TRANSCODE_ROOT = '/video_transcoded'
     TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
     ALLOWED_HOSTS = ['localhost',
         '127.0.0.1', 
@@ -107,6 +115,7 @@ else:
     # somewhere the ingestion scanner already walks).
     UPLOAD_STAGING_DIR = os.path.join(PHOTO_ROOT, 'aggregated', 'uploaded')
     VIDEO_ROOT = '/home/benjamin/git_repos/picasa_files/actual_videos'
+    VIDEO_TRANSCODE_ROOT = os.path.join(PROJECT_ROOT, 'video_transcoded')
     TEST_IMG_DIR_FILEPOPULATE = '/home/benjamin/git_repos/picasa_files/test_imgs'
 
     STATIC_URL = 'http://localhost/static/'
@@ -621,6 +630,18 @@ CELERY_BEAT_SCHEDULE = {
         # first-Monday-3am weekly vacuum-swap.
         'schedule': crontab(minute='0', hour='4', day_of_week='0'),
     },
+   'transcode_videos': {
+        'task': 'filepopulator.transcode_videos',
+        # Daily, capped at 2h -- deliberately NOT interleaved with
+        # video_face_extraction's 3h/2.5h-active cycle (both are CPU-
+        # saturating; see that task's own comment on why this project
+        # accepts a bounded daily window over trying to dodge it
+        # precisely). 5am: after cleanup_orphaned_media's Sunday 4am
+        # slot clears (that one's a one-hour-ish filesystem walk), clear
+        # of the 2am daily backup and the first-Monday 3am vacuum-swap.
+        'schedule': crontab(minute='0', hour='5'),
+        'kwargs': {'max_runtime_seconds': 7200},
+    },
   'classify_unlabeled': {
       'task': 'face_manager.assign_faces',
       'schedule': crontab( minute = '0', hour='*'),
@@ -712,6 +733,16 @@ VIDEO_ROOTS = [
 # tree (some are, per the user, alongside the two dedicated folders
 # above).
 FILEPOPULATOR_SERVER_VIDEO_DIRS = VIDEO_ROOTS + [PHOTO_ROOT]
+
+# Phase 5 (transcode pipeline), added 2026-10-15. Codecs a browser (or
+# the Raspberry Pi this is actually being built for, which has no
+# hardware HEVC decode either) can already play natively -- anything
+# else gets transcoded to H.264 before being served. Real library
+# breakdown checked before picking this (2026-10-15): h264 (3,960
+# files, 330.1GB) + vp9 (38 files, 0.3GB) already native; everything
+# else (2,192 files, 126.3GB -- hevc, mjpeg, mpeg1/2/4video, wmv1/2/3,
+# h263) needs it.
+WEB_NATIVE_CODECS = {'h264', 'vp9'}
 
 # Videos shorter than this are excluded rather than ingested -- Live
 # Photos/motion-photo clips and accidental taps tend to land well under
