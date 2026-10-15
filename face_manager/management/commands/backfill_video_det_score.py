@@ -48,10 +48,30 @@ class Command(BaseCommand):
                  'backlog (which also includes faces already correctly declared to a '
                  'real person, and ones still genuinely unassigned).',
         )
+        parser.add_argument(
+            '--pad-pct', type=float, default=None,
+            help='Override _redetect_in_crop\'s default crop padding (REDETECT_PAD_PCT, '
+                 '0.6) -- a larger crop gives a real face near the stored box\'s edge '
+                 'another chance to be found, for a retry pass on faces the default '
+                 'padding already missed.',
+        )
+        parser.add_argument(
+            '--det-thresh', type=float, default=None,
+            help='Override the detector\'s own det_thresh (default 0.5 -- note this is '
+                 'a hard cutoff baked into the model itself: a genuine face below it is '
+                 'discarded before this command ever sees it, not filtered by anything '
+                 'here). Lowering it for a retry pass recovers real, lower-confidence '
+                 'faces missed the first time -- they still only pass '
+                 'VIDEO_DET_SCORE_FLOOR (0.5) if their real score clears it, so this '
+                 'cannot inflate a score, only reveal one that was being silently '
+                 'discarded.',
+        )
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
         limit = options['limit']
+        pad_pct = options['pad_pct']
+        det_thresh = options['det_thresh']
 
         qs = Face.objects.filter(
             source_video_file__isnull=False, det_score__isnull=True,
@@ -64,6 +84,9 @@ class Command(BaseCommand):
 
         self.stdout.write("Loading VideoFaceExtractor (real model load)...")
         extractor = VideoFaceExtractor()
+        if det_thresh is not None:
+            self.stdout.write(f"Overriding det_thresh: {extractor.det10g_model.det_thresh} -> {det_thresh}")
+            extractor.det10g_model.det_thresh = det_thresh
 
         total = matched = no_frame = no_detect = iou_mismatch = 0
         ffprobe_cache = {}
@@ -115,7 +138,10 @@ class Command(BaseCommand):
                 no_frame += 1
                 continue
 
-            result = extractor._redetect_in_crop(frame, box)
+            if pad_pct is not None:
+                result = extractor._redetect_in_crop(frame, box, pad_pct=pad_pct)
+            else:
+                result = extractor._redetect_in_crop(frame, box)
             if result is None:
                 no_detect += 1
                 continue

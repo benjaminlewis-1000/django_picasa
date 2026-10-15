@@ -430,8 +430,16 @@ def delete_removed_videos():
 # the same as any other non-web-native codec, not special-cased for
 # Safari the way it would be for a general-browser audience.
 TRANSCODE_TIMEOUT_SECONDS = 3600
-TRANSCODE_CRF = 23
-TRANSCODE_PRESET = 'medium'
+# CRF 28, not the usual "visually near-lossless" 23 -- this is a casual
+# slideshow viewing context, not something anyone's pixel-peeping, and
+# CRF scales roughly logarithmically (every +6 or so roughly halves
+# bitrate), so this is a real, substantial size win. preset slow (not
+# medium) -- this is a one-time backlog, not a tight loop, so trading
+# more encode time for meaningfully better compression at the same CRF
+# is worth it. Both picked 2026-10-15; see CLAUDE.md for the real-file
+# CRF 23 vs 28 comparison this was validated against.
+TRANSCODE_CRF = 28
+TRANSCODE_PRESET = 'slow'
 
 
 def _sharded_transcode_path(content_hash):
