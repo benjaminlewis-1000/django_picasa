@@ -642,6 +642,18 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': crontab(minute='0', hour='5'),
         'kwargs': {'max_runtime_seconds': 7200},
     },
+   'transcode_videos_morning': {
+        # Extra daily pass added 2026-10-19 to help clear the real
+        # backlog (2,194 videos needing transcode) faster than one 2h
+        # window/day was covering -- same task, same advisory lock
+        # (filepopulator.transcode_videos) as the 5am run, so this just
+        # extends today's coverage rather than risking a double-run;
+        # if the 5am run is still going (it shouldn't be, given its own
+        # 2h cap), this one just no-ops and logs a skip.
+        'task': 'filepopulator.transcode_videos',
+        'schedule': crontab(minute='0', hour='7'),
+        'kwargs': {'max_runtime_seconds': 10800},
+    },
   'classify_unlabeled': {
       'task': 'face_manager.assign_faces',
       'schedule': crontab( minute = '0', hour='*'),
