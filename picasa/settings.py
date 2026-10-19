@@ -503,6 +503,13 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    # Only applied to the slideshow's public, key-gated endpoints (see
+    # api/throttles.py) - everything else is unaffected since nothing
+    # else sets throttle_classes.
+    'DEFAULT_THROTTLE_RATES': {
+        'slideshow_list': '30/min',
+        'slideshow_media': '180/min',
+    },
 }
 
 

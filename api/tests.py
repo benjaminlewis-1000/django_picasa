@@ -2896,6 +2896,18 @@ class KeyedVideoViewTests(ApiTestCase):
     needs the Apache credentials ParameterCredentialExposureTests above
     locks down."""
 
+    @staticmethod
+    def _sig(video_id):
+        # Lazy import, not at module scope - see the module-level comment
+        # at the top of this file on why api.views must never be imported
+        # before ApiTestCase.setUpClass has created the sentinel Person
+        # rows it needs at import time. By the time any test method body
+        # runs, that's already happened (and api.views has, in practice,
+        # already been imported anyway via URL resolution on the first
+        # request).
+        from api.views import _slideshow_current_sig
+        return _slideshow_current_sig('video', video_id)
+
     def _make_transcoded_video(self):
         directory = Directory.objects.create(dir_path='/videos/keyed_video_test')
         video = VideoFile.objects.create(
@@ -2926,13 +2938,13 @@ class KeyedVideoViewTests(ApiTestCase):
 
     def test_wrong_access_key_rejected(self):
         video = self._make_transcoded_video()
-        resp = self.anon_client.get(f'/api/keyed_video/{video.id}/?access_key=not-the-key')
+        resp = self.anon_client.get(f'/api/keyed_video/{video.id}/?sig=not-the-sig')
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_streams_transcoded_video_bytes_with_correct_access_key(self):
         video = self._make_transcoded_video()
         resp = self.anon_client.get(
-            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}'
+            f'/api/keyed_video/{video.id}/?sig={self._sig(video.id)}'
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(b''.join(resp.streaming_content), b'fake transcoded mp4 bytes')
@@ -2948,7 +2960,7 @@ class KeyedVideoViewTests(ApiTestCase):
         # preload.
         video = self._make_transcoded_video()  # body: b'fake transcoded mp4 bytes' (25 bytes)
         resp = self.anon_client.get(
-            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}',
+            f'/api/keyed_video/{video.id}/?sig={self._sig(video.id)}',
             HTTP_RANGE='bytes=5-12',
         )
         self.assertEqual(resp.status_code, status.HTTP_206_PARTIAL_CONTENT)
@@ -2959,7 +2971,7 @@ class KeyedVideoViewTests(ApiTestCase):
     def test_range_request_with_open_ended_end_goes_to_eof(self):
         video = self._make_transcoded_video()
         resp = self.anon_client.get(
-            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}',
+            f'/api/keyed_video/{video.id}/?sig={self._sig(video.id)}',
             HTTP_RANGE='bytes=20-',
         )
         self.assertEqual(resp.status_code, status.HTTP_206_PARTIAL_CONTENT)
@@ -2969,7 +2981,7 @@ class KeyedVideoViewTests(ApiTestCase):
     def test_suffix_range_request_returns_last_n_bytes(self):
         video = self._make_transcoded_video()
         resp = self.anon_client.get(
-            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}',
+            f'/api/keyed_video/{video.id}/?sig={self._sig(video.id)}',
             HTTP_RANGE='bytes=-5',
         )
         self.assertEqual(resp.status_code, status.HTTP_206_PARTIAL_CONTENT)
@@ -2979,7 +2991,7 @@ class KeyedVideoViewTests(ApiTestCase):
     def test_range_entirely_past_eof_returns_416(self):
         video = self._make_transcoded_video()
         resp = self.anon_client.get(
-            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}',
+            f'/api/keyed_video/{video.id}/?sig={self._sig(video.id)}',
             HTTP_RANGE='bytes=1000-2000',
         )
         self.assertEqual(resp.status_code, status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE)
@@ -2988,7 +3000,7 @@ class KeyedVideoViewTests(ApiTestCase):
     def test_malformed_range_header_falls_back_to_full_200_response(self):
         video = self._make_transcoded_video()
         resp = self.anon_client.get(
-            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}',
+            f'/api/keyed_video/{video.id}/?sig={self._sig(video.id)}',
             HTTP_RANGE='not-a-range-header',
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
@@ -2999,7 +3011,7 @@ class KeyedVideoViewTests(ApiTestCase):
         video = self._make_native_video(tmp_path)
         self.addCleanup(lambda: os.path.exists(tmp_path) and os.remove(tmp_path))
         resp = self.anon_client.get(
-            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}'
+            f'/api/keyed_video/{video.id}/?sig={self._sig(video.id)}'
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(b''.join(resp.streaming_content), b'fake native-codec mp4 bytes')
@@ -3016,13 +3028,13 @@ class KeyedVideoViewTests(ApiTestCase):
             width=640, height=480, duration_seconds=5, codec='hevc',
         )
         resp = self.anon_client.get(
-            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}'
+            f'/api/keyed_video/{video.id}/?sig={self._sig(video.id)}'
         )
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_unknown_video_id_returns_404(self):
         resp = self.anon_client.get(
-            f'/api/keyed_video/999999/?access_key={settings.RANDOM_ACCESS_KEY}'
+            f'/api/keyed_video/999999/?sig={self._sig(999999)}'
         )
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
@@ -3052,3 +3064,158 @@ class VideoDataNeverExposesPlaybackCredentialsTests(ApiTestCase):
         entry = resp.json()['video_data'][str(video.id)]
         self.assertNotIn('playback_url', entry)
         self.assertTrue(entry['ready'])
+        self.assertIn('sig', entry)
+
+
+class SlideshowPaginationTests(ApiTestCase):
+    """filteredImagesView used to hand back the ENTIRE filtered id list
+    (and, with full_data, every id's metadata) in one response - which
+    meant anyone holding the slideshow key could read the whole library
+    in a single request, no scraping sophistication required. These
+    lock down the replacement: every response is capped to a bounded
+    page, and offset/limit walk through the rest."""
+
+    def _make_images(self, n):
+        # Direct ORM creation rather than make_image() (which is backed
+        # by a handful of real fixture files - not enough for the
+        # dozens-to-hundreds of images these pagination tests need).
+        # ImageFile.save() opens and decodes the file at `filename` for
+        # real (_init_image), so each one still needs an actual tiny
+        # JPEG on disk, not just a DB row.
+        from datetime import timedelta
+        tmp_dir = tempfile.mkdtemp(prefix='pagination_test_')
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        directory = Directory.objects.create(dir_path=tmp_dir)
+        base = datetime(2020, 1, 1, tzinfo=dt_timezone.utc)
+        images = []
+        for i in range(n):
+            path = os.path.join(tmp_dir, f'{i}.jpg')
+            with open(path, 'wb') as f:
+                f.write(_tiny_jpeg_bytes())
+            images.append(ImageFile.objects.create(
+                filename=path, directory=directory, width=50, height=50,
+                dateTaken=base + timedelta(days=i),
+            ))
+        return images
+
+    def test_default_page_is_capped_even_with_a_much_larger_library(self):
+        from api.views import SLIDESHOW_PAGE_SIZE_DEFAULT
+        self._make_images(SLIDESHOW_PAGE_SIZE_DEFAULT + 15)
+        resp = self.anon_client.get(f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}&cronological')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.json()
+        self.assertEqual(len(data['items']), SLIDESHOW_PAGE_SIZE_DEFAULT)
+        self.assertEqual(data['total_count'], SLIDESHOW_PAGE_SIZE_DEFAULT + 15)
+
+    def test_requested_limit_is_hard_capped_regardless_of_what_client_asks_for(self):
+        from api.views import SLIDESHOW_PAGE_SIZE_MAX
+        self._make_images(SLIDESHOW_PAGE_SIZE_MAX + 20)
+        resp = self.anon_client.get(
+            f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}&cronological&limit=100000'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.json()
+        self.assertEqual(len(data['items']), SLIDESHOW_PAGE_SIZE_MAX)
+        self.assertEqual(data['limit'], SLIDESHOW_PAGE_SIZE_MAX)
+
+    def test_chronological_pages_are_consecutive_and_non_overlapping(self):
+        images = self._make_images(10)
+        resp1 = self.anon_client.get(
+            f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}&cronological&limit=4&offset=0'
+        )
+        resp2 = self.anon_client.get(
+            f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}&cronological&limit=4&offset=4'
+        )
+        ids1 = [i['id'] for i in resp1.json()['items']]
+        ids2 = [i['id'] for i in resp2.json()['items']]
+        expected = [img.id for img in images]
+        self.assertEqual(ids1, expected[0:4])
+        self.assertEqual(ids2, expected[4:8])
+
+    def test_shuffled_pages_with_same_seed_never_repeat_an_id(self):
+        images = self._make_images(20)
+        resp1 = self.anon_client.get(
+            f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}&limit=10&offset=0'
+        )
+        seed = resp1.json()['seed']
+        resp2 = self.anon_client.get(
+            f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}&limit=10&offset=10&seed={seed}'
+        )
+        ids1 = {i['id'] for i in resp1.json()['items']}
+        ids2 = {i['id'] for i in resp2.json()['items']}
+        self.assertEqual(len(ids1), 10)
+        self.assertEqual(len(ids2), 10)
+        self.assertEqual(ids1 & ids2, set())
+        self.assertEqual(ids1 | ids2, {img.id for img in images})
+
+    def test_not_ready_video_is_excluded_from_items_and_total_count(self):
+        directory = Directory.objects.create(dir_path='/videos/pagination_test')
+        VideoFile.objects.create(
+            filename='/videos/pagination_test/pending.mov', directory=directory,
+            width=640, height=480, duration_seconds=5, codec='hevc',
+            # No transcoded_path, non-web-native codec - get_playback_url()
+            # returns None, so this should never appear.
+        )
+        resp = self.anon_client.get(f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}&cronological')
+        data = resp.json()
+        self.assertEqual(data['total_count'], 0)
+        self.assertEqual(data['items'], [])
+
+    def test_full_data_only_covers_the_current_page_not_the_whole_library(self):
+        self._make_images(5)
+        resp = self.anon_client.get(
+            f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}&full_data=true&cronological&limit=2'
+        )
+        data = resp.json()
+        self.assertEqual(len(data['items']), 2)
+        self.assertEqual(set(data['full_data'].keys()), {str(i['id']) for i in data['items']})
+        for entry in data['full_data'].values():
+            self.assertIn('sig', entry)
+
+
+class SlideshowMediaSigTests(ApiTestCase):
+    """KeyedImageView's 'slideshow' type and KeyedVideoView now require a
+    per-id, time-boxed sig (minted by filteredImagesView) instead of the
+    old shared, unscoped access_key - the actual fix for 'just increment
+    the id' scraping, since a sig minted for one id is cryptographically
+    useless for any other id."""
+
+    def test_sig_minted_for_one_image_does_not_work_for_a_different_image(self):
+        from api.views import _slideshow_current_sig
+        # Two DISTINCT fixture files - make_image()'s default arg always
+        # resolves to the same underlying row, which would make this test
+        # vacuously pass (same id both times).
+        image_a = self.make_image(relative_fixture="naming/good/1.JPG")
+        image_b = self.make_image(relative_fixture="naming/good/2.jpg")
+        sig_for_a = _slideshow_current_sig('image', image_a.id)
+        resp = self.anon_client.get(f'/api/keyed_image/slideshow/?id={image_b.id}&sig={sig_for_a}')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_correct_sig_for_the_right_image_is_accepted(self):
+        from api.views import _slideshow_current_sig
+        image = self.make_image()
+        sig = _slideshow_current_sig('image', image.id)
+        resp = self.anon_client.get(f'/api/keyed_image/slideshow/?id={image.id}&sig={sig}')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_old_global_access_key_no_longer_works_for_slideshow_type(self):
+        image = self.make_image()
+        resp = self.anon_client.get(
+            f'/api/keyed_image/slideshow/?id={image.id}&access_key={settings.RANDOM_ACCESS_KEY}'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_sig_outside_its_time_window_is_rejected(self):
+        # NOTE: this module imports `time` from `datetime` (a time-of-day
+        # type), not the stdlib `time` module - hence the `import time as
+        # time_mod` below rather than a bare `import time`.
+        import time as time_mod
+        from api.views import _slideshow_current_sig, SLIDESHOW_TOKEN_BUCKET_SECONDS
+        image = self.make_image()
+        sig = _slideshow_current_sig('image', image.id)
+        # Jump forward far enough that neither the current nor the
+        # previous grace bucket still matches.
+        future_time = time_mod.time() + 3 * SLIDESHOW_TOKEN_BUCKET_SECONDS
+        with mock.patch('api.views.time.time', return_value=future_time):
+            resp = self.anon_client.get(f'/api/keyed_image/slideshow/?id={image.id}&sig={sig}')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)

@@ -38,14 +38,19 @@ import common
 import cv2
 import subprocess
 from datetime import datetime, timedelta
+import hashlib
+import hmac
 import json
 import numpy as np
 import mimetypes
 import os
 import PIL
+import random
 import re
 import requests
+import string
 from .permissions import HasSlideshowKeyOrAuthenticated
+from .throttles import SlideshowListThrottle, SlideshowMediaThrottle
 import threading
 import threading
 import time
@@ -1300,6 +1305,7 @@ def _extract_video_face_frame_fast(face):
 class KeyedImageView(APIView):
 
     permission_classes = [AllowAny]
+    throttle_classes = [SlideshowMediaThrottle]
 
     def get(self, request, *args, **kwargs):
         '''
@@ -1349,7 +1355,14 @@ class KeyedImageView(APIView):
             id_key = params['id']
 
         if not request.user.is_authenticated:
-            if 'access_key' not in params.keys():
+            if image_type == 'slideshow':
+                # Per-photo, time-boxed token instead of the shared global
+                # access_key - see the "Slideshow media tokens" comment
+                # above filteredImagesView for why. Minted there, not
+                # guessable/reusable for any id other than this one.
+                if not _slideshow_sig_valid('image', id_key, params.get('sig')):
+                    return err_404('Invalid or expired sig.')
+            elif 'access_key' not in params.keys():
                 print("no access key")
                 print(request.user.is_authenticated)
                 return err_404('Access key not provided.')
@@ -1548,11 +1561,62 @@ class KeyedImageView(APIView):
 
         return _set_image_cache_headers(HttpResponse(temp_thumb.read(), content_type="image/jpeg"))
 
+
+# --- Slideshow media tokens -------------------------------------------------
+#
+# The 'slideshow' KeyedImageView type and KeyedVideoView used to accept any
+# request carrying settings.RANDOM_ACCESS_KEY - a single secret shared by
+# every unauthenticated caller, valid for the lifetime of the gunicorn
+# process, and not scoped to any particular photo/video. That meant anyone
+# who read the key out of net_slideshow's public JS bundle could fetch ANY
+# id just by incrementing it, not only the ones actually shown to them -
+# turning a slideshow into a full-library scraping endpoint.
+#
+# These tokens replace that for those two endpoints only (face_*/full_small
+# KeyedImageView types, used by the mobile app and facewires_frontend, are
+# untouched and keep using RANDOM_ACCESS_KEY). A token is derived from the
+# specific (kind, id) it's for plus a coarse time bucket, using Django's own
+# SECRET_KEY - so it's only ever valid for that one piece of media, and only
+# for a limited window, without needing any server-side session/token
+# storage. filteredImagesView mints one per id it actually hands back in a
+# page; KeyedImageView/KeyedVideoView just recompute and compare.
+SLIDESHOW_TOKEN_BUCKET_SECONDS = 20 * 60  # each token is good for ~20-40 min
+SLIDESHOW_PAGE_SIZE_DEFAULT = 60
+SLIDESHOW_PAGE_SIZE_MAX = 120
+
+
+def _slideshow_token_buckets():
+    now = int(time.time())
+    current = now // SLIDESHOW_TOKEN_BUCKET_SECONDS
+    # Also accept the previous bucket, so a token minted right before a
+    # bucket boundary doesn't go stale mid-slideshow.
+    return (current, current - 1)
+
+
+def _slideshow_sig(kind, media_id, bucket):
+    msg = f'{kind}:{media_id}:{bucket}'.encode()
+    return hmac.new(settings.SECRET_KEY.encode(), msg, hashlib.sha256).hexdigest()[:16]
+
+
+def _slideshow_current_sig(kind, media_id):
+    return _slideshow_sig(kind, media_id, _slideshow_token_buckets()[0])
+
+
+def _slideshow_sig_valid(kind, media_id, provided):
+    if not provided:
+        return False
+    return any(
+        hmac.compare_digest(_slideshow_sig(kind, media_id, bucket), provided)
+        for bucket in _slideshow_token_buckets()
+    )
+
+
 class filteredImagesView(APIView):
-    
+
     authentication_classes = [] # Optional: keeps session auth available
     permission_classes = [HasSlideshowKeyOrAuthenticated]
     # permission_classes = (HasSlideshowKeyOrAuthenticated,)
+    throttle_classes = [SlideshowListThrottle]
 
     def get(self, request, *args, **kwargs):
         # print(self.request.query_params)
@@ -1638,17 +1702,88 @@ class filteredImagesView(APIView):
                 else:
                     video_obj = VideoFile.objects.filter(video_query).exclude(face__declared_name__person_name='Charlotte Lewis').distinct().order_by('dateTaken').values_list('id', 'dateTaken')
 
-        ids = list(([o[0] for o in obj]))
-        video_ids = list(([o[0] for o in video_obj]))
+        # include_images/include_videos: dropping a whole kind up front
+        # (rather than after full_data fetch) keeps the excluded kind from
+        # ever touching ordering, pagination, or total_count.
+        image_rows = list(obj) if params.get('include_images') != 'false' else []
+        video_candidate_rows = list(video_obj) if params.get('include_videos') != 'false' else []
 
-        js = {'url_keys': ids, 'video_keys': video_ids}
+        # A video with no playable URL yet (still mid-transcode) used to be
+        # filtered out client-side, AFTER the full, undisclosed id list had
+        # already been handed over. Filtering it out here instead means it
+        # never occupies a page/offset slot or counts toward total_count at
+        # all - this used to run only when full_data was requested, but it
+        # has to run unconditionally now since it affects which ids even
+        # exist in the paginated sequence, not just what metadata comes back
+        # for them. See VideoFile.get_playback_url's own docstring for what
+        # "ready" means (transcoded, or a native codec with playback_path set).
+        video_rows = []
+        if video_candidate_rows:
+            ready_ids = {
+                v.id for v in VideoFile.objects.filter(
+                    id__in=[row[0] for row in video_candidate_rows]
+                )
+                if v.get_playback_url() is not None
+            }
+            video_rows = [row for row in video_candidate_rows if row[0] in ready_ids]
+
+        entries = [{'id': i, 'kind': 'image', 'date': d} for i, d in image_rows]
+        entries += [{'id': i, 'kind': 'video', 'date': d} for i, d in video_rows]
+
+        cronological = 'cronological' in params.keys()
+        seed = None
+        if cronological:
+            entries.sort(key=lambda e: (e['date'] is None, e['date']))
+        else:
+            # A stable order across pages (so later pages don't repeat or
+            # skip entries from earlier ones) without keeping any
+            # server-side session state: the client generates a seed once
+            # and resends it on every subsequent page request for this same
+            # slideshow run. random.Random(seed) is a separate, private PRNG
+            # instance - this never touches (or is affected by) any other
+            # random.* call elsewhere in the process.
+            seed = params.get('seed') or ''.join(
+                random.choice(string.ascii_letters + string.digits) for _ in range(16)
+            )
+            random.Random(seed).shuffle(entries)
+
+        total_count = len(entries)
+
+        try:
+            offset = max(0, int(params.get('offset', 0)))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            limit = int(params.get('limit', SLIDESHOW_PAGE_SIZE_DEFAULT))
+        except (TypeError, ValueError):
+            limit = SLIDESHOW_PAGE_SIZE_DEFAULT
+        # Hard-capped regardless of what's requested - this is what actually
+        # stops a single call from ever disclosing the whole library, not
+        # just a default a well-behaved client happens to respect.
+        limit = max(1, min(limit, SLIDESHOW_PAGE_SIZE_MAX))
+
+        page = entries[offset:offset + limit]
+
+        js = {
+            'items': [{'id': e['id'], 'kind': e['kind']} for e in page],
+            'total_count': total_count,
+            'offset': offset,
+            'limit': limit,
+        }
+        if seed is not None:
+            js['seed'] = seed
+
         if 'full_data' in params.keys():
-            # Slideshow frontend's date/location overlay - a second,
-            # separate query (rather than folding this into the query
-            # above) so the common no-full_data path never pays for the
-            # geocode join. Keyed by id (not a list) for O(1) frontend
-            # lookups per image.
-            meta_rows = ImageFile.objects.filter(id__in=ids).values(
+            page_image_ids = [e['id'] for e in page if e['kind'] == 'image']
+            page_video_ids = [e['id'] for e in page if e['kind'] == 'video']
+
+            # Slideshow frontend's date/location overlay, and (new) each
+            # id's signed media token - a second, separate query (rather
+            # than folding this into the query above) so the common
+            # no-full_data path never pays for the geocode join. Only
+            # covers THIS page's ids now, not the whole filtered set.
+            # Keyed by id (not a list) for O(1) frontend lookups per image.
+            meta_rows = ImageFile.objects.filter(id__in=page_image_ids).values(
                 'id', 'dateTaken', 'geocode__nearest_metro_name', 'geocode__locality'
             )
             full_data = {}
@@ -1664,6 +1799,7 @@ class filteredImagesView(APIView):
                 full_data[row['id']] = {
                     'date': row['dateTaken'].isoformat() if row['dateTaken'] else None,
                     'location': location,
+                    'sig': _slideshow_current_sig('image', row['id']),
                 }
             js['full_data'] = full_data
 
@@ -1680,19 +1816,19 @@ class filteredImagesView(APIView):
             # client that only proves it holds the slideshow key would
             # leak them to anyone who can read that key out of the
             # frontend bundle. Instead the frontend builds a
-            # /api/keyed_video/<id>/?access_key=... URL itself, exactly
-            # like it already does for images - KeyedVideoView below
-            # streams the bytes straight from this container's own
-            # filesystem mounts, so the real Apache password never
-            # needs to leave the backend at all.
+            # /api/keyed_video/<id>/?sig=... URL itself, exactly like it
+            # already does for images - KeyedVideoView below streams the
+            # bytes straight from this container's own filesystem mounts,
+            # so the real Apache password never needs to leave the
+            # backend at all.
             # select_related('geocode'), not .values() -- get_playback_url()
             # needs a real model instance (see VideoFile.get_playback_url's
             # own comment for why this is the single source of truth
             # shared with VideoFileSerializer, rather than re-deriving the
             # transcoded-vs-original-vs-not-ready logic a second time here).
-            video_rows = VideoFile.objects.filter(id__in=video_ids).select_related('geocode')
+            video_rows_full = VideoFile.objects.filter(id__in=page_video_ids).select_related('geocode')
             video_data = {}
-            for video in video_rows:
+            for video in video_rows_full:
                 location = None
                 if video.geocode is not None:
                     location = video.geocode.nearest_metro_name or video.geocode.locality or None
@@ -1702,7 +1838,10 @@ class filteredImagesView(APIView):
                     'duration_seconds': video.duration_seconds,
                     'width': video.width,
                     'height': video.height,
-                    'ready': video.get_playback_url() is not None,
+                    # Already filtered to playable-only ids above, so every
+                    # video that reaches this point is ready by definition.
+                    'ready': True,
+                    'sig': _slideshow_current_sig('video', video.id),
                 }
             js['video_data'] = video_data
         return HttpResponse(json.dumps(js), content_type='application/json')
@@ -1801,16 +1940,17 @@ class KeyedVideoView(APIView):
     require shipping Apache's real Basic Auth credentials
     (img_server_user/img_server_pw) to the browser, and this endpoint
     (like KeyedImageView) is reachable with just the low-trust slideshow
-    key. Same id/access_key auth as KeyedImageView, reusing
-    settings.RANDOM_ACCESS_KEY - a harmless, per-process rotating nonce,
-    not a real credential."""
+    key. Auth is a per-video, time-boxed `sig` (see the "Slideshow media
+    tokens" comment above filteredImagesView), not the old shared,
+    unscoped access_key - a leaked sig only ever works for this one
+    video, and only for a limited window."""
     permission_classes = [AllowAny]
+    throttle_classes = [SlideshowMediaThrottle]
 
     def get(self, request, id, *args, **kwargs):
         if not request.user.is_authenticated:
-            access_key = request.query_params.get('access_key')
-            if not access_key or access_key != settings.RANDOM_ACCESS_KEY:
-                return render_404(request, 'Invalid or missing access key.')
+            if not _slideshow_sig_valid('video', str(id), request.query_params.get('sig')):
+                return render_404(request, 'Invalid or expired sig.')
 
         try:
             video = VideoFile.objects.get(pk=id)
