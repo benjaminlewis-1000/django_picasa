@@ -234,7 +234,23 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--rehearse", action="store_true", help="Safe: dump+restore+verify only, app stays live.")
     mode.add_argument("--promote", action="store_true", help="Real: stops the app and swaps the DB.")
+    parser.add_argument(
+        "--only-first-monday", action="store_true",
+        help="No-op (exit 0) unless today is day-of-month 1-7. Only meant for the "
+             "cron entry itself -- cron's own day-of-month/day-of-week fields can't "
+             "express 'first Monday' (both-restricted fields are OR'd together, not "
+             "AND'd, a real bug found 2026-10-19: the crontab used to be scheduled "
+             "'1-7 * 1' and fired on EVERY Monday as well as every day 1-7, not just "
+             "the first Monday). Scheduling every Monday in crontab_root and gating "
+             "here instead makes the AND logic unambiguous. Never pass this for a "
+             "manual --promote -- per this script's own docstring, a manual run is "
+             "meant to work any time disk usage is tight, not just the first week."
+    )
     args = parser.parse_args()
+
+    if args.promote and args.only_first_monday and not (1 <= datetime.now().day <= 7):
+        print(f"[{datetime.now()}] Not the first Monday of the month -- skipping.")
+        sys.exit(0)
 
     ok = rehearse() if args.rehearse else promote()
     sys.exit(0 if ok else 1)

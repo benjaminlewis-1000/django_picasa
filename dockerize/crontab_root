@@ -8,15 +8,28 @@
 
 # Low-downtime VACUUM FULL via dump/restore/promote (weekly_vacuum_
 # swap.py's own docstring has the full mechanism). Changed 2026-09-04
-# from every Monday to the FIRST Monday of each month ("day-of-month
-# 1-7" + "weekday Monday" together only matches once a month): it exists
-# purely to reclaim disk space in the LIVE DB's on-disk footprint
-# (regular autovacuum already keeps the table usable/performant on its
-# own, it just doesn't shrink the file back down) -- separate from
-# backup size, which was never affected by live bloat either way
-# (pg_dump/postgres_bak.sh only ever dumps live row data, not dead
-# tuples/free space, regardless of bloat). Not worth picasa_api downtime
-# every single week for that; monthly is the compromise. Still Monday
-# 3am specifically so it doesn't collide with the daily backup (2am) or
+# from every Monday to the FIRST Monday of each month: it exists purely
+# to reclaim disk space in the LIVE DB's on-disk footprint (regular
+# autovacuum already keeps the table usable/performant on its own, it
+# just doesn't shrink the file back down) -- separate from backup size,
+# which was never affected by live bloat either way (pg_dump/
+# postgres_bak.sh only ever dumps live row data, not dead tuples/free
+# space, regardless of bloat). Not worth picasa_api downtime every
+# single week for that; monthly is the compromise.
+#
+# REAL BUG, found and fixed 2026-10-19: the original entry was
+# "0 3 1-7 * 1" (day-of-month 1-7, weekday Monday). Cron's documented
+# semantics: when BOTH day-of-month and day-of-week are restricted
+# (neither is "*"), the job fires if EITHER matches -- not both. So
+# this was actually firing every Monday (matching that previously
+# every-Monday entry anyway) AND every day 1-7 of the month, up to
+# several times a month instead of once -- confirmed via
+# picasa_prevacuum_2026_10_07 (a Wednesday) and _10_12 (a Monday)
+# both already sitting on disk from recent weeks. Fixed by scheduling
+# every Monday here (no day-of-month restriction, so no AND/OR
+# ambiguity) and moving the real "only the FIRST Monday" check into
+# the script itself (plain AND logic in Python, unambiguous) -- see
+# weekly_vacuum_swap.py's own day-of-month guard. Still Monday 3am
+# specifically so it doesn't collide with the daily backup (2am) or
 # the stock weekly slot above (Saturday, weekday 6).
-0	3	1-7	*	1	python3 /etc/periodic/weekly_vacuum_swap.py --promote >> /var/log/weekly_vacuum_swap.log 2>&1
+0	3	*	*	1	python3 /etc/periodic/weekly_vacuum_swap.py --promote --only-first-monday >> /var/log/weekly_vacuum_swap.log 2>&1
