@@ -10,7 +10,7 @@ from django.core.paginator import Paginator
 from django.db import connections
 from django.db.models import Count
 from django.db.models import Q
-from django.http import HttpResponse, Http404
+from django.http import HttpResponse, Http404, FileResponse
 from django.shortcuts import render
 from django.shortcuts import render
 from django_filters.rest_framework import DjangoFilterBackend
@@ -40,6 +40,7 @@ import subprocess
 from datetime import datetime, timedelta
 import json
 import numpy as np
+import mimetypes
 import os
 import PIL
 import requests
@@ -1668,9 +1669,21 @@ class filteredImagesView(APIView):
             # video_data mirrors full_data, plus the fields a frontend
             # needs to actually play a video (image entries never need
             # these -- the plain 'slideshow' keyed_image type already
-            # handles resizing/serving for images; a video's playback
-            # URL is served directly by Apache instead, see
-            # VideoFileSerializer.get_playback_url).
+            # handles resizing/serving for images). Deliberately NO
+            # playback_url here (unlike the Phase 4 design this
+            # originally shipped with) -- that would be Apache's direct,
+            # Basic-Auth-protected media URL, and this endpoint is
+            # reachable with just the low-trust slideshow key, not a
+            # real login. Shipping Apache's real media credentials
+            # (api/parameters' img_server_user/img_server_pw) to a
+            # client that only proves it holds the slideshow key would
+            # leak them to anyone who can read that key out of the
+            # frontend bundle. Instead the frontend builds a
+            # /api/keyed_video/<id>/?access_key=... URL itself, exactly
+            # like it already does for images - KeyedVideoView below
+            # streams the bytes straight from this container's own
+            # filesystem mounts, so the real Apache password never
+            # needs to leave the backend at all.
             # select_related('geocode'), not .values() -- get_playback_url()
             # needs a real model instance (see VideoFile.get_playback_url's
             # own comment for why this is the single source of truth
@@ -1682,18 +1695,64 @@ class filteredImagesView(APIView):
                 location = None
                 if video.geocode is not None:
                     location = video.geocode.nearest_metro_name or video.geocode.locality or None
-                playback_url = video.get_playback_url()
                 video_data[video.id] = {
                     'date': video.dateTaken.isoformat() if video.dateTaken else None,
                     'location': location,
                     'duration_seconds': video.duration_seconds,
                     'width': video.width,
                     'height': video.height,
-                    'playback_url': playback_url,
-                    'ready': playback_url is not None,
+                    'ready': video.get_playback_url() is not None,
                 }
             js['video_data'] = video_data
         return HttpResponse(json.dumps(js), content_type='application/json')
+
+
+class KeyedVideoView(APIView):
+    """GET /api/keyed_video/<id>/?access_key=<key> - streams a video's
+    playable bytes straight from THIS container's own filesystem mounts
+    (/videos read-only, /video_transcoded read-write - both already
+    mounted here for the transcode pipeline), with Range-request support
+    via FileResponse (so seeking/scrubbing and the slideshow's next-
+    video preload both work).
+
+    Deliberately NOT a redirect to Apache's direct media URL the way
+    filteredImagesView's old playback_url field worked - that would
+    require shipping Apache's real Basic Auth credentials
+    (img_server_user/img_server_pw) to the browser, and this endpoint
+    (like KeyedImageView) is reachable with just the low-trust slideshow
+    key. Same id/access_key auth as KeyedImageView, reusing
+    settings.RANDOM_ACCESS_KEY - a harmless, per-process rotating nonce,
+    not a real credential."""
+    permission_classes = [AllowAny]
+
+    def get(self, request, id, *args, **kwargs):
+        if not request.user.is_authenticated:
+            access_key = request.query_params.get('access_key')
+            if not access_key or access_key != settings.RANDOM_ACCESS_KEY:
+                return render_404(request, 'Invalid or missing access key.')
+
+        try:
+            video = VideoFile.objects.get(pk=id)
+        except VideoFile.DoesNotExist:
+            return render_404(request, 'No video with that id.')
+
+        if video.transcoded_path:
+            file_path = os.path.join(settings.VIDEO_TRANSCODE_ROOT, video.transcoded_path)
+            content_type = 'video/mp4'
+        elif video.codec in settings.WEB_NATIVE_CODECS:
+            # Mirrors VideoFile.get_playback_url()'s own transcoded-vs-
+            # original-vs-not-ready logic exactly - see that method's
+            # docstring for why it's the single source of truth, not
+            # re-derived independently here.
+            file_path = video.filename
+            content_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
+        else:
+            return render_404(request, 'Video not ready for playback yet.')
+
+        if not os.path.exists(file_path):
+            return render_404(request, 'Video file missing on disk.')
+
+        return FileResponse(open(file_path, 'rb'), content_type=content_type)
 
 
 # class HelloView(APIView):
@@ -1776,7 +1835,21 @@ class ParameterViewSet(viewsets.ViewSet):
     permission_classes = (HasSlideshowKeyOrAuthenticated,)
 
     def list(self, request):
-        serializer = api_ser.ParameterSerializer(instance=api_ser.ParameterSerializer.Parameters(), many=False)
+        instance = api_ser.ParameterSerializer.Parameters()
+        if not request.user.is_authenticated:
+            # The slideshow key alone (unlike a real session) does NOT
+            # earn you Apache's actual media credentials - that key is
+            # unavoidably public (baked into net_slideshow's frontend
+            # bundle, readable by anyone who loads the page), so
+            # anything gated only by it has to be treated as public
+            # too. random_access_key is fine to hand out here (just a
+            # low-stakes nonce gating KeyedImageView/KeyedVideoView,
+            # rotated per process) - img_server_user/img_server_pw are
+            # real Basic Auth credentials for the whole media library
+            # and must stay behind a real login.
+            instance.img_server_user = None
+            instance.img_server_pw = None
+        serializer = api_ser.ParameterSerializer(instance=instance, many=False)
         return Response(serializer.data)
 
 class SlideshowConfigViewSet(viewsets.ModelViewSet):

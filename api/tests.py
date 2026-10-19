@@ -2862,3 +2862,137 @@ class ActiveSlideshowConfigViewTests(ApiTestCase):
         self.assertIsNotNone(resp.data['rule_id'])
         self.assertEqual(resp.data['people'], 'Nana,Pop')
         self.assertEqual(resp.data['slide_len'], 10)
+
+
+class ParameterCredentialExposureTests(ApiTestCase):
+    """Regression test for a real pre-fix vulnerability: ParameterViewSet
+    used to hand img_server_user/img_server_pw (Apache's real media Basic
+    Auth credentials) to ANY caller holding the slideshow key - and that
+    key is unavoidably public (baked into net_slideshow's frontend
+    bundle). Real credentials must only ever reach a genuine
+    authenticated session."""
+
+    def test_slideshow_key_alone_gets_null_media_credentials(self):
+        resp = self.anon_client.get(
+            '/api/parameters/', HTTP_X_SLIDESHOW_KEY=settings.SLIDESHOW_API_KEY
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIsNone(resp.data['img_server_user'])
+        self.assertIsNone(resp.data['img_server_pw'])
+        # The low-stakes nonce is still fine to hand out - that's what
+        # KeyedImageView/KeyedVideoView actually gate on.
+        self.assertTrue(resp.data['random_access_key'])
+
+    def test_authenticated_session_still_gets_real_media_credentials(self):
+        resp = self.client.get('/api/parameters/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['img_server_user'], settings.MEDIA_URL_USER)
+        self.assertEqual(resp.data['img_server_pw'], settings.MEDIA_URL_PW)
+
+
+class KeyedVideoViewTests(ApiTestCase):
+    """GET /api/keyed_video/<id>/ - streams bytes straight from this
+    container's own filesystem mounts, never from Apache, and never
+    needs the Apache credentials ParameterCredentialExposureTests above
+    locks down."""
+
+    def _make_transcoded_video(self):
+        directory = Directory.objects.create(dir_path='/videos/keyed_video_test')
+        video = VideoFile.objects.create(
+            filename='/videos/keyed_video_test/original.mov', directory=directory,
+            width=640, height=480, duration_seconds=5, codec='hevc',
+            transcoded_path='ab/c/abc123.mp4',
+        )
+        out_path = os.path.join(settings.VIDEO_TRANSCODE_ROOT, 'ab/c/abc123.mp4')
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, 'wb') as f:
+            f.write(b'fake transcoded mp4 bytes')
+        self.addCleanup(lambda: os.path.exists(out_path) and os.remove(out_path))
+        return video
+
+    def _make_native_video(self, tmp_path):
+        directory = Directory.objects.create(dir_path='/videos/keyed_video_test_native')
+        with open(tmp_path, 'wb') as f:
+            f.write(b'fake native-codec mp4 bytes')
+        return VideoFile.objects.create(
+            filename=tmp_path, directory=directory,
+            width=640, height=480, duration_seconds=5, codec='h264',
+        )
+
+    def test_requires_access_key_or_session(self):
+        video = self._make_transcoded_video()
+        resp = self.anon_client.get(f'/api/keyed_video/{video.id}/')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_wrong_access_key_rejected(self):
+        video = self._make_transcoded_video()
+        resp = self.anon_client.get(f'/api/keyed_video/{video.id}/?access_key=not-the-key')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_streams_transcoded_video_bytes_with_correct_access_key(self):
+        video = self._make_transcoded_video()
+        resp = self.anon_client.get(
+            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(b''.join(resp.streaming_content), b'fake transcoded mp4 bytes')
+        self.assertEqual(resp['Content-Type'], 'video/mp4')
+
+    def test_streams_native_codec_video_from_its_original_path(self):
+        tmp_path = tempfile.mktemp(suffix='.mp4')
+        video = self._make_native_video(tmp_path)
+        self.addCleanup(lambda: os.path.exists(tmp_path) and os.remove(tmp_path))
+        resp = self.anon_client.get(
+            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(b''.join(resp.streaming_content), b'fake native-codec mp4 bytes')
+
+    def test_authenticated_session_bypasses_access_key_requirement(self):
+        video = self._make_transcoded_video()
+        resp = self.client.get(f'/api/keyed_video/{video.id}/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_not_yet_transcoded_non_native_video_returns_404(self):
+        directory = Directory.objects.create(dir_path='/videos/keyed_video_test_pending')
+        video = VideoFile.objects.create(
+            filename='/videos/keyed_video_test_pending/a.mov', directory=directory,
+            width=640, height=480, duration_seconds=5, codec='hevc',
+        )
+        resp = self.anon_client.get(
+            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_unknown_video_id_returns_404(self):
+        resp = self.anon_client.get(
+            f'/api/keyed_video/999999/?access_key={settings.RANDOM_ACCESS_KEY}'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class VideoDataNeverExposesPlaybackCredentialsTests(ApiTestCase):
+    """filteredImagesView's video_data must never include a direct
+    Apache playback_url (see KeyedVideoViewTests/
+    ParameterCredentialExposureTests for the full reasoning) - just
+    enough metadata for the frontend to build its own
+    /api/keyed_video/<id>/ URL."""
+
+    def test_video_data_has_no_playback_url_field(self):
+        directory = Directory.objects.create(dir_path='/videos/video_data_test')
+        video = VideoFile.objects.create(
+            filename='/videos/video_data_test/a.mp4', directory=directory,
+            width=640, height=480, duration_seconds=12, codec='h264',
+            # get_playback_url() returns THIS field for a native-codec,
+            # not-yet-transcoded video (not just a bool check on codec) -
+            # see its own docstring. Set here so 'ready' actually comes
+            # back true, matching a real ingested native-codec video.
+            playback_path='https://media.example.com/full_res/a.mp4',
+        )
+        resp = self.anon_client.get(
+            f'/api/image_list/?full_data=true&key={settings.SLIDESHOW_API_KEY}'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        entry = resp.json()['video_data'][str(video.id)]
+        self.assertNotIn('playback_url', entry)
+        self.assertTrue(entry['ready'])

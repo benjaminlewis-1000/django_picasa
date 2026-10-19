@@ -40,6 +40,7 @@ urlpatterns = [
     path(r'person_list/', views.PersonListView.as_view(), name='person_list'),
     path(r'folder_list/', views.FolderListView.as_view(), name='folder_list'),
     path(r'keyed_image/<slug:type>/', views.KeyedImageView.as_view(), name='keyed_image'),
+    path(r'keyed_video/<int:id>/', views.KeyedVideoView.as_view(), name='keyed_video'),
     path(r'authelia_state/', views.AutheliaStateView.as_view(), name='authelia_state'),
     path(r'clean_logout/', views.CleanLogoutView.as_view(), name='clean_logout'),
     path(r'mobile/confident_unlabeled/', mobile_views.ConfidentUnlabeledView.as_view(), name='unlabeled'),
