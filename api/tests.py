@@ -2937,6 +2937,62 @@ class KeyedVideoViewTests(ApiTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(b''.join(resp.streaming_content), b'fake transcoded mp4 bytes')
         self.assertEqual(resp['Content-Type'], 'video/mp4')
+        self.assertEqual(resp['Accept-Ranges'], 'bytes')
+
+    def test_range_request_returns_206_with_only_the_requested_bytes(self):
+        # Regression test: Django's FileResponse (and even
+        # django.views.static.serve()) has NO built-in Range support -
+        # the first version of this view silently ignored the Range
+        # header and always returned the whole file with a plain 200,
+        # which defeats both scrubbing and Slideshow.jsx's next-video
+        # preload.
+        video = self._make_transcoded_video()  # body: b'fake transcoded mp4 bytes' (25 bytes)
+        resp = self.anon_client.get(
+            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}',
+            HTTP_RANGE='bytes=5-12',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_206_PARTIAL_CONTENT)
+        self.assertEqual(b''.join(resp.streaming_content), b'transcod')
+        self.assertEqual(resp['Content-Range'], 'bytes 5-12/25')
+        self.assertEqual(resp['Content-Length'], '8')
+
+    def test_range_request_with_open_ended_end_goes_to_eof(self):
+        video = self._make_transcoded_video()
+        resp = self.anon_client.get(
+            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}',
+            HTTP_RANGE='bytes=20-',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_206_PARTIAL_CONTENT)
+        self.assertEqual(b''.join(resp.streaming_content), b'bytes')
+        self.assertEqual(resp['Content-Range'], 'bytes 20-24/25')
+
+    def test_suffix_range_request_returns_last_n_bytes(self):
+        video = self._make_transcoded_video()
+        resp = self.anon_client.get(
+            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}',
+            HTTP_RANGE='bytes=-5',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_206_PARTIAL_CONTENT)
+        self.assertEqual(b''.join(resp.streaming_content), b'bytes')
+        self.assertEqual(resp['Content-Range'], 'bytes 20-24/25')
+
+    def test_range_entirely_past_eof_returns_416(self):
+        video = self._make_transcoded_video()
+        resp = self.anon_client.get(
+            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}',
+            HTTP_RANGE='bytes=1000-2000',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE)
+        self.assertEqual(resp['Content-Range'], 'bytes */25')
+
+    def test_malformed_range_header_falls_back_to_full_200_response(self):
+        video = self._make_transcoded_video()
+        resp = self.anon_client.get(
+            f'/api/keyed_video/{video.id}/?access_key={settings.RANDOM_ACCESS_KEY}',
+            HTTP_RANGE='not-a-range-header',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(b''.join(resp.streaming_content), b'fake transcoded mp4 bytes')
 
     def test_streams_native_codec_video_from_its_original_path(self):
         tmp_path = tempfile.mktemp(suffix='.mp4')

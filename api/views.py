@@ -43,6 +43,7 @@ import numpy as np
 import mimetypes
 import os
 import PIL
+import re
 import requests
 from .permissions import HasSlideshowKeyOrAuthenticated
 import threading
@@ -1707,13 +1708,93 @@ class filteredImagesView(APIView):
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 
+_RANGE_HEADER_RE = re.compile(r'bytes=(\d*)-(\d*)$')
+
+
+class _LimitedReader:
+    """Wraps an already-seeked, open file object so FileResponse's
+    internal `iter(lambda: filelike.read(block_size), b"")` loop stops
+    after exactly `limit` bytes - i.e. serves exactly one HTTP Range.
+    Deliberately exposes neither seek/tell/seekable/name: FileResponse.
+    set_headers() only tries to auto-compute Content-Length/Content-Type
+    from those, and _ranged_file_response() below sets both explicitly
+    instead (auto-computing from this wrapper would see the
+    UNDERLYING file's full size/position, not the slice)."""
+
+    def __init__(self, fileobj, limit):
+        self._fileobj = fileobj
+        self._remaining = limit
+
+    def read(self, size=-1):
+        if self._remaining <= 0:
+            return b''
+        if size < 0 or size > self._remaining:
+            size = self._remaining
+        chunk = self._fileobj.read(size)
+        self._remaining -= len(chunk)
+        return chunk
+
+    def close(self):
+        self._fileobj.close()
+
+
+def _ranged_file_response(file_path, content_type, range_header):
+    """Django has no built-in Range support for hand-written views -
+    neither FileResponse nor even django.views.static.serve() implement
+    it (confirmed by reading both; this surprised whoever wrote this
+    view first, so it's documented here). Without this, every video
+    request downloads the ENTIRE file regardless of what the <video>
+    element actually asked for, defeating both seeking/scrubbing and
+    Slideshow.jsx's next-video preload (which exists specifically to
+    start streaming ahead of time without downloading clips that may
+    never even be reached).
+
+    Only a single `bytes=start-end` range is handled (what every real
+    browser/media pipeline actually sends for progressive video - multi-
+    range requests are vanishingly rare for this use case) - anything
+    else (no header, multi-range, malformed) falls back to a plain full
+    200 response rather than erroring, since a confused client will
+    just re-request without Range anyway."""
+    file_size = os.path.getsize(file_path)
+    match = _RANGE_HEADER_RE.match((range_header or '').strip())
+    if not match:
+        response = FileResponse(open(file_path, 'rb'), content_type=content_type)
+        response.headers['Accept-Ranges'] = 'bytes'
+        return response
+
+    start_str, end_str = match.groups()
+    if start_str:
+        start = int(start_str)
+        end = int(end_str) if end_str else file_size - 1
+    else:
+        # Suffix form, "bytes=-500" = "the last 500 bytes".
+        start = max(file_size - int(end_str), 0)
+        end = file_size - 1
+    end = min(end, file_size - 1)
+
+    if start > end or start >= file_size:
+        response = HttpResponse(status=416)
+        response.headers['Content-Range'] = f'bytes */{file_size}'
+        return response
+
+    length = end - start + 1
+    f = open(file_path, 'rb')
+    f.seek(start)
+    response = FileResponse(_LimitedReader(f, length), content_type=content_type)
+    response.status_code = 206
+    response.headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
+    response.headers['Content-Length'] = str(length)
+    response.headers['Accept-Ranges'] = 'bytes'
+    return response
+
+
 class KeyedVideoView(APIView):
     """GET /api/keyed_video/<id>/?access_key=<key> - streams a video's
     playable bytes straight from THIS container's own filesystem mounts
     (/videos read-only, /video_transcoded read-write - both already
-    mounted here for the transcode pipeline), with Range-request support
-    via FileResponse (so seeking/scrubbing and the slideshow's next-
-    video preload both work).
+    mounted here for the transcode pipeline), with hand-rolled Range-
+    request support (see _ranged_file_response) so seeking/scrubbing and
+    the slideshow's next-video preload both actually work.
 
     Deliberately NOT a redirect to Apache's direct media URL the way
     filteredImagesView's old playback_url field worked - that would
@@ -1752,7 +1833,7 @@ class KeyedVideoView(APIView):
         if not os.path.exists(file_path):
             return render_404(request, 'Video file missing on disk.')
 
-        return FileResponse(open(file_path, 'rb'), content_type=content_type)
+        return _ranged_file_response(file_path, content_type, request.META.get('HTTP_RANGE'))
 
 
 # class HelloView(APIView):
