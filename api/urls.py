@@ -21,6 +21,8 @@ router.register(r'faces', views.FaceViewSet)
 router.register(r'people', views.PersonViewSet)
 router.register(r'parameters', views.ParameterViewSet, basename='params')
 router.register(r'server_stats', views.StatsViewSet, basename='stats')
+router.register(r'slideshow_configs', views.SlideshowConfigViewSet)
+router.register(r'schedule_rules', views.ScheduleRuleViewSet)
 # router.register(r'request-token', obtain_auth_token)
 
 # TODO: Add a 'Help' section or something. 
@@ -33,6 +35,7 @@ urlpatterns = [
     # url(r'^', include(router.urls)),
     path('', include(router.urls)),
     path(r'image_list/', views.filteredImagesView.as_view(), name='image_list'),
+    path(r'slideshow/active_config/', views.ActiveSlideshowConfigView.as_view(), name='active_slideshow_config'),
     path(r'paginate_obj_ids/<int:id>/<slug:field>', views.PersonParamView.as_view(), name='face_pages'),
     path(r'person_list/', views.PersonListView.as_view(), name='person_list'),
     path(r'folder_list/', views.FolderListView.as_view(), name='folder_list'),

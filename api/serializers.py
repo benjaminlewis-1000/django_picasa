@@ -4,6 +4,7 @@ from django.conf import settings
 from django.contrib.auth.models import User, Group
 from django.core.paginator import Paginator
 from drf_queryfields import QueryFieldsMixin
+from api.models import ScheduleRule, SlideshowConfig
 from face_manager.models import Person, Face
 from filepopulator.models import ImageFile, Directory, VideoFile
 from rest_framework import serializers
@@ -315,3 +316,46 @@ class ServerStatsSerializer(serializers.Serializer):
 
     def create(self, validated_data):
         return Stats()
+
+
+class SlideshowConfigSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SlideshowConfig
+        fields = [
+            'id', 'name', 'people', 'year_start', 'year_end', 'cronological',
+            'slide_len', 'show_meta', 'include_videos', 'include_images',
+            'debug_limit', 'is_default', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate(self, data):
+        year_start = data.get('year_start', getattr(self.instance, 'year_start', None))
+        year_end = data.get('year_end', getattr(self.instance, 'year_end', None))
+        if year_start is not None and year_end is not None and year_start > year_end:
+            raise serializers.ValidationError('year_start must not be after year_end.')
+        return data
+
+
+class ScheduleRuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ScheduleRule
+        fields = [
+            'id', 'config', 'name', 'days', 'start_time', 'end_time',
+            'priority', 'enabled', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_days(self, value):
+        days = [d.strip().upper() for d in value.split(',') if d.strip()]
+        if not days:
+            raise serializers.ValidationError('At least one day is required.')
+        invalid = sorted(set(days) - set(ScheduleRule.WEEKDAY_ABBREVIATIONS))
+        if invalid:
+            raise serializers.ValidationError(
+                f"Invalid day(s): {', '.join(invalid)}. Use MON/TUE/WED/THU/FRI/SAT/SUN."
+            )
+        # Normalize to a fixed MON..SUN order regardless of input order/
+        # duplicates, so two equivalent day sets always compare equal
+        # (e.g. in tests) and render consistently in the settings page.
+        ordered = [d for d in ScheduleRule.WEEKDAY_ABBREVIATIONS if d in days]
+        return ','.join(ordered)

@@ -31,6 +31,7 @@ from django.utils.functional import SimpleLazyObject
 from face_manager.tasks import api_bulk_operation
 from time import sleep
 import api.serializers as api_ser
+from api.models import ScheduleRule, SlideshowConfig, resolve_active_slideshow_config
 from queue import Queue
 import base64
 import common
@@ -1777,6 +1778,65 @@ class ParameterViewSet(viewsets.ViewSet):
     def list(self, request):
         serializer = api_ser.ParameterSerializer(instance=api_ser.ParameterSerializer.Parameters(), many=False)
         return Response(serializer.data)
+
+class SlideshowConfigViewSet(viewsets.ModelViewSet):
+    """CRUD for named slideshow configs (net_slideshow's settings page) -
+    session/Authelia-authenticated only, unlike the slideshow-facing
+    endpoints below. Building/editing these isn't something the Pi
+    itself ever needs to do."""
+    permission_classes = (IsAuthenticated,)
+    queryset = SlideshowConfig.objects.all().order_by('name')
+    serializer_class = api_ser.SlideshowConfigSerializer
+
+
+class ScheduleRuleViewSet(viewsets.ModelViewSet):
+    """CRUD for day/time schedule rules, each pointing at a
+    SlideshowConfig. Same auth as SlideshowConfigViewSet - see its
+    docstring."""
+    permission_classes = (IsAuthenticated,)
+    queryset = ScheduleRule.objects.all().order_by('-priority', 'start_time')
+    serializer_class = api_ser.ScheduleRuleSerializer
+
+
+class ActiveSlideshowConfigView(APIView):
+    """GET /api/slideshow/active_config/ - what the slideshow should be
+    playing right now, resolved from ScheduleRule day/time windows (see
+    api/models.py's resolve_active_slideshow_config). Slideshow-key
+    reachable like filteredImagesView/ParameterViewSet - the Pi polls
+    this periodically with no session of its own.
+
+    Flat response shape deliberately mirrors the URL params
+    net_slideshow's App.jsx already understands, so the frontend can
+    forward these straight through unchanged. config_id is included so
+    the frontend can cheaply detect "did the active config change since
+    I last checked" without comparing every field."""
+    authentication_classes = []
+    permission_classes = [HasSlideshowKeyOrAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        config, rule = resolve_active_slideshow_config()
+        if config is None:
+            return Response({
+                'config_id': None, 'config_name': None, 'rule_id': None,
+                'people': '', 'year_start': None, 'year_end': None,
+                'cronological': False, 'slide_len': 6, 'show_meta': True,
+                'include_videos': True, 'include_images': True, 'debug_limit': None,
+            })
+        return Response({
+            'config_id': config.id,
+            'config_name': config.name,
+            'rule_id': rule.id if rule else None,
+            'people': config.people,
+            'year_start': config.year_start,
+            'year_end': config.year_end,
+            'cronological': config.cronological,
+            'slide_len': config.slide_len,
+            'show_meta': config.show_meta,
+            'include_videos': config.include_videos,
+            'include_images': config.include_images,
+            'debug_limit': config.debug_limit,
+        })
+
 
 class StatsViewSet(viewsets.ViewSet):
 ### NOTE###  Don't Use ViewSet for MODELS!!!

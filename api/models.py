@@ -1,7 +1,9 @@
 import uuid
 
 from django.contrib.auth.models import User
-from django.db import models
+from django.db import models, transaction
+from django.db.models import Q
+from django.utils import timezone
 
 
 class UploadSession(models.Model):
@@ -95,6 +97,124 @@ class GooglePhotosWatchedAlbum(models.Model):
 
     def __str__(self):
         return f"GooglePhotosWatchedAlbum({self.title!r})"
+
+
+class SlideshowConfig(models.Model):
+    """A named, reusable bundle of slideshow filter/display settings -
+    the same knobs net_slideshow's App.jsx already accepts as URL
+    params (see its CLAUDE.md), just saved server-side so the settings
+    page can build/update them without anyone hand-editing a URL, and
+    so ScheduleRule can reference them by name for time-based
+    switching."""
+    name = models.CharField(max_length=128, unique=True)
+    # Comma-separated person names, matching the slideshow's own
+    # people= filter format - stored as the same flat string rather than
+    # an M2M to Person, since this is just forwarded straight through to
+    # filteredImagesView, never queried against directly.
+    people = models.CharField(max_length=512, blank=True, default='')
+    year_start = models.IntegerField(null=True, blank=True)
+    year_end = models.IntegerField(null=True, blank=True)
+    # Mirrors the slideshow's `cronological` URL param name (including
+    # its existing misspelling) so the active_config response can be
+    # forwarded through unchanged.
+    cronological = models.BooleanField(default=False)
+    slide_len = models.PositiveIntegerField(default=6)
+    show_meta = models.BooleanField(default=True)
+    include_videos = models.BooleanField(default=True)
+    include_images = models.BooleanField(default=True)
+    debug_limit = models.PositiveIntegerField(null=True, blank=True)
+    # The fallback config when no enabled ScheduleRule matches the
+    # current day/time (or no rules exist at all yet). At most one row
+    # may have this set - enforced at the DB level by the partial unique
+    # constraint below, AND defensively in save() so flipping a second
+    # row to default through the API demotes the previous one instead of
+    # raising an IntegrityError.
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['is_default'], condition=Q(is_default=True),
+                name='unique_default_slideshow_config',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.is_default:
+            with transaction.atomic():
+                SlideshowConfig.objects.filter(is_default=True).exclude(pk=self.pk).update(is_default=False)
+                super().save(*args, **kwargs)
+        else:
+            super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"SlideshowConfig({self.name!r}, default={self.is_default})"
+
+
+class ScheduleRule(models.Model):
+    """Plays `config` whenever the current local time falls inside this
+    rule's day-of-week + time-of-day window. Multiple enabled rules can
+    match at once (e.g. overlapping windows); `priority` is the explicit,
+    user-controlled tie-break (see resolve_active_slideshow_config)
+    rather than leaving it to insertion order or rule id, which would be
+    invisible and unintuitive to someone editing rules in the settings
+    page."""
+    WEEKDAY_ABBREVIATIONS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
+
+    config = models.ForeignKey(SlideshowConfig, on_delete=models.CASCADE, related_name='schedule_rules')
+    name = models.CharField(max_length=128, blank=True, default='')
+    # Comma-separated subset of WEEKDAY_ABBREVIATIONS - a single row can
+    # cover several days ("weekday mornings") instead of needing one row
+    # per day. Validated/normalized in api/serializers.py, not here -
+    # this field intentionally has no model-level choices/validators so
+    # a plain CharField read stays simple.
+    days = models.CharField(max_length=27)
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+    priority = models.IntegerField(default=0)
+    enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def day_list(self):
+        return [d.strip().upper() for d in self.days.split(',') if d.strip()]
+
+    def contains(self, local_dt):
+        """Whether `local_dt` (an aware datetime already in local time -
+        see resolve_active_slideshow_config) falls inside this rule's
+        day+time window. end_time < start_time is treated as an
+        overnight window (e.g. 22:00-06:00) that wraps past midnight,
+        rather than an always-false empty range."""
+        if self.WEEKDAY_ABBREVIATIONS[local_dt.weekday()] not in self.day_list():
+            return False
+        t = local_dt.time()
+        if self.start_time <= self.end_time:
+            return self.start_time <= t < self.end_time
+        return t >= self.start_time or t < self.end_time
+
+    def __str__(self):
+        return f"ScheduleRule({self.name!r}, {self.days}, {self.start_time}-{self.end_time} -> {self.config_id})"
+
+
+def resolve_active_slideshow_config(now=None):
+    """What should be playing right now. Returns (config, rule) - rule
+    is None when falling back to the default config (or when there's no
+    config at all yet, in which case config is also None).
+
+    Among every enabled rule whose window contains `now`, the highest
+    `priority` wins; a tie is broken by the most-recently-created rule
+    (higher id) - an explicit, documented tie-break rather than
+    whatever order the DB happens to return rows in.
+    """
+    local_now = timezone.localtime(now or timezone.now())
+    matching = [r for r in ScheduleRule.objects.filter(enabled=True).select_related('config')
+                if r.contains(local_now)]
+    if matching:
+        best = max(matching, key=lambda r: (r.priority, r.id))
+        return best.config, best
+    return SlideshowConfig.objects.filter(is_default=True).first(), None
 
 
 class GooglePhotosSyncedItem(models.Model):
