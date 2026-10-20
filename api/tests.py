@@ -1053,6 +1053,49 @@ class StatsAndParametersTests(ApiTestCase):
         self.assertGreaterEqual(resp.data["num_imgs"], 1)
         self.assertGreaterEqual(resp.data["num_faces"], 1)
 
+    def test_stats_endpoint_by_collection_breakdown(self):
+        # A real second PhotoCollection, scoped to one fixture subdirectory
+        # via root_directory -- an image under it resolves (longest-prefix
+        # match) to this collection instead of falling back to Default.
+        import os
+        from filepopulator.models import PhotoCollection
+
+        second = PhotoCollection.objects.create(
+            name='Second Collection',
+            root_directory=os.path.join(settings.FILEPOPULATOR_VAL_DIRECTORY, 'naming', 'good'),
+        )
+
+        # Falls back to Default -- doesn't match 'second's root_directory.
+        default_img = self.make_image('orientation/2_4.jpg')
+        default_img.isProcessed = True
+        default_img.save()
+        self.make_face(default_img)
+
+        # Resolves to 'second' (longest-prefix match against its root).
+        second_img = self.make_image('naming/good/1.JPG')
+        second_img.isProcessed = True
+        second_img.save()
+        self.make_face(second_img)
+
+        resp = self.client.get("/api/server_stats/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        by_name = {row['name']: row for row in resp.data['by_collection']}
+        self.assertIn('Default', by_name)
+        self.assertIn('Second Collection', by_name)
+
+        # Second Collection has exactly the one image/face placed in it,
+        # not the Default collection's image too.
+        self.assertEqual(by_name['Second Collection']['num_imgs'], 1)
+        self.assertEqual(by_name['Second Collection']['num_faces'], 1)
+        self.assertFalse(by_name['Second Collection']['is_default'])
+        self.assertTrue(by_name['Default']['is_default'])
+
+        # Global totals are unaffected -- still reflect everything, same
+        # as before this feature existed.
+        self.assertGreaterEqual(resp.data['num_imgs'], 2)
+        self.assertGreaterEqual(resp.data['num_faces'], 2)
+
     def test_stats_endpoint_video_fields_with_no_videos(self):
         """No VideoFile rows at all -- percentages must not divide by zero."""
         img = self.make_image()
