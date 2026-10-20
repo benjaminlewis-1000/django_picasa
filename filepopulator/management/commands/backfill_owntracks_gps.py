@@ -10,11 +10,20 @@
 # confirmed offset source before being added there, not just added
 # blindly).
 
+import datetime
+
 from django.core.management.base import BaseCommand, CommandError
 
 from filepopulator.owntracks_gps import (
     OwnTracksConfigError, SUPPORTED_CAMERA_MODELS, backfill_camera_gps,
 )
+
+
+def _parse_date(value):
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        raise CommandError(f"Not a valid YYYY-MM-DD date: {value!r}")
 
 
 class Command(BaseCommand):
@@ -35,6 +44,17 @@ class Command(BaseCommand):
                  f"SUPPORTED_CAMERA_MODELS ({', '.join(SUPPORTED_CAMERA_MODELS)}) -- this "
                  "narrows a run for testing, it does not add a new camera.",
         )
+        parser.add_argument(
+            '--start-date', type=_parse_date, default=None,
+            help="YYYY-MM-DD -- only photos on/after this date (by dateTaken). Real motivating "
+                 "case: a camera with years of history predating OwnTracks tracking entirely "
+                 "would otherwise spend a real exiftool+HTTP round trip per photo just to "
+                 "learn that, over and over.",
+        )
+        parser.add_argument(
+            '--end-date', type=_parse_date, default=None,
+            help="YYYY-MM-DD -- only photos on/before this date (by dateTaken).",
+        )
 
     def handle(self, *args, **options):
         camera_models = options['camera_model']
@@ -49,6 +69,7 @@ class Command(BaseCommand):
         try:
             counts = backfill_camera_gps(
                 camera_models=camera_models,
+                start_date=options['start_date'], end_date=options['end_date'],
                 dry_run=options['dry_run'], limit=options['limit'], log=self.stdout.write,
             )
         except OwnTracksConfigError as e:
