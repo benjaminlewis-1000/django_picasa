@@ -170,6 +170,16 @@ DUPLICATES_FILE = '/code/duplicates.csv'
 # rejects/blocks requests using geopy's generic default.
 NOMINATIM_USER_AGENT = 'django_picasa (self-hosted photo library, contact: ' + os.environ.get('NOMINATIM_CONTACT_EMAIL', 'unset@example.com') + ')'
 
+# OwnTracks-backed "nearest recorded location" service (separate project,
+# not this repo) -- backs backfill_s23_gps's GPS-estimation-from-location-
+# history for photos with no camera GPS at all. Optional (.get(), not
+# os.environ[...]) since this is a one-off tool, not required for the app
+# to run -- the command itself errors clearly if either is unset rather
+# than this file failing to import. Real values live only in dockerize/
+# .env (not committed), same precedent as CARTO_API_KEY.
+OWNTRACKS_LOCATION_API_URL = os.environ.get('OWNTRACKS_LOCATION_API_URL')
+OWNTRACKS_LOCATION_API_KEY = os.environ.get('OWNTRACKS_LOCATION_API_KEY')
+
 # Max phash Hamming distance (out of 64 bits) for two images to be
 # considered near-duplicates. Chosen from real production photos: exact
 # recompressed duplicates and true repeat-shots scored 0-6, genuinely
