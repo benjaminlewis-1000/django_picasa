@@ -191,6 +191,16 @@ class Face(models.Model):
     # missing embeddings.
     det_score = models.FloatField(null=True, blank=True, default=None)
 
+    # min(box_width, box_height) / min(image_width, image_height) at
+    # detection time -- relative, not an absolute pixel count, so one
+    # number is comparable across wildly different source resolutions.
+    # Stored (not just computed on demand) so a frontend tagging queue
+    # can filter cheaply without joining back to the source image's own
+    # dimensions on every request. See PhotoCollection.
+    # min_face_relative_size (filepopulator/models.py) for the
+    # per-collection floor this is compared against at detection time.
+    relative_size = models.FloatField(null=True, blank=True, default=None)
+
     # Populated by the nightly face_manager.cluster_unverified_faces task:
     # per-person complete-linkage clustering (see verification_clustering.py)
     # over this person's own unverified faces, so a human reviewing a run

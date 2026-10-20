@@ -3,7 +3,7 @@
 from django.conf import settings
 from django.db.models import Q
 from face_manager.models import Person, Face
-from filepopulator.models import ImageFile
+from filepopulator.models import ImageFile, below_collection_floor
 from insightface.app import FaceAnalysis
 import ctypes
 import django
@@ -595,48 +595,57 @@ class FaceExtractor(object):
         
         new_face = Face()
 
-        new_face.face_encoding_512 = insight_detected_face['embedding'].tolist()
         new_face.kps = self._flatten_kps(insight_detected_face['kps'])
         new_face.det_score = insight_detected_face['det_score']
         new_face.declared_name = self.blank_face_person
         new_face.written_to_photo_metadata = False
         new_face.reencoded = True
 
-        img_h, img_w, _ = img_numpy.shape 
-        
+        img_h, img_w, _ = img_numpy.shape
+
         bb_l = np.max((0, int(bb_l)))
         bb_t = np.max((0, int(bb_t)))
         bb_r = np.min((int(bb_r), img_w))
-        bb_b = np.min((int(bb_b), img_h))           
+        bb_b = np.min((int(bb_b), img_h))
 
         new_face.box_top = bb_t
         new_face.box_bottom = bb_b
         new_face.box_left = bb_l
         new_face.box_right = bb_r
 
+        # Always stored, every collection -- generally useful (not just
+        # for the floor check below), and cheap to compute. See
+        # Face.relative_size's own comment.
+        box_w, box_h = bb_r - bb_l, bb_b - bb_t
+        image_min_dim = min(img_w, img_h)
+        new_face.relative_size = min(box_w, box_h) / image_min_dim if image_min_dim > 0 else 0
+
         # Per-collection detection floors (PhotoCollection.
-        # min_face_det_score/min_face_relative_size) -- skip creating a
-        # Face row at all for a detection too small/low-confidence to
-        # be worth reviewing, rather than creating one and relying on
-        # review to discard it. None (the default collection's own
+        # min_face_det_score/min_face_relative_size) -- the Face row is
+        # ALWAYS created (box/kps/det_score/relative_size always stored,
+        # the detection itself is never lost/unreviewable), but a
+        # detection below either floor never gets a real embedding
+        # stored. No separate "withheld" flag -- det_score/relative_size
+        # are already stored on the row, and the collection's own
+        # current thresholds are the single source of truth for whether
+        # a face qualifies (see below_collection_floor(), reused by
+        # reencode_missing_faces() so the two can never drift out of
+        # sync with each other). This also means retuning a collection's
+        # floor later naturally applies to faces detected before the
+        # change too, with no backfill needed.
+        #
+        # Untrustworthy-because-too-small-or-low-confidence is a
+        # property of the pixels, not of review status -- a human can
+        # still confirm the face to a real person (the row/label/
+        # thumbnail stay fully intact and findable either way), it just
+        # never gets a real embedding and never participates in
+        # classify_unassigned()'s gallery comparisons (confirmed with
+        # the user 2026-10-20). None (the default collection's own
         # unchanged behavior) means no floor -- every detection on your
-        # existing library is kept exactly as before this existed.
-        # Relative, not absolute pixel size: min(box_w, box_h) /
-        # min(image_w, image_h), so one floor works across wildly
-        # different source resolutions (an old scan vs. a modern phone
-        # photo) rather than needing a different absolute number per
-        # source quality.
-        collection = img_obj.directory.collection
-        if collection is not None:
-            if (collection.min_face_det_score is not None
-                    and insight_detected_face['det_score'] < collection.min_face_det_score):
-                return
-            if collection.min_face_relative_size is not None:
-                box_w, box_h = bb_r - bb_l, bb_b - bb_t
-                image_min_dim = min(img_w, img_h)
-                relative_size = min(box_w, box_h) / image_min_dim if image_min_dim > 0 else 0
-                if relative_size < collection.min_face_relative_size:
-                    return
+        # existing library still gets encoded exactly as before this
+        # existed.
+        if not below_collection_floor(img_obj.directory.collection, new_face.det_score, new_face.relative_size):
+            new_face.face_encoding_512 = insight_detected_face['embedding'].tolist()
 
         new_face.source_image_file = img_obj
         new_face.dateTakenUTC = img_obj.dateTakenUTC
@@ -836,7 +845,7 @@ class FaceExtractor(object):
             Q(face_encoding_512__isnull=True) | Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
         ).exclude(
             declared_name__person_name__in=[settings.SOFT_IGNORE_NAME, '.realignore']
-        ).select_related('source_image_file')
+        ).select_related('source_image_file__directory__collection')
 
         rec_model = self.app.app.models['recognition']
 
@@ -844,6 +853,15 @@ class FaceExtractor(object):
             img_obj = face.source_image_file
             if img_obj is None or not img_obj.filename or not os.path.exists(img_obj.filename):
                 settings.LOGGER.error(f"Cannot re-encode Face {face.id}: source image missing or unset.")
+                continue
+
+            # Checked live against the collection's CURRENT thresholds,
+            # not a stored flag -- see below_collection_floor()'s own
+            # docstring for why. Without this, this sweep would
+            # immediately re-encode every PhotoCollection-floor-skipped
+            # face on its very next (hourly) run, defeating the entire
+            # point of skipping them in the first place.
+            if below_collection_floor(img_obj.directory.collection, face.det_score, face.relative_size):
                 continue
 
             try:

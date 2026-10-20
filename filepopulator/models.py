@@ -260,6 +260,32 @@ class PhotoCollection(models.Model):
         return best
 
 
+def below_collection_floor(collection, det_score, relative_size):
+    """True if a detection with this det_score/relative_size would NOT
+    get a real embedding stored under collection's CURRENT thresholds --
+    the single source of truth both face_manager.face_extract_encode's
+    add_new_face() (deciding whether to store a fresh detection's
+    embedding) and reencode_missing_faces() (deciding whether a face
+    missing an embedding should get one) check, so the two can never
+    drift out of sync with each other. Deliberately NOT a stored flag
+    on Face -- comparing live against the collection's own fields means
+    retuning a floor later automatically applies to faces detected
+    before the change too, with no backfill needed.
+
+    collection=None (or a collection with neither floor set) always
+    returns False -- no floor means every detection qualifies, the
+    default collection's own unchanged behavior."""
+    if collection is None:
+        return False
+    if collection.min_face_det_score is not None:
+        if det_score is None or det_score < collection.min_face_det_score:
+            return True
+    if collection.min_face_relative_size is not None:
+        if relative_size is None or relative_size < collection.min_face_relative_size:
+            return True
+    return False
+
+
 class Directory(models.Model):
     dir_path = models.CharField(max_length=512, unique=True)
     # Which PhotoCollection this directory's tree belongs to -- its

@@ -574,11 +574,14 @@ class FaceExtractorCorruptedImageTests(TestCase):
 
 
 class AddNewFacePhotoCollectionGateTests(TestCase):
-    """add_new_face()'s per-PhotoCollection detection floors (see that
-    model's own docstring in filepopulator/models.py). Uses a real
-    FaceExtractor (ONNX models loaded once via setUpClass, same pattern
-    as FaceExtractorCorruptedImageTests -- add_new_face() itself never
-    touches the ONNX session, only pure-Python helpers) with a
+    """add_new_face()'s per-PhotoCollection detection floors (see
+    below_collection_floor() in filepopulator/models.py). The Face row
+    is ALWAYS created regardless of the floors -- box/kps/det_score/
+    relative_size are always stored, so a detection is never silently
+    lost -- only face_encoding_512 is conditionally withheld. Uses a
+    real FaceExtractor (ONNX models loaded once via setUpClass, same
+    pattern as FaceExtractorCorruptedImageTests -- add_new_face() itself
+    never touches the ONNX session, only pure-Python helpers) with a
     synthetic insightface.app.common.Face (a plain dict subclass, real
     inference not needed to construct one) so the det_score/box can be
     controlled directly rather than depending on what a real image
@@ -617,7 +620,7 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
             bbox=np.array(bbox, dtype=np.int64),
             kps=np.zeros((5, 2), dtype=np.float32),
             det_score=det_score,
-            embedding=np.zeros(512, dtype=np.float32),
+            embedding=np.ones(512, dtype=np.float32),  # ones, not zeros -- distinguishable from "never set"
             age=30, gender=0,
         )
 
@@ -625,7 +628,7 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
         import numpy as np
         return np.zeros((480, 640, 3), dtype=np.uint8)
 
-    def test_default_collection_no_floor_keeps_everything(self):
+    def test_default_collection_no_floor_keeps_everything_including_encoding(self):
         from filepopulator.models import PhotoCollection
         default = PhotoCollection.objects.get(is_default=True)
         img = self._make_image_in_collection(default, '/photos/gate_test_default/a.jpg')
@@ -634,9 +637,11 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
         # default collection has none.
         face = self._fake_detection([100, 100, 200, 200], det_score=0.1)
         self.extractor.add_new_face(face, img, self._img_numpy())
-        self.assertEqual(Face.objects.filter(source_image_file=img).count(), 1)
+        saved = Face.objects.get(source_image_file=img)
+        self.assertIsNotNone(saved.face_encoding_512)
+        self.assertAlmostEqual(saved.relative_size, 100 / 480, places=3)
 
-    def test_det_score_below_floor_is_skipped(self):
+    def test_det_score_below_floor_still_creates_row_but_withholds_encoding(self):
         from filepopulator.models import PhotoCollection
         collection = PhotoCollection.objects.create(
             name='Low Fidelity', root_directory='/photos/gate_test_detscore', min_face_det_score=0.6,
@@ -644,9 +649,12 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
         img = self._make_image_in_collection(collection, '/photos/gate_test_detscore/a.jpg')
         face = self._fake_detection([50, 50, 400, 400], det_score=0.5)
         self.extractor.add_new_face(face, img, self._img_numpy())
-        self.assertEqual(Face.objects.filter(source_image_file=img).count(), 0)
+        saved = Face.objects.get(source_image_file=img)
+        self.assertIsNone(saved.face_encoding_512)
+        self.assertAlmostEqual(saved.det_score, 0.5)
+        self.assertIsNotNone(saved.kps)
 
-    def test_det_score_at_or_above_floor_is_kept(self):
+    def test_det_score_at_or_above_floor_gets_encoded(self):
         from filepopulator.models import PhotoCollection
         collection = PhotoCollection.objects.create(
             name='Low Fidelity 2', root_directory='/photos/gate_test_detscore2', min_face_det_score=0.6,
@@ -654,9 +662,10 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
         img = self._make_image_in_collection(collection, '/photos/gate_test_detscore2/a.jpg')
         face = self._fake_detection([50, 50, 400, 400], det_score=0.6)
         self.extractor.add_new_face(face, img, self._img_numpy())
-        self.assertEqual(Face.objects.filter(source_image_file=img).count(), 1)
+        saved = Face.objects.get(source_image_file=img)
+        self.assertIsNotNone(saved.face_encoding_512)
 
-    def test_relative_size_below_floor_is_skipped(self):
+    def test_relative_size_below_floor_still_creates_row_but_withholds_encoding(self):
         from filepopulator.models import PhotoCollection
         collection = PhotoCollection.objects.create(
             name='Low Fidelity 3', root_directory='/photos/gate_test_size', min_face_relative_size=0.3,
@@ -666,9 +675,11 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
         # below the 0.3 floor.
         face = self._fake_detection([100, 100, 200, 200], det_score=0.9)
         self.extractor.add_new_face(face, img, self._img_numpy())
-        self.assertEqual(Face.objects.filter(source_image_file=img).count(), 0)
+        saved = Face.objects.get(source_image_file=img)
+        self.assertIsNone(saved.face_encoding_512)
+        self.assertAlmostEqual(saved.relative_size, 100 / 480, places=3)
 
-    def test_relative_size_at_or_above_floor_is_kept(self):
+    def test_relative_size_at_or_above_floor_gets_encoded(self):
         from filepopulator.models import PhotoCollection
         collection = PhotoCollection.objects.create(
             name='Low Fidelity 4', root_directory='/photos/gate_test_size2', min_face_relative_size=0.1,
@@ -677,7 +688,99 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
         # box 100x100 -> relative size 0.208, above the 0.1 floor.
         face = self._fake_detection([100, 100, 200, 200], det_score=0.9)
         self.extractor.add_new_face(face, img, self._img_numpy())
-        self.assertEqual(Face.objects.filter(source_image_file=img).count(), 1)
+        saved = Face.objects.get(source_image_file=img)
+        self.assertIsNotNone(saved.face_encoding_512)
+
+    def test_retuning_floor_changes_outcome_for_the_same_stored_values(self):
+        # The real point of NOT storing a separate flag: below_collection_
+        # floor() always checks the collection's CURRENT thresholds, so
+        # loosening/tightening a floor later automatically reclassifies
+        # faces detected before the change, with no backfill needed.
+        from filepopulator.models import PhotoCollection, below_collection_floor
+
+        collection = PhotoCollection.objects.create(
+            name='Retune Test', root_directory='/photos/gate_test_retune', min_face_relative_size=0.3,
+        )
+        self.assertTrue(below_collection_floor(collection, det_score=0.9, relative_size=0.208))
+
+        collection.min_face_relative_size = 0.1
+        collection.save()
+        self.assertFalse(below_collection_floor(collection, det_score=0.9, relative_size=0.208))
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class BackfillRelativeSizeTests(TestCase):
+    """backfill_relative_size: pure-arithmetic backfill, no decode/model
+    inference needed, so plain ImageFile/Face rows built directly
+    (bulk_create, same shape as make_preexisting_image_row) are enough --
+    no real fixture images required."""
+
+    def _make_image(self, width, height, name):
+        directory, _ = Directory.objects.get_or_create(dir_path='/photos/relsize_test')
+        path = f'/photos/relsize_test/{name}.jpg'
+        img = ImageFile(filename=path, directory=directory, thumbnail_small="", width=width, height=height)
+        ImageFile.objects.bulk_create([img])
+        return ImageFile.objects.get(filename=path)
+
+    def _make_bare_face(self, img, box, person=None):
+        bl, bt, br, bb = box
+        face = Face(
+            source_image_file=img, declared_name=person or get_default_blank_person(),
+            box_left=bl, box_top=bt, box_right=br, box_bottom=bb,
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.save()
+        return face
+
+    def test_backfill_computes_correct_relative_size(self):
+        img = self._make_image(640, 480, 'a')
+        face = self._make_bare_face(img, (100, 100, 200, 200))  # 100x100 box, min dim 480 -> 0.2083
+
+        call_command('backfill_relative_size')
+
+        face.refresh_from_db()
+        self.assertAlmostEqual(face.relative_size, 100 / 480, places=4)
+
+    def test_dry_run_does_not_write(self):
+        img = self._make_image(640, 480, 'b')
+        face = self._make_bare_face(img, (100, 100, 200, 200))
+
+        call_command('backfill_relative_size', '--dry-run')
+
+        face.refresh_from_db()
+        self.assertIsNone(face.relative_size)
+
+    def test_already_populated_rows_are_skipped(self):
+        img = self._make_image(640, 480, 'c')
+        face = self._make_bare_face(img, (100, 100, 200, 200))
+        Face.objects.filter(pk=face.pk).update(relative_size=0.999)
+
+        call_command('backfill_relative_size')
+
+        face.refresh_from_db()
+        self.assertEqual(face.relative_size, 0.999)
+
+    def test_face_with_no_source_image_is_skipped_not_errored(self):
+        # Video-sourced faces (source_image_file=None) must not crash
+        # the backfill -- they're simply excluded from this query (the
+        # feature this backfill supports is image-collection-only right
+        # now).
+        from filepopulator.models import VideoFile
+        directory, _ = Directory.objects.get_or_create(dir_path='/videos/relsize_test')
+        video = VideoFile.objects.create(
+            filename='/videos/relsize_test/v.mp4', directory=directory, width=640, height=480,
+        )
+        video_face = Face(
+            declared_name=get_default_blank_person(), source_video_file=video,
+            box_left=1, box_top=1, box_right=10, box_bottom=10,
+        )
+        video_face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        video_face.save()
+
+        call_command('backfill_relative_size')  # must not raise
+
+        video_face.refresh_from_db()
+        self.assertIsNone(video_face.relative_size)
 
 
 class UpdateListOfNoMatchingDetectsTests(TestCase):
