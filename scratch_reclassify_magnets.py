@@ -1,3 +1,4 @@
+from django.conf import settings
 from face_manager.models import Face, Person
 from face_manager.assign_faces import faceAssigner
 
@@ -14,7 +15,11 @@ fa = faceAssigner()
 fa.load_encodings()
 print("Encodings loaded.", flush=True)
 
-target_faces = list(Face.objects.filter(poss_ident1_id__in=people_ids))
+target_faces = list(
+    Face.objects.filter(poss_ident1_id__in=people_ids)
+    .exclude(face_encoding_512__isnull=True)
+    .exclude(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
+)
 print(f"Reclassifying {len(target_faces)} currently-proposed faces...", flush=True)
 
 reverted = 0
