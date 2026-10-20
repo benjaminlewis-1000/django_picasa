@@ -1,0 +1,61 @@
+#! /usr/bin/env python
+
+# Backfill: estimates GPS for photos from an explicitly opted-in list of
+# cameras (filepopulator/owntracks_gps.py's SUPPORTED_CAMERA_MODELS),
+# from OwnTracks location history. Safely re-runnable -- only ever
+# touches rows still missing GPS, so this is meant to end up as a
+# recurring cron/Celery task once a camera's own offset-source has been
+# validated, not a true one-off. See that module's own docstring for
+# the real per-camera offset detail (and why a new camera needs its own
+# confirmed offset source before being added there, not just added
+# blindly).
+
+from django.core.management.base import BaseCommand, CommandError
+
+from filepopulator.owntracks_gps import (
+    OwnTracksConfigError, SUPPORTED_CAMERA_MODELS, backfill_camera_gps,
+)
+
+
+class Command(BaseCommand):
+    help = "Estimate GPS for allowlisted cameras' photos missing it, from OwnTracks location history."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--dry-run', action='store_true',
+            help="Only print what would be matched; don't write or query-write anything.",
+        )
+        parser.add_argument(
+            '--limit', type=int, default=None,
+            help="Only process this many photos (useful for a quick test run).",
+        )
+        parser.add_argument(
+            '--camera-model', action='append', default=None,
+            help="Scope to just this camera_model (repeatable). Must already be in "
+                 f"SUPPORTED_CAMERA_MODELS ({', '.join(SUPPORTED_CAMERA_MODELS)}) -- this "
+                 "narrows a run for testing, it does not add a new camera.",
+        )
+
+    def handle(self, *args, **options):
+        camera_models = options['camera_model']
+        if camera_models:
+            unknown = set(camera_models) - set(SUPPORTED_CAMERA_MODELS)
+            if unknown:
+                raise CommandError(
+                    f"Not in SUPPORTED_CAMERA_MODELS: {sorted(unknown)}. Add it there first "
+                    "(with a confirmed offset source) before scoping a run to it."
+                )
+
+        try:
+            counts = backfill_camera_gps(
+                camera_models=camera_models,
+                dry_run=options['dry_run'], limit=options['limit'], log=self.stdout.write,
+            )
+        except OwnTracksConfigError as e:
+            raise CommandError(str(e))
+
+        self.stdout.write(
+            f"{'Would match' if options['dry_run'] else 'Matched'} {counts['matched']} photo(s). "
+            f"{counts['no_offset_tag']} skipped (no offset source), "
+            f"{counts['no_nearby_point']} skipped (no nearby OwnTracks point)."
+        )

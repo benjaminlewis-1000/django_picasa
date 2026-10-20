@@ -32,6 +32,7 @@ import pillow_heif
 # Create your tests here.
 
 from django.core.management import call_command
+from django.core.management.base import CommandError
 
 from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, guess_date_from_filename, VideoFile, FailedVideoFile, DuplicateVideoFile
 # from .forms import ImageFileForm, DirectoryForm
@@ -4019,10 +4020,12 @@ class ParseExifVideoDateTests(unittest.TestCase):
 @override_settings(OWNTRACKS_LOCATION_API_URL='https://owntracks.example.com',
                     OWNTRACKS_LOCATION_API_KEY='test-key')
 class BackfillS23GpsTests(TestCase):
-    """backfill_s23_gps / filepopulator.owntracks_gps -- see that
+    """backfill_owntracks_gps / filepopulator.owntracks_gps -- see that
     module's own docstring for the real detail this was built around:
     ImageFile.dateTaken/_get_date_taken() throws away the real UTC
-    offset, so this re-reads EXIF directly rather than trusting the DB.
+    offset, so this re-reads EXIF directly rather than trusting the DB,
+    trying each known per-camera offset source in turn (standard EXIF
+    OffsetTimeOriginal, Nikon's MakerNotes TimeZone+DaylightSavings).
     exiftool and the HTTP call are both mocked; no real subprocess or
     network calls."""
 
@@ -4056,13 +4059,98 @@ class BackfillS23GpsTests(TestCase):
             gps_lat_decimal=gps_lat_decimal,
         )
 
-    def _exiftool_result(self, date_str=None, offset_str=None):
+    def _exiftool_result(self, date_str=None, offset_str=None,
+                          nikon_timezone=None, nikon_dst=None):
         entry = {}
         if date_str is not None:
             entry['DateTimeOriginal'] = date_str
         if offset_str is not None:
             entry['OffsetTimeOriginal'] = offset_str
+        if nikon_timezone is not None:
+            entry['TimeZone'] = nikon_timezone
+        if nikon_dst is not None:
+            entry['DaylightSavings'] = nikon_dst
         return mock.Mock(stdout=json.dumps([entry]))
+
+    def test_nikon_timezone_and_dst_sets_gps(self):
+        # Real case this was built from: a Nikon D3200 trip to Italy,
+        # clock left on home World Time (-05:00) with DST on -- the
+        # true effective offset is -04:00, confirmed against a real
+        # OwnTracks match that resolved to Pisa, Italy.
+        img = self._bare_image('NIKON D3200')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result(
+                             '2026:06:14 14:28:52', nikon_timezone='-05:00', nikon_dst='Yes')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 43.718, 'longitude': 10.402},
+            )
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            backfill_camera_gps()
+
+        called_params = mock_get.call_args.kwargs['params']
+        self.assertEqual(called_params['datetime'], '2026-06-14T14:28:52-04:00')
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, 43.718)
+
+    def test_nikon_without_dst_uses_base_timezone_only(self):
+        img = self._bare_image('NIKON D3200')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result(
+                             '2026:01:14 14:28:52', nikon_timezone='-05:00', nikon_dst='No')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 1.0, 'longitude': 1.0},
+            )
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            backfill_camera_gps()
+
+        called_params = mock_get.call_args.kwargs['params']
+        self.assertEqual(called_params['datetime'], '2026-01-14T14:28:52-05:00')
+
+    def test_exif_offset_preferred_over_nikon_tags_if_both_present(self):
+        # Not a real-world case (a phone wouldn't have Nikon MakerNotes
+        # tags), but confirms the precedence is deliberate, not
+        # order-of-dict-insertion luck.
+        from filepopulator.owntracks_gps import _read_offset_datetime
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result(
+                             '2026:06:14 14:28:52', offset_str='+01:00',
+                             nikon_timezone='-05:00', nikon_dst='Yes')):
+            date_str, offset_str = _read_offset_datetime('/fake/path.jpg')
+        self.assertEqual(offset_str, '+01:00')
+
+    def test_unparseable_nikon_timezone_is_skipped_not_guessed(self):
+        img = self._bare_image('NIKON D3200')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result(
+                             '2026:06:14 14:28:52', nikon_timezone='garbage', nikon_dst='Yes')):
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            counts = backfill_camera_gps()
+
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, -999)
+        self.assertEqual(counts['no_offset_tag'], 1)
+
+    def test_command_rejects_camera_model_not_in_allowlist(self):
+        with self.assertRaises(CommandError):
+            call_command('backfill_owntracks_gps', '--camera-model', 'Some Random Camera')
+
+    def test_command_scopes_to_requested_camera_model_only(self):
+        self._bare_image('Galaxy S23+')
+        self._bare_image('NIKON D3200')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
+            )
+            call_command('backfill_owntracks_gps', '--camera-model', 'Galaxy S23+')
+
+        nikon = ImageFile.objects.get(camera_model='NIKON D3200')
+        self.assertEqual(nikon.gps_lat_decimal, -999)
+        s23 = ImageFile.objects.get(camera_model='Galaxy S23+')
+        self.assertEqual(s23.gps_lat_decimal, 40.1)
 
     def test_only_scopes_configured_s23_camera_models(self):
         self._bare_image('Galaxy S23+')
@@ -4075,8 +4163,8 @@ class BackfillS23GpsTests(TestCase):
             mock_get.return_value = mock.Mock(
                 status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
             )
-            from filepopulator.owntracks_gps import backfill_s23_gps
-            counts = backfill_s23_gps()
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            counts = backfill_camera_gps()
 
         self.assertEqual(counts['matched'], 2)
         iphone = ImageFile.objects.get(camera_model='iPhone 12 mini')
@@ -4095,8 +4183,8 @@ class BackfillS23GpsTests(TestCase):
             mock_get.return_value = mock.Mock(
                 status_code=200, json=lambda: {'latitude': 43.7, 'longitude': 10.4},
             )
-            from filepopulator.owntracks_gps import backfill_s23_gps
-            backfill_s23_gps()
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            backfill_camera_gps()
 
         called_params = mock_get.call_args.kwargs['params']
         self.assertEqual(called_params['datetime'], '2026-06-14T15:18:10+01:00')
@@ -4109,8 +4197,8 @@ class BackfillS23GpsTests(TestCase):
             mock_get.return_value = mock.Mock(
                 status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
             )
-            from filepopulator.owntracks_gps import backfill_s23_gps
-            backfill_s23_gps()
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            backfill_camera_gps()
 
         img.refresh_from_db()
         self.assertEqual(img.gps_lat_decimal, 40.1)
@@ -4123,8 +4211,8 @@ class BackfillS23GpsTests(TestCase):
                          return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
              mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
             mock_get.return_value = mock.Mock(status_code=404, text='nothing within 15 minutes')
-            from filepopulator.owntracks_gps import backfill_s23_gps
-            counts = backfill_s23_gps()
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            counts = backfill_camera_gps()
 
         img.refresh_from_db()
         self.assertEqual(img.gps_lat_decimal, -999)
@@ -4137,16 +4225,16 @@ class BackfillS23GpsTests(TestCase):
                          return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
              mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
             mock_get.return_value = mock.Mock(status_code=401, text='bad key')
-            from filepopulator.owntracks_gps import backfill_s23_gps, OwnTracksConfigError
+            from filepopulator.owntracks_gps import backfill_camera_gps, OwnTracksConfigError
             with self.assertRaises(OwnTracksConfigError):
-                backfill_s23_gps()
+                backfill_camera_gps()
 
     def test_missing_offset_tag_is_skipped_not_guessed(self):
         img = self._bare_image('Galaxy S23+')
         with mock.patch('filepopulator.owntracks_gps.subprocess.run',
                          return_value=self._exiftool_result('2026:10:16 14:46:17', None)):
-            from filepopulator.owntracks_gps import backfill_s23_gps
-            counts = backfill_s23_gps()
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            counts = backfill_camera_gps()
 
         img.refresh_from_db()
         self.assertEqual(img.gps_lat_decimal, -999)
@@ -4160,8 +4248,8 @@ class BackfillS23GpsTests(TestCase):
             mock_get.return_value = mock.Mock(
                 status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
             )
-            from filepopulator.owntracks_gps import backfill_s23_gps
-            backfill_s23_gps(dry_run=True)
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            backfill_camera_gps(dry_run=True)
 
         img.refresh_from_db()
         self.assertEqual(img.gps_lat_decimal, -999)
@@ -4169,8 +4257,8 @@ class BackfillS23GpsTests(TestCase):
     def test_already_populated_rows_are_excluded(self):
         self._bare_image('Galaxy S23+', gps_lat_decimal=40.5)
         with mock.patch('filepopulator.owntracks_gps.subprocess.run') as mock_run:
-            from filepopulator.owntracks_gps import backfill_s23_gps
-            backfill_s23_gps()
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            backfill_camera_gps()
         mock_run.assert_not_called()
 
     def test_missing_config_raises_clear_error(self):
@@ -4178,9 +4266,9 @@ class BackfillS23GpsTests(TestCase):
         with mock.patch('filepopulator.owntracks_gps.subprocess.run',
                          return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
              override_settings(OWNTRACKS_LOCATION_API_URL=None, OWNTRACKS_LOCATION_API_KEY=None):
-            from filepopulator.owntracks_gps import backfill_s23_gps, OwnTracksConfigError
+            from filepopulator.owntracks_gps import backfill_camera_gps, OwnTracksConfigError
             with self.assertRaises(OwnTracksConfigError):
-                backfill_s23_gps()
+                backfill_camera_gps()
 
     def test_management_command_runs_end_to_end(self):
         self._bare_image('Galaxy S23+')
@@ -4190,4 +4278,4 @@ class BackfillS23GpsTests(TestCase):
             mock_get.return_value = mock.Mock(
                 status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
             )
-            call_command('backfill_s23_gps')
+            call_command('backfill_owntracks_gps')
