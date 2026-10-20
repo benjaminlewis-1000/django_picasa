@@ -1,7 +1,10 @@
 from __future__ import absolute_import, unicode_literals
 
 # from .scripts import populateFromImageMultiGPU, establish_server_connection, establish_multi_server_connection
-from .models import Person, Face, clear_confirmed_ignore_face_encodings, clear_encodings_below_collection_floor
+from .models import (
+    Person, Face, clear_confirmed_ignore_face_encodings,
+    clear_encodings_below_collection_floor, clear_stale_proposals_with_no_encoding,
+)
 from assign_faces import faceAssigner
 from verification_clustering import cluster_all_unverified_faces
 from celery import shared_task
@@ -279,6 +282,22 @@ def apply_collection_floor_change(collection_id):
         except Exception:
             settings.LOGGER.exception(
                 f"Error clearing encodings below the floor for collection {collection_id}."
+            )
+
+        try:
+            # Catch-up for any already-null-encoded face still carrying a
+            # stale poss_identN proposal (e.g. a prior run's clearing
+            # pass, from before this cleanup existed, or any other gap) --
+            # see clear_stale_proposals_with_no_encoding()'s own docstring.
+            # Runs every time a threshold changes, not just once, so the
+            # backlog can never silently reaccumulate for this collection.
+            stale_cleared = clear_stale_proposals_with_no_encoding(collection=collection)
+            settings.LOGGER.debug(
+                f"Collection {collection_id} floor change: cleared {stale_cleared} stale unencoded proposal(s)."
+            )
+        except Exception:
+            settings.LOGGER.exception(
+                f"Error clearing stale unencoded proposals for collection {collection_id}."
             )
 
         try:
