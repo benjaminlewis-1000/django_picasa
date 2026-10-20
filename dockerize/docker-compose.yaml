@@ -49,6 +49,12 @@ services:
       # application code does. Host directory is created if missing.
       - ${PHOTO_ROOT}/aggregated/uploaded:/photos_upload
       - ${VIDEO_ROOT}:/videos:ro
+      # Second photo collection (filepopulator/models.py's
+      # PhotoCollection -- a relative's newly-acquired archive, scanned
+      # alongside the main library with shared Person/Face identities).
+      # Read-only: this ingestion scanner only ever reads from a source
+      # library, same reasoning as the main /photos:ro mount.
+      - ${LEWIS_PARENTS_ROOT}:/lewis_parents:ro
       # Dedicated read-write mount for the transcode pipeline
       # (filepopulator/video_scripts.py's transcode_video()) -- own
       # mount, not the read-only VIDEO_ROOT above, same reasoning as
