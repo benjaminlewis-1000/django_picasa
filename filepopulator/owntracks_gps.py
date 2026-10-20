@@ -2,22 +2,35 @@
 separate OwnTracks-fed service (not part of this repo) that answers
 "where was the phone at timestamp X" from continuous location history.
 
-Deliberately scoped to ONE camera at a time (see S23_CAMERA_MODELS) --
-the location history only actually corresponds to one specific phone's
-owner, so applying this to every camera in the library would silently
-attribute someone else's photos (or a different device's EXIF-copied
-metadata -- see the "Family Texts" case found while investigating this)
-to a location the actual photographer never visited.
+Deliberately scoped to an explicit allowlist of cameras (see
+SUPPORTED_CAMERA_MODELS) -- the location history only actually
+corresponds to one specific person's own location, so applying this to
+every camera in the library would silently attribute someone else's
+photos (or a different device's EXIF-copied metadata -- see the
+"Family Texts" case found while investigating this) to a location the
+actual photographer never visited. A new camera is onboarded by adding
+it here explicitly, never automatically.
 
 The one detail that would silently produce wrong results if gotten
 wrong: this project's own ImageFile.dateTaken/_get_date_taken() throws
 away the real UTC offset entirely -- it reads EXIF's naive local-time
 string and blindly tags it UTC (see that method's own comment), so
 dateTaken in the DB is NOT usable to build the datetime this service
-needs. Confirmed via real EXIF on the actual target photos: a real
-OffsetTimeOriginal tag is present and varies by real travel location
-(-04:00 at home, +01:00/+02:00/+03:00 while traveling) -- re-read fresh
-from the file here rather than trusting the DB.
+needs. Re-read fresh from the file here instead, trying each known
+real source of a per-photo offset in turn:
+  - Standard EXIF OffsetTimeOriginal (phones) -- confirmed present and
+    varying by real travel location on the Galaxy S23+ (-04:00 at
+    home, +01:00/+02:00/+03:00 while traveling).
+  - Nikon's MakerNotes TimeZone + DaylightSavings (the camera's "World
+    Time" setting) -- confirmed present and correct on a real Nikon
+    D3200 trip: TimeZone=-05:00 + DaylightSavings=Yes gave the exact
+    true -04:00 offset, verified against a real OwnTracks match
+    (resolved to Pisa, Italy, to the hundredth of a degree) while the
+    camera's raw (unadjusted) clock reading would have been wrong by a
+    full 8 hours.
+Never falls back to a guessed/assumed timezone (e.g. this project's
+own configured TIME_ZONE) -- that would be wrong for exactly the
+travel photos most likely to be missing GPS in the first place.
 """
 import json
 import subprocess
@@ -28,10 +41,13 @@ from django.conf import settings
 EXIFTOOL_TIMEOUT_SECONDS = 30
 REQUEST_TIMEOUT_SECONDS = 15
 
-# Only the Galaxy S23+ for now, per explicit instruction -- the two
-# camera_model strings the same physical phone has written to EXIF (see
-# CLAUDE.md's "which cameras have the most/least GPS" investigation).
-S23_CAMERA_MODELS = ['Galaxy S23+', 'SM-S916U']
+# Explicit per-camera allowlist -- see this module's own docstring for
+# why. Add a new camera here only once its own real per-photo offset
+# source has been confirmed against real files (not assumed).
+SUPPORTED_CAMERA_MODELS = [
+    'Galaxy S23+', 'SM-S916U',  # the same physical phone, two EXIF spellings
+    'NIKON D3200',
+]
 
 # Flags this coordinate as inferred from location history, not a real
 # camera GPS reading -- distinct from the field's own 'exif' default, so
@@ -44,15 +60,43 @@ class OwnTracksConfigError(Exception):
     """Raised when OWNTRACKS_LOCATION_API_URL/_API_KEY aren't configured."""
 
 
+def _nikon_offset_str(timezone_str, daylight_savings_str):
+    """Nikon's World Time setting stores a base UTC offset plus a
+    separate yes/no DST flag -- the real effective offset is their sum
+    (confirmed against a real file: TimeZone=-05:00 + DaylightSavings=
+    Yes -> true -04:00, matching a real OwnTracks match to the hundredth
+    of a degree). Returns a '+HH:MM'/'-HH:MM' string, or None if
+    timezone_str isn't a recognizable +/-HH:MM shape."""
+    import re
+
+    m = re.match(r'^([+-])(\d{2}):(\d{2})$', timezone_str or '')
+    if not m:
+        return None
+    sign, hours, minutes = m.group(1), int(m.group(2)), int(m.group(3))
+    # DST always ADDS an hour to the real, SIGNED offset (EST -05:00 ->
+    # EDT -04:00, a smaller-magnitude negative number) -- must be applied
+    # after the sign, not to the unsigned magnitude (the original bug
+    # here: adding 60 to the magnitude before negating made a negative
+    # offset MORE negative instead of less, caught by a real test).
+    signed_minutes = hours * 60 + minutes
+    if sign == '-':
+        signed_minutes = -signed_minutes
+    if (daylight_savings_str or '').strip().lower() == 'yes':
+        signed_minutes += 60
+    out_sign = '+' if signed_minutes >= 0 else '-'
+    magnitude = abs(signed_minutes)
+    return f'{out_sign}{magnitude // 60:02d}:{magnitude % 60:02d}'
+
+
 def _read_offset_datetime(file_path):
-    """Returns (naive_date_str, offset_str) straight from exiftool, or
-    (None, None) if either tag is missing/unparseable -- never guesses a
-    timezone (e.g. this project's own configured TIME_ZONE) as a
-    fallback, since that would be wrong for every travel photo, which is
-    exactly the case most likely to be missing GPS in the first place."""
+    """Returns (naive_date_str, offset_str) for file_path's real capture
+    instant, trying each known offset source in turn (see this module's
+    own docstring), or (None, None) if none of them are present/
+    parseable -- never guesses a timezone as a fallback."""
     try:
         result = subprocess.run(
-            ['exiftool', '-j', '-DateTimeOriginal', '-OffsetTimeOriginal', file_path],
+            ['exiftool', '-j', '-DateTimeOriginal', '-OffsetTimeOriginal',
+             '-Nikon:TimeZone', '-Nikon:DaylightSavings', file_path],
             capture_output=True, text=True, timeout=EXIFTOOL_TIMEOUT_SECONDS,
         )
         data = json.loads(result.stdout)
@@ -62,8 +106,13 @@ def _read_offset_datetime(file_path):
         return None, None
     entry = data[0]
     date_str = entry.get('DateTimeOriginal')
+    if not date_str:
+        return None, None
+
     offset_str = entry.get('OffsetTimeOriginal')
-    if not date_str or not offset_str:
+    if not offset_str:
+        offset_str = _nikon_offset_str(entry.get('TimeZone'), entry.get('DaylightSavings'))
+    if not offset_str:
         return None, None
     return date_str, offset_str
 
@@ -134,14 +183,24 @@ def query_nearest_location(iso8601_datetime):
     return data['latitude'], data['longitude']
 
 
-def backfill_s23_gps(dry_run=False, limit=None, log=print):
-    """One-time (but safely re-runnable) backfill: for every S23_
-    CAMERA_MODELS photo still missing GPS, estimate it from OwnTracks
-    location history. Returns a dict of outcome counts."""
+def backfill_camera_gps(camera_models=None, dry_run=False, limit=None, log=print):
+    """One-time-per-photo (but safely re-runnable -- intended to end up
+    as a recurring cron/Celery task, picking up each newly-opted-in
+    camera's new photos as they're ingested) backfill: for every photo
+    from an allowlisted camera still missing GPS, estimate it from
+    OwnTracks location history. Returns a dict of outcome counts.
+
+    camera_models defaults to the full SUPPORTED_CAMERA_MODELS list --
+    a caller only passes a narrower list to test/scope a single camera
+    (see --camera-model on the management command), never to permanently
+    widen scope beyond what's been explicitly opted in here."""
     from filepopulator.models import ImageFile
 
+    if camera_models is None:
+        camera_models = SUPPORTED_CAMERA_MODELS
+
     qs = ImageFile.objects.filter(
-        camera_model__in=S23_CAMERA_MODELS, gps_lat_decimal=-999,
+        camera_model__in=camera_models, gps_lat_decimal=-999,
     ).order_by('dateTaken')
     if limit:
         qs = qs[:limit]
@@ -151,7 +210,7 @@ def backfill_s23_gps(dry_run=False, limit=None, log=print):
         iso = build_capture_iso8601(img.filename)
         if iso is None:
             counts['no_offset_tag'] += 1
-            log(f"SKIP (no OffsetTimeOriginal tag): {img.filename}")
+            log(f"SKIP (no offset source): {img.filename}")
             continue
 
         try:
