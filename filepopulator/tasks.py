@@ -39,13 +39,19 @@ def load_images_into_db():
     # atomic and covers every entry point, not just concurrent Celery
     # tasks of this same name -- the same reasoning that removed the
     # equivalent racy check from face_manager.tasks.process_faces().
-    base_directory = settings.FILEPOPULATOR_SERVER_IMG_DIR
-    # fname = os.path.join(os.environ['HOME'], 'filepopulate.txt')
-    # logger.info("Write time")
-    # with open(fname, 'a') as fh:
-    #     fh.write('The time is : {}\n'.format( time.time() ) )
+    #
+    # Walks every registered PhotoCollection's own root, not just the
+    # single hardcoded FILEPOPULATOR_SERVER_IMG_DIR (== PHOTO_ROOT) --
+    # the default collection's root_directory equals PHOTO_ROOT (seeded
+    # at migration time), so this is behavior-preserving for the
+    # existing library and additionally covers any other collection
+    # (e.g. a newly-acquired relative's archive) with zero further
+    # scheduling changes. See filepopulator/models.py's PhotoCollection
+    # for the full design.
+    from .models import PhotoCollection
     print("Loading images into database...")
-    add_from_root_dir(base_directory)
+    for collection in PhotoCollection.objects.all():
+        add_from_root_dir(collection.root_directory)
     print("Finished adding photos")
     delete_removed_photos()
     print("Done! Finished removing photos that aren't there.")

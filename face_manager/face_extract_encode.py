@@ -614,6 +614,30 @@ class FaceExtractor(object):
         new_face.box_left = bb_l
         new_face.box_right = bb_r
 
+        # Per-collection detection floors (PhotoCollection.
+        # min_face_det_score/min_face_relative_size) -- skip creating a
+        # Face row at all for a detection too small/low-confidence to
+        # be worth reviewing, rather than creating one and relying on
+        # review to discard it. None (the default collection's own
+        # unchanged behavior) means no floor -- every detection on your
+        # existing library is kept exactly as before this existed.
+        # Relative, not absolute pixel size: min(box_w, box_h) /
+        # min(image_w, image_h), so one floor works across wildly
+        # different source resolutions (an old scan vs. a modern phone
+        # photo) rather than needing a different absolute number per
+        # source quality.
+        collection = img_obj.directory.collection
+        if collection is not None:
+            if (collection.min_face_det_score is not None
+                    and insight_detected_face['det_score'] < collection.min_face_det_score):
+                return
+            if collection.min_face_relative_size is not None:
+                box_w, box_h = bb_r - bb_l, bb_b - bb_t
+                image_min_dim = min(img_w, img_h)
+                relative_size = min(box_w, box_h) / image_min_dim if image_min_dim > 0 else 0
+                if relative_size < collection.min_face_relative_size:
+                    return
+
         new_face.source_image_file = img_obj
         new_face.dateTakenUTC = img_obj.dateTakenUTC
         new_face.detected_age = detected_age
