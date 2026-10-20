@@ -183,7 +183,8 @@ def query_nearest_location(iso8601_datetime):
     return data['latitude'], data['longitude']
 
 
-def backfill_camera_gps(camera_models=None, dry_run=False, limit=None, log=print):
+def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
+                         dry_run=False, limit=None, log=print):
     """One-time-per-photo (but safely re-runnable -- intended to end up
     as a recurring cron/Celery task, picking up each newly-opted-in
     camera's new photos as they're ingested) backfill: for every photo
@@ -193,7 +194,18 @@ def backfill_camera_gps(camera_models=None, dry_run=False, limit=None, log=print
     camera_models defaults to the full SUPPORTED_CAMERA_MODELS list --
     a caller only passes a narrower list to test/scope a single camera
     (see --camera-model on the management command), never to permanently
-    widen scope beyond what's been explicitly opted in here."""
+    widen scope beyond what's been explicitly opted in here.
+
+    start_date/end_date (date objects) filter on dateTaken -- useful for
+    a camera with years of history that predates OwnTracks tracking
+    entirely (confirmed real: an unscoped run against a Nikon D3200's
+    full ~27k-photo backlog spent its first many calls on 2014 photos
+    that could only ever come back "no nearby point," each one still
+    paying a real exiftool+HTTP round trip for nothing). dateTaken is
+    the UNRELIABLE, offset-blind field for anything needing real
+    precision (see this module's own docstring) -- fine here since a
+    multi-day scoping window swallows the few hours of error that
+    causes, nowhere close to misses at a day boundary mattering."""
     from filepopulator.models import ImageFile
 
     if camera_models is None:
@@ -202,6 +214,10 @@ def backfill_camera_gps(camera_models=None, dry_run=False, limit=None, log=print
     qs = ImageFile.objects.filter(
         camera_model__in=camera_models, gps_lat_decimal=-999,
     ).order_by('dateTaken')
+    if start_date:
+        qs = qs.filter(dateTaken__date__gte=start_date)
+    if end_date:
+        qs = qs.filter(dateTaken__date__lte=end_date)
     if limit:
         qs = qs[:limit]
 

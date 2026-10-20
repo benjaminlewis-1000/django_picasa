@@ -4037,7 +4037,7 @@ class BackfillS23GpsTests(TestCase):
     def tearDown(self):
         ImageFile.objects.all().delete()
 
-    def _bare_image(self, camera_model, gps_lat_decimal=-999, filename=None):
+    def _bare_image(self, camera_model, gps_lat_decimal=-999, filename=None, dateTaken=None):
         # ImageFile.save() -> _init_image() really opens the file (PIL),
         # so this needs a real tiny image on disk, not just a DB row --
         # same reason other tests in this file copy a real fixture
@@ -4048,7 +4048,7 @@ class BackfillS23GpsTests(TestCase):
         if filename is None:
             shutil.copy(self.FIXTURE_IMG, dest)
         directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(dest))
-        return ImageFile.objects.create(
+        img = ImageFile.objects.create(
             filename=dest,
             directory=directory,
             pixel_hash=f'hash{ImageFile.objects.count()}',
@@ -4058,6 +4058,10 @@ class BackfillS23GpsTests(TestCase):
             camera_model=camera_model,
             gps_lat_decimal=gps_lat_decimal,
         )
+        if dateTaken is not None:
+            ImageFile.objects.filter(pk=img.pk).update(dateTaken=dateTaken)
+            img.refresh_from_db()
+        return img
 
     def _exiftool_result(self, date_str=None, offset_str=None,
                           nikon_timezone=None, nikon_dst=None):
@@ -4151,6 +4155,34 @@ class BackfillS23GpsTests(TestCase):
         self.assertEqual(nikon.gps_lat_decimal, -999)
         s23 = ImageFile.objects.get(camera_model='Galaxy S23+')
         self.assertEqual(s23.gps_lat_decimal, 40.1)
+
+    def test_start_end_date_excludes_photos_outside_the_window(self):
+        # Real motivating case: a camera with years of history predating
+        # OwnTracks entirely would otherwise burn a real exiftool+HTTP
+        # round trip per photo just to learn "no nearby point," every
+        # single run.
+        import datetime
+        old = self._bare_image('NIKON D3200', dateTaken=datetime.datetime(2014, 10, 25, tzinfo=datetime.timezone.utc))
+        in_range = self._bare_image('NIKON D3200', dateTaken=datetime.datetime(2026, 6, 14, tzinfo=datetime.timezone.utc))
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result(
+                             '2026:06:14 14:28:52', nikon_timezone='-05:00', nikon_dst='Yes')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 43.718, 'longitude': 10.402},
+            )
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            counts = backfill_camera_gps(
+                camera_models=['NIKON D3200'],
+                start_date=datetime.date(2026, 6, 10), end_date=datetime.date(2026, 6, 21),
+            )
+
+        self.assertEqual(counts['matched'], 1)
+        old.refresh_from_db()
+        self.assertEqual(old.gps_lat_decimal, -999)
+        in_range.refresh_from_db()
+        self.assertEqual(in_range.gps_lat_decimal, 43.718)
 
     def test_only_scopes_configured_s23_camera_models(self):
         self._bare_image('Galaxy S23+')
