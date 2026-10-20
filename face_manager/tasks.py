@@ -1,7 +1,7 @@
 from __future__ import absolute_import, unicode_literals
 
 # from .scripts import populateFromImageMultiGPU, establish_server_connection, establish_multi_server_connection
-from .models import Person, Face, clear_confirmed_ignore_face_encodings
+from .models import Person, Face, clear_confirmed_ignore_face_encodings, clear_encodings_below_collection_floor
 from assign_faces import faceAssigner
 from verification_clustering import cluster_all_unverified_faces
 from celery import shared_task
@@ -10,7 +10,7 @@ from django.contrib.auth.models import User
 from django.db.models import Q
 from django.utils.crypto import get_random_string
 from face_extract_encode import FaceExtractor
-from filepopulator.models import ImageFile, VideoFile
+from filepopulator.models import ImageFile, VideoFile, PhotoCollection
 from common.advisory_lock import advisory_lock
 from picasa import celery_app
 import os
@@ -246,6 +246,48 @@ def reencode_missing_faces():
         extractor.reencode_missing_faces()
     except:
         settings.LOGGER.debug("Ending reencode task")
+
+@shared_task(ignore_result=True, name='face_manager.apply_collection_floor_change')
+def apply_collection_floor_change(collection_id):
+    # Fired automatically by PhotoCollection.save() whenever
+    # min_face_det_score/min_face_relative_size actually changes -- see
+    # that model's save() override. Handles both directions: a tightened
+    # floor leaves already-encoded, not-yet-adjudicated faces with a now-
+    # stale embedding (cleared here, no model inference needed); a
+    # loosened floor leaves faces that were previously skipped still
+    # missing one (re-encoded here, which does need real model inference,
+    # hence FaceExtractor()). Scoped to just this collection's images via
+    # the `collection=` param both functions take -- an unrelated
+    # collection's floor changing never touches this collection's faces.
+    try:
+        collection = PhotoCollection.objects.get(pk=collection_id)
+    except PhotoCollection.DoesNotExist:
+        return
+
+    with advisory_lock(f'face_manager.apply_collection_floor_change.{collection_id}') as acquired:
+        if not acquired:
+            settings.LOGGER.warning(
+                f"apply_collection_floor_change already running for collection {collection_id}, skipping."
+            )
+            return
+
+        try:
+            scanned, cleared = clear_encodings_below_collection_floor(collection=collection)
+            settings.LOGGER.debug(
+                f"Collection {collection_id} floor change: cleared {cleared}/{scanned} encodings."
+            )
+        except Exception:
+            settings.LOGGER.exception(
+                f"Error clearing encodings below the floor for collection {collection_id}."
+            )
+
+        try:
+            extractor = FaceExtractor()
+            extractor.reencode_missing_faces(collection=collection)
+        except Exception:
+            settings.LOGGER.exception(
+                f"Error re-encoding newly-eligible faces for collection {collection_id}."
+            )
 
 @shared_task(ignore_result=True, name='face_manager.clear_ignored_encodings')
 def clear_ignored_encodings():

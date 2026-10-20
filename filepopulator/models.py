@@ -235,8 +235,35 @@ class PhotoCollection(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Snapshot at load/construction time, so save() can tell whether
+        # a floor actually changed -- see save() below.
+        self._floor_snapshot = (self.min_face_det_score, self.min_face_relative_size)
+
     def __str__(self):
         return self.name
+
+    def save(self, *args, **kwargs):
+        floor_changed = (not self._state.adding) and (
+            (self.min_face_det_score, self.min_face_relative_size) != self._floor_snapshot
+        )
+        super().save(*args, **kwargs)
+        self._floor_snapshot = (self.min_face_det_score, self.min_face_relative_size)
+
+        if floor_changed:
+            # A tightened floor leaves existing, not-yet-adjudicated faces
+            # with a now-stale embedding (add_new_face()/
+            # reencode_missing_faces() only ever gate a face that DOESN'T
+            # already have one); a loosened floor leaves faces that were
+            # previously skipped still missing one. Both directions need
+            # real work (a DB sweep, and possibly real model inference),
+            # so this is handled async rather than inline in save().
+            # Deferred import: face_manager imports from filepopulator at
+            # module load time, so importing face_manager.tasks at the
+            # top of this file would be circular.
+            from face_manager.tasks import apply_collection_floor_change
+            apply_collection_floor_change.delay(self.pk)
 
     @classmethod
     def resolve_for_path(cls, path):

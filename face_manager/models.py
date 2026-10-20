@@ -536,3 +536,63 @@ def clear_confirmed_ignore_face_encodings():
     ).exclude(face_encoding_512__isnull=True)
     return qs.update(face_encoding_512=None)
 
+
+def clear_encodings_below_collection_floor(collection=None, dry_run=False):
+    """Apply a PhotoCollection's CURRENT min_face_det_score/
+    min_face_relative_size floor to faces that already have a usable
+    embedding -- add_new_face()/FaceExtractor.reencode_missing_faces()
+    only ever gate a face that DOESN'T already have one, so retuning a
+    floor down has no effect on the existing backlog without this.
+
+    Deliberately scoped to faces never human-adjudicated
+    (declared_name == BLANK_FACE_NAME, validated=False) -- nothing a
+    human has confirmed or verified is ever stripped of its embedding,
+    regardless of how small/low-confidence the detection looks. The
+    Face row, box, and thumbnail are untouched either way; only the
+    embedding (and therefore future gallery-comparison participation)
+    is withheld.
+
+    collection=None sweeps every image-backed, not-yet-adjudicated face
+    in the whole library (the one-off/manual-backfill shape); passing a
+    specific PhotoCollection scopes the sweep to just that collection's
+    images, which is all the automatic save()-triggered re-application
+    (see PhotoCollection.save()) ever needs.
+
+    Returns (scanned, cleared). Single source of truth for the actual
+    write, shared by the clear_encodings_below_floor management command
+    and the face_manager.apply_collection_floor_change Celery task."""
+    from filepopulator.models import below_collection_floor
+
+    BATCH_SIZE = 5000
+    candidates = Face.objects.filter(
+        declared_name__person_name=settings.BLANK_FACE_NAME,
+        validated=False,
+        face_encoding_512__isnull=False,
+        source_image_file__isnull=False,
+    ).exclude(
+        face_encoding_512=settings.NON_DETECTED_FACE_ENCODING,
+    ).select_related('source_image_file__directory__collection')
+    if collection is not None:
+        candidates = candidates.filter(source_image_file__directory__collection=collection)
+
+    to_update = []
+    scanned = 0
+    cleared = 0
+    for face in candidates.iterator(chunk_size=BATCH_SIZE):
+        scanned += 1
+        img_obj = face.source_image_file
+        if not below_collection_floor(img_obj.directory.collection, face.det_score, face.relative_size):
+            continue
+        cleared += 1
+        if not dry_run:
+            face.face_encoding_512 = None
+            to_update.append(face)
+            if len(to_update) >= BATCH_SIZE:
+                Face.objects.bulk_update(to_update, ['face_encoding_512'], batch_size=BATCH_SIZE)
+                to_update = []
+
+    if not dry_run and to_update:
+        Face.objects.bulk_update(to_update, ['face_encoding_512'], batch_size=BATCH_SIZE)
+
+    return scanned, cleared
+

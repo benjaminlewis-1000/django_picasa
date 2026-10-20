@@ -784,8 +784,18 @@ class FaceExtractor(object):
         # Use a secure hash algorithm like SHA256
         return hashlib.sha256(combined_data).hexdigest()
 
-    def reencode_missing_faces(self):
+    def reencode_missing_faces(self, collection=None):
         """
+        collection=None (default) sweeps every eligible face library-wide
+        (the scheduled face_manager.reencode task's shape); passing a
+        specific filepopulator.models.PhotoCollection scopes the sweep to
+        just that collection's images -- used by
+        face_manager.apply_collection_floor_change, triggered
+        automatically when a collection's floor is loosened (a face
+        previously skipped as below-floor may now qualify, but it has no
+        embedding yet to re-check live, so it needs an actual re-encode
+        rather than just a comparison).
+
         Re-encode faces that have no *usable* face_encoding_512 but are no
         longer declared .ignore/.realignore -- e.g. a confirmed-ignore face
         whose embedding was cleared to save storage, then reassigned away
@@ -846,6 +856,8 @@ class FaceExtractor(object):
         ).exclude(
             declared_name__person_name__in=[settings.SOFT_IGNORE_NAME, '.realignore']
         ).select_related('source_image_file__directory__collection')
+        if collection is not None:
+            faces_to_reencode = faces_to_reencode.filter(source_image_file__directory__collection=collection)
 
         rec_model = self.app.app.models['recognition']
 
