@@ -204,8 +204,84 @@ def phash_to_bigint(image_hash):
     unsigned = int(str(image_hash), 16)
     return int(np.uint64(unsigned).astype(np.int64))
 
-class Directory(models.Model): 
+class PhotoCollection(models.Model):
+    """A separately-scanned photo tree (your own curated library, a
+    newly-acquired relative's archive, etc.) -- deliberately general,
+    not hardcoded to any one source, so a third collection later is
+    just a new row, no code change. Person/Face are NEVER partitioned
+    by collection (that's the whole point -- see Directory.collection
+    and ImageFile.collections below for exactly what IS scoped).
+
+    Each registered root is walked by the scheduled ingestion task
+    (filepopulator.populate_files_from_root) the same way the single
+    hardcoded PHOTO_ROOT always was -- adding a collection here is
+    enough to bring its whole tree into the regular scan cadence, no
+    separate one-off backfill needed.
+
+    min_face_det_score/min_face_relative_size gate whether a detected
+    face even becomes a Face row at all for images under this
+    collection (see face_manager/face_extract_encode.py) -- None means
+    no floor (the default collection's existing, unchanged behavior).
+    min_face_relative_size is min(box_width, box_height) /
+    min(image_width, image_height) -- relative, not an absolute pixel
+    count, so one floor works sensibly across wildly different source
+    resolutions (an old scan vs. a modern phone photo) rather than
+    needing a different absolute number per source quality."""
+    name = models.CharField(max_length=128, unique=True)
+    root_directory = models.CharField(max_length=1024, unique=True)
+    is_default = models.BooleanField(default=False)
+    min_face_det_score = models.FloatField(null=True, blank=True)
+    min_face_relative_size = models.FloatField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def resolve_for_path(cls, path):
+        """Longest-prefix match among every registered root_directory,
+        falling back to the default collection. Called at the one
+        moment a path's collection is actually decided -- new Directory
+        creation (Directory._get_dir()) and duplicate-file discovery
+        (filepopulator/scripts.py's create_image_file()) -- rather than
+        threaded as a parameter through every ingestion call site, so
+        ANY path (manual add, the upload endpoint, tests) resolves
+        correctly with no caller needing to know collections exist."""
+        normalized = os.path.normpath(path)
+        best = None
+        for candidate in cls.objects.all():
+            root = os.path.normpath(candidate.root_directory)
+            if normalized == root or normalized.startswith(root + os.sep):
+                if best is None or len(root) > len(os.path.normpath(best.root_directory)):
+                    best = candidate
+        if best is None:
+            best = cls.objects.filter(is_default=True).first()
+        return best
+
+
+class Directory(models.Model):
     dir_path = models.CharField(max_length=512, unique=True)
+    # Which PhotoCollection this directory's tree belongs to -- its
+    # "home," resolved once at creation time (see _get_dir() below) and
+    # never changed afterward. Distinct from ImageFile.collections
+    # (plural, "visible from") -- a photo whose home directory is here
+    # can still become visible from ANOTHER collection too, if a later
+    # scan of that other collection discovers it as a duplicate (see
+    # create_image_file()'s DuplicateFile branches).
+    # Deliberately kept nullable at the DB level permanently (not
+    # tightened to NOT NULL once backfilled) -- this project has a
+    # documented real incident where a NOT NULL column with no db_default
+    # broke on a stale, already-forked Celery worker process mid-deploy
+    # (its Python registry hadn't picked up the new column yet). A
+    # sensible db_default isn't possible here anyway (it would need to
+    # reference a specific PhotoCollection row's id, which doesn't exist
+    # until the seed migration runs). _get_dir() is the sole Directory
+    # creation path and always sets this -- application-level discipline
+    # instead of a hard DB constraint.
+    collection = models.ForeignKey(
+        PhotoCollection, on_delete=models.PROTECT, null=True, related_name='directories',
+    )
     mean_datetime = models.DateTimeField(default = timezone.now)
     mean_datesec = models.FloatField(default = -1)
     first_datetime = models.DateTimeField(default = timezone.now)
@@ -305,6 +381,18 @@ class DuplicateFile(models.Model):
     original = models.ForeignKey(
         'ImageFile', on_delete=models.CASCADE, null=True, blank=True,
         related_name='duplicates',
+    )
+
+    # Which collection's scan discovered THIS path as a duplicate --
+    # distinct from original.directory.collection (the primary's own
+    # home). Resolved via PhotoCollection.resolve_for_path() at the
+    # moment this row is created (see create_image_file()). An audit
+    # trail only -- the actually-queryable "is this image visible from
+    # collection X" answer lives on ImageFile.collections (below),
+    # which gets this same collection added to the PRIMARY's set at the
+    # same time this row is written.
+    collection = models.ForeignKey(
+        'PhotoCollection', on_delete=models.SET_NULL, null=True, blank=True,
     )
 
 
@@ -464,6 +552,19 @@ class ImageFile(models.Model):
     filename = models.CharField(max_length=1024, validators=[RegexValidator(regex=IMAGE_EXTENSION_REGEX, message="Filename must be a JPG, JPEG, HEIC, or HEIF")], db_index = True)
     # CASCADE is expected; if delete directory, delete images.
     directory = models.ForeignKey(Directory, on_delete=models.PROTECT, related_name='image_set')
+    # The SET of collections this image's content is visible from --
+    # plural, unlike directory.collection (singular, "home"). Always
+    # includes directory.collection (added in instance_clean_and_save()
+    # right after every successful save); gains an ADDITIONAL entry
+    # whenever a later scan of a different collection discovers this
+    # same content as a duplicate (create_image_file()'s DuplicateFile
+    # branches) -- e.g. a photo that lives in your own default
+    # collection but was ALSO found in a newly-ingested relative's
+    # archive. Query "what's visible from collection X" against this
+    # field, never against directory__collection alone, or a
+    # cross-linked photo whose home is elsewhere will be silently
+    # missed.
+    collections = models.ManyToManyField('PhotoCollection', related_name='images', blank=True)
     pixel_hash = models.CharField(max_length = 64, null = False, default = -1)
     file_hash = models.CharField(max_length = 64, null = False, default = -1)
 
@@ -626,6 +727,7 @@ class ImageFile(models.Model):
             self.directory = Directory.objects.get (dir_path = directory_of_file)
         except :
             instance = Directory(dir_path = directory_of_file)
+            instance.collection = PhotoCollection.resolve_for_path(directory_of_file)
             try:
                 instance.full_clean()
             except ValidationError as ve:

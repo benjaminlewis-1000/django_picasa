@@ -34,7 +34,7 @@ import pillow_heif
 from django.core.management import call_command
 from django.core.management.base import CommandError
 
-from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, guess_date_from_filename, VideoFile, FailedVideoFile, DuplicateVideoFile
+from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, PhotoCollection, guess_date_from_filename, VideoFile, FailedVideoFile, DuplicateVideoFile
 # from .forms import ImageFileForm, DirectoryForm
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods, delete_old_thumbnails
 from .video_scripts import create_video_file, add_videos_from_root_dir, delete_removed_videos, _parse_exif_date, compute_video_content_hash
@@ -4374,3 +4374,169 @@ class BackfillS23GpsTests(TestCase):
                 status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
             )
             call_command('backfill_owntracks_gps')
+
+
+class PhotoCollectionTests(TestCase):
+    """PhotoCollection: resolution, per-collection Directory assignment
+    at ingestion, and the cross-collection duplicate-marking mechanism
+    (ImageFile.collections gaining an extra collection when a LATER
+    scan of a different collection discovers the same photo content --
+    this is what makes "find all faces for a person visible from
+    collection X, even if the source file's home is collection Y"
+    actually answerable). See filepopulator/models.py's PhotoCollection
+    for the full design discussion."""
+
+    FIXTURE_IMG = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'ci_fixtures', 'test_imgs_filepopulate', 'gps.jpg',
+    )
+
+    def setUp(self):
+        self.default_collection = PhotoCollection.objects.get(is_default=True)
+        self.second_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.second_root, ignore_errors=True)
+        self.second_collection = PhotoCollection.objects.create(
+            name='Second Collection', root_directory=self.second_root,
+        )
+
+    def tearDown(self):
+        ImageFile.objects.all().delete()
+        Directory.objects.exclude(collection=self.default_collection).delete()
+
+    def test_resolve_for_path_matches_registered_root(self):
+        nested = os.path.join(self.second_root, 'sub', 'dir')
+        resolved = PhotoCollection.resolve_for_path(nested)
+        self.assertEqual(resolved.pk, self.second_collection.pk)
+
+    def test_resolve_for_path_falls_back_to_default(self):
+        resolved = PhotoCollection.resolve_for_path('/some/totally/unregistered/path')
+        self.assertEqual(resolved.pk, self.default_collection.pk)
+
+    def test_new_photo_under_second_root_gets_that_collection(self):
+        dest = os.path.join(self.second_root, 'new_photo.jpg')
+        shutil.copy(self.FIXTURE_IMG, dest)
+
+        create_image_file(dest)
+
+        img = ImageFile.objects.get(filename=dest)
+        self.assertEqual(img.directory.collection_id, self.second_collection.pk)
+        self.assertIn(self.second_collection, img.collections.all())
+        self.assertNotIn(self.default_collection, img.collections.all())
+
+    def test_duplicate_found_under_second_collection_cross_links_the_original(self):
+        # The real motivating case: a photo you already have (home =
+        # default collection) gets re-discovered byte-for-byte while
+        # scanning a newly-added collection -- it should become
+        # queryable as "visible from" BOTH, not just its own home.
+        original_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, original_dir, ignore_errors=True)
+        original_path = os.path.join(original_dir, 'original.jpg')
+        shutil.copy(self.FIXTURE_IMG, original_path)
+        create_image_file(original_path)
+        original = ImageFile.objects.get(filename=original_path)
+
+        # Confirm its home really did resolve to the default collection
+        # (original_dir was never registered as any collection's root).
+        self.assertEqual(original.directory.collection_id, self.default_collection.pk)
+        self.assertIn(self.default_collection, original.collections.all())
+        self.assertNotIn(self.second_collection, original.collections.all())
+
+        dup_path = os.path.join(self.second_root, 'duplicate_of_original.jpg')
+        shutil.copy(self.FIXTURE_IMG, dup_path)
+        create_image_file(dup_path)
+
+        # No second ImageFile row -- same content, recorded as a
+        # DuplicateFile instead.
+        self.assertFalse(ImageFile.objects.filter(filename=dup_path).exists())
+        dup = DuplicateFile.objects.get(filename=dup_path)
+        self.assertEqual(dup.original_id, original.pk)
+        self.assertEqual(dup.collection_id, self.second_collection.pk)
+
+        # The ORIGINAL (whose home is still the default collection) is
+        # now also visible from the second collection.
+        original.refresh_from_db()
+        self.assertIn(self.default_collection, original.collections.all())
+        self.assertIn(self.second_collection, original.collections.all())
+
+    def test_detection_floors_default_to_none(self):
+        # The default collection (and any newly-created one with no
+        # explicit floors) must impose no detection-time filtering --
+        # None, not 0 or some other falsy-but-truthy-adjacent value,
+        # since face_extract_encode.py's gate checks `is not None`.
+        self.assertIsNone(self.default_collection.min_face_det_score)
+        self.assertIsNone(self.default_collection.min_face_relative_size)
+        fresh = PhotoCollection.objects.create(name='Fresh', root_directory='/tmp/fresh_collection_test')
+        self.assertIsNone(fresh.min_face_det_score)
+        self.assertIsNone(fresh.min_face_relative_size)
+
+    def _attach_face(self, img, person):
+        face = Face(
+            source_image_file=img, declared_name=person, validated=True,
+            box_left=1, box_top=1,
+            box_right=min(40, img.width - 1), box_bottom=min(40, img.height - 1),
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.save()
+        return face
+
+    def test_faces_for_a_person_are_queryable_by_collection_even_when_the_source_image_lives_elsewhere(self):
+        # The exact behavior this whole feature was built around: a
+        # photo whose HOME is the default collection, but that's also
+        # visible from the second collection (via the duplicate
+        # cross-link above), must show up when querying "this person's
+        # faces, as seen from the second collection" -- via
+        # source_image_file__collections, never directory__collection
+        # alone (which would only ever see the home collection).
+        from face_manager.models import Person
+
+        person, _ = Person.objects.get_or_create(person_name='Collection Query Test Person')
+
+        # A face whose source image's home is the default collection
+        # AND is cross-linked into the second collection (same
+        # mechanism as test_duplicate_found_under_second_collection_
+        # cross_links_the_original above).
+        home_path = os.path.join(tempfile.mkdtemp(), 'home.jpg')
+        os.makedirs(os.path.dirname(home_path), exist_ok=True)
+        shutil.copy(self.FIXTURE_IMG, home_path)
+        create_image_file(home_path)
+        cross_linked_img = ImageFile.objects.get(filename=home_path)
+        cross_linked_img.collections.add(self.second_collection)
+        cross_linked_face = self._attach_face(cross_linked_img, person)
+
+        # A second face for the SAME person, genuinely only in the
+        # default collection -- must NOT show up in the second
+        # collection's view. A DIFFERENT fixture than home_path's --
+        # otherwise it's pixel-identical and gets correctly recorded as
+        # a duplicate of home_path instead of a genuinely new photo.
+        other_fixture = os.path.join(
+            os.path.dirname(self.FIXTURE_IMG), 'has_face_tags.jpg',
+        )
+        default_only_path = os.path.join(tempfile.mkdtemp(), 'default_only.jpg')
+        os.makedirs(os.path.dirname(default_only_path), exist_ok=True)
+        shutil.copy(other_fixture, default_only_path)
+        create_image_file(default_only_path)
+        default_only_img = ImageFile.objects.get(filename=default_only_path)
+        default_only_face = self._attach_face(default_only_img, person)
+
+        faces_in_second_collection = Face.objects.filter(
+            declared_name=person, source_image_file__collections=self.second_collection,
+        )
+        self.assertIn(cross_linked_face, faces_in_second_collection)
+        self.assertNotIn(default_only_face, faces_in_second_collection)
+
+        # And person.face_declared still returns both, unfiltered --
+        # Person/Face themselves are never partitioned by collection.
+        self.assertEqual(set(person.face_declared.all()), {cross_linked_face, default_only_face})
+
+    def test_load_images_into_db_walks_every_registered_collection_root(self):
+        from unittest import mock
+        from filepopulator.tasks import load_images_into_db
+
+        with mock.patch('filepopulator.tasks.add_from_root_dir') as mock_add, \
+             mock.patch('filepopulator.tasks.delete_removed_photos'):
+            load_images_into_db()
+
+        called_roots = {call.args[0] for call in mock_add.call_args_list}
+        self.assertIn(self.default_collection.root_directory, called_roots)
+        self.assertIn(self.second_collection.root_directory, called_roots)
+        self.assertEqual(mock_add.call_count, PhotoCollection.objects.count())

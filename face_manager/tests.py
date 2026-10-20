@@ -573,6 +573,113 @@ class FaceExtractorCorruptedImageTests(TestCase):
         self.assertTrue(img_obj.isProcessed)
 
 
+class AddNewFacePhotoCollectionGateTests(TestCase):
+    """add_new_face()'s per-PhotoCollection detection floors (see that
+    model's own docstring in filepopulator/models.py). Uses a real
+    FaceExtractor (ONNX models loaded once via setUpClass, same pattern
+    as FaceExtractorCorruptedImageTests -- add_new_face() itself never
+    touches the ONNX session, only pure-Python helpers) with a
+    synthetic insightface.app.common.Face (a plain dict subclass, real
+    inference not needed to construct one) so the det_score/box can be
+    controlled directly rather than depending on what a real image
+    happens to detect."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.extractor = FaceExtractor()
+
+    def _make_image_in_collection(self, collection, path):
+        directory, _ = Directory.objects.get_or_create(
+            dir_path=os.path.dirname(path), defaults={'collection': collection},
+        )
+        if directory.collection_id != (collection.id if collection else None):
+            directory.collection = collection
+            directory.save()
+        image = ImageFile(
+            filename=path, directory=directory, thumbnail_small="",
+            width=640, height=480, pixel_hash='hash', file_hash='fhash', dateTakenUTC=0,
+        )
+        ImageFile.objects.bulk_create([image])
+        return ImageFile.objects.get(filename=path)
+
+    def _fake_detection(self, bbox, det_score):
+        import insightface.app.common
+        import numpy as np
+        # Integer dtype deliberately, not float32 -- get_square_face_img()
+        # slices img_numpy directly with values derived from this bbox,
+        # which needs __index__-capable (integer) values. A real
+        # detection's bbox is float32 too, but something upstream of
+        # here evidently normalizes it before this point in production;
+        # for this synthetic unit test, int is simplest and correct
+        # enough (only relative proportions matter for the gate itself).
+        return insightface.app.common.Face(
+            bbox=np.array(bbox, dtype=np.int64),
+            kps=np.zeros((5, 2), dtype=np.float32),
+            det_score=det_score,
+            embedding=np.zeros(512, dtype=np.float32),
+            age=30, gender=0,
+        )
+
+    def _img_numpy(self):
+        import numpy as np
+        return np.zeros((480, 640, 3), dtype=np.uint8)
+
+    def test_default_collection_no_floor_keeps_everything(self):
+        from filepopulator.models import PhotoCollection
+        default = PhotoCollection.objects.get(is_default=True)
+        img = self._make_image_in_collection(default, '/photos/gate_test_default/a.jpg')
+        # Small box (20.8% of the image's min dimension) and a low
+        # det_score -- would fail floors if any were set, but the
+        # default collection has none.
+        face = self._fake_detection([100, 100, 200, 200], det_score=0.1)
+        self.extractor.add_new_face(face, img, self._img_numpy())
+        self.assertEqual(Face.objects.filter(source_image_file=img).count(), 1)
+
+    def test_det_score_below_floor_is_skipped(self):
+        from filepopulator.models import PhotoCollection
+        collection = PhotoCollection.objects.create(
+            name='Low Fidelity', root_directory='/photos/gate_test_detscore', min_face_det_score=0.6,
+        )
+        img = self._make_image_in_collection(collection, '/photos/gate_test_detscore/a.jpg')
+        face = self._fake_detection([50, 50, 400, 400], det_score=0.5)
+        self.extractor.add_new_face(face, img, self._img_numpy())
+        self.assertEqual(Face.objects.filter(source_image_file=img).count(), 0)
+
+    def test_det_score_at_or_above_floor_is_kept(self):
+        from filepopulator.models import PhotoCollection
+        collection = PhotoCollection.objects.create(
+            name='Low Fidelity 2', root_directory='/photos/gate_test_detscore2', min_face_det_score=0.6,
+        )
+        img = self._make_image_in_collection(collection, '/photos/gate_test_detscore2/a.jpg')
+        face = self._fake_detection([50, 50, 400, 400], det_score=0.6)
+        self.extractor.add_new_face(face, img, self._img_numpy())
+        self.assertEqual(Face.objects.filter(source_image_file=img).count(), 1)
+
+    def test_relative_size_below_floor_is_skipped(self):
+        from filepopulator.models import PhotoCollection
+        collection = PhotoCollection.objects.create(
+            name='Low Fidelity 3', root_directory='/photos/gate_test_size', min_face_relative_size=0.3,
+        )
+        img = self._make_image_in_collection(collection, '/photos/gate_test_size/a.jpg')
+        # 640x480 image, box 100x100 -> relative size = 100/480 = 0.208,
+        # below the 0.3 floor.
+        face = self._fake_detection([100, 100, 200, 200], det_score=0.9)
+        self.extractor.add_new_face(face, img, self._img_numpy())
+        self.assertEqual(Face.objects.filter(source_image_file=img).count(), 0)
+
+    def test_relative_size_at_or_above_floor_is_kept(self):
+        from filepopulator.models import PhotoCollection
+        collection = PhotoCollection.objects.create(
+            name='Low Fidelity 4', root_directory='/photos/gate_test_size2', min_face_relative_size=0.1,
+        )
+        img = self._make_image_in_collection(collection, '/photos/gate_test_size2/a.jpg')
+        # box 100x100 -> relative size 0.208, above the 0.1 floor.
+        face = self._fake_detection([100, 100, 200, 200], det_score=0.9)
+        self.extractor.add_new_face(face, img, self._img_numpy())
+        self.assertEqual(Face.objects.filter(source_image_file=img).count(), 1)
+
+
 class UpdateListOfNoMatchingDetectsTests(TestCase):
     """Regression test for a fixed bug: update_list_of_no_matching_detects()
     only clamped each box coordinate on one side (box_left/box_top floored

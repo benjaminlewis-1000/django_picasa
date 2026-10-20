@@ -1,6 +1,6 @@
 #! /usr/bin/env python
 
-from .models import ImageFile, VideoFile, Directory, DuplicateFile, FailedImageFile, IMAGE_EXTENSION_REGEX, HEIC_EXTENSIONS
+from .models import ImageFile, VideoFile, Directory, DuplicateFile, FailedImageFile, PhotoCollection, IMAGE_EXTENSION_REGEX, HEIC_EXTENSIONS
 import common
 from datetime import datetime
 from django.conf import settings
@@ -213,6 +213,15 @@ def instance_clean_and_save(instance, record_failure=True):
         # A successful save means this file just decoded fine -- clear any
         # stale FailedImageFile record from an earlier failed attempt.
         FailedImageFile.objects.filter(filename=file_path).delete()
+
+        # Every successful save gets its directory's home collection
+        # added to its visible-from set -- idempotent (M2M .add() is a
+        # no-op if already present), so this is safe to run on every
+        # path through here (new file, moved, orientation-changed,
+        # hash-changed-replacement), not just true first-time creation.
+        if instance.directory.collection_id is not None:
+            instance.collections.add(instance.directory.collection_id)
+
         return True, None
 
 # def add_new_photo(file_path):
@@ -535,9 +544,12 @@ def create_image_file(file_path):
             # duplicates.
             for each in exist_with_same_hash:
                 if _pixel_arrays_match(new_photo, each.filename):
-                    new_dup = DuplicateFile(filename=file_path, original=each)
+                    dup_collection = PhotoCollection.resolve_for_path(file_path)
+                    new_dup = DuplicateFile(filename=file_path, original=each, collection=dup_collection)
                     print("File exists (multiple)...", file_path, '. Marking as duplicate.')
                     new_dup.save()
+                    if dup_collection is not None:
+                        each.collections.add(dup_collection)
                     return
             settings.LOGGER.warning(
                 f"pixel_hash matched {len(exist_with_same_hash)} existing row(s) for "
@@ -555,9 +567,14 @@ def create_image_file(file_path):
             # file got correctly recorded as a DuplicateFile AND
             # incorrectly given its own full ImageFile row).
             if _pixel_arrays_match(new_photo, exist_with_same_hash[0].filename):
-                new_dup = DuplicateFile(filename=file_path, original=exist_with_same_hash[0])
+                dup_collection = PhotoCollection.resolve_for_path(file_path)
+                new_dup = DuplicateFile(
+                    filename=file_path, original=exist_with_same_hash[0], collection=dup_collection,
+                )
                 print("File exists...", file_path, exist_with_same_hash[0].filename, '. Marking as duplicate.')
                 new_dup.save()
+                if dup_collection is not None:
+                    exist_with_same_hash[0].collections.add(dup_collection)
                 return
             settings.LOGGER.warning(
                 f"pixel_hash matched {exist_with_same_hash[0].filename} for {file_path}, "
