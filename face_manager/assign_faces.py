@@ -202,6 +202,46 @@ class faceAssigner():
         self.DET_SCORE_FLOOR = 0.6
         self.CANDIDATE_MARGIN_FLOOR = 0.03
 
+        # Added 2026-10-20 after a real investigation into whether
+        # Face.relative_size (a detection's size as a fraction of its
+        # source image's shorter dimension -- see PhotoCollection's own
+        # min_face_relative_size floor) helps classification the same way
+        # det_score does above. Real leave-one-out ground truth (15,755
+        # confirmed-correct matches recomputed fresh, 3,473 known-bad
+        # proposals from the same 5 problem galleries as the det_score
+        # investigation): corr(relative_size, margin) = 0.29 -- a real,
+        # continuous effect, not a clean step function, so this is an
+        # ADDITIONAL per-query margin requirement that decays to zero
+        # above SIZE_NUDGE_REF_SIZE, not a hard floor like DET_SCORE_FLOOR.
+        # A continuous linear decay clearly beat discrete size tiers at
+        # matched cost in the sweep (e.g. 41.9% cut at 2.5% cost vs. the
+        # best tiered config's 31.1% cut at the same cost) -- see
+        # CLAUDE.md for the full grid.
+        #
+        # Also swept lowering CANDIDATE_MARGIN_FLOOR itself to see whether
+        # the size term could free up "room" elsewhere -- it can't: the
+        # size term is zero above SIZE_NUDGE_REF_SIZE by construction, and
+        # real junk exists among LARGER faces too (even the largest-face
+        # decile in the raw data still had an 11% known-bad-gallery rate),
+        # so lowering the baseline for everyone let that junk flood back
+        # in regardless of the size term (regret jumped to 97.7% the
+        # moment the baseline dropped below 0.03). CANDIDATE_MARGIN_FLOOR
+        # is catching real false positives the size signal can't explain
+        # -- left unchanged.
+        #
+        # Chose the mild end of the validated range (cost=0.2%, cut=7.9%)
+        # over a more aggressive point (e.g. ref=0.06/max=0.10, cost=2.5%/
+        # cut=41.9%) after a real visual spot-check: at the more
+        # aggressive setting, several of the faces that would newly fail
+        # were genuinely clean, clearly-identifiable photos (not borderline
+        # garbage) -- this system is already fairly performant, so a small,
+        # low-risk edge was preferred over a bigger, riskier one. A face
+        # with relative_size still NULL (not yet reached by a backfill, or
+        # a video-sourced query) skips this term entirely, same convention
+        # as DET_SCORE_FLOOR above.
+        self.SIZE_NUDGE_REF_SIZE = 0.04
+        self.SIZE_NUDGE_MAX = 0.02
+
         # Added 2026-10-13 after a real investigation (prompted by the
         # user noticing video faces miss classification much more often
         # than image faces): video's detector (det_500m, a lighter model
@@ -789,9 +829,26 @@ class faceAssigner():
         det_score = unassigned_face.det_score
         effective_det_floor = self.VIDEO_DET_SCORE_FLOOR if is_video_query else self.DET_SCORE_FLOOR
         passes_det_score_gate = det_score is None or det_score >= effective_det_floor
+
+        # SIZE_NUDGE_REF_SIZE/SIZE_NUDGE_MAX -- see their own comment in
+        # __init__. A continuous, query-level ADDITION to the margin
+        # requirement (not a hard floor like det_score), decaying linearly
+        # to zero at SIZE_NUDGE_REF_SIZE. relative_size is a property of
+        # the query face itself, so like det_score it applies once, not
+        # per-candidate. NULL relative_size (not yet backfilled, or a
+        # video-sourced query) contributes no penalty.
+        relative_size = unassigned_face.relative_size
+        if relative_size is None:
+            size_nudge = 0.0
+        else:
+            size_nudge = self.SIZE_NUDGE_MAX * np.clip(
+                (self.SIZE_NUDGE_REF_SIZE - relative_size) / self.SIZE_NUDGE_REF_SIZE, 0, 1
+            )
+        effective_margin_floor = self.CANDIDATE_MARGIN_FLOOR + size_nudge
+
         if passes_det_score_gate:
             possible_idcs = np.where(
-                metrics_array[:, 0] - metrics_array[:, 1] >= self.CANDIDATE_MARGIN_FLOOR
+                metrics_array[:, 0] - metrics_array[:, 1] >= effective_margin_floor
             )[0]
         else:
             possible_idcs = np.array([], dtype=int)

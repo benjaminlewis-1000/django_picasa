@@ -1643,9 +1643,9 @@ class DetScoreMarginGateTests(TestCase):
     visual false positive (a photo of toy building blocks) that this
     combined gate catches but det_score alone did not."""
 
-    def _make_face_with_single_candidate(self, similarity, gallery_size=600, det_score=None):
+    def _make_face_with_single_candidate(self, similarity, gallery_size=600, det_score=None, relative_size=None):
         assigner = faceAssigner()
-        person = make_person(f"Candidate {similarity}-{gallery_size}-{det_score}")
+        person = make_person(f"Candidate {similarity}-{gallery_size}-{det_score}-{relative_size}")
         assigner.likely_people_ids = [person.id]
 
         query = np.zeros(512)
@@ -1663,6 +1663,7 @@ class DetScoreMarginGateTests(TestCase):
         face = make_face(img, declared_name=blank_person)
         face.face_encoding_512 = query.tolist()
         face.det_score = det_score
+        face.relative_size = relative_size
         face.save()
         return assigner, face, person
 
@@ -1865,6 +1866,125 @@ class DetScoreMarginGateTests(TestCase):
             assigner.classify_unassigned(face)
         mock_set.assert_called_once()
         self.assertEqual(mock_set.call_args[0][0], assigner.ignore_person_id)
+
+
+class SizeNudgeMarginGateTests(TestCase):
+    """SIZE_NUDGE_REF_SIZE/SIZE_NUDGE_MAX: added 2026-10-20 after a real
+    investigation into whether Face.relative_size helps classification --
+    see CLAUDE.md for the full sweep (continuous linear decay vs. tiers,
+    and why lowering CANDIDATE_MARGIN_FLOOR itself doesn't help even with
+    this term in place). Uses a standalone copy of DetScoreMarginGateTests'
+    _make_face_with_single_candidate helper (not a subclass -- subclassing
+    a TestCase to reuse a helper also re-runs every inherited test method
+    under this class name too) -- det_score is always a comfortable 0.9,
+    well above DET_SCORE_FLOOR, isolating the size term specifically."""
+
+    def _make_face_with_single_candidate(self, similarity, gallery_size=600, det_score=None, relative_size=None):
+        assigner = faceAssigner()
+        person = make_person(f"SizeCandidate {similarity}-{gallery_size}-{det_score}-{relative_size}")
+        assigner.likely_people_ids = [person.id]
+
+        query = np.zeros(512)
+        query[0] = 1.0
+        ref = query.copy()
+        ref[0] = similarity
+        ref[1] = np.sqrt(max(0.0, 1 - similarity ** 2))
+
+        assigner.embedding_dict = {person.id: np.tile(ref.reshape(512, 1), (1, gallery_size))}
+        assigner.norm_dict = {person.id: np.ones(gallery_size)}
+        assigner._build_concatenated_gallery()
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+        face = make_face(img, declared_name=blank_person)
+        face.face_encoding_512 = query.tolist()
+        face.det_score = det_score
+        face.relative_size = relative_size
+        face.save()
+        return assigner, face, person
+
+    def test_small_face_with_thin_margin_is_rejected(self):
+        # A margin that would clear the plain CANDIDATE_MARGIN_FLOOR
+        # (0.03) on its own, but not once the small-face size nudge
+        # (relative_size well below SIZE_NUDGE_REF_SIZE=0.04) adds its
+        # full SIZE_NUDGE_MAX=0.02 on top -- effective floor 0.05.
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        similarity = threshold + 0.04  # margin=0.04: clears 0.03, not 0.05
+        assigner, face, person = self._make_face_with_single_candidate(
+            similarity=similarity, det_score=0.9, relative_size=0.005,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        self.assertEqual(mock_set.call_args[0][0], assigner.ignore_person_id)
+
+    def test_small_face_with_margin_clearing_the_nudged_floor_is_accepted(self):
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        similarity = threshold + 0.06  # margin=0.06, clears 0.03+0.02=0.05
+        assigner, face, person = self._make_face_with_single_candidate(
+            similarity=similarity, det_score=0.9, relative_size=0.005,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        self.assertEqual(mock_set.call_args[0][0], person.id)
+
+    def test_face_at_or_above_ref_size_gets_no_nudge(self):
+        # relative_size >= SIZE_NUDGE_REF_SIZE (0.04) -- same plain 0.03
+        # floor as before this feature existed.
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        similarity = threshold + 0.04  # margin=0.04, clears the plain 0.03 floor
+        assigner, face, person = self._make_face_with_single_candidate(
+            similarity=similarity, det_score=0.9, relative_size=0.04,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        self.assertEqual(mock_set.call_args[0][0], person.id)
+
+    def test_null_relative_size_skips_the_size_nudge(self):
+        # Not yet reached by a relative_size backfill (or a video-sourced
+        # query) -- must not be penalized, same convention as a NULL
+        # det_score skipping its own half of the gate.
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        similarity = threshold + 0.04  # margin=0.04: would fail a nudged floor, passes the plain one
+        assigner, face, person = self._make_face_with_single_candidate(
+            similarity=similarity, det_score=0.9, relative_size=None,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        self.assertEqual(mock_set.call_args[0][0], person.id)
+
+    def test_nudge_decays_linearly_partway_to_ref_size(self):
+        # relative_size halfway between 0 and SIZE_NUDGE_REF_SIZE (0.02 of
+        # 0.04) -- nudge should be half of SIZE_NUDGE_MAX (0.01), so
+        # margin=0.035 (clears 0.03+0.01=0.04) should be accepted...
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        similarity = threshold + 0.045
+        assigner, face, person = self._make_face_with_single_candidate(
+            similarity=similarity, det_score=0.9, relative_size=0.02,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        self.assertEqual(mock_set.call_args[0][0], person.id)
+
+        # ...but margin=0.035 (just under 0.03+0.01=0.04) should not.
+        assigner2 = faceAssigner()
+        similarity2 = threshold + 0.035
+        assigner2, face2, person2 = self._make_face_with_single_candidate(
+            similarity=similarity2, det_score=0.9, relative_size=0.02,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set2:
+            assigner2.classify_unassigned(face2)
+        mock_set2.assert_called_once()
+        self.assertEqual(mock_set2.call_args[0][0], assigner2.ignore_person_id)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
