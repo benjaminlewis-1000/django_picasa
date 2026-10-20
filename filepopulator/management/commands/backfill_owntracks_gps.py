@@ -1,21 +1,19 @@
 #! /usr/bin/env python
 
 # Backfill: estimates GPS for photos from an explicitly opted-in list of
-# cameras (filepopulator/owntracks_gps.py's SUPPORTED_CAMERA_MODELS),
-# from OwnTracks location history. Safely re-runnable -- only ever
-# touches rows still missing GPS, so this is meant to end up as a
-# recurring cron/Celery task once a camera's own offset-source has been
-# validated, not a true one-off. See that module's own docstring for
-# the real per-camera offset detail (and why a new camera needs its own
-# confirmed offset source before being added there, not just added
-# blindly).
+# cameras (CameraGpsBackfillConfig, toggled via a frontend page -- see
+# that model's own docstring), from OwnTracks location history. Safely
+# re-runnable -- only ever touches rows still missing GPS, so this is
+# meant to end up as a recurring cron/Celery task, not a true one-off.
+# See owntracks_gps.py's own docstring for the real per-camera offset
+# detail.
 
 import datetime
 
 from django.core.management.base import BaseCommand, CommandError
 
 from filepopulator.owntracks_gps import (
-    OwnTracksConfigError, SUPPORTED_CAMERA_MODELS, backfill_camera_gps,
+    OwnTracksConfigError, backfill_camera_gps, get_enabled_camera_models,
 )
 
 
@@ -40,9 +38,9 @@ class Command(BaseCommand):
         )
         parser.add_argument(
             '--camera-model', action='append', default=None,
-            help="Scope to just this camera_model (repeatable). Must already be in "
-                 f"SUPPORTED_CAMERA_MODELS ({', '.join(SUPPORTED_CAMERA_MODELS)}) -- this "
-                 "narrows a run for testing, it does not add a new camera.",
+            help="Scope to just this camera_model (repeatable). Must already be enabled in "
+                 "CameraGpsBackfillConfig -- this narrows a run for testing, it does not "
+                 "enable a new camera (use the toggle page/API for that).",
         )
         parser.add_argument(
             '--start-date', type=_parse_date, default=None,
@@ -66,11 +64,11 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         camera_models = options['camera_model']
         if camera_models:
-            unknown = set(camera_models) - set(SUPPORTED_CAMERA_MODELS)
+            unknown = set(camera_models) - set(get_enabled_camera_models())
             if unknown:
                 raise CommandError(
-                    f"Not in SUPPORTED_CAMERA_MODELS: {sorted(unknown)}. Add it there first "
-                    "(with a confirmed offset source) before scoping a run to it."
+                    f"Not enabled in CameraGpsBackfillConfig: {sorted(unknown)}. Enable it "
+                    "there first before scoping a run to it."
                 )
 
         try:

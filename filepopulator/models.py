@@ -308,6 +308,34 @@ class DuplicateFile(models.Model):
     )
 
 
+class CameraGpsBackfillConfig(models.Model):
+    # Replaces the old hardcoded SUPPORTED_CAMERA_MODELS Python list in
+    # filepopulator/owntracks_gps.py -- the real allowlist of which
+    # cameras' missing-GPS photos may be estimated from OwnTracks
+    # location history. DB-backed (not code) so a frontend toggle page
+    # can let the real device owner curate this directly, rather than
+    # a developer guessing which camera_model strings correspond to a
+    # device THEY personally carried (the real privacy boundary here --
+    # OwnTracks only reflects one person's location; enabling a camera
+    # that was ever someone else's, even briefly, misattributes their
+    # photos to the wrong person's location).
+    #
+    # Enabling a camera here doesn't guarantee any photo actually gets
+    # a match -- that still depends entirely on whether that specific
+    # camera/file has a recognizable offset source (standard EXIF
+    # OffsetTimeOriginal, or Nikon-style MakerNotes TimeZone/
+    # DaylightSavings -- see owntracks_gps.py's own docstring) at the
+    # time it's actually attempted. This table only controls the scope
+    # boundary, not whether the underlying detection logic exists.
+    camera_model = models.CharField(max_length=128, unique=True)
+    enabled = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"CameraGpsBackfillConfig({self.camera_model}, enabled={self.enabled})"
+
+
 class FailedImageFile(models.Model):
     # Tracks a file that has never successfully been ingested into
     # ImageFile -- e.g. corrupted/truncated from the moment it appeared in

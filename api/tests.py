@@ -1097,6 +1097,96 @@ class StatsAndParametersTests(ApiTestCase):
         self.assertEqual(resp.data["num_videos_failed"], 1)
 
 
+class CameraGpsBackfillConfigApiTests(ApiTestCase):
+    """Backend for the camera-opt-in toggle page (mirrors the existing
+    nearest-metro-override tool's split -- this repo provides the API,
+    the actual page is built elsewhere). See filepopulator/
+    owntracks_gps.py's own docstring for why this is scoped per-camera
+    at all (OwnTracks only reflects one person's location)."""
+
+    def test_requires_auth(self):
+        resp = self.anon_client.get("/api/camera_gps_backfill_config/")
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_list_groups_by_model_not_make(self):
+        # Real case this was built around: the same physical device can
+        # write different camera_make spellings across firmware/OS
+        # versions (confirmed: 'LGE'/'LG Electronics' both for
+        # 'LM-G710') -- grouping by (make, model) together would
+        # silently fragment one device's real count into two rows.
+        img1 = self.make_image("naming/good/1.JPG")
+        ImageFile.objects.filter(pk=img1.pk).update(
+            camera_make='LGE', camera_model='LM-G710', gps_lat_decimal=-999,
+        )
+        img2 = self.make_image("naming/good/2.jpg")
+        ImageFile.objects.filter(pk=img2.pk).update(
+            camera_make='LG Electronics', camera_model='LM-G710', gps_lat_decimal=40.0,
+        )
+
+        resp = self.client.get("/api/camera_gps_backfill_config/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        rows = [r for r in resp.data if r['camera_model'] == 'LM-G710']
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row['total'], 2)
+        self.assertEqual(row['missing_gps'], 1)
+        self.assertEqual(sorted(row['camera_make_examples']), ['LG Electronics', 'LGE'])
+        self.assertFalse(row['enabled'])
+
+    def test_list_reflects_enabled_state(self):
+        from filepopulator.models import CameraGpsBackfillConfig
+
+        img = self.make_image("naming/good/1.JPG")
+        ImageFile.objects.filter(pk=img.pk).update(camera_model='Test Camera XYZ')
+        CameraGpsBackfillConfig.objects.create(camera_model='Test Camera XYZ', enabled=True)
+
+        resp = self.client.get("/api/camera_gps_backfill_config/")
+        row = next(r for r in resp.data if r['camera_model'] == 'Test Camera XYZ')
+        self.assertTrue(row['enabled'])
+
+    def test_set_enabled_upserts_new_camera(self):
+        from filepopulator.models import CameraGpsBackfillConfig
+
+        self.assertFalse(CameraGpsBackfillConfig.objects.filter(camera_model='Brand New Camera').exists())
+        resp = self.client.post(
+            "/api/camera_gps_backfill_config/set_enabled/",
+            {"camera_model": "Brand New Camera", "enabled": True},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        config = CameraGpsBackfillConfig.objects.get(camera_model='Brand New Camera')
+        self.assertTrue(config.enabled)
+
+    def test_set_enabled_can_flip_back_off(self):
+        from filepopulator.models import CameraGpsBackfillConfig
+
+        CameraGpsBackfillConfig.objects.create(camera_model='Already On', enabled=True)
+        resp = self.client.post(
+            "/api/camera_gps_backfill_config/set_enabled/",
+            {"camera_model": "Already On", "enabled": False},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        config = CameraGpsBackfillConfig.objects.get(camera_model='Already On')
+        self.assertFalse(config.enabled)
+
+    def test_set_enabled_rejects_missing_fields(self):
+        resp = self.client.post(
+            "/api/camera_gps_backfill_config/set_enabled/",
+            {"camera_model": "Incomplete"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_set_enabled_rejects_non_boolean_enabled(self):
+        resp = self.client.post(
+            "/api/camera_gps_backfill_config/set_enabled/",
+            {"camera_model": "Bad Type", "enabled": "yes"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+
 class MobileViewTests(ApiTestCase):
     """Tests for api/mobile_views.py -- split out of api/views.py, which
     had grown to mix these mobile-app-facing endpoints in with the
