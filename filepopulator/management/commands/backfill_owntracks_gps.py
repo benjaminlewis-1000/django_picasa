@@ -55,6 +55,13 @@ class Command(BaseCommand):
             '--end-date', type=_parse_date, default=None,
             help="YYYY-MM-DD -- only photos on/before this date (by dateTaken).",
         )
+        parser.add_argument(
+            '--retry-failed', action='store_true',
+            help="Also re-attempt photos already marked 'no_nearby_point' from a previous run "
+                 "(e.g. after the OwnTracks service's own location history grew). Never "
+                 "re-attempts 'no_offset_tag' -- that can't change. By default, any photo with "
+                 "an existing attempt record of either kind is skipped entirely.",
+        )
 
     def handle(self, *args, **options):
         camera_models = options['camera_model']
@@ -70,6 +77,7 @@ class Command(BaseCommand):
             counts = backfill_camera_gps(
                 camera_models=camera_models,
                 start_date=options['start_date'], end_date=options['end_date'],
+                retry_failed=options['retry_failed'],
                 dry_run=options['dry_run'], limit=options['limit'], log=self.stdout.write,
             )
         except OwnTracksConfigError as e:
