@@ -55,6 +55,16 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
     changes away from the blank sentinel), not built -- user declined for now.
   - 1,378 flagged-for-review video faces still sit on an `.ignore` proposal even after the
     reclassification run above -- not investigated further.
+- **`VideoFile` has no `PhotoCollection` association at all** -- flagged 2026-10-20, not scoped.
+  `PhotoCollection`/`Directory.collection`/`ImageFile.collections` are all image-only right now;
+  `below_collection_floor()`'s detection-floor gating, the `/api/server_stats/` `by_collection`
+  breakdown (added 2026-10-20), and anything else collection-scoped currently has nothing to say
+  about videos -- a video's faces/stats are always lumped into the global/ungrouped totals
+  regardless of which library (default vs. Lewis Parents, etc.) it actually came from. Worth a
+  real design pass: likely a `VideoFile.directory` already resolves a collection the same way an
+  `ImageFile`'s does (if `VideoFile`s are rooted under `VIDEO_ROOTS` separately from
+  `PHOTO_ROOT`/collection root directories, the existing `PhotoCollection.resolve_for_path()`
+  longest-prefix match might already "just work" once a `collection` FK is added -- not confirmed).
 ## DONE (2026-10-08): removed `thumbnail_big`/`thumbnail_medium` (zero real consumers, 28.4GB
 reclaimed)
 
