@@ -6,7 +6,7 @@ from django.core.paginator import Paginator
 from drf_queryfields import QueryFieldsMixin
 from api.models import ScheduleRule, SlideshowConfig
 from face_manager.models import Person, Face
-from filepopulator.models import ImageFile, Directory, VideoFile
+from filepopulator.models import ImageFile, Directory, VideoFile, PhotoCollection
 from rest_framework import serializers
 import datetime
 import dateutil.parser
@@ -257,6 +257,32 @@ class ParameterSerializer(serializers.Serializer):
     def create(self, validated_data):
         return Parameters()
     
+def _compute_image_face_stats(image_qs, face_qs):
+    """Shared by ServerStatsSerializer's global totals and its
+    per-collection breakdown -- same formulas, just handed a
+    pre-filtered (or unfiltered, for the global case) ImageFile/Face
+    queryset pair. Video stats are deliberately NOT included here --
+    VideoFile has no PhotoCollection concept at all yet (see
+    filepopulator/models.py), so there's nothing to scope by; they stay
+    global-only on the serializer itself."""
+    stats = {}
+    stats['num_imgs'] = image_qs.count()
+    stats['num_face_processed'] = image_qs.filter(isProcessed=True).count()
+    proc_percent = (stats['num_face_processed'] / stats['num_imgs'] * 100) if stats['num_imgs'] else 0.0
+    stats['percent_face_processed'] = f'{proc_percent:.2f}%'
+
+    stats['num_people'] = Person.objects.filter(face_declared__in=face_qs).distinct().count()
+    stats['num_faces'] = face_qs.count()
+    stats['num_unlabeled_faces'] = face_qs.filter(declared_name__person_name=settings.BLANK_FACE_NAME).count()
+
+    stats['num_verified'] = face_qs.filter(validated=True).count()
+    stats['num_tagged'] = face_qs.filter(~Q(declared_name__person_name__in=settings.IGNORED_NAMES)).count()
+    verified_percent = (stats['num_verified'] / stats['num_tagged'] * 100) if stats['num_tagged'] else 0.0
+    stats['verified_progress'] = f'{verified_percent:.2f}%'
+
+    return stats
+
+
 class ServerStatsSerializer(serializers.Serializer):
     num_imgs = serializers.IntegerField()
     num_face_processed = serializers.IntegerField()
@@ -276,23 +302,28 @@ class ServerStatsSerializer(serializers.Serializer):
     unprocessed_video_length = serializers.CharField(max_length=256)
     percent_video_length_processed = serializers.CharField(max_length=256)
     num_videos_failed = serializers.IntegerField()
+    # Same fields as above (minus the video-only ones, which have no
+    # PhotoCollection concept to scope by), broken out per collection --
+    # a plain list of dicts rather than a nested serializer, since this
+    # is a read-only reporting shape with no input to validate.
+    by_collection = serializers.ListField(child=serializers.DictField(), read_only=True)
 
     class Stats(object):
         def __init__(self):
-            self.num_imgs = ImageFile.objects.count()
-            self.num_face_processed = ImageFile.objects.filter(isProcessed=True).count()
-            self.num_people = Person.objects.count()
-            self.num_faces = Face.objects.count()
-            self.num_unlabeled_faces = Face.objects.filter(declared_name__person_name=settings.BLANK_FACE_NAME).count()
+            global_stats = _compute_image_face_stats(ImageFile.objects.all(), Face.objects.all())
+            self.num_imgs = global_stats['num_imgs']
+            self.num_face_processed = global_stats['num_face_processed']
+            self.percent_face_processed = global_stats['percent_face_processed']
+            self.num_people = global_stats['num_people']
+            self.num_faces = global_stats['num_faces']
+            self.num_unlabeled_faces = global_stats['num_unlabeled_faces']
+            self.num_verified = global_stats['num_verified']
+            self.num_tagged = global_stats['num_tagged']
+            self.verified_progress = global_stats['verified_progress']
+
             self.imgs_per_hour_est = 1600 # An estimate -- I'm clocking 177 images in 26 minutes
             imgs_left_to_process = self.num_imgs - self.num_face_processed
             self.estimated_hours_facerec_left = imgs_left_to_process / self.imgs_per_hour_est
-            proc_percent = self.num_face_processed / self.num_imgs * 100
-            self.percent_face_processed = f'{proc_percent:.2f}%'
-
-            self.num_verified = Face.objects.filter(validated=True).count()
-            self.num_tagged = Face.objects.filter(~Q(declared_name__person_name__in=settings.IGNORED_NAMES) ).count()
-            self.verified_progress = f'{self.num_verified / self.num_tagged * 100:.2f}%'
 
             self.num_videos = VideoFile.objects.count()
             self.num_videos_processed = VideoFile.objects.filter(isProcessed=True).count()
@@ -313,6 +344,20 @@ class ServerStatsSerializer(serializers.Serializer):
             # VideoFile that WAS ingested but whose face-extraction pass
             # raised (see face_manager.tasks.process_video_faces).
             self.num_videos_failed = VideoFile.objects.filter(face_extraction_failed=True).count()
+
+            # Per-collection breakdown -- scoped via ImageFile.collections
+            # (the "visible from" M2M), not Directory.collection (the
+            # single "home" FK), so a cross-collection duplicate photo is
+            # correctly counted in every collection it's visible from, not
+            # just the one that originally discovered it.
+            self.by_collection = []
+            for collection in PhotoCollection.objects.all().order_by('name'):
+                image_qs = ImageFile.objects.filter(collections=collection)
+                face_qs = Face.objects.filter(source_image_file__collections=collection)
+                collection_stats = _compute_image_face_stats(image_qs, face_qs)
+                collection_stats['name'] = collection.name
+                collection_stats['is_default'] = collection.is_default
+                self.by_collection.append(collection_stats)
 
     def create(self, validated_data):
         return Stats()
