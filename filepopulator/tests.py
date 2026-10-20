@@ -9,6 +9,7 @@ from django.db import connection
 import psycopg2
 import zlib
 import hashlib
+import json
 import os
 import binascii
 import subprocess
@@ -4013,3 +4014,180 @@ class ParseExifVideoDateTests(unittest.TestCase):
         # date via dateutil.parser instead of None.
         result = _parse_exif_date('not a real date at all')
         self.assertIsNone(result)
+
+
+@override_settings(OWNTRACKS_LOCATION_API_URL='https://owntracks.example.com',
+                    OWNTRACKS_LOCATION_API_KEY='test-key')
+class BackfillS23GpsTests(TestCase):
+    """backfill_s23_gps / filepopulator.owntracks_gps -- see that
+    module's own docstring for the real detail this was built around:
+    ImageFile.dateTaken/_get_date_taken() throws away the real UTC
+    offset, so this re-reads EXIF directly rather than trusting the DB.
+    exiftool and the HTTP call are both mocked; no real subprocess or
+    network calls."""
+
+    FIXTURE_IMG = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'ci_fixtures', 'test_imgs_filepopulate', 'gps.jpg',
+    )
+
+    def tearDown(self):
+        ImageFile.objects.all().delete()
+
+    def _bare_image(self, camera_model, gps_lat_decimal=-999, filename=None):
+        # ImageFile.save() -> _init_image() really opens the file (PIL),
+        # so this needs a real tiny image on disk, not just a DB row --
+        # same reason other tests in this file copy a real fixture
+        # rather than fabricate a path.
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        dest = filename or os.path.join(tmp_dir, f'{camera_model}_{ImageFile.objects.count()}.jpg')
+        if filename is None:
+            shutil.copy(self.FIXTURE_IMG, dest)
+        directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(dest))
+        return ImageFile.objects.create(
+            filename=dest,
+            directory=directory,
+            pixel_hash=f'hash{ImageFile.objects.count()}',
+            file_hash=f'fhash{ImageFile.objects.count()}',
+            width=100, height=100, orientation=1,
+            dateAdded=timezone.now(), dateModified=timezone.now(),
+            camera_model=camera_model,
+            gps_lat_decimal=gps_lat_decimal,
+        )
+
+    def _exiftool_result(self, date_str=None, offset_str=None):
+        entry = {}
+        if date_str is not None:
+            entry['DateTimeOriginal'] = date_str
+        if offset_str is not None:
+            entry['OffsetTimeOriginal'] = offset_str
+        return mock.Mock(stdout=json.dumps([entry]))
+
+    def test_only_scopes_configured_s23_camera_models(self):
+        self._bare_image('Galaxy S23+')
+        self._bare_image('SM-S916U')
+        self._bare_image('iPhone 12 mini')  # must never be touched
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
+            )
+            from filepopulator.owntracks_gps import backfill_s23_gps
+            counts = backfill_s23_gps()
+
+        self.assertEqual(counts['matched'], 2)
+        iphone = ImageFile.objects.get(camera_model='iPhone 12 mini')
+        self.assertEqual(iphone.gps_lat_decimal, -999)
+
+    def test_builds_offset_aware_datetime_from_fresh_exif_not_db(self):
+        # The real detail this whole module exists to get right -- the
+        # DB's own dateTaken is unreliable (tagged UTC regardless of the
+        # real offset), so the request must reflect the file's own real
+        # OffsetTimeOriginal, re-read fresh.
+        self._bare_image('Galaxy S23+')
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:06:14 15:18:10', '+01:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 43.7, 'longitude': 10.4},
+            )
+            from filepopulator.owntracks_gps import backfill_s23_gps
+            backfill_s23_gps()
+
+        called_params = mock_get.call_args.kwargs['params']
+        self.assertEqual(called_params['datetime'], '2026-06-14T15:18:10+01:00')
+
+    def test_200_sets_gps_and_source(self):
+        img = self._bare_image('Galaxy S23+')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
+            )
+            from filepopulator.owntracks_gps import backfill_s23_gps
+            backfill_s23_gps()
+
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, 40.1)
+        self.assertEqual(img.gps_lon_decimal, -111.9)
+        self.assertEqual(img.gps_source, 'owntracks')
+
+    def test_404_leaves_gps_untouched(self):
+        img = self._bare_image('Galaxy S23+')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(status_code=404, text='nothing within 15 minutes')
+            from filepopulator.owntracks_gps import backfill_s23_gps
+            counts = backfill_s23_gps()
+
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, -999)
+        self.assertEqual(counts['no_nearby_point'], 1)
+
+    def test_401_aborts_the_whole_run(self):
+        self._bare_image('Galaxy S23+')
+        self._bare_image('Galaxy S23+')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(status_code=401, text='bad key')
+            from filepopulator.owntracks_gps import backfill_s23_gps, OwnTracksConfigError
+            with self.assertRaises(OwnTracksConfigError):
+                backfill_s23_gps()
+
+    def test_missing_offset_tag_is_skipped_not_guessed(self):
+        img = self._bare_image('Galaxy S23+')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', None)):
+            from filepopulator.owntracks_gps import backfill_s23_gps
+            counts = backfill_s23_gps()
+
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, -999)
+        self.assertEqual(counts['no_offset_tag'], 1)
+
+    def test_dry_run_does_not_write(self):
+        img = self._bare_image('Galaxy S23+')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
+            )
+            from filepopulator.owntracks_gps import backfill_s23_gps
+            backfill_s23_gps(dry_run=True)
+
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, -999)
+
+    def test_already_populated_rows_are_excluded(self):
+        self._bare_image('Galaxy S23+', gps_lat_decimal=40.5)
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run') as mock_run:
+            from filepopulator.owntracks_gps import backfill_s23_gps
+            backfill_s23_gps()
+        mock_run.assert_not_called()
+
+    def test_missing_config_raises_clear_error(self):
+        self._bare_image('Galaxy S23+')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             override_settings(OWNTRACKS_LOCATION_API_URL=None, OWNTRACKS_LOCATION_API_KEY=None):
+            from filepopulator.owntracks_gps import backfill_s23_gps, OwnTracksConfigError
+            with self.assertRaises(OwnTracksConfigError):
+                backfill_s23_gps()
+
+    def test_management_command_runs_end_to_end(self):
+        self._bare_image('Galaxy S23+')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
+            )
+            call_command('backfill_s23_gps')
