@@ -1790,5 +1790,79 @@ class StatsViewSet(viewsets.ViewSet):
         return Response(stat_serializer.data)
 
 
+class CameraGpsBackfillConfigViewSet(viewsets.ViewSet):
+    """Backend for a frontend toggle page (same shape as the existing
+    nearest-metro-override tool, built outside this repo) -- lets the
+    real device owner curate which cameras' missing-GPS photos may be
+    estimated from OwnTracks location history (see filepopulator/
+    owntracks_gps.py's own docstring for the privacy reasoning: this
+    only ever reflects one person's location, so a camera that was ever
+    someone else's device must never be enabled)."""
+
+    permission_classes = (IsAuthenticated,)
+    serializer_class = api_ser.CameraGpsBackfillStatusSerializer
+
+    def list(self, request):
+        from django.db.models import Count, Q
+
+        from filepopulator.models import CameraGpsBackfillConfig, ImageFile
+
+        rows = (
+            ImageFile.objects
+            .exclude(camera_model__isnull=True).exclude(camera_model__exact='')
+            .values('camera_model')
+            .annotate(total=Count('id'), missing_gps=Count('id', filter=Q(gps_lat_decimal=-999)))
+            .order_by('-total')
+        )
+
+        # One query for every distinct (model, make) pair, grouped in
+        # Python into model -> sorted list of makes seen for it -- see
+        # CameraGpsBackfillStatusSerializer's own docstring for why this
+        # is kept separate from the grouping above.
+        makes_by_model = {}
+        for pair in ImageFile.objects.exclude(camera_model__isnull=True).exclude(
+            camera_model__exact=''
+        ).values('camera_model', 'camera_make').distinct():
+            makes_by_model.setdefault(pair['camera_model'], set()).add(pair['camera_make'] or '')
+
+        enabled_by_model = dict(
+            CameraGpsBackfillConfig.objects.values_list('camera_model', 'enabled')
+        )
+
+        data = [
+            {
+                'camera_model': row['camera_model'],
+                'camera_make_examples': sorted(makes_by_model.get(row['camera_model'], [])),
+                'total': row['total'],
+                'missing_gps': row['missing_gps'],
+                'enabled': enabled_by_model.get(row['camera_model'], False),
+            }
+            for row in rows
+        ]
+        serializer = api_ser.CameraGpsBackfillStatusSerializer(data, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['post'])
+    def set_enabled(self, request):
+        # Accessible as <root>/api/camera_gps_backfill_config/set_enabled/
+        # Accept: POST, body: {"camera_model": "...", "enabled": true}
+        # Upserts by camera_model string, not a numeric pk -- a candidate
+        # camera has no CameraGpsBackfillConfig row at all until the
+        # first time it's toggled, so a detail-view PUT (which needs an
+        # existing pk to target) wouldn't work for a first-time enable.
+        from filepopulator.models import CameraGpsBackfillConfig
+
+        payload = request.data
+        if 'camera_model' not in payload or 'enabled' not in payload:
+            return render_404(request, 'Body must include "camera_model" and "enabled".')
+        if not isinstance(payload['enabled'], bool):
+            return render_404(request, 'The "enabled" value must be a boolean.')
+
+        config, _ = CameraGpsBackfillConfig.objects.update_or_create(
+            camera_model=payload['camera_model'], defaults={'enabled': payload['enabled']},
+        )
+        return Response({'camera_model': config.camera_model, 'enabled': config.enabled})
+
+
 # Mobile-app-facing views (ConfidentUnlabeledView, UnlabeledMobileInfo,
 # ResetFace, MobileNameList) live in api/mobile_views.py, not here.

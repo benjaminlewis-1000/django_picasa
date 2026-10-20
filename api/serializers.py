@@ -315,3 +315,18 @@ class ServerStatsSerializer(serializers.Serializer):
 
     def create(self, validated_data):
         return Stats()
+
+
+class CameraGpsBackfillStatusSerializer(serializers.Serializer):
+    """One row per distinct ImageFile.camera_model (grouped by model
+    ALONE, not (make, model) together -- the same physical device can
+    write different camera_make spellings across firmware/OS versions,
+    e.g. 'LGE'/'LG Electronics' both for 'LM-G710', confirmed via a real
+    10,063-vs-115-photo split that grouping by the pair would have
+    silently fragmented). camera_make_examples lists every distinct make
+    string seen for this model, for frontend display context only."""
+    camera_model = serializers.CharField()
+    camera_make_examples = serializers.ListField(child=serializers.CharField())
+    total = serializers.IntegerField()
+    missing_gps = serializers.IntegerField()
+    enabled = serializers.BooleanField()

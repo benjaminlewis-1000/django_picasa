@@ -3,13 +3,14 @@ separate OwnTracks-fed service (not part of this repo) that answers
 "where was the phone at timestamp X" from continuous location history.
 
 Deliberately scoped to an explicit allowlist of cameras (see
-SUPPORTED_CAMERA_MODELS) -- the location history only actually
-corresponds to one specific person's own location, so applying this to
-every camera in the library would silently attribute someone else's
-photos (or a different device's EXIF-copied metadata -- see the
-"Family Texts" case found while investigating this) to a location the
-actual photographer never visited. A new camera is onboarded by adding
-it here explicitly, never automatically.
+CameraGpsBackfillConfig, a DB-backed table a frontend toggle page can
+curate directly) -- the location history only actually corresponds to
+one specific person's own location, so applying this to every camera
+in the library would silently attribute someone else's photos (or a
+different device's EXIF-copied metadata -- see the "Family Texts" case
+found while investigating this) to a location the actual photographer
+never visited. A camera is onboarded by enabling it there explicitly,
+never automatically.
 
 The one detail that would silently produce wrong results if gotten
 wrong: this project's own ImageFile.dateTaken/_get_date_taken() throws
@@ -41,13 +42,16 @@ from django.conf import settings
 EXIFTOOL_TIMEOUT_SECONDS = 30
 REQUEST_TIMEOUT_SECONDS = 15
 
-# Explicit per-camera allowlist -- see this module's own docstring for
-# why. Add a new camera here only once its own real per-photo offset
-# source has been confirmed against real files (not assumed).
-SUPPORTED_CAMERA_MODELS = [
-    'Galaxy S23+', 'SM-S916U',  # the same physical phone, two EXIF spellings
-    'NIKON D3200',
-]
+# The per-camera allowlist itself now lives in CameraGpsBackfillConfig
+# (DB-backed, toggleable from a frontend page) -- see that model's own
+# docstring for why this moved out of code. get_enabled_camera_models()
+# is the single place anything in this module reads the current
+# allowlist from.
+def get_enabled_camera_models():
+    from filepopulator.models import CameraGpsBackfillConfig
+    return list(
+        CameraGpsBackfillConfig.objects.filter(enabled=True).values_list('camera_model', flat=True)
+    )
 
 # Flags this coordinate as inferred from location history, not a real
 # camera GPS reading -- distinct from the field's own 'exif' default, so
@@ -191,10 +195,11 @@ def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
     from an allowlisted camera still missing GPS, estimate it from
     OwnTracks location history. Returns a dict of outcome counts.
 
-    camera_models defaults to the full SUPPORTED_CAMERA_MODELS list --
-    a caller only passes a narrower list to test/scope a single camera
-    (see --camera-model on the management command), never to permanently
-    widen scope beyond what's been explicitly opted in here.
+    camera_models defaults to get_enabled_camera_models() (every camera
+    currently toggled on in CameraGpsBackfillConfig) -- a caller only
+    passes a narrower list to test/scope a single camera (see
+    --camera-model on the management command), never to permanently
+    widen scope beyond what's been explicitly opted in there.
 
     start_date/end_date (date objects) filter on dateTaken -- useful for
     a camera with years of history that predates OwnTracks tracking
@@ -215,7 +220,7 @@ def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
     from filepopulator.models import GpsEstimationAttempt, ImageFile
 
     if camera_models is None:
-        camera_models = SUPPORTED_CAMERA_MODELS
+        camera_models = get_enabled_camera_models()
 
     qs = ImageFile.objects.filter(
         camera_model__in=camera_models, gps_lat_decimal=-999,
