@@ -804,7 +804,7 @@ class ClearEncodingsBelowFloorTests(TestCase):
         ImageFile.objects.bulk_create([img])
         return ImageFile.objects.get(filename=path)
 
-    def _make_face(self, img, relative_size, det_score=0.9, person=None, validated=False, encoding=None):
+    def _make_face(self, img, relative_size, det_score=0.9, person=None, validated=False, encoding=None, poss_ident1=None):
         face = Face(
             source_image_file=img, declared_name=person or get_default_blank_person(),
             box_left=0, box_top=0, box_right=10, box_bottom=10,
@@ -812,6 +812,9 @@ class ClearEncodingsBelowFloorTests(TestCase):
             face_encoding_512=encoding if encoding is not None else ([0.1] * 512),
         )
         face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        if poss_ident1 is not None:
+            face.poss_ident1 = poss_ident1
+            face.weight_1 = 0.5
         face.save()
         return face
 
@@ -838,6 +841,26 @@ class ClearEncodingsBelowFloorTests(TestCase):
 
         face.refresh_from_db()
         self.assertIsNone(face.face_encoding_512)
+
+    def test_also_clears_stale_poss_identN_proposals(self):
+        # A never-adjudicated face can still carry a live poss_ident1/
+        # weight_1 proposal from a past classification run -- clearing
+        # the encoding without also clearing this leaves a stale
+        # proposal with nothing left to justify it (misleading, and a
+        # real crash risk for anything that assumes a proposal implies a
+        # usable embedding -- confirmed in production 2026-10-20).
+        from face_manager.models import Person
+        proposed = Person.objects.create(person_name='Proposed Candidate')
+        collection = self._default_collection(min_face_relative_size=0.02)
+        img = self._make_image(640, 480, 'g', collection=collection)
+        face = self._make_face(img, relative_size=0.01, poss_ident1=proposed)
+
+        call_command('clear_encodings_below_floor')
+
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_512)
+        self.assertIsNone(face.poss_ident1)
+        self.assertEqual(face.weight_1, 0.0)
 
     def test_leaves_encoding_on_unconfirmed_face_at_or_above_floor(self):
         collection = self._default_collection(min_face_relative_size=0.02)
@@ -889,6 +912,139 @@ class ClearEncodingsBelowFloorTests(TestCase):
         # Must not raise -- NULL encodings are excluded from the query
         # entirely (nothing to clear).
         call_command('clear_encodings_below_floor')
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class ClearStaleUnencodedProposalsTests(TestCase):
+    """clear_stale_proposals_with_no_encoding: the catch-up pass for the
+    backlog clear_encodings_below_collection_floor() can't reach -- a
+    face already NULL-encoded before that function's own poss_identN
+    clearing existed (or for any other reason) but still carrying a
+    stale proposal."""
+
+    def _make_image(self, name):
+        directory, _ = Directory.objects.get_or_create(dir_path='/photos/stale_proposal_test')
+        path = f'/photos/stale_proposal_test/{name}.jpg'
+        img = ImageFile(filename=path, directory=directory, thumbnail_small="", width=640, height=480)
+        ImageFile.objects.bulk_create([img])
+        return ImageFile.objects.get(filename=path)
+
+    def _make_face(self, img, person=None, validated=False, encoding=None, poss_ident1=None):
+        face = Face(
+            source_image_file=img, declared_name=person or get_default_blank_person(),
+            box_left=0, box_top=0, box_right=10, box_bottom=10, validated=validated,
+            face_encoding_512=encoding,
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        if poss_ident1 is not None:
+            face.poss_ident1 = poss_ident1
+            face.weight_1 = 0.5
+        face.save()
+        return face
+
+    def test_clears_stale_proposal_on_unencoded_unconfirmed_face(self):
+        from face_manager.models import Person, clear_stale_proposals_with_no_encoding
+        proposed = Person.objects.create(person_name='Stale Candidate')
+        img = self._make_image('a')
+        face = self._make_face(img, encoding=None, poss_ident1=proposed)
+
+        count = clear_stale_proposals_with_no_encoding()
+
+        face.refresh_from_db()
+        self.assertEqual(count, 1)
+        self.assertIsNone(face.poss_ident1)
+        self.assertEqual(face.weight_1, 0.0)
+
+    def test_leaves_encoded_face_with_proposal_untouched(self):
+        from face_manager.models import Person, clear_stale_proposals_with_no_encoding
+        proposed = Person.objects.create(person_name='Real Candidate')
+        img = self._make_image('b')
+        face = self._make_face(img, encoding=[0.1] * 512, poss_ident1=proposed)
+
+        clear_stale_proposals_with_no_encoding()
+
+        face.refresh_from_db()
+        self.assertEqual(face.poss_ident1_id, proposed.id)
+
+    def test_leaves_unencoded_face_with_no_proposal_untouched(self):
+        from face_manager.models import clear_stale_proposals_with_no_encoding
+        img = self._make_image('c')
+        self._make_face(img, encoding=None, poss_ident1=None)
+
+        count = clear_stale_proposals_with_no_encoding()
+        self.assertEqual(count, 0)
+
+    def test_never_touches_a_validated_or_declared_face(self):
+        from face_manager.models import Person, clear_stale_proposals_with_no_encoding
+        proposed = Person.objects.create(person_name='Candidate')
+        real_person = Person.objects.create(person_name='Real Person')
+        img = self._make_image('d')
+        validated_face = self._make_face(img, encoding=None, validated=True, poss_ident1=proposed)
+        img2 = self._make_image('e')
+        declared_face = self._make_face(img2, person=real_person, encoding=None, poss_ident1=proposed)
+
+        clear_stale_proposals_with_no_encoding()
+
+        validated_face.refresh_from_db()
+        declared_face.refresh_from_db()
+        self.assertEqual(validated_face.poss_ident1_id, proposed.id)
+        self.assertEqual(declared_face.poss_ident1_id, proposed.id)
+
+    def test_dry_run_does_not_write_but_returns_count(self):
+        from face_manager.models import Person, clear_stale_proposals_with_no_encoding
+        proposed = Person.objects.create(person_name='Dry Run Candidate')
+        img = self._make_image('f')
+        face = self._make_face(img, encoding=None, poss_ident1=proposed)
+
+        count = clear_stale_proposals_with_no_encoding(dry_run=True)
+
+        face.refresh_from_db()
+        self.assertEqual(count, 1)
+        self.assertEqual(face.poss_ident1_id, proposed.id)
+
+    def test_scoped_to_a_specific_collection(self):
+        from filepopulator.models import PhotoCollection
+        from face_manager.models import Person, clear_stale_proposals_with_no_encoding
+
+        with patch('face_manager.tasks.apply_collection_floor_change.delay'):
+            other_collection = PhotoCollection.objects.create(
+                name='Other Collection', root_directory='/photos/stale_proposal_other',
+            )
+        other_dir, _ = Directory.objects.get_or_create(
+            dir_path='/photos/stale_proposal_other', defaults={'collection': other_collection},
+        )
+        other_img = ImageFile(
+            filename='/photos/stale_proposal_other/a.jpg', directory=other_dir,
+            thumbnail_small="", width=640, height=480,
+        )
+        ImageFile.objects.bulk_create([other_img])
+        other_img = ImageFile.objects.get(filename='/photos/stale_proposal_other/a.jpg')
+
+        proposed = Person.objects.create(person_name='Scoped Candidate')
+        default_face = self._make_face(self._make_image('g'), encoding=None, poss_ident1=proposed)
+        other_face = self._make_face(other_img, encoding=None, poss_ident1=proposed)
+
+        count = clear_stale_proposals_with_no_encoding(collection=other_collection)
+
+        default_face.refresh_from_db()
+        other_face.refresh_from_db()
+        self.assertEqual(count, 1)
+        self.assertEqual(default_face.poss_ident1_id, proposed.id)  # untouched -- different collection
+        self.assertIsNone(other_face.poss_ident1)
+
+    def test_management_command_dry_run_vs_real(self):
+        from face_manager.models import Person
+        proposed = Person.objects.create(person_name='Command Candidate')
+        img = self._make_image('h')
+        face = self._make_face(img, encoding=None, poss_ident1=proposed)
+
+        call_command('clear_stale_unencoded_proposals', '--dry-run')
+        face.refresh_from_db()
+        self.assertEqual(face.poss_ident1_id, proposed.id)
+
+        call_command('clear_stale_unencoded_proposals')
+        face.refresh_from_db()
+        self.assertIsNone(face.poss_ident1)
 
 
 class PhotoCollectionFloorChangeTriggerTests(TestCase):
@@ -985,21 +1141,25 @@ class ApplyCollectionFloorChangeTaskTests(TestCase):
             )
 
         with patch('face_manager.tasks.clear_encodings_below_collection_floor', return_value=(0, 0)) as mock_clear, \
+             patch('face_manager.tasks.clear_stale_proposals_with_no_encoding', return_value=0) as mock_stale, \
              patch('face_manager.tasks.FaceExtractor') as mock_extractor_cls:
             mock_extractor = mock_extractor_cls.return_value
             apply_collection_floor_change(collection.pk)
 
         mock_clear.assert_called_once_with(collection=collection)
+        mock_stale.assert_called_once_with(collection=collection)
         mock_extractor.reencode_missing_faces.assert_called_once_with(collection=collection)
 
     def test_missing_collection_is_a_no_op(self):
         from face_manager.tasks import apply_collection_floor_change
 
         with patch('face_manager.tasks.clear_encodings_below_collection_floor') as mock_clear, \
+             patch('face_manager.tasks.clear_stale_proposals_with_no_encoding') as mock_stale, \
              patch('face_manager.tasks.FaceExtractor') as mock_extractor_cls:
             apply_collection_floor_change(999999)  # no such PhotoCollection
 
         mock_clear.assert_not_called()
+        mock_stale.assert_not_called()
         mock_extractor_cls.assert_not_called()
 
     def test_concurrent_run_for_the_same_collection_is_skipped(self):
@@ -1013,11 +1173,13 @@ class ApplyCollectionFloorChangeTaskTests(TestCase):
 
         with patch('face_manager.tasks.advisory_lock') as mock_lock, \
              patch('face_manager.tasks.clear_encodings_below_collection_floor') as mock_clear, \
+             patch('face_manager.tasks.clear_stale_proposals_with_no_encoding') as mock_stale, \
              patch('face_manager.tasks.FaceExtractor') as mock_extractor_cls:
             mock_lock.return_value.__enter__.return_value = False
             apply_collection_floor_change(collection.pk)
 
         mock_clear.assert_not_called()
+        mock_stale.assert_not_called()
         mock_extractor_cls.assert_not_called()
 
 

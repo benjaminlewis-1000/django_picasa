@@ -1,4 +1,5 @@
 from django.db import models
+from django.db.models import Q
 from django.conf import settings
 from django.forms import ModelForm
 from django.core.validators import MinValueValidator, MaxValueValidator, RegexValidator
@@ -552,6 +553,19 @@ def clear_encodings_below_collection_floor(collection=None, dry_run=False):
     embedding (and therefore future gallery-comparison participation)
     is withheld.
 
+    Also clears every poss_identN/weight_N on the face (same shape as
+    remove_poss_ident(), without the per-row save() that method does) --
+    a stale proposal whose backing embedding no longer exists is both
+    misleading (a face shown as "proposed as X" with nothing left to
+    justify it) and a real crash risk (classify_unassigned() assumes a
+    usable embedding on anything it's handed; a targeted reclassification
+    pass that doesn't separately filter this out raises a TypeError on
+    np.linalg.norm(None), confirmed in production 2026-10-20). A
+    confirmed (declared_name/validated) face already gets this via
+    associate_person()/verify_person_in_image() at confirmation time --
+    this function's own scope (never-adjudicated faces only) is exactly
+    the population that wouldn't otherwise go through that path.
+
     collection=None sweeps every image-backed, not-yet-adjudicated face
     in the whole library (the one-off/manual-backfill shape); passing a
     specific PhotoCollection scopes the sweep to just that collection's
@@ -564,6 +578,11 @@ def clear_encodings_below_collection_floor(collection=None, dry_run=False):
     from filepopulator.models import below_collection_floor
 
     BATCH_SIZE = 5000
+    update_fields = ['face_encoding_512']
+    for poss_idx in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1):
+        update_fields.append(f'poss_ident{poss_idx}')
+        update_fields.append(f'weight_{poss_idx}')
+
     candidates = Face.objects.filter(
         declared_name__person_name=settings.BLANK_FACE_NAME,
         validated=False,
@@ -586,13 +605,64 @@ def clear_encodings_below_collection_floor(collection=None, dry_run=False):
         cleared += 1
         if not dry_run:
             face.face_encoding_512 = None
+            for poss_idx in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1):
+                setattr(face, f'poss_ident{poss_idx}', None)
+                setattr(face, f'weight_{poss_idx}', 0.0)
             to_update.append(face)
             if len(to_update) >= BATCH_SIZE:
-                Face.objects.bulk_update(to_update, ['face_encoding_512'], batch_size=BATCH_SIZE)
+                Face.objects.bulk_update(to_update, update_fields, batch_size=BATCH_SIZE)
                 to_update = []
 
     if not dry_run and to_update:
-        Face.objects.bulk_update(to_update, ['face_encoding_512'], batch_size=BATCH_SIZE)
+        Face.objects.bulk_update(to_update, update_fields, batch_size=BATCH_SIZE)
 
     return scanned, cleared
+
+
+def clear_stale_proposals_with_no_encoding(collection=None, dry_run=False):
+    """Catch-up for the backlog clear_encodings_below_collection_floor()
+    couldn't reach: that function only clears poss_identN/weight_N on a
+    face it ITSELF nulls the encoding on -- a face whose encoding was
+    already NULL before this fix existed (e.g. 32,344 faces cleared by
+    the one-time library-wide sweep run 2026-10-20, before this function
+    was added) is invisible to it (its own candidate query requires
+    face_encoding_512__isnull=False, so an already-NULL row never
+    matches). This sweeps the opposite condition: any never-adjudicated
+    face (declared_name == BLANK_FACE_NAME, validated=False) that's
+    missing an encoding but still carries a stale poss_identN proposal,
+    regardless of why the encoding went missing.
+
+    A plain queryset .update() (no bulk_update needed -- every row gets
+    the same static values, not a per-row Python-computed one), so this
+    is cheap even at full-library scale.
+
+    collection=None sweeps the whole library; passing a specific
+    PhotoCollection scopes it to that collection's images only -- used
+    by face_manager.apply_collection_floor_change so a threshold change
+    also mops up any stale backlog for that collection on every run, not
+    just newly-cleared faces.
+
+    Returns the number of faces updated."""
+    candidates = Face.objects.filter(
+        declared_name__person_name=settings.BLANK_FACE_NAME,
+        validated=False,
+        face_encoding_512__isnull=True,
+        source_image_file__isnull=False,
+    )
+    if collection is not None:
+        candidates = candidates.filter(source_image_file__directory__collection=collection)
+
+    has_any_proposal = Q()
+    for poss_idx in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1):
+        has_any_proposal |= Q(**{f'poss_ident{poss_idx}__isnull': False})
+    candidates = candidates.filter(has_any_proposal)
+
+    if dry_run:
+        return candidates.count()
+
+    update_kwargs = {}
+    for poss_idx in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1):
+        update_kwargs[f'poss_ident{poss_idx}'] = None
+        update_kwargs[f'weight_{poss_idx}'] = 0.0
+    return candidates.update(**update_kwargs)
 
