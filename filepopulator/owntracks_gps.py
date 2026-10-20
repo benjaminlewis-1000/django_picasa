@@ -184,7 +184,7 @@ def query_nearest_location(iso8601_datetime):
 
 
 def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
-                         dry_run=False, limit=None, log=print):
+                         retry_failed=False, dry_run=False, limit=None, log=print):
     """One-time-per-photo (but safely re-runnable -- intended to end up
     as a recurring cron/Celery task, picking up each newly-opted-in
     camera's new photos as they're ingested) backfill: for every photo
@@ -205,8 +205,14 @@ def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
     the UNRELIABLE, offset-blind field for anything needing real
     precision (see this module's own docstring) -- fine here since a
     multi-day scoping window swallows the few hours of error that
-    causes, nowhere close to misses at a day boundary mattering."""
-    from filepopulator.models import ImageFile
+    causes, nowhere close to misses at a day boundary mattering.
+
+    By default, any photo with an existing GpsEstimationAttempt record
+    is skipped entirely (no exiftool/HTTP call at all) -- see that
+    model's own docstring for why. retry_failed=True re-includes rows
+    whose existing attempt was 'no_nearby_point' specifically (never
+    'no_offset_tag', which can't change)."""
+    from filepopulator.models import GpsEstimationAttempt, ImageFile
 
     if camera_models is None:
         camera_models = SUPPORTED_CAMERA_MODELS
@@ -218,6 +224,10 @@ def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
         qs = qs.filter(dateTaken__date__gte=start_date)
     if end_date:
         qs = qs.filter(dateTaken__date__lte=end_date)
+    if retry_failed:
+        qs = qs.exclude(gps_estimation_attempt__reason=GpsEstimationAttempt.REASON_NO_OFFSET_TAG)
+    else:
+        qs = qs.filter(gps_estimation_attempt__isnull=True)
     if limit:
         qs = qs[:limit]
 
@@ -227,6 +237,10 @@ def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
         if iso is None:
             counts['no_offset_tag'] += 1
             log(f"SKIP (no offset source): {img.filename}")
+            if not dry_run:
+                GpsEstimationAttempt.objects.update_or_create(
+                    image=img, defaults={'reason': GpsEstimationAttempt.REASON_NO_OFFSET_TAG},
+                )
             continue
 
         try:
@@ -237,6 +251,10 @@ def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
         if result is None:
             counts['no_nearby_point'] += 1
             log(f"SKIP (no nearby OwnTracks point): {img.filename} ({iso})")
+            if not dry_run:
+                GpsEstimationAttempt.objects.update_or_create(
+                    image=img, defaults={'reason': GpsEstimationAttempt.REASON_NO_NEARBY_POINT},
+                )
             continue
 
         lat, lon = result
@@ -246,5 +264,6 @@ def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
             ImageFile.objects.filter(pk=img.pk).update(
                 gps_lat_decimal=lat, gps_lon_decimal=lon, gps_source=GPS_SOURCE_OWNTRACKS,
             )
+            GpsEstimationAttempt.objects.filter(image=img).delete()
 
     return counts

@@ -4293,6 +4293,69 @@ class BackfillS23GpsTests(TestCase):
             backfill_camera_gps()
         mock_run.assert_not_called()
 
+    def test_failed_attempt_is_recorded_and_skipped_on_next_run(self):
+        from filepopulator.models import GpsEstimationAttempt
+        from filepopulator.owntracks_gps import backfill_camera_gps
+
+        img = self._bare_image('Galaxy S23+')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(status_code=404, text='nothing nearby')
+            counts = backfill_camera_gps()
+        self.assertEqual(counts['no_nearby_point'], 1)
+        attempt = GpsEstimationAttempt.objects.get(image=img)
+        self.assertEqual(attempt.reason, GpsEstimationAttempt.REASON_NO_NEARBY_POINT)
+
+        # Second run, no --retry-failed -- must not even attempt exiftool.
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run') as mock_run:
+            counts2 = backfill_camera_gps()
+        mock_run.assert_not_called()
+        self.assertEqual(counts2['no_nearby_point'], 0)
+
+    def test_no_offset_tag_attempt_is_never_retried_even_with_retry_failed(self):
+        from filepopulator.models import GpsEstimationAttempt
+        from filepopulator.owntracks_gps import backfill_camera_gps
+
+        img = self._bare_image('Galaxy S23+')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', None)):
+            backfill_camera_gps()
+        self.assertEqual(
+            GpsEstimationAttempt.objects.get(image=img).reason,
+            GpsEstimationAttempt.REASON_NO_OFFSET_TAG,
+        )
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run') as mock_run:
+            backfill_camera_gps(retry_failed=True)
+        mock_run.assert_not_called()
+
+    def test_retry_failed_reattempts_no_nearby_point_and_can_succeed(self):
+        from filepopulator.owntracks_gps import backfill_camera_gps
+
+        img = self._bare_image('Galaxy S23+')
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(status_code=404, text='nothing nearby')
+            backfill_camera_gps()
+
+        # Simulates the OwnTracks service's own history growing -- the
+        # exact real case this session hit.
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
+            )
+            counts = backfill_camera_gps(retry_failed=True)
+
+        self.assertEqual(counts['matched'], 1)
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, 40.1)
+        from filepopulator.models import GpsEstimationAttempt
+        self.assertFalse(GpsEstimationAttempt.objects.filter(image=img).exists())
+
     def test_missing_config_raises_clear_error(self):
         self._bare_image('Galaxy S23+')
         with mock.patch('filepopulator.owntracks_gps.subprocess.run',

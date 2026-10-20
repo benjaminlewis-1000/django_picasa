@@ -331,6 +331,36 @@ class FailedImageFile(models.Model):
         return f"FailedImageFile({self.filename})"
 
 
+class GpsEstimationAttempt(models.Model):
+    # Tracks a filepopulator.owntracks_gps backfill attempt that did NOT
+    # result in a GPS match -- so a recurring run (meant to end up as a
+    # cron/Celery task, see CLAUDE.md) doesn't keep re-paying a real
+    # exiftool+HTTP round trip for a photo that's already known to be
+    # unmatchable right now. Real motivating case: a camera with years
+    # of history predating OwnTracks tracking entirely would otherwise
+    # retry every one of those old photos, forever, on every run.
+    #
+    # 'no_offset_tag' is permanent -- the file's own EXIF won't spontaneously
+    # grow a timezone tag -- so it's never auto-retried. 'no_nearby_point'
+    # can become matchable later if the OwnTracks service's own location
+    # history grows (a real, observed case this session: a service-side
+    # fix recovered 29 previously-unmatchable S23+ photos) -- re-attempted
+    # only via an explicit --retry-failed run, never automatically.
+    image = models.OneToOneField(
+        'ImageFile', on_delete=models.CASCADE, related_name='gps_estimation_attempt',
+    )
+    REASON_NO_OFFSET_TAG = 'no_offset_tag'
+    REASON_NO_NEARBY_POINT = 'no_nearby_point'
+    reason = models.CharField(max_length=32, choices=[
+        (REASON_NO_OFFSET_TAG, REASON_NO_OFFSET_TAG),
+        (REASON_NO_NEARBY_POINT, REASON_NO_NEARBY_POINT),
+    ])
+    attempted_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"GpsEstimationAttempt({self.image.filename}, {self.reason})"
+
+
 class GeocodeCache(models.Model):
     # Keyed by coordinate (rounded to ~11m -- see ROUND_DECIMALS below),
     # not by ImageFile: a photo library has massive location reuse (home,
