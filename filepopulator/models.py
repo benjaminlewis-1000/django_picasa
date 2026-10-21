@@ -226,12 +226,24 @@ class PhotoCollection(models.Model):
     min(image_width, image_height) -- relative, not an absolute pixel
     count, so one floor works sensibly across wildly different source
     resolutions (an old scan vs. a modern phone photo) rather than
-    needing a different absolute number per source quality."""
+    needing a different absolute number per source quality.
+
+    Videos: root_directory is ALWAYS also scanned for videos (mirrors
+    PHOTO_ROOT's own long-standing "interspersed videos" behavior --
+    every real collection so far wants this, so there's no separate
+    opt-in flag). extra_video_roots covers the other real shape: a
+    dedicated video-only archive that isn't under any collection's own
+    photo root at all (e.g. Our_Home_Videos, a sibling folder of
+    PHOTO_ROOT under the shared VIDEO_ROOT mount) -- added 2026-10-21,
+    replacing the previously-hardcoded VIDEO_ROOTS Django setting (see
+    CLAUDE.md) with a DB-driven equivalent, same motivation as
+    PhotoCollection itself: a new root shouldn't need a code deploy."""
     name = models.CharField(max_length=128, unique=True)
     root_directory = models.CharField(max_length=1024, unique=True)
     is_default = models.BooleanField(default=False)
     min_face_det_score = models.FloatField(null=True, blank=True)
     min_face_relative_size = models.FloatField(null=True, blank=True)
+    extra_video_roots = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

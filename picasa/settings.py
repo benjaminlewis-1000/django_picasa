@@ -59,14 +59,6 @@ if in_docker:
         
     PHOTO_ROOT = '/photos'
     PHOTO_ROOT_RW = '/photos_rw'
-    # Second PhotoCollection's root (see filepopulator/models.py's
-    # PhotoCollection) -- same mount already used for the "Lewis Parents"
-    # photo collection (docker-compose.yaml's LEWIS_PARENTS_ROOT bind
-    # mount), now also added to FILEPOPULATOR_SERVER_VIDEO_DIRS below so
-    # videos interspersed in their tree (no dedicated video subfolder,
-    # same "intermixed with photos" layout as PHOTO_ROOT) get scanned
-    # too -- added 2026-10-21, at the user's request.
-    LEWIS_PARENTS_ROOT = '/lewis_parents'
     # Deliberately its OWN bind mount (docker-compose.yaml), not a reuse
     # of PHOTO_ROOT_RW's whole-tree read-write access -- the upload
     # endpoint (api/upload_views.py) can only ever write inside this one
@@ -81,8 +73,9 @@ if in_docker:
     # UPLOAD_STAGING_DIR above. The transcode task needs to write here;
     # VIDEO_ROOT must never be writable from this container, and this
     # being a genuinely separate mount point means the ingestion scanner
-    # (which only ever walks VIDEO_ROOTS below) can't wander into it even
-    # by accident, not just "isn't in the allowlist."
+    # (which only ever walks the roots registered via PhotoCollection --
+    # see load_videos_into_db()) can't wander into it even by accident,
+    # not just "isn't in the allowlist."
     VIDEO_TRANSCODE_ROOT = '/video_transcoded'
     TEST_IMG_DIR_FILEPOPULATE = '/test_imgs_filepopulate'
     ALLOWED_HOSTS = ['localhost',
@@ -118,10 +111,6 @@ else:
     SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
     ALLOWED_HOSTS = ['localhost', '127.0.0.1']
     PHOTO_ROOT = '/home/benjamin/git_repos/picasa_files/actual_imgs'
-    # No real Lewis Parents mount in local dev -- just a harmless unused
-    # path (the scanner finds nothing there, same as any other locally-
-    # absent directory already tolerated elsewhere in this codebase).
-    LEWIS_PARENTS_ROOT = os.path.join(PROJECT_ROOT, 'lewis_parents_local_dev_stub')
     # No separate mount in local dev -- just a subdirectory of the same
     # tree, matching the Docker layout's intent (staged uploads land
     # somewhere the ingestion scanner already walks).
@@ -747,31 +736,14 @@ FILEPOPULATOR_SERVER_IMG_DIR = PHOTO_ROOT # root location of images you want to 
 
 # VIDEO_ROOT is a single bind mount (host: /mnt/data/samba_share/Video)
 # covering several sibling folders, not all of which are meant to be
-# scanned yet -- rather than mounting each wanted folder separately (or
-# adding exclude-list logic to the video ingestion walk), VIDEO_ROOTS
-# explicitly lists only the subfolders to actually walk. Adding another
-# folder later, or excluding one, is a one-line change here, no new
-# mount or code change needed.
-VIDEO_ROOTS = [
-    os.path.join(VIDEO_ROOT, 'Our_Home_Videos'),
-    # Lewis_family_videos itself deliberately still excluded (2026-09-15,
-    # at the user's request): the original long VHS-encode tapes are
-    # being re-cut into smaller clips outside this app first. Its own
-    # VideoFile/Face rows were removed at the same time -- see CLAUDE.md.
-    #
-    # Lewis_family_VHS_video_clips added 2026-09-16: the re-cut clips
-    # land here as they're produced, each stamped with a real CreateDate
-    # (verified against a real sample -- see CLAUDE.md), so no filename-
-    # date-guessing fallback risk like the original tapes had.
-    os.path.join(VIDEO_ROOT, 'Lewis_family_VHS_video_clips'),
-]
-# Also scan PHOTO_ROOT for videos interspersed in the existing photo
-# tree (some are, per the user, alongside the two dedicated folders
-# above). LEWIS_PARENTS_ROOT added 2026-10-21 for the same reason --
-# that collection has no dedicated video subfolder either (confirmed by
-# directory listing), videos are interspersed in their Pictures tree
-# just like PHOTO_ROOT's own.
-FILEPOPULATOR_SERVER_VIDEO_DIRS = VIDEO_ROOTS + [PHOTO_ROOT, LEWIS_PARENTS_ROOT]
+# scanned -- which ones actually get walked (and every PhotoCollection's
+# own root_directory, for videos interspersed with photos) now lives in
+# the DB (PhotoCollection.extra_video_roots), not here -- see
+# filepopulator/tasks.py's load_videos_into_db() and
+# filepopulator/migrations/0029_seed_default_extra_video_roots.py for
+# the historical VIDEO_ROOTS values (Our_Home_Videos,
+# Lewis_family_VHS_video_clips) this replaced, 2026-10-21. A new root no
+# longer needs a code deploy, same motivation as PhotoCollection itself.
 
 # Phase 5 (transcode pipeline), added 2026-10-15. Codecs a browser (or
 # the Raspberry Pi this is actually being built for, which has no

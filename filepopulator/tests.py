@@ -3596,10 +3596,10 @@ class VideoIngestionTests(TestCase):
         self.assertEqual(VideoFile.objects.count(), first_count)
 
     def test_multiple_roots_are_all_walked(self):
-        # add_videos_from_root_dir() takes a LIST of roots (VIDEO_ROOTS is
-        # an explicit allowlist of subfolders under one shared bind mount,
-        # plus PHOTO_ROOT for interspersed videos) -- confirm passing two
-        # roots actually walks both, not just the first.
+        # add_videos_from_root_dir() takes a LIST of roots (built by the
+        # caller from every PhotoCollection's root_directory plus its
+        # extra_video_roots -- see load_videos_into_db()) -- confirm
+        # passing two roots actually walks both, not just the first.
         #
         # The second root's copy is BYTE-IDENTICAL to the first (same
         # fixture, copied verbatim) -- since content-hash-based duplicate
@@ -5155,3 +5155,23 @@ class PhotoCollectionTests(TestCase):
         self.assertIn(self.default_collection.root_directory, called_roots)
         self.assertIn(self.second_collection.root_directory, called_roots)
         self.assertEqual(mock_add.call_count, PhotoCollection.objects.count())
+
+    def test_load_videos_into_db_builds_roots_from_every_collection(self):
+        from unittest import mock
+        from filepopulator.tasks import load_videos_into_db
+
+        self.second_collection.extra_video_roots = ['/videos/second_extra']
+        self.second_collection.save()
+        self.default_collection.extra_video_roots = ['/videos/default_extra_1', '/videos/default_extra_2']
+        self.default_collection.save()
+
+        with mock.patch('filepopulator.tasks.add_videos_from_root_dir') as mock_add, \
+             mock.patch('filepopulator.tasks.delete_removed_videos'):
+            load_videos_into_db()
+
+        mock_add.assert_called_once()
+        roots = set(mock_add.call_args[0][0])
+        self.assertEqual(roots, {
+            self.default_collection.root_directory, self.second_collection.root_directory,
+            '/videos/second_extra', '/videos/default_extra_1', '/videos/default_extra_2',
+        })

@@ -65,8 +65,23 @@ def load_videos_into_db():
     # Own advisory lock (see add_videos_from_root_dir()), own task, own
     # schedule -- matches the existing one-task-per-concern pattern
     # rather than folding this into load_images_into_db() above.
+    #
+    # Roots are DB-driven (every PhotoCollection's own root_directory,
+    # always scanned for interspersed videos -- same precedent
+    # PHOTO_ROOT already set; plus each collection's extra_video_roots,
+    # for dedicated video-only archives like Our_Home_Videos that aren't
+    # under any collection's photo root at all) -- replaces the
+    # previously-hardcoded VIDEO_ROOTS/FILEPOPULATOR_SERVER_VIDEO_DIRS
+    # settings, 2026-10-21, same motivation as load_images_into_db()
+    # above: a new root shouldn't need a code deploy. See
+    # filepopulator/models.py's PhotoCollection for the full design.
+    from .models import PhotoCollection
     print("Loading videos into database...")
-    add_videos_from_root_dir(settings.FILEPOPULATOR_SERVER_VIDEO_DIRS)
+    roots = []
+    for collection in PhotoCollection.objects.all():
+        roots.append(collection.root_directory)
+        roots.extend(collection.extra_video_roots or [])
+    add_videos_from_root_dir(roots)
     print("Finished adding videos")
     delete_removed_videos()
     print("Done! Finished removing videos that aren't there.")

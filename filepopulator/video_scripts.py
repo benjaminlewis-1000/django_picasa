@@ -382,10 +382,11 @@ def create_video_file(file_path):
 
 def add_videos_from_root_dir(root_dirs):
     """Walk each directory in root_dirs (a list, not a single path --
-    VIDEO_ROOTS is an explicit allowlist of subfolders under the one
-    VIDEO_ROOT bind mount, plus PHOTO_ROOT for videos interspersed in
-    the existing photo tree) and create/update a VideoFile row for any
-    new or changed video file found.
+    the caller, filepopulator.tasks.load_videos_into_db(), builds this
+    from every PhotoCollection's own root_directory plus its
+    extra_video_roots, an explicit allowlist of dedicated video-only
+    subfolders under the shared VIDEO_ROOT bind mount) and create/update
+    a VideoFile row for any new or changed video file found.
 
     One advisory lock covers the whole call (all roots), not one per
     root -- matches add_from_root_dir()'s own locking, own distinct
