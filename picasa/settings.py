@@ -649,6 +649,14 @@ CELERY_BEAT_SCHEDULE = {
         # jobs above/below.
         'schedule': crontab(minute='15', hour='1'),
     },
+   'check_task_heartbeats': {
+        'task': 'common.check_task_heartbeats',
+        # Watches common/tasks.py's HEARTBEAT_REGISTRY (currently just
+        # classify_unlabeled_all_weekly) for silence/hangs -- see
+        # TaskHeartbeat's own docstring. Daily is plenty given the
+        # registered task's own ~weekly cadence; same off-peak window.
+        'schedule': crontab(minute='25', hour='1'),
+    },
    'cleanup_orphaned_media': {
         'task': 'filepopulator.cleanup_orphaned_media',
         # Weekly, not daily -- this walks every file across 5 real media

@@ -16,6 +16,7 @@ from face_extract_encode import FaceExtractor
 from filepopulator.models import ImageFile, VideoFile, PhotoCollection
 from common.advisory_lock import advisory_lock
 from common.error_log import log_error
+from common.heartbeat import record_heartbeat_start, record_heartbeat_done
 from picasa import celery_app
 import os
 import queue
@@ -395,12 +396,26 @@ def thistask(redo_all=False):
         settings.LOGGER.warning("Classification locked!")
         return
 
+    # Only the weekly redo_all=True run is currently watched for
+    # silence/hangs (see common/tasks.py's HEARTBEAT_REGISTRY) -- the
+    # hourly incremental run isn't registered there, so recording its
+    # heartbeat too is harmless (just an unused row) rather than
+    # something that needs its own guard here.
+    heartbeat_name = (
+        'face_manager.thistask.weekly_full' if redo_all else 'face_manager.thistask.hourly'
+    )
+    record_heartbeat_start(heartbeat_name)
     try:
         classer = faceAssigner()
         classer.execute(redo_all)
+        settings.LOGGER.info(
+            f"thistask(redo_all={redo_all}) completed."
+        )
     except Exception as e:
         _log_task_crash('thistask', e)
-        
+    finally:
+        record_heartbeat_done(heartbeat_name)
+
 @shared_task(ignore_result=True, name='face_manager.reload_classifier_pkl')
 def classifier_pkl_file_reload():
     classer = faceAssigner()

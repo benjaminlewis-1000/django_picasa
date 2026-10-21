@@ -1273,6 +1273,46 @@ class TaskCrashLoggingTests(TestCase):
         error = ApplicationError.objects.get()
         self.assertEqual(error.source, 'face_manager.tasks.thistask')
 
+    def test_weekly_redo_all_run_records_its_own_heartbeat(self):
+        from common.models import TaskHeartbeat
+        from face_manager.tasks import thistask
+        with self._mock_empty_inspect(), \
+             patch('face_manager.tasks.faceAssigner') as mock_assigner_cls:
+            thistask(redo_all=True)
+
+        heartbeat = TaskHeartbeat.objects.get(task_name='face_manager.thistask.weekly_full')
+        self.assertIsNotNone(heartbeat.last_started_at)
+        # A clean (mocked, non-crashing) run must mark itself done, not stuck.
+        self.assertIsNotNone(heartbeat.last_completed_at)
+        self.assertGreaterEqual(heartbeat.last_completed_at, heartbeat.last_started_at)
+
+    def test_hourly_run_records_a_distinctly_named_heartbeat(self):
+        # Must not collide with the weekly one -- they're watched for
+        # staleness/hangs independently (only the weekly one is
+        # currently in common.tasks.HEARTBEAT_REGISTRY).
+        from common.models import TaskHeartbeat
+        from face_manager.tasks import thistask
+        with self._mock_empty_inspect(), \
+             patch('face_manager.tasks.faceAssigner') as mock_assigner_cls:
+            thistask(redo_all=False)
+
+        self.assertTrue(TaskHeartbeat.objects.filter(task_name='face_manager.thistask.hourly').exists())
+        self.assertFalse(
+            TaskHeartbeat.objects.filter(task_name='face_manager.thistask.weekly_full').exists())
+
+    def test_crashing_run_still_marks_its_heartbeat_done_not_stuck(self):
+        # A crash is a DIFFERENT, already-logged failure mode (see
+        # test_assign_faces_crash_is_recorded above) -- it must not also
+        # look like a hang to the heartbeat watchdog.
+        from common.models import TaskHeartbeat
+        from face_manager.tasks import thistask
+        with self._mock_empty_inspect(), \
+             patch('face_manager.tasks.faceAssigner', side_effect=RuntimeError("boom")):
+            thistask(redo_all=True)
+
+        heartbeat = TaskHeartbeat.objects.get(task_name='face_manager.thistask.weekly_full')
+        self.assertIsNotNone(heartbeat.last_completed_at)
+
     def test_cluster_unverified_faces_crash_is_recorded(self):
         from common.models import ApplicationError
         from face_manager.tasks import cluster_unverified_faces_task

@@ -10,3 +10,4 @@ from .open_img_oriented import open_img_oriented, apply_exif_orientation
 from .equalize import clahe_equalize_bgr
 from .advisory_lock import advisory_lock
 from .error_log import log_error
+from .heartbeat import record_heartbeat_start, record_heartbeat_done

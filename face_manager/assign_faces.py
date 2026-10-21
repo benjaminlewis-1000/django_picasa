@@ -656,7 +656,14 @@ class faceAssigner():
         if self.DEBUG:
             unassigned = unassigned[:1001]
         num_unassigned = int(unassigned.count())
-        print(f"There are {num_unassigned} faces to classify")
+        # settings.LOGGER (not print) -- durable in the real log files,
+        # not just celery's own ephemeral stdout (which is lost across a
+        # container recreation/restart, confirmed a real gap while
+        # investigating whether the weekly redo_all=True run had ever
+        # actually fired, 2026-10-21).
+        settings.LOGGER.info(
+            f"classify_unassigned execute(redo_all={redo_all}): {num_unassigned} face(s) to classify."
+        )
 
         # Always load encodings, regardless of batch size. This used to be
         # skipped for small batches (num_unassigned <= 100), leaving

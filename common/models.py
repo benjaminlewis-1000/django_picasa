@@ -27,3 +27,36 @@ class ApplicationError(models.Model):
 
     def __str__(self):
         return f"ApplicationError({self.source}, {self.created_at})"
+
+
+class TaskHeartbeat(models.Model):
+    """Durable "this scheduled task actually got invoked, and finished"
+    record, for recurring tasks where SILENCE is itself a failure mode
+    a try/except can't catch:
+    - never invoked at all (Celery beat down, a bad schedule edit, the
+      task deregistered) -- nothing ever reaches a try/except to log a
+      crash, so a try/except-based error (common.error_log.
+      ApplicationError) can only ever catch a task that DID start.
+    - invoked, but stuck/hung (not actually raising -- an infinite
+      loop, waiting forever on a lock/resource) -- again, nothing a
+      try/except would ever see.
+
+    task_name is a short, stable identifier distinguishing this
+    specific recurring schedule entry, not just the underlying task
+    function (see common.heartbeat.record_heartbeat_start()'s own
+    docstring). last_started_at is updated unconditionally at the very
+    start of the task's real work, before anything that could fail;
+    last_completed_at is updated once that work actually finishes
+    (success OR a caught exception -- either way, not stuck). A row
+    where last_started_at is newer than last_completed_at means a run
+    is (or was) genuinely still in progress. common.tasks.
+    check_task_heartbeats (a separate, low-frequency watchdog task)
+    uses both fields to tell "hasn't run recently enough" apart from
+    "started but never finished," and records an ApplicationError for
+    either."""
+    task_name = models.CharField(max_length=256, unique=True)
+    last_started_at = models.DateTimeField()
+    last_completed_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"TaskHeartbeat({self.task_name}, started={self.last_started_at})"
