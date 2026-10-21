@@ -2349,6 +2349,30 @@ class ClassificationInvariantCheckTests(TestCase):
         self.assertIn(str(face.id), error.message)
         self.assertFalse(error.dismissed)
 
+    def test_newly_created_face_during_retry_window_is_not_falsely_flagged(self):
+        # Real production false-positive (2026-10-21): a face created
+        # concurrently by face_extraction, in the window between
+        # building leftover_ids and the still_broken re-check, must not
+        # be reported as "still broken after a retry" -- it was never
+        # part of the retry batch at all, just an ordinary new,
+        # not-yet-classified face.
+        from common.models import ApplicationError
+        face = self._make_leftover_face()
+        assigner = faceAssigner()
+
+        def fake_classify(f):
+            person = make_person("Retried Match For Race Test")
+            f.poss_ident1 = person
+            f.save()
+            # A brand-new face lands concurrently, created AFTER
+            # leftover_ids was already built -- never actually retried.
+            self._make_leftover_face()
+
+        with patch.object(faceAssigner, 'classify_unassigned', side_effect=fake_classify):
+            assigner._verify_classification_invariant()
+
+        self.assertEqual(ApplicationError.objects.count(), 0)
+
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class VerificationClusterGroupTests(TestCase):

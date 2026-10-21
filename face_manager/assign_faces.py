@@ -722,8 +722,18 @@ class faceAssigner():
         for face in Face.objects.filter(id__in=leftover_ids).select_related('declared_name'):
             self._classify_one_safely(face.id, face)
 
+        # Scoped to leftover_ids specifically -- NOT a fresh, unscoped
+        # re-query. Real false-positive found in production (2026-10-21):
+        # an unscoped query here can pick up brand-new faces that
+        # face_extraction creates concurrently, in the window between
+        # building leftover_ids and this check -- those were never
+        # actually retried (never even existed when leftover_ids was
+        # built), so reporting them as "still broken after a retry"
+        # misdiagnosed an ordinary new, not-yet-classified face as a
+        # persistent failure.
         still_broken = list(
-            Face.objects.filter(unassigned_crit & has_long & long_encoded & no_suggestions)
+            Face.objects.filter(id__in=leftover_ids)
+            .filter(unassigned_crit & has_long & long_encoded & no_suggestions)
             .values_list('id', flat=True)
         )
         if still_broken:
