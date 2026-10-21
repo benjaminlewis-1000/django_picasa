@@ -15,6 +15,7 @@ from django.utils.crypto import get_random_string
 from face_extract_encode import FaceExtractor
 from filepopulator.models import ImageFile, VideoFile, PhotoCollection
 from common.advisory_lock import advisory_lock
+from common.error_log import log_error
 from picasa import celery_app
 import os
 import queue
@@ -84,7 +85,22 @@ if not settings.configured:
 # Tasks can be autodiscovered by placing the app in the projec, then creating 
 # celery.py in the <PROJECT> directory and putting the following:
 # app.config_from_object('django.conf:settings', namespace='CELERY')
-# app.autodiscover_tasks() 
+# app.autodiscover_tasks()
+
+def _log_task_crash(task_name, exc):
+    """Shared helper for the scheduled tasks below: a whole-task crash is
+    genuinely rare/exceptional (not a routine per-item failure, which
+    already has its own dedicated tracking -- FailedImageFile,
+    face_extraction_failed, etc.) -- but several of these tasks used to
+    wrap their entire body in a bare `except:` that discarded the real
+    exception completely, not even writing it to the log files
+    (confirmed real, 2026-10-21). Logs the real exception AND records it
+    via common.error_log.log_error(), so a genuine crash is visible in
+    the frontend instead of only in log files a human has to think to
+    go check -- log files that, until now, didn't even have the detail
+    in them to find."""
+    settings.LOGGER.error(f"{task_name} crashed: {type(exc).__name__}: {exc}", exc_info=True)
+    log_error(f'face_manager.tasks.{task_name}', f"{type(exc).__name__}: {exc}")
 
 @shared_task(ignore_result=True, name='face_manager.face_extraction')
 def process_faces():
@@ -113,10 +129,9 @@ def process_faces():
         extractor = FaceExtractor()
         extractor.find_and_encode_faces()
 
-    except:
+    except Exception as e:
+        _log_task_crash('process_faces', e)
 
-        settings.LOGGER.debug("Ending face adding task")
-        
 @shared_task(ignore_result=True, name='face_manager.video_face_extraction')
 def process_video_faces(max_runtime_seconds=None):
     """Phase 3: one Face row per union-merge track-group, per unprocessed
@@ -190,6 +205,11 @@ def process_video_faces(max_runtime_seconds=None):
                         f"(>{PER_VIDEO_TIMEOUT_SECONDS}s each): {exc}"
                     )[:2000]
                     video.isProcessed = True
+                    log_error(
+                        'face_manager.tasks.process_video_faces',
+                        f"{video.filename} gave up after "
+                        f"{video.face_extraction_timeout_count} timeouts: {exc}",
+                    )
                 else:
                     settings.LOGGER.warning(
                         f"Video face extraction timed out for {video.filename} "
@@ -213,6 +233,10 @@ def process_video_faces(max_runtime_seconds=None):
                 video.face_extraction_failed = True
                 video.face_extraction_error = f"{type(exc).__name__}: {exc}"[:2000]
                 video.isProcessed = True
+                log_error(
+                    'face_manager.tasks.process_video_faces',
+                    f"{video.filename} failed: {type(exc).__name__}: {exc}",
+                )
                 video.save()
                 continue
 
@@ -247,8 +271,8 @@ def reencode_missing_faces():
     try:
         extractor = FaceExtractor()
         extractor.reencode_missing_faces()
-    except:
-        settings.LOGGER.debug("Ending reencode task")
+    except Exception as e:
+        _log_task_crash('reencode_missing_faces', e)
 
 @shared_task(ignore_result=True, name='face_manager.apply_collection_floor_change')
 def apply_collection_floor_change(collection_id):
@@ -279,9 +303,14 @@ def apply_collection_floor_change(collection_id):
             settings.LOGGER.debug(
                 f"Collection {collection_id} floor change: cleared {cleared}/{scanned} encodings."
             )
-        except Exception:
+        except Exception as e:
             settings.LOGGER.exception(
                 f"Error clearing encodings below the floor for collection {collection_id}."
+            )
+            log_error(
+                'face_manager.tasks.apply_collection_floor_change',
+                f"Error clearing encodings below the floor for collection {collection_id}: "
+                f"{type(e).__name__}: {e}",
             )
 
         try:
@@ -295,17 +324,27 @@ def apply_collection_floor_change(collection_id):
             settings.LOGGER.debug(
                 f"Collection {collection_id} floor change: cleared {stale_cleared} stale unencoded proposal(s)."
             )
-        except Exception:
+        except Exception as e:
             settings.LOGGER.exception(
                 f"Error clearing stale unencoded proposals for collection {collection_id}."
+            )
+            log_error(
+                'face_manager.tasks.apply_collection_floor_change',
+                f"Error clearing stale unencoded proposals for collection {collection_id}: "
+                f"{type(e).__name__}: {e}",
             )
 
         try:
             extractor = FaceExtractor()
             extractor.reencode_missing_faces(collection=collection)
-        except Exception:
+        except Exception as e:
             settings.LOGGER.exception(
                 f"Error re-encoding newly-eligible faces for collection {collection_id}."
+            )
+            log_error(
+                'face_manager.tasks.apply_collection_floor_change',
+                f"Error re-encoding newly-eligible faces for collection {collection_id}: "
+                f"{type(e).__name__}: {e}",
             )
 
 @shared_task(ignore_result=True, name='face_manager.clear_ignored_encodings')
@@ -333,8 +372,8 @@ def clear_ignored_encodings():
     try:
         updated = clear_confirmed_ignore_face_encodings()
         settings.LOGGER.debug(f"Cleared face_encoding_512 for {updated} confirmed-ignore face(s).")
-    except:
-        settings.LOGGER.debug("Ending clear_ignored_encodings task")
+    except Exception as e:
+        _log_task_crash('clear_ignored_encodings', e)
 
 @shared_task(ignore_result=True, name='face_manager.assign_faces')
 def thistask(redo_all=False):
@@ -359,8 +398,8 @@ def thistask(redo_all=False):
     try:
         classer = faceAssigner()
         classer.execute(redo_all)
-    except:
-        print("Image classification failed!")
+    except Exception as e:
+        _log_task_crash('thistask', e)
         
 @shared_task(ignore_result=True, name='face_manager.reload_classifier_pkl')
 def classifier_pkl_file_reload():
@@ -393,5 +432,5 @@ def cluster_unverified_faces_task():
         settings.LOGGER.debug(
             f"Clustered {num_faces} unverified face(s) across {num_people} person(s)."
         )
-    except:
-        settings.LOGGER.debug("Ending cluster_unverified_faces task")
+    except Exception as e:
+        _log_task_crash('cluster_unverified_faces_task', e)

@@ -667,6 +667,23 @@ def add_from_root_dir(root_dir):
             )
             print(f"New file length is {len(new_files)}")
 
+            # A root that walked to zero files is routine for a brand-new
+            # collection root with nothing in it yet -- but if ImageFile
+            # rows are ALREADY tracked under this exact root, zero files
+            # now is a real, exceptional signal (dropped mount, bad
+            # permissions, a renamed/moved root), not routine content
+            # churn (a single corrupted/missing file already has its own
+            # dedicated tracking via FailedImageFile/image_load_failed).
+            if len(actual_file_list) == 0 and ImageFile.objects.filter(
+                filename__startswith=root_dir
+            ).exists():
+                message = (
+                    f"Scan of {root_dir} found 0 files, but ImageFile rows are already "
+                    f"tracked under it -- possible unmounted/unreachable source."
+                )
+                settings.LOGGER.error(f"add_from_root_dir: {message}")
+                common.log_error('filepopulator.scripts.add_from_root_dir', message)
+
             for filename in new_files:
                 try:
                     create_image_file(filename)

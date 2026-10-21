@@ -418,12 +418,29 @@ def add_videos_from_root_dir(root_dirs):
 
         actual_file_list = []
         for root_dir in root_dirs:
+            found_in_this_root = 0
             for root, dirs, files in os.walk(root_dir):
                 for f in files:
                     if f.startswith('.'):
                         continue
                     if re.search(VIDEO_EXTENSION_REGEX, f):
                         actual_file_list.append(os.path.join(root, f))
+                        found_in_this_root += 1
+
+            # Same reasoning as add_from_root_dir()'s own check (image
+            # side): a root walking to zero files is routine for a
+            # brand-new, genuinely-empty root, but exceptional if
+            # VideoFile rows are already tracked under it -- a possible
+            # dropped mount/unreachable source, not routine content churn.
+            if found_in_this_root == 0 and VideoFile.objects.filter(
+                filename__startswith=root_dir
+            ).exists():
+                message = (
+                    f"Scan of {root_dir} found 0 video files, but VideoFile rows are already "
+                    f"tracked under it -- possible unmounted/unreachable source."
+                )
+                settings.LOGGER.error(f"add_videos_from_root_dir: {message}")
+                common.log_error('filepopulator.video_scripts.add_videos_from_root_dir', message)
 
         db_file_list = list(VideoFile.objects.values_list('filename', flat=True))
 

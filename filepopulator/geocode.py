@@ -376,6 +376,13 @@ def reverse_geocode_precise(lat, lon):
 # were within this radius of an already-successful precise geocode.
 GEOCODE_REUSE_RADIUS_KM = 0.15
 
+# run_geocoding_backfill()'s own run-level failure-rate check (see its
+# own comment) -- a minimum sample size avoids flagging a tiny batch
+# where 1-2 failures look like a high percentage but aren't meaningful,
+# and a >50% threshold is well above ordinary single-coordinate noise.
+GEOCODE_FAILURE_RATE_MIN_ATTEMPTS = 5
+GEOCODE_FAILURE_RATE_THRESHOLD = 0.5
+
 
 def _find_nearby_precise_geocode(lat, lon, candidates, radius_km=GEOCODE_REUSE_RADIUS_KM):
     """candidates: a list of (lat, lon, dict) tuples for already-known
@@ -667,4 +674,24 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
         f"no Nominatim call), {result['failed']} failed, {time.time() - start:.0f}s total. "
         f"Retries: {result['retried']} attempted, {result['retried_succeeded']} now succeeded. "
         f"Also relinked {result['relinked_from_cache']} image(s) to an already-cached coordinate.")
+
+    # Run-level failure-rate check, not per-coordinate -- a single failed
+    # coordinate is routine (self-heals via the retry path above), but a
+    # real outage/rate-limit event (confirmed real, 2026-09-10: Nominatim
+    # temporarily blocked this server's IP after a heavy batch) fails
+    # most or all of a run's real calls at once. Reused-nearby results
+    # never call Nominatim at all, so they're excluded from the
+    # denominator -- only real attempts count.
+    real_attempts = (result['succeeded'] - result['reused_nearby']) + result['failed']
+    if real_attempts >= GEOCODE_FAILURE_RATE_MIN_ATTEMPTS:
+        failure_rate = result['failed'] / real_attempts
+        if failure_rate > GEOCODE_FAILURE_RATE_THRESHOLD:
+            message = (
+                f"{result['failed']}/{real_attempts} real Nominatim call(s) failed this run "
+                f"({failure_rate:.0%}) -- possible rate-limit or outage."
+            )
+            settings.LOGGER.error(f"run_geocoding_backfill: {message}")
+            from common.error_log import log_error
+            log_error('filepopulator.geocode.run_geocoding_backfill', message)
+
     return result
