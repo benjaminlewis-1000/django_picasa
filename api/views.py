@@ -424,7 +424,24 @@ class PersonListView(APIView):
             p_dict['further_images_unlikely'] = p.further_images_unlikely
 
             if p.person_name == settings.BLANK_FACE_NAME:
-                num_blanks = Face.objects.filter(declared_name__person_name=settings.BLANK_FACE_NAME).count()
+                # poss_ident1__isnull=False excludes faces with no
+                # candidate suggestion at all (2026-10-21, per the user's
+                # own call) - these are mostly tiny/low-quality detections
+                # the recognition pipeline never produced a guess for,
+                # overwhelmingly belonging to people already declared
+                # .ignore, that aren't worth surfacing for manual review.
+                # This population isn't static (the backend's own pipeline
+                # keeps assigning them faces over time), so it's excluded
+                # here at display/count time rather than deleted or
+                # permanently reclassified - scoped to this web-facing
+                # count/listing only; mobile_views.py/assign_faces.py's own
+                # Unassigned-population queries are untouched, since they
+                # need the true full population to do their jobs.
+                blanks_qs = Face.objects.filter(
+                    declared_name__person_name=settings.BLANK_FACE_NAME,
+                    poss_ident1__isnull=False,
+                )
+                num_blanks = blanks_qs.count()
                 p_dict['num_possibilities'] = num_blanks
                 p_dict['num_unverified_faces'] = num_blanks
                 p_dict['num_faces'] = num_blanks
@@ -432,9 +449,7 @@ class PersonListView(APIView):
                 # (not a per-person loop, see live_counts.py's own
                 # reasoning for why that matters) for the frontend's
                 # "Confirm from" sidebar split (personSidebar.jsx).
-                num_blanks_video = Face.objects.filter(
-                    declared_name__person_name=settings.BLANK_FACE_NAME, source_video_file__isnull=False
-                ).count()
+                num_blanks_video = blanks_qs.filter(source_video_file__isnull=False).count()
                 p_dict['num_possibilities_video'] = num_blanks_video
                 p_dict['num_possibilities_image'] = num_blanks - num_blanks_video
             else:
@@ -634,6 +649,13 @@ class PersonParamView(APIView):
             if field == 'face_declared':
 
                 default_query = Q(declared_name=person_obj)
+                # Keep this in sync with PersonListView's own BLANK_FACE_NAME
+                # count override above - same reasoning (2026-10-21): faces
+                # with no candidate suggestion at all are excluded from
+                # Unassigned's own gallery/count here, not from the Face
+                # table itself.
+                if person_obj.person_name == settings.BLANK_FACE_NAME:
+                    default_query &= Q(poss_ident1__isnull=False)
                 unverified_query = Q(validated=False)
                 # verification_cluster_group (face_manager/
                 # verification_clustering.py's nightly job) only ever gets
