@@ -343,6 +343,32 @@ class ApplicationErrorLogTests(TestCase):
         messages_in_order = list(ApplicationError.objects.values_list('message', flat=True))
         self.assertEqual(messages_in_order, ['second', 'first'])
 
+    def test_message_under_the_cap_is_not_truncated(self):
+        from common.error_log import log_error, MAX_MESSAGE_LENGTH
+        from common.models import ApplicationError
+
+        message = 'x' * (MAX_MESSAGE_LENGTH - 1)
+        log_error('a', message)
+
+        self.assertEqual(ApplicationError.objects.get().message, message)
+
+    def test_message_over_the_cap_is_truncated_centrally(self):
+        # The real backstop: even a call site that forgot to bound its
+        # own message (e.g. a huge, un-truncated id list or traceback
+        # dump) can't flood a single row -- enforced here regardless of
+        # what the caller passed in.
+        from common.error_log import log_error, MAX_MESSAGE_LENGTH
+        from common.models import ApplicationError
+
+        huge_message = 'x' * (MAX_MESSAGE_LENGTH * 10)
+        log_error('a', huge_message)
+
+        stored = ApplicationError.objects.get().message
+        self.assertLess(len(stored), len(huge_message))
+        self.assertTrue(stored.startswith('x' * 100))
+        self.assertIn(str(len(huge_message)), stored)
+        self.assertIn('truncated', stored)
+
 
 class TaskHeartbeatTests(TestCase):
     def test_start_creates_a_row(self):
