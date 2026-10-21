@@ -1182,6 +1182,107 @@ class ApplyCollectionFloorChangeTaskTests(TestCase):
         mock_stale.assert_not_called()
         mock_extractor_cls.assert_not_called()
 
+    def test_a_failing_step_is_recorded_as_an_application_error(self):
+        from common.models import ApplicationError
+        from filepopulator.models import PhotoCollection
+        from face_manager.tasks import apply_collection_floor_change
+
+        with patch('face_manager.tasks.apply_collection_floor_change.delay'):
+            collection = PhotoCollection.objects.create(
+                name='Task Error Logging', root_directory='/photos/task_error_logging',
+                min_face_relative_size=0.1,
+            )
+
+        with patch('face_manager.tasks.clear_encodings_below_collection_floor',
+                   side_effect=RuntimeError("boom")), \
+             patch('face_manager.tasks.clear_stale_proposals_with_no_encoding', return_value=0), \
+             patch('face_manager.tasks.FaceExtractor') as mock_extractor_cls:
+            mock_extractor_cls.return_value.reencode_missing_faces.return_value = None
+            apply_collection_floor_change(collection.pk)
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'face_manager.tasks.apply_collection_floor_change')
+        self.assertIn(str(collection.pk), error.message)
+        self.assertIn('boom', error.message)
+
+
+class TaskCrashLoggingTests(TestCase):
+    """Regression tests for a real, confirmed bug (2026-10-21):
+    process_faces/reencode_missing_faces/clear_ignored_encodings/
+    thistask (assign_faces)/cluster_unverified_faces_task all used to
+    wrap their entire body in a bare `except:` that discarded the real
+    exception completely -- not even writing it to the log files. Now
+    routed through the shared _log_task_crash() helper, which logs the
+    real exception AND records it via common.error_log.log_error()."""
+
+    def _mock_empty_inspect(self):
+        mock_inspect = MagicMock()
+        mock_inspect.active.return_value = {}
+        return patch('face_manager.tasks.celery_app.control.inspect', return_value=mock_inspect)
+
+    def test_log_task_crash_logs_and_records(self):
+        from common.models import ApplicationError
+        from face_manager.tasks import _log_task_crash
+        _log_task_crash('some_task', RuntimeError("boom"))
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'face_manager.tasks.some_task')
+        self.assertIn('RuntimeError', error.message)
+        self.assertIn('boom', error.message)
+
+    def test_process_faces_crash_is_recorded(self):
+        from common.models import ApplicationError
+        from face_manager.tasks import process_faces
+        img = make_image()
+        img.isProcessed = False
+        img.save()
+
+        with patch('face_manager.tasks.FaceExtractor', side_effect=RuntimeError("boom")):
+            process_faces()
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'face_manager.tasks.process_faces')
+        self.assertIn('boom', error.message)
+
+    def test_reencode_missing_faces_crash_is_recorded(self):
+        from common.models import ApplicationError
+        from face_manager.tasks import reencode_missing_faces
+        with self._mock_empty_inspect(), \
+             patch('face_manager.tasks.FaceExtractor', side_effect=RuntimeError("boom")):
+            reencode_missing_faces()
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'face_manager.tasks.reencode_missing_faces')
+
+    def test_clear_ignored_encodings_crash_is_recorded(self):
+        from common.models import ApplicationError
+        from face_manager.tasks import clear_ignored_encodings
+        with self._mock_empty_inspect(), \
+             patch('face_manager.tasks.clear_confirmed_ignore_face_encodings', side_effect=RuntimeError("boom")):
+            clear_ignored_encodings()
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'face_manager.tasks.clear_ignored_encodings')
+
+    def test_assign_faces_crash_is_recorded(self):
+        from common.models import ApplicationError
+        from face_manager.tasks import thistask
+        with self._mock_empty_inspect(), \
+             patch('face_manager.tasks.faceAssigner', side_effect=RuntimeError("boom")):
+            thistask()
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'face_manager.tasks.thistask')
+
+    def test_cluster_unverified_faces_crash_is_recorded(self):
+        from common.models import ApplicationError
+        from face_manager.tasks import cluster_unverified_faces_task
+        with self._mock_empty_inspect(), \
+             patch('face_manager.tasks.cluster_all_unverified_faces', side_effect=RuntimeError("boom")):
+            cluster_unverified_faces_task()
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'face_manager.tasks.cluster_unverified_faces_task')
+
 
 class UpdateListOfNoMatchingDetectsTests(TestCase):
     """Regression test for a fixed bug: update_list_of_no_matching_detects()
@@ -4510,3 +4611,30 @@ class ProcessVideoFacesFailureTrackingTests(TestCase):
             process_video_faces()
         self.video.refresh_from_db()
         self.assertEqual(self.video.face_extraction_timeout_count, 0)
+
+    def test_real_failure_is_recorded_as_an_application_error(self):
+        from common.models import ApplicationError
+        from face_manager.tasks import process_video_faces
+        with patch('video_face_pipeline.VideoFaceExtractor') as MockExtractor:
+            MockExtractor.return_value.process_video.side_effect = RuntimeError("boom")
+            process_video_faces()
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'face_manager.tasks.process_video_faces')
+        self.assertIn(self.video.filename, error.message)
+        self.assertIn('boom', error.message)
+
+    def test_exhausted_timeout_retries_is_recorded_as_an_application_error(self):
+        from common.models import ApplicationError
+        from face_manager.tasks import process_video_faces, _VideoProcessingTimeout, MAX_VIDEO_TIMEOUT_RETRIES
+        with patch('video_face_pipeline.VideoFaceExtractor') as MockExtractor:
+            MockExtractor.return_value.process_video.side_effect = _VideoProcessingTimeout("boom")
+            for _ in range(MAX_VIDEO_TIMEOUT_RETRIES):
+                process_video_faces()
+                self.video.refresh_from_db()
+                if not self.video.face_extraction_failed:
+                    self.video.isProcessed = False
+                    self.video.save()
+        self.assertEqual(ApplicationError.objects.count(), 1)
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'face_manager.tasks.process_video_faces')
+        self.assertIn(self.video.filename, error.message)

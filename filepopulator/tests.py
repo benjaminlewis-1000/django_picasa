@@ -1002,6 +1002,35 @@ class ImageFileTests(TestCase):
         add_from_root_dir(self.tmp_valid_dir)
         self.assertGreater(ImageFile.objects.count(), 0)
 
+    def test_tracked_root_going_empty_is_recorded_as_an_application_error(self):
+        # Real, exceptional signal (dropped mount, bad permissions, a
+        # renamed root) -- distinct from a brand-new, genuinely-empty
+        # root (next test), which must NOT be flagged.
+        from common.models import ApplicationError
+        add_from_root_dir(self.tmp_valid_dir)
+        self.assertGreater(ImageFile.objects.count(), 0)
+
+        shutil.rmtree(self.tmp_valid_dir)
+        os.makedirs(self.tmp_valid_dir)
+
+        add_from_root_dir(self.tmp_valid_dir)
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'filepopulator.scripts.add_from_root_dir')
+        self.assertIn(self.tmp_valid_dir, error.message)
+
+    def test_brand_new_empty_root_is_not_recorded(self):
+        from common.models import ApplicationError
+        empty_root = '/tmp/brand_new_empty_root'
+        if os.path.exists(empty_root):
+            shutil.rmtree(empty_root)
+        os.makedirs(empty_root)
+        self.addCleanup(shutil.rmtree, empty_root, ignore_errors=True)
+
+        add_from_root_dir(empty_root)
+
+        self.assertEqual(ApplicationError.objects.count(), 0)
+
 
 class DeleteRemovedPhotosGracePeriodTests(TestCase):
     """ImageFile.missing_since / delete_removed_photos()'s grace period,
@@ -2710,6 +2739,49 @@ class BackfillGeocodingTests(TestCase):
         self.assertFalse(img.geocode.lookup_failed)
         self.assertEqual(img.geocode.locality, 'Seattle')
 
+    def test_high_failure_rate_this_run_is_recorded_as_an_application_error(self):
+        # Run-level, not per-coordinate -- a real outage/rate-limit event
+        # (confirmed real, 2026-09-10) fails most or all of a run's real
+        # calls at once, unlike ordinary single-coordinate noise.
+        from common.models import ApplicationError
+        for i in range(6):
+            self._make_bare_image_file(f"/tmp/geocode_test/fail{i}.jpg", 10.0 + i, 10.0 + i)
+
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise',
+                         side_effect=RuntimeError("simulated Nominatim outage")):
+            call_command('backfill_geocoding')
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'filepopulator.geocode.run_geocoding_backfill')
+        self.assertIn('6/6', error.message)
+
+    def test_low_failure_rate_is_not_recorded(self):
+        from common.models import ApplicationError
+        for i in range(6):
+            self._make_bare_image_file(f"/tmp/geocode_test/ok{i}.jpg", 20.0 + i, 20.0 + i)
+
+        fake_result = {
+            'locality': 'Somewhere', 'county': None, 'state': None,
+            'country': 'United States', 'display_name': 'Somewhere, USA',
+            'raw_response': {'address': {}},
+        }
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise', return_value=fake_result):
+            call_command('backfill_geocoding')
+
+        self.assertEqual(ApplicationError.objects.count(), 0)
+
+    def test_small_batch_below_min_attempts_is_not_recorded(self):
+        # Even a 100% failure rate shouldn't flag a tiny batch -- too
+        # noisy a signal below GEOCODE_FAILURE_RATE_MIN_ATTEMPTS.
+        from common.models import ApplicationError
+        self._make_bare_image_file("/tmp/geocode_test/tiny0.jpg", 30.0, 30.0)
+
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise',
+                         side_effect=RuntimeError("simulated failure")):
+            call_command('backfill_geocoding')
+
+        self.assertEqual(ApplicationError.objects.count(), 0)
+
 
 class SimilarityTests(TestCase):
     """Exercises phash-based near-duplicate detection
@@ -3930,6 +4002,38 @@ class VideoIngestionTests(TestCase):
         first_count = VideoFile.objects.count()
         add_videos_from_root_dir([self.VIDEO_DIR])
         self.assertEqual(VideoFile.objects.count(), first_count)
+
+    def test_tracked_video_root_going_empty_is_recorded_as_an_application_error(self):
+        # Mirrors add_from_root_dir()'s own check (image side) -- a real,
+        # exceptional signal (dropped mount, bad permissions, a renamed
+        # root), distinct from a brand-new, genuinely-empty root (next
+        # test), which must NOT be flagged. VIDEO_DIR itself is a
+        # read-only real-fixture mount, so this copies one fixture into a
+        # controlled tmp root instead of touching VIDEO_DIR directly.
+        from common.models import ApplicationError
+        long_enough = self._long_enough_files()
+        if not long_enough:
+            self.skipTest("no real fixture long enough to ingest")
+        tmp_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        shutil.copy(os.path.join(self.VIDEO_DIR, long_enough[0]), os.path.join(tmp_root, long_enough[0]))
+
+        add_videos_from_root_dir([tmp_root])
+        self.assertGreater(VideoFile.objects.count(), 0)
+
+        os.remove(os.path.join(tmp_root, long_enough[0]))
+        add_videos_from_root_dir([tmp_root])
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'filepopulator.video_scripts.add_videos_from_root_dir')
+        self.assertIn(tmp_root, error.message)
+
+    def test_brand_new_empty_video_root_is_not_recorded(self):
+        from common.models import ApplicationError
+        empty_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty_root, ignore_errors=True)
+        add_videos_from_root_dir([empty_root])
+        self.assertEqual(ApplicationError.objects.count(), 0)
 
     def test_multiple_roots_are_all_walked(self):
         # add_videos_from_root_dir() takes a LIST of roots (built by the
