@@ -720,6 +720,17 @@ CELERY_BEAT_SCHEDULE = {
        # (declared_name itself, not just poss_ident1) -- that population
        # needs its own deliberate one-off reclassification pass, same as
        # the earlier -0.05 threshold reclassification work.
+       # Verified end-to-end against a real run, 2026-10-21: temporarily
+       # rescheduled to fire within a few minutes, confirmed via
+       # TaskHeartbeat and the new durable execute() log line that it
+       # actually started (87,811 faces queued) -- then reverted back to
+       # the real schedule below. Along the way, confirmed Celery's
+       # crontab evaluation uses its own configured timezone (America/
+       # New_York, via app.conf.timezone -- inherited from Django's
+       # TIME_ZONE despite CELERY_TIMEZONE itself being commented out),
+       # NOT UTC -- a first attempt computed in UTC silently missed by
+       # ~4 hours as a result. Worth remembering for any future
+       # near-term reschedule test.
        'schedule': crontab( minute = '4', hour='1', day_of_week=1),
        'args': (True, ), # Reassign all faces.
    },
