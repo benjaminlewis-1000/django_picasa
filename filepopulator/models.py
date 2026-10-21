@@ -1540,6 +1540,18 @@ class VideoFile(models.Model):
     playback_path = models.CharField(max_length=1024, null=True, blank=True)
     transcode_error = models.TextField(null=True, blank=True)
 
+    # Mirrors ImageFile.collections exactly -- "visible from" (plural),
+    # distinct from directory.collection's "home" (singular). Gains an
+    # additional entry when a LATER scan of a different collection
+    # discovers the same video content as a duplicate (see
+    # create_video_file()) -- the queryable answer to "is this video
+    # visible from collection X," same as the image side. Added
+    # 2026-10-21, closing a real gap: content_hash-based duplicate
+    # detection already PREVENTED a second VideoFile row from being
+    # created for the same content in a second collection, but nothing
+    # recorded that the video is ALSO visible from that collection.
+    collections = models.ManyToManyField('PhotoCollection', related_name='videos', blank=True)
+
     def __str__(self):
         return self.filename
 
@@ -1606,6 +1618,17 @@ class DuplicateVideoFile(models.Model):
     original = models.ForeignKey(
         'VideoFile', on_delete=models.CASCADE, null=True, blank=True,
         related_name='duplicates',
+    )
+
+    # Which collection's scan discovered THIS path as a duplicate --
+    # distinct from original.directory.collection (the primary's own
+    # home). Mirrors DuplicateFile.collection exactly (see its own
+    # docstring) -- an audit trail only; the actually-queryable "is this
+    # video visible from collection X" answer lives on
+    # VideoFile.collections, which gets this same collection added to
+    # the PRIMARY's set at the same time this row is written.
+    collection = models.ForeignKey(
+        'PhotoCollection', on_delete=models.SET_NULL, null=True, blank=True,
     )
 
     def __str__(self):

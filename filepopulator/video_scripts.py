@@ -286,7 +286,20 @@ def create_video_file(file_path):
             # create_image_file()'s pixel_hash duplicate branch,
             # including the bug that branch had to fix (never fall
             # through to also creating a full row for the duplicate).
-            DuplicateVideoFile.objects.create(filename=file_path, original=still_present[0])
+            #
+            # Also cross-links the collection this duplicate was found
+            # under onto the primary's own `collections` -- otherwise
+            # the same real video landing in two collections would
+            # correctly avoid a second row, but have no record it's
+            # actually visible from both (added 2026-10-21, mirrors
+            # create_image_file()'s equivalent duplicate-collection
+            # linking).
+            dup_collection = PhotoCollection.resolve_for_path(file_path)
+            DuplicateVideoFile.objects.create(
+                filename=file_path, original=still_present[0], collection=dup_collection,
+            )
+            if dup_collection is not None:
+                still_present[0].collections.add(dup_collection)
             settings.LOGGER.info(
                 f"Video {file_path} is a content-duplicate of "
                 f"{still_present[0].filename} -- recorded, not re-ingested."
@@ -374,6 +387,12 @@ def create_video_file(file_path):
     video.playback_path = compute_video_playback_path(file_path)
 
     video.save()
+
+    # Mirrors instance_clean_and_save()'s equivalent call for images --
+    # a freshly-saved video's own home collection is always itself one
+    # of the collections it's "visible from."
+    if video.directory.collection_id is not None:
+        video.collections.add(video.directory.collection_id)
 
     # Clear a stale failure record now that this file has actually
     # succeeded (mirrors create_image_file()'s equivalent handling).

@@ -2858,7 +2858,7 @@ class ResolveCrossCollectionPairTests(TestCase):
         self.shared_date_taken = timezone.now()
 
     def _make_image(self, name, collection, size_bytes, width=100, height=100,
-                     date_taken=None, make='samsung', model='SM-A326W'):
+                     date_taken=None, make='samsung', model='SM-A326W', is_processed=False):
         root = self.second_root if collection.pk == self.collection_b.pk else self.first_root
         directory, _ = Directory.objects.get_or_create(dir_path=root, defaults={'collection': collection})
         if directory.collection_id != collection.pk:
@@ -2872,7 +2872,7 @@ class ResolveCrossCollectionPairTests(TestCase):
             pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
             file_hash=binascii.hexlify(os.urandom(16)).decode(),
             width=width, height=height, dateTaken=date_taken or self.shared_date_taken,
-            camera_make=make, camera_model=model,
+            camera_make=make, camera_model=model, isProcessed=is_processed,
         )
         ImageFile.objects.bulk_create([img])
         img = ImageFile.objects.get(filename=path)
@@ -2883,11 +2883,11 @@ class ResolveCrossCollectionPairTests(TestCase):
         img.collections.add(collection)
         return img
 
-    def _make_face(self, image, box, person=None, validated=False):
+    def _make_face(self, image, box, person=None, validated=False, kps=None):
         bl, bt, br, bb = box
         face = Face(
             source_image_file=image, declared_name=person or get_default_blank_person(),
-            box_left=bl, box_top=bt, box_right=br, box_bottom=bb, validated=validated,
+            box_left=bl, box_top=bt, box_right=br, box_bottom=bb, validated=validated, kps=kps,
         )
         face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
         face.save()
@@ -3031,6 +3031,143 @@ class ResolveCrossCollectionPairTests(TestCase):
 
         stats = resolve_pair(pair, dry_run=False)
         self.assertEqual(stats['faces_matched'], 1)
+
+    def test_unmatched_transferred_face_box_is_rescaled_into_primarys_space(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+        # Real bug, found 2026-10-21 (see CLAUDE.md): a face transferred
+        # from secondary onto primary without rescaling its box kept
+        # secondary's own pixel coordinates -- silently wrong once the
+        # two images have different resolutions, and a real risk of the
+        # face being clamped/deleted the next time primary goes through
+        # face_extract_encode.py's "existing face, no matching fresh
+        # detection" reconciliation path.
+        small = self._make_image('resc_small', self.collection_a, size_bytes=100, width=100, height=200)
+        big = self._make_image('resc_big', self.collection_b, size_bytes=5000, width=400, height=800)  # 4x both axes
+        # Only on the secondary (small) -- nothing on primary to match
+        # against, so this is definitely the "unmatched, transfer" path.
+        unmatched_face = self._make_face(small, (10, 20, 30, 50))
+        pair = self._make_pair(small, big)
+
+        stats = resolve_pair(pair, dry_run=False)
+
+        self.assertEqual(stats['primary_id'], big.id)
+        self.assertEqual(stats['faces_transferred'], 1)
+        unmatched_face.refresh_from_db()
+        self.assertEqual(unmatched_face.source_image_file_id, big.id)
+        # Rescaled by the real 4x width/4x height ratio between the pair.
+        self.assertEqual(
+            (unmatched_face.box_left, unmatched_face.box_top, unmatched_face.box_right, unmatched_face.box_bottom),
+            (40, 80, 120, 200),
+        )
+        # And the rescaled box is a real, valid, non-degenerate box that
+        # genuinely fits inside primary's actual dimensions -- the
+        # concrete guarantee this fix is for.
+        self.assertTrue(0 <= unmatched_face.box_left < unmatched_face.box_right <= big.width)
+        self.assertTrue(0 <= unmatched_face.box_top < unmatched_face.box_bottom <= big.height)
+
+    def test_matched_but_secondary_wins_face_box_is_also_rescaled(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+        # The OTHER path a transferred face can take -- matched to a
+        # primary face, but the secondary's own copy is judged the
+        # better survivor (e.g. it's validated) -- needs the exact same
+        # rescaling as the unmatched-transfer path, not just a special
+        # case of it.
+        from face_manager.models import Person
+        person = Person.objects.create(person_name='Rescale Survivor')
+
+        small = self._make_image('resc_small2', self.collection_a, size_bytes=100, width=100, height=100)
+        big = self._make_image('resc_big2', self.collection_b, size_bytes=5000, width=300, height=300)  # 3x both axes
+        # Secondary's copy is validated -- it must win and be transferred
+        # (rescaled) onto primary; primary's own (unvalidated) copy at
+        # the matching relative position must be deleted.
+        survivor = self._make_face(small, (10, 10, 30, 30), person=person, validated=True)
+        loser = self._make_face(big, (30, 30, 90, 90))  # same relative position, 3x scale
+        pair = self._make_pair(small, big)
+
+        stats = resolve_pair(pair, dry_run=False)
+
+        self.assertEqual(stats['faces_matched'], 1)
+        self.assertFalse(Face.objects.filter(pk=loser.pk).exists())
+        survivor.refresh_from_db()
+        self.assertEqual(survivor.source_image_file_id, big.id)
+        self.assertEqual(
+            (survivor.box_left, survivor.box_top, survivor.box_right, survivor.box_bottom),
+            (30, 30, 90, 90),
+        )
+
+    def test_transferred_face_kps_is_rescaled_not_discarded(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+        small = self._make_image('resc_small3', self.collection_a, size_bytes=100, width=100, height=200)
+        big = self._make_image('resc_big3', self.collection_b, size_bytes=5000, width=200, height=400)  # 2x both axes
+        kps = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
+        face = self._make_face(small, (10, 20, 30, 50), kps=kps)
+        pair = self._make_pair(small, big)
+
+        resolve_pair(pair, dry_run=False)
+
+        face.refresh_from_db()
+        self.assertEqual(face.source_image_file_id, big.id)
+        # Even indices (x) scaled by scale_x=2.0, odd indices (y) by
+        # scale_y=2.0 -- same 2x on both axes here, but computed via the
+        # real per-axis logic, not just "double everything".
+        self.assertEqual(face.kps, [20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0, 200.0])
+
+    def test_null_kps_stays_null_after_transfer(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+        small = self._make_image('resc_small4', self.collection_a, size_bytes=100, width=100, height=100)
+        big = self._make_image('resc_big4', self.collection_b, size_bytes=5000, width=200, height=200)
+        face = self._make_face(small, (10, 10, 30, 30), kps=None)
+        pair = self._make_pair(small, big)
+
+        resolve_pair(pair, dry_run=False)
+
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+
+    def test_primary_marked_processed_when_secondary_already_was(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+        # Real bug, found 2026-10-21: if secondary already completed its
+        # own real face-extraction pass, every real face for this
+        # content is now on primary too (matched + transferred) -- but
+        # primary's own isProcessed flag was never updated, so the
+        # normal scheduled face_extraction task would later run a
+        # wasteful (and, pre-rescaling-fix, risky) redundant detection
+        # pass on it.
+        small = self._make_image('proc_small', self.collection_a, size_bytes=100, is_processed=True)
+        big = self._make_image('proc_big', self.collection_b, size_bytes=5000, is_processed=False)
+        self._make_face(small, (10, 10, 30, 30))
+        pair = self._make_pair(small, big)
+
+        resolve_pair(pair, dry_run=False)
+
+        big.refresh_from_db()
+        self.assertTrue(big.isProcessed)
+
+    def test_primary_left_unprocessed_when_secondary_never_was(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+        # The opposite case: secondary was NEVER processed (no real
+        # detection pass has ever found whatever faces might be in this
+        # content) -- primary must NOT be force-marked done, since it
+        # may still need its own genuine first detection pass.
+        small = self._make_image('proc_small2', self.collection_a, size_bytes=100, is_processed=False)
+        big = self._make_image('proc_big2', self.collection_b, size_bytes=5000, is_processed=False)
+        pair = self._make_pair(small, big)
+
+        resolve_pair(pair, dry_run=False)
+
+        big.refresh_from_db()
+        self.assertFalse(big.isProcessed)
+
+    def test_primary_already_processed_stays_processed_regardless(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+        small = self._make_image('proc_small3', self.collection_a, size_bytes=100, is_processed=False)
+        big = self._make_image('proc_big3', self.collection_b, size_bytes=5000, is_processed=True)
+        pair = self._make_pair(small, big)
+
+        resolve_pair(pair, dry_run=False)
+
+        big.refresh_from_db()
+        self.assertTrue(big.isProcessed)
 
 
 class FindUnresolvedCrossCollectionPairsTests(TestCase):
@@ -3875,6 +4012,75 @@ class VideoDirectoryCollectionTests(TestCase):
 
         image_only_dir.refresh_from_db()
         self.assertIsNone(image_only_dir.collection)
+
+
+class VideoCrossCollectionDuplicateTests(TestCase):
+    """create_video_file()'s content_hash-based duplicate detection
+    already prevented a second VideoFile row for the same real content
+    landing in a second collection -- these confirm the real gap that
+    was missing until 2026-10-21: that the primary becomes queryable as
+    "visible from" the second collection too (VideoFile.collections),
+    not just left attributed to its own original home. Exact mirror of
+    PhotoCollectionTests' equivalent image-side test."""
+
+    def setUp(self):
+        self.default_collection = PhotoCollection.objects.get(is_default=True)
+        self.second_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.second_root, ignore_errors=True)
+        self.second_collection = PhotoCollection.objects.create(
+            name='Second Video Collection', root_directory=self.second_root,
+        )
+
+    def tearDown(self):
+        VideoFile.objects.all().delete()
+        FailedVideoFile.objects.all().delete()
+        DuplicateVideoFile.objects.all().delete()
+        Directory.objects.exclude(collection=self.default_collection).delete()
+
+    def _a_long_enough_fixture(self):
+        from django.conf import settings
+        video_dir = '/photos/video_samples'
+        for filename in sorted(os.listdir(video_dir)):
+            path = os.path.join(video_dir, filename)
+            from .video_scripts import _run_ffprobe
+            probe = _run_ffprobe(path)
+            duration = float(probe.get('format', {}).get('duration', 0) or 0)
+            if duration >= settings.MIN_VIDEO_DURATION_SECONDS:
+                return path
+        self.skipTest("No fixture video clears MIN_VIDEO_DURATION_SECONDS in this environment.")
+
+    def test_duplicate_found_under_second_collection_cross_links_the_original(self):
+        fixture = self._a_long_enough_fixture()
+
+        original_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, original_dir, ignore_errors=True)
+        original_path = os.path.join(original_dir, os.path.basename(fixture))
+        shutil.copy(fixture, original_path)
+        create_video_file(original_path)
+        original = VideoFile.objects.get(filename=original_path)
+
+        # Confirm its home really did resolve to the default collection
+        # (original_dir was never registered as any collection's root).
+        self.assertEqual(original.directory.collection_id, self.default_collection.pk)
+        self.assertIn(self.default_collection, original.collections.all())
+        self.assertNotIn(self.second_collection, original.collections.all())
+
+        dup_path = os.path.join(self.second_root, 'duplicate_' + os.path.basename(fixture))
+        shutil.copy(fixture, dup_path)
+        create_video_file(dup_path)
+
+        # No second VideoFile row -- same content, recorded as a
+        # DuplicateVideoFile instead.
+        self.assertFalse(VideoFile.objects.filter(filename=dup_path).exists())
+        dup = DuplicateVideoFile.objects.get(filename=dup_path)
+        self.assertEqual(dup.original_id, original.pk)
+        self.assertEqual(dup.collection_id, self.second_collection.pk)
+
+        # The ORIGINAL (whose home is still the default collection) is
+        # now also visible from the second collection.
+        original.refresh_from_db()
+        self.assertIn(self.default_collection, original.collections.all())
+        self.assertIn(self.second_collection, original.collections.all())
 
 
 @override_settings(VIDEO_TRANSCODE_ROOT='/tmp/video_transcode_test')

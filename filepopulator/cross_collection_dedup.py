@@ -231,6 +231,10 @@ def resolve_pair(pair, dry_run=False):
             # -- never discard it.
             secondary_transfer_ids.append(s_info['id'])
 
+    # secondary.isProcessed is read BEFORE this function ever touches it
+    # -- used below to decide whether primary can also be marked done.
+    secondary_was_processed = secondary.isProcessed
+
     if not dry_run:
         with transaction.atomic():
             for face in Face.objects.filter(pk__in=primary_delete_ids):
@@ -238,7 +242,40 @@ def resolve_pair(pair, dry_run=False):
             for face in Face.objects.filter(pk__in=secondary_delete_ids):
                 face.delete()
             if secondary_transfer_ids:
-                Face.objects.filter(pk__in=secondary_transfer_ids).update(source_image_file=primary)
+                # A transferred face's box AND kps (both stored in the
+                # SOURCE IMAGE's own absolute pixel coordinates) are only
+                # valid in secondary's resolution -- found as a real bug
+                # 2026-10-21 (see CLAUDE.md): a face transferred without
+                # rescaling could silently misplace a box, or (worse) get
+                # caught by face_extract_encode.py's "existing face, no
+                # matching fresh detection" reconciliation path the next
+                # time primary is processed, which clamps the box to
+                # primary's actual dimensions and -- if that clamping
+                # produces a degenerate box -- deletes the face outright.
+                # Rescaling by the pair's own width/height ratio (already
+                # computed above for the IOU match itself) keeps every
+                # transferred face's geometry correct in primary's space.
+                # kps is a flat [x1,y1,x2,y2,...,x5,y5] list -- the same
+                # per-axis scale applies to each point, same as the box
+                # corners; rescaling it (rather than discarding it) keeps
+                # reencode_missing_faces()'s exact kps-replay path
+                # available later instead of falling back to its lossier
+                # crop-based re-detection.
+                to_transfer = list(Face.objects.filter(pk__in=secondary_transfer_ids))
+                for face in to_transfer:
+                    face.source_image_file = primary
+                    face.box_left = int(round(face.box_left * scale_x))
+                    face.box_top = int(round(face.box_top * scale_y))
+                    face.box_right = int(round(face.box_right * scale_x))
+                    face.box_bottom = int(round(face.box_bottom * scale_y))
+                    if face.kps is not None:
+                        face.kps = [
+                            coord * (scale_x if idx % 2 == 0 else scale_y)
+                            for idx, coord in enumerate(face.kps)
+                        ]
+                Face.objects.bulk_update(
+                    to_transfer, ['source_image_file', 'box_left', 'box_top', 'box_right', 'box_bottom', 'kps'],
+                )
 
             # Keep the primary queryable as "visible from" the secondary's
             # collection too, same cross-linking convention
@@ -250,6 +287,19 @@ def resolve_pair(pair, dry_run=False):
             # Never independently re-extracted again -- all of its real
             # faces now live on primary (or already did).
             ImageFile.objects.filter(pk=secondary.pk).update(isProcessed=True)
+
+            # If secondary had already completed its own real detection
+            # pass, every real face for this content is now captured on
+            # primary too (matched survivors + transfers) -- marking
+            # primary done as well avoids both a wasted redundant
+            # detection pass AND the reconciliation risk above for any
+            # face that doesn't happen to re-match. If secondary was
+            # NEVER processed, primary is left exactly as it was (it may
+            # still need its own first real detection pass -- nothing
+            # here can know whether more faces exist that neither copy's
+            # extraction run ever found).
+            if secondary_was_processed:
+                ImageFile.objects.filter(pk=primary.pk).update(isProcessed=True)
 
             CrossCollectionImageDuplicate.objects.update_or_create(
                 image_a_id=lo_id, image_b_id=hi_id,
