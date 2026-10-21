@@ -2150,6 +2150,66 @@ class SizeNudgeMarginGateTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class ClassificationInvariantCheckTests(TestCase):
+    """faceAssigner._verify_classification_invariant(): a safety net run
+    at the end of every execute() call -- a face with a real encoding
+    and no poss_ident1 proposal shouldn't exist after a normal pass
+    (every real classify_unassigned() success path sets something).
+    classify_unassigned() itself is mocked throughout -- this tests the
+    invariant-check/retry/log_error wiring, not real classification
+    math (already covered elsewhere)."""
+
+    def _make_leftover_face(self):
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+        face = make_face(img, declared_name=blank_person)
+        face.face_encoding_512 = (np.ones(512) / np.sqrt(512)).tolist()
+        face.poss_ident1 = None
+        face.save()
+        return face
+
+    def test_no_leftover_faces_is_a_no_op(self):
+        from common.models import ApplicationError
+        assigner = faceAssigner()
+        with patch.object(faceAssigner, 'classify_unassigned') as mock_classify:
+            assigner._verify_classification_invariant()
+        mock_classify.assert_not_called()
+        self.assertEqual(ApplicationError.objects.count(), 0)
+
+    def test_leftover_face_that_succeeds_on_retry_is_not_logged(self):
+        from common.models import ApplicationError
+        face = self._make_leftover_face()
+        person = make_person("Retried Match")
+        assigner = faceAssigner()
+
+        def fake_classify(f):
+            # Simulate a successful classification on retry.
+            f.poss_ident1 = person
+            f.save()
+
+        with patch.object(faceAssigner, 'classify_unassigned', side_effect=fake_classify):
+            assigner._verify_classification_invariant()
+
+        face.refresh_from_db()
+        self.assertEqual(face.poss_ident1_id, person.id)
+        self.assertEqual(ApplicationError.objects.count(), 0)
+
+    def test_leftover_face_that_keeps_failing_is_logged(self):
+        from common.models import ApplicationError
+        face = self._make_leftover_face()
+        assigner = faceAssigner()
+
+        with patch.object(faceAssigner, 'classify_unassigned', side_effect=RuntimeError("boom")):
+            assigner._verify_classification_invariant()
+
+        self.assertEqual(ApplicationError.objects.count(), 1)
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'face_manager.assign_faces.execute')
+        self.assertIn(str(face.id), error.message)
+        self.assertFalse(error.dismissed)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class VerificationClusterGroupTests(TestCase):
     """Face.verification_cluster_group: nightly per-person complete-linkage
     clustering of confirmed-but-unverified faces, so a human reviewer can

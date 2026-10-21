@@ -5,6 +5,7 @@ from django.contrib.auth.models import User, Group
 from django.core.paginator import Paginator
 from drf_queryfields import QueryFieldsMixin
 from api.models import ScheduleRule, SlideshowConfig
+from common.models import ApplicationError
 from face_manager.models import Person, Face
 from filepopulator.models import ImageFile, Directory, VideoFile, PhotoCollection
 from rest_framework import serializers
@@ -537,6 +538,13 @@ class ScheduleRuleSerializer(serializers.ModelSerializer):
         # (e.g. in tests) and render consistently in the settings page.
         ordered = [d for d in ScheduleRule.WEEKDAY_ABBREVIATIONS if d in days]
         return ','.join(ordered)
+
+
+class ApplicationErrorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ApplicationError
+        fields = ['id', 'source', 'message', 'created_at', 'dismissed', 'dismissed_at']
+        read_only_fields = fields
 
 
 class CameraGpsBackfillStatusSerializer(serializers.Serializer):

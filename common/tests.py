@@ -315,3 +315,28 @@ class AdvisoryLockTests(TestCase):
             with advisory_lock('common.tests.name_b') as acquired_b:
                 self.assertTrue(acquired_a)
                 self.assertTrue(acquired_b)
+
+
+class ApplicationErrorLogTests(TestCase):
+    def test_log_error_creates_an_undismissed_row(self):
+        from common.error_log import log_error
+        from common.models import ApplicationError
+
+        log_error('some.module.function', 'Something worth a look.')
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'some.module.function')
+        self.assertEqual(error.message, 'Something worth a look.')
+        self.assertFalse(error.dismissed)
+        self.assertIsNone(error.dismissed_at)
+        self.assertIsNotNone(error.created_at)
+
+    def test_newest_first_ordering(self):
+        from common.error_log import log_error
+        from common.models import ApplicationError
+
+        log_error('a', 'first')
+        log_error('a', 'second')
+
+        messages_in_order = list(ApplicationError.objects.values_list('message', flat=True))
+        self.assertEqual(messages_in_order, ['second', 'first'])

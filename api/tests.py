@@ -1179,6 +1179,55 @@ class StatsAndParametersTests(ApiTestCase):
         self.assertEqual(resp.data["num_videos_failed"], 1)
 
 
+class ApplicationErrorApiTests(ApiTestCase):
+    """common.models.ApplicationError / common.error_log.log_error() --
+    a curated, dismissible error log entries are written to server-side;
+    this API only ever lists and dismisses them."""
+
+    def test_requires_auth(self):
+        resp = self.anon_client.get("/api/application_errors/")
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_list_defaults_to_undismissed_only(self):
+        from common.error_log import log_error
+        log_error('a.b', 'still open')
+        log_error('a.b', 'already handled')
+        from common.models import ApplicationError
+        ApplicationError.objects.filter(message='already handled').update(dismissed=True)
+
+        resp = self.client.get("/api/application_errors/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        messages = [row['message'] for row in resp.data['results']] if 'results' in resp.data else [
+            row['message'] for row in resp.data]
+        self.assertIn('still open', messages)
+        self.assertNotIn('already handled', messages)
+
+    def test_include_dismissed_query_param(self):
+        from common.error_log import log_error
+        log_error('a.b', 'already handled')
+        from common.models import ApplicationError
+        ApplicationError.objects.filter(message='already handled').update(dismissed=True)
+
+        resp = self.client.get("/api/application_errors/?include_dismissed=true")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        messages = [row['message'] for row in resp.data['results']] if 'results' in resp.data else [
+            row['message'] for row in resp.data]
+        self.assertIn('already handled', messages)
+
+    def test_dismiss_marks_it_dismissed(self):
+        from common.error_log import log_error
+        log_error('a.b', 'needs dismissing')
+        from common.models import ApplicationError
+        error = ApplicationError.objects.get()
+
+        resp = self.client.post(f"/api/application_errors/{error.pk}/dismiss/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        error.refresh_from_db()
+        self.assertTrue(error.dismissed)
+        self.assertIsNotNone(error.dismissed_at)
+
+
 class CameraGpsBackfillConfigApiTests(ApiTestCase):
     """Backend for the camera-opt-in toggle page (mirrors the existing
     nearest-metro-override tool's split -- this repo provides the API,

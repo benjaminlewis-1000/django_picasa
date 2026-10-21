@@ -24,6 +24,7 @@ router.register(r'server_stats', views.StatsViewSet, basename='stats')
 router.register(r'slideshow_configs', views.SlideshowConfigViewSet)
 router.register(r'schedule_rules', views.ScheduleRuleViewSet)
 router.register(r'camera_gps_backfill_config', views.CameraGpsBackfillConfigViewSet, basename='camera_gps_backfill_config')
+router.register(r'application_errors', views.ApplicationErrorViewSet, basename='application_errors')
 # router.register(r'request-token', obtain_auth_token)
 
 # TODO: Add a 'Help' section or something. 

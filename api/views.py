@@ -2144,6 +2144,33 @@ class StatsViewSet(viewsets.ViewSet):
         return Response(stat_serializer.data)
 
 
+class ApplicationErrorViewSet(viewsets.ReadOnlyModelViewSet):
+    """Backend-written, frontend-dismissible error log (common.models.
+    ApplicationError / common.error_log.log_error()) -- a curated,
+    smaller layer on top of real server logging, for things worth
+    surfacing to a human without them having to think to go check log
+    files. Read-only + dismiss from the API -- entries are only ever
+    created server-side, via log_error()."""
+    permission_classes = (IsAuthenticated,)
+    serializer_class = api_ser.ApplicationErrorSerializer
+
+    def get_queryset(self):
+        from common.models import ApplicationError
+        qs = ApplicationError.objects.all()
+        if self.request.query_params.get('include_dismissed', '').lower() != 'true':
+            qs = qs.filter(dismissed=False)
+        return qs
+
+    @action(detail=True, methods=['post'])
+    def dismiss(self, request, pk=None):
+        from django.utils import timezone
+        error = self.get_object()
+        error.dismissed = True
+        error.dismissed_at = timezone.now()
+        error.save()
+        return Response(api_ser.ApplicationErrorSerializer(error).data)
+
+
 class CameraGpsBackfillConfigViewSet(viewsets.ViewSet):
     """Backend for a frontend toggle page (same shape as the existing
     nearest-metro-override tool, built outside this repo) -- lets the

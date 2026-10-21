@@ -672,6 +672,63 @@ class faceAssigner():
         for u_img in tqdm(unassigned.iterator()):
             self._classify_one_safely(u_img.id, u_img)
 
+        self._verify_classification_invariant()
+
+    def _verify_classification_invariant(self):
+        """Safety net, run at the end of every execute() call: a face
+        that's declared_name=blank, has a real (non-NULL, non-sentinel)
+        encoding, and still has no poss_ident1 proposal should not exist
+        after a normal pass -- every real success path through
+        classify_unassigned() ends by calling set_possible_person() with
+        something (a real candidate or the soft-ignore person, see that
+        method's own branches). The only way a face stays in this state
+        is an exception during classify_unassigned() (already logged
+        individually by _classify_one_safely(), but easy to miss among
+        everything else) or a genuine race (e.g. its source ImageFile
+        was deleted mid-run -- confirmed real, 2026-10-05).
+
+        Retries each once more here -- cheap, and resolves most transient
+        cases within the same run instead of leaving them for the next
+        scheduled run an hour later -- then records anything still
+        unresolved via common.error_log.log_error(), so a genuinely
+        persistent problem is visible in the frontend's error log
+        instead of silently piling up (confirmed real need, 2026-10-21:
+        investigating a user-reported gap between "faces with a
+        proposal" and "total unassigned faces" found this exact
+        invariant had no visibility when violated)."""
+        unassigned_crit = Q(declared_name__person_name=settings.BLANK_FACE_NAME)
+        has_long = ~Q(face_encoding_512=None)
+        long_encoded = ~Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
+        no_suggestions = Q(poss_ident1__person_name=None)
+
+        leftover_ids = list(
+            Face.objects.filter(unassigned_crit & has_long & long_encoded & no_suggestions)
+            .values_list('id', flat=True)
+        )
+        if not leftover_ids:
+            return
+
+        settings.LOGGER.warning(
+            f"classify_unassigned() invariant check: {len(leftover_ids)} face(s) still have no "
+            f"proposal despite a real encoding after this run -- retrying once."
+        )
+        for face in Face.objects.filter(id__in=leftover_ids).select_related('declared_name'):
+            self._classify_one_safely(face.id, face)
+
+        still_broken = list(
+            Face.objects.filter(unassigned_crit & has_long & long_encoded & no_suggestions)
+            .values_list('id', flat=True)
+        )
+        if still_broken:
+            message = (
+                f"{len(still_broken)} face(s) still have no proposal despite a real encoding, "
+                f"even after a retry this run -- ids: {still_broken[:50]}"
+                f"{'...' if len(still_broken) > 50 else ''}"
+            )
+            settings.LOGGER.error(f"classify_unassigned() invariant check: {message}")
+            from common.error_log import log_error
+            log_error('face_manager.assign_faces.execute', message)
+
     def _classify_one_safely(self, face_id, face):
         try:
             self.classify_unassigned(face)
