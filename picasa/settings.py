@@ -59,6 +59,14 @@ if in_docker:
         
     PHOTO_ROOT = '/photos'
     PHOTO_ROOT_RW = '/photos_rw'
+    # Second PhotoCollection's root (see filepopulator/models.py's
+    # PhotoCollection) -- same mount already used for the "Lewis Parents"
+    # photo collection (docker-compose.yaml's LEWIS_PARENTS_ROOT bind
+    # mount), now also added to FILEPOPULATOR_SERVER_VIDEO_DIRS below so
+    # videos interspersed in their tree (no dedicated video subfolder,
+    # same "intermixed with photos" layout as PHOTO_ROOT) get scanned
+    # too -- added 2026-10-21, at the user's request.
+    LEWIS_PARENTS_ROOT = '/lewis_parents'
     # Deliberately its OWN bind mount (docker-compose.yaml), not a reuse
     # of PHOTO_ROOT_RW's whole-tree read-write access -- the upload
     # endpoint (api/upload_views.py) can only ever write inside this one
@@ -110,6 +118,10 @@ else:
     SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
     ALLOWED_HOSTS = ['localhost', '127.0.0.1']
     PHOTO_ROOT = '/home/benjamin/git_repos/picasa_files/actual_imgs'
+    # No real Lewis Parents mount in local dev -- just a harmless unused
+    # path (the scanner finds nothing there, same as any other locally-
+    # absent directory already tolerated elsewhere in this codebase).
+    LEWIS_PARENTS_ROOT = os.path.join(PROJECT_ROOT, 'lewis_parents_local_dev_stub')
     # No separate mount in local dev -- just a subdirectory of the same
     # tree, matching the Docker layout's intent (staged uploads land
     # somewhere the ingestion scanner already walks).
@@ -755,8 +767,11 @@ VIDEO_ROOTS = [
 ]
 # Also scan PHOTO_ROOT for videos interspersed in the existing photo
 # tree (some are, per the user, alongside the two dedicated folders
-# above).
-FILEPOPULATOR_SERVER_VIDEO_DIRS = VIDEO_ROOTS + [PHOTO_ROOT]
+# above). LEWIS_PARENTS_ROOT added 2026-10-21 for the same reason --
+# that collection has no dedicated video subfolder either (confirmed by
+# directory listing), videos are interspersed in their Pictures tree
+# just like PHOTO_ROOT's own.
+FILEPOPULATOR_SERVER_VIDEO_DIRS = VIDEO_ROOTS + [PHOTO_ROOT, LEWIS_PARENTS_ROOT]
 
 # Phase 5 (transcode pipeline), added 2026-10-15. Codecs a browser (or
 # the Raspberry Pi this is actually being built for, which has no
