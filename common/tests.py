@@ -1,5 +1,6 @@
 import os
 import zlib
+from datetime import timedelta
 
 import cv2
 import numpy as np
@@ -7,6 +8,7 @@ import psycopg2
 from django.conf import settings
 from django.db import connection
 from django.test import TestCase
+from django.utils import timezone
 from PIL import Image
 
 from common.advisory_lock import advisory_lock
@@ -340,3 +342,141 @@ class ApplicationErrorLogTests(TestCase):
 
         messages_in_order = list(ApplicationError.objects.values_list('message', flat=True))
         self.assertEqual(messages_in_order, ['second', 'first'])
+
+
+class TaskHeartbeatTests(TestCase):
+    def test_start_creates_a_row(self):
+        from common.heartbeat import record_heartbeat_start
+        from common.models import TaskHeartbeat
+
+        record_heartbeat_start('some.task')
+
+        heartbeat = TaskHeartbeat.objects.get(task_name='some.task')
+        self.assertIsNotNone(heartbeat.last_started_at)
+        self.assertIsNone(heartbeat.last_completed_at)
+
+    def test_start_then_done_updates_both_fields(self):
+        from common.heartbeat import record_heartbeat_start, record_heartbeat_done
+        from common.models import TaskHeartbeat
+
+        record_heartbeat_start('some.task')
+        record_heartbeat_done('some.task')
+
+        heartbeat = TaskHeartbeat.objects.get(task_name='some.task')
+        self.assertIsNotNone(heartbeat.last_completed_at)
+        self.assertGreaterEqual(heartbeat.last_completed_at, heartbeat.last_started_at)
+
+    def test_second_start_overwrites_the_same_row_not_a_duplicate(self):
+        from common.heartbeat import record_heartbeat_start
+        from common.models import TaskHeartbeat
+
+        record_heartbeat_start('some.task')
+        record_heartbeat_start('some.task')
+
+        self.assertEqual(TaskHeartbeat.objects.filter(task_name='some.task').count(), 1)
+
+    def test_done_without_a_prior_start_is_a_harmless_no_op(self):
+        from common.heartbeat import record_heartbeat_done
+        from common.models import TaskHeartbeat
+
+        record_heartbeat_done('never_started.task')  # must not raise
+
+        self.assertFalse(TaskHeartbeat.objects.filter(task_name='never_started.task').exists())
+
+
+class CheckTaskHeartbeatsTaskTests(TestCase):
+    """common.check_task_heartbeats -- watches common.tasks.
+    HEARTBEAT_REGISTRY for two independent failure modes a try/except
+    can never catch on its own: a task that hasn't been invoked
+    recently enough, and a task that started but never finished (stuck/
+    hung). Exercises the registry's own real entry directly rather than
+    a fake one, since the watchdog task hardcodes HEARTBEAT_REGISTRY
+    (not dependency-injected) -- this is the one real registered task
+    name, 'face_manager.thistask.weekly_full'."""
+
+    TASK_NAME = 'face_manager.thistask.weekly_full'
+
+    def test_never_recorded_is_flagged(self):
+        from common.models import ApplicationError
+        from common.tasks import check_task_heartbeats
+
+        check_task_heartbeats()
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'common.tasks.check_task_heartbeats')
+        self.assertIn(self.TASK_NAME, error.message)
+        self.assertIn('never recorded', error.message)
+
+    def test_recently_started_and_completed_is_healthy(self):
+        from common.models import ApplicationError, TaskHeartbeat
+        from common.tasks import check_task_heartbeats
+
+        now = timezone.now()
+        TaskHeartbeat.objects.create(
+            task_name=self.TASK_NAME, last_started_at=now, last_completed_at=now,
+        )
+
+        check_task_heartbeats()
+
+        self.assertEqual(ApplicationError.objects.count(), 0)
+
+    def test_stale_start_is_flagged(self):
+        from common.models import ApplicationError, TaskHeartbeat
+        from common.tasks import check_task_heartbeats
+
+        long_ago = timezone.now() - timedelta(days=30)
+        TaskHeartbeat.objects.create(
+            task_name=self.TASK_NAME, last_started_at=long_ago, last_completed_at=long_ago,
+        )
+
+        check_task_heartbeats()
+
+        error = ApplicationError.objects.get()
+        self.assertIn("hasn't started a new run", error.message)
+
+    def test_started_but_never_completed_within_budget_is_flagged_as_stuck(self):
+        from common.models import ApplicationError, TaskHeartbeat
+        from common.tasks import check_task_heartbeats
+
+        # Recent enough that "hasn't started recently" wouldn't fire on
+        # its own, but well past the 24h runtime budget with no
+        # completion recorded at all -- the stuck/hung case.
+        started = timezone.now() - timedelta(hours=25)
+        TaskHeartbeat.objects.create(
+            task_name=self.TASK_NAME, last_started_at=started, last_completed_at=None,
+        )
+
+        check_task_heartbeats()
+
+        error = ApplicationError.objects.get()
+        self.assertIn('possibly stuck', error.message)
+
+    def test_in_progress_but_still_within_runtime_budget_is_not_flagged(self):
+        from common.models import ApplicationError, TaskHeartbeat
+        from common.tasks import check_task_heartbeats
+
+        started = timezone.now() - timedelta(hours=2)
+        TaskHeartbeat.objects.create(
+            task_name=self.TASK_NAME, last_started_at=started, last_completed_at=None,
+        )
+
+        check_task_heartbeats()
+
+        self.assertEqual(ApplicationError.objects.count(), 0)
+
+    def test_stale_previous_completion_does_not_mask_a_stuck_current_run(self):
+        # last_completed_at from a PREVIOUS run, older than the current
+        # last_started_at, must not be read as "this run finished."
+        from common.models import ApplicationError, TaskHeartbeat
+        from common.tasks import check_task_heartbeats
+
+        old_completion = timezone.now() - timedelta(days=7)
+        new_start = timezone.now() - timedelta(hours=25)
+        TaskHeartbeat.objects.create(
+            task_name=self.TASK_NAME, last_started_at=new_start, last_completed_at=old_completion,
+        )
+
+        check_task_heartbeats()
+
+        error = ApplicationError.objects.get()
+        self.assertIn('possibly stuck', error.message)
