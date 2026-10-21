@@ -5509,6 +5509,60 @@ class BackfillS23GpsTests(TestCase):
 
         self.assertEqual(counts['matched'], 1)
 
+    def test_corrupted_ancient_date_is_excluded_from_the_queue(self):
+        # Real production bug (2026-10-21): confirmed ImageFile.dateTaken
+        # corruption (e.g. year 0102) sorted first under order_by(
+        # 'dateTaken'), burning the whole run's budget on guaranteed-
+        # failure rows before ever reaching a real candidate.
+        # dateTakenValid=True on every one of these (it only tracks "a
+        # date was parsed from somewhere," not "the date is plausible"),
+        # so MIN_SANE_DATE_TAKEN_YEAR is a real, separate floor.
+        import datetime
+        old = self._bare_image(
+            'Galaxy S23+', dateTaken=datetime.datetime(102, 10, 9, tzinfo=datetime.timezone.utc))
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run') as mock_exiftool:
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            backfill_camera_gps()
+
+        mock_exiftool.assert_not_called()
+        from filepopulator.models import GpsEstimationAttempt
+        self.assertFalse(GpsEstimationAttempt.objects.filter(image=old).exists())
+        old.refresh_from_db()
+        self.assertEqual(old.gps_lat_decimal, -999)
+
+    def test_camera_and_person_populations_each_get_a_fair_share_of_limit(self):
+        # Real production bug (2026-10-21): adding the verified-person
+        # path grew the eligible queue substantially (camera-allowlist-
+        # only backlog ~11k -> ~22k combined), and a single combined
+        # date-ordered queue let the larger population completely starve
+        # the other out of ever being reached. Each population must now
+        # get its own fair share of `limit` instead.
+        from face_manager.models import Person
+        person = Person.objects.create(person_name='Benjamin Lewis', gps_backfill_source=True)
+
+        camera_imgs = [self._bare_image('Galaxy S23+') for _ in range(3)]
+        person_imgs = []
+        for _ in range(3):
+            img = self._bare_image('Totally Unenrolled Camera')
+            self._make_face(img, person, True)
+            person_imgs.append(img)
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(status_code=404)  # "no nearby point"
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            backfill_camera_gps(limit=2)
+
+        from filepopulator.models import GpsEstimationAttempt
+        touched_camera = GpsEstimationAttempt.objects.filter(
+            image__in=camera_imgs).count()
+        touched_person = GpsEstimationAttempt.objects.filter(
+            image__in=person_imgs).count()
+        self.assertEqual(touched_camera, 1)
+        self.assertEqual(touched_person, 1)
+
 
 class PhotoCollectionTests(TestCase):
     """PhotoCollection: resolution, per-collection Directory assignment

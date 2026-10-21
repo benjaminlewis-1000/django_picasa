@@ -42,6 +42,16 @@ from django.conf import settings
 EXIFTOOL_TIMEOUT_SECONDS = 30
 REQUEST_TIMEOUT_SECONDS = 15
 
+# Excludes confirmed ImageFile.dateTaken corruption (e.g. year 0102 --
+# see backfill_camera_gps()'s own docstring) from ever leading the
+# date-ordered backfill queue. Doubles as a real OwnTracks-tracking-start
+# floor, not just a corruption filter -- tracking began around 2015, so
+# nothing before this year could ever get a real match anyway (would
+# just burn a call to end up "no nearby point"). 2010 per the user's own
+# recollection (2026-10-21), a deliberately conservative few years
+# earlier than the actual ~2015 start, in case that's misremembered.
+MIN_SANE_DATE_TAKEN_YEAR = 2010
+
 # The per-camera allowlist itself now lives in CameraGpsBackfillConfig
 # (DB-backed, toggleable from a frontend page) -- see that model's own
 # docstring for why this moved out of code. get_enabled_camera_models()
@@ -225,30 +235,69 @@ def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
     is skipped entirely (no exiftool/HTTP call at all) -- see that
     model's own docstring for why. retry_failed=True re-includes rows
     whose existing attempt was 'no_nearby_point' specifically (never
-    'no_offset_tag', which can't change)."""
+    'no_offset_tag', which can't change).
+
+    MIN_SANE_DATE_TAKEN_YEAR excludes ImageFile.dateTaken corruption
+    (confirmed real, 2026-10-21: 4,937 rows with a dateTaken year before
+    1990, e.g. year 0102 -- a known fallback/default-date bug, NOT
+    filtered out by dateTakenValid, which is True on every one of them;
+    that field only tracks "a date was parsed from somewhere," not "the
+    date is plausible"). Without this bound, ordering by dateTaken puts
+    every corrupted row first, burning the whole run's budget on
+    guaranteed no_offset_tag skips before ever reaching a real candidate.
+
+    The two eligibility reasons are queried and capped SEPARATELY (each
+    gets a fair half of `limit`, one borrowing the other's slack if it
+    has fewer candidates) rather than one combined date-ordered queue --
+    confirmed real, 2026-10-21: adding the verified-person path grew the
+    queue from ~11k to ~22k, and a single combined queue let it
+    completely starve the original camera-allowlist population (3 full
+    runs, 3000 photos, zero reaching a camera-allowlist-only row) even
+    before the date-corruption issue above compounded it further."""
     from django.db.models import Q
     from filepopulator.models import GpsEstimationAttempt, ImageFile
 
     if camera_models is None:
         camera_models = get_enabled_camera_models()
 
-    eligibility = Q(camera_model__in=camera_models)
-    if include_verified_person:
-        eligibility |= Q(face__validated=True, face__declared_name__gps_backfill_source=True)
+    def _scope(qs):
+        qs = qs.filter(gps_lat_decimal=-999, dateTaken__year__gte=MIN_SANE_DATE_TAKEN_YEAR)
+        if start_date:
+            qs = qs.filter(dateTaken__date__gte=start_date)
+        if end_date:
+            qs = qs.filter(dateTaken__date__lte=end_date)
+        if retry_failed:
+            qs = qs.exclude(gps_estimation_attempt__reason=GpsEstimationAttempt.REASON_NO_OFFSET_TAG)
+        else:
+            qs = qs.filter(gps_estimation_attempt__isnull=True)
+        return qs.order_by('dateTaken')
 
-    qs = ImageFile.objects.filter(
-        eligibility, gps_lat_decimal=-999,
-    ).distinct().order_by('dateTaken')
-    if start_date:
-        qs = qs.filter(dateTaken__date__gte=start_date)
-    if end_date:
-        qs = qs.filter(dateTaken__date__lte=end_date)
-    if retry_failed:
-        qs = qs.exclude(gps_estimation_attempt__reason=GpsEstimationAttempt.REASON_NO_OFFSET_TAG)
+    camera_qs = _scope(ImageFile.objects.filter(camera_model__in=camera_models))
+    if include_verified_person:
+        person_qs = _scope(
+            ImageFile.objects.filter(face__validated=True, face__declared_name__gps_backfill_source=True)
+            .exclude(camera_model__in=camera_models)
+        ).distinct()
     else:
-        qs = qs.filter(gps_estimation_attempt__isnull=True)
+        person_qs = ImageFile.objects.none()
+
     if limit:
-        qs = qs[:limit]
+        camera_share = limit // 2 + limit % 2
+        camera_todo = list(camera_qs[:camera_share])
+        person_todo = list(person_qs[:limit - len(camera_todo)])
+        # camera_todo took its full share but person_qs still had room
+        # left in its own share -- or vice versa -- don't waste it.
+        slack = limit - len(camera_todo) - len(person_todo)
+        if slack > 0:
+            if len(camera_todo) == camera_share:
+                camera_todo += list(camera_qs[camera_share:camera_share + slack])
+            else:
+                person_todo += list(person_qs[len(person_todo):len(person_todo) + slack])
+    else:
+        camera_todo = list(camera_qs)
+        person_todo = list(person_qs)
+
+    qs = camera_todo + person_todo
 
     counts = {'matched': 0, 'no_offset_tag': 0, 'no_nearby_point': 0, 'error': 0}
     for img in qs:
