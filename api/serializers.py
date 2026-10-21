@@ -257,14 +257,43 @@ class ParameterSerializer(serializers.Serializer):
     def create(self, validated_data):
         return Parameters()
     
+def _compute_video_stats(video_qs):
+    """Shared by ServerStatsSerializer's global totals and its
+    per-collection breakdown -- same formulas, just handed a pre-filtered
+    (or unfiltered, for the global case) VideoFile queryset. Scoped via
+    VideoFile.directory__collection (the single "home" FK -- videos have
+    no ImageFile.collections-style "visible from" M2M, since there's no
+    cross-collection video dedup/cross-linking the way there is for
+    images)."""
+    stats = {}
+    stats['num_videos'] = video_qs.count()
+    stats['num_videos_processed'] = video_qs.filter(isProcessed=True).count()
+    video_percent = (stats['num_videos_processed'] / stats['num_videos'] * 100) if stats['num_videos'] else 0.0
+    stats['percent_video_processed'] = f'{video_percent:.2f}%'
+
+    total_seconds = video_qs.aggregate(total=Sum('duration_seconds'))['total'] or 0
+    unprocessed_seconds = video_qs.filter(isProcessed=False).aggregate(
+        total=Sum('duration_seconds'))['total'] or 0
+    stats['total_video_length'] = _format_duration_seconds(total_seconds)
+    stats['unprocessed_video_length'] = _format_duration_seconds(unprocessed_seconds)
+    processed_seconds = total_seconds - unprocessed_seconds
+    length_percent = (processed_seconds / total_seconds * 100) if total_seconds else 0.0
+    stats['percent_video_length_processed'] = f'{length_percent:.2f}%'
+
+    # Distinct from FailedVideoFile (an ingestion-time failure -- never
+    # even became a VideoFile row) -- this counts a VideoFile that WAS
+    # ingested but whose face-extraction pass raised (see
+    # face_manager.tasks.process_video_faces).
+    stats['num_videos_failed'] = video_qs.filter(face_extraction_failed=True).count()
+
+    return stats
+
+
 def _compute_image_face_stats(image_qs, face_qs):
     """Shared by ServerStatsSerializer's global totals and its
     per-collection breakdown -- same formulas, just handed a
     pre-filtered (or unfiltered, for the global case) ImageFile/Face
-    queryset pair. Video stats are deliberately NOT included here --
-    VideoFile has no PhotoCollection concept at all yet (see
-    filepopulator/models.py), so there's nothing to scope by; they stay
-    global-only on the serializer itself."""
+    queryset pair."""
     stats = {}
     stats['num_imgs'] = image_qs.count()
     stats['num_face_processed'] = image_qs.filter(isProcessed=True).count()
@@ -325,36 +354,36 @@ class ServerStatsSerializer(serializers.Serializer):
             imgs_left_to_process = self.num_imgs - self.num_face_processed
             self.estimated_hours_facerec_left = imgs_left_to_process / self.imgs_per_hour_est
 
-            self.num_videos = VideoFile.objects.count()
-            self.num_videos_processed = VideoFile.objects.filter(isProcessed=True).count()
-            video_percent = (self.num_videos_processed / self.num_videos * 100) if self.num_videos else 0.0
-            self.percent_video_processed = f'{video_percent:.2f}%'
+            global_video_stats = _compute_video_stats(VideoFile.objects.all())
+            self.num_videos = global_video_stats['num_videos']
+            self.num_videos_processed = global_video_stats['num_videos_processed']
+            self.percent_video_processed = global_video_stats['percent_video_processed']
+            self.total_video_length = global_video_stats['total_video_length']
+            self.unprocessed_video_length = global_video_stats['unprocessed_video_length']
+            self.percent_video_length_processed = global_video_stats['percent_video_length_processed']
+            self.num_videos_failed = global_video_stats['num_videos_failed']
 
-            total_seconds = VideoFile.objects.aggregate(total=Sum('duration_seconds'))['total'] or 0
-            unprocessed_seconds = VideoFile.objects.filter(isProcessed=False).aggregate(
-                total=Sum('duration_seconds'))['total'] or 0
-            self.total_video_length = _format_duration_seconds(total_seconds)
-            self.unprocessed_video_length = _format_duration_seconds(unprocessed_seconds)
-            processed_seconds = total_seconds - unprocessed_seconds
-            length_percent = (processed_seconds / total_seconds * 100) if total_seconds else 0.0
-            self.percent_video_length_processed = f'{length_percent:.2f}%'
-
-            # Distinct from FailedVideoFile (an ingestion-time failure --
-            # never even became a VideoFile row) -- this counts a
-            # VideoFile that WAS ingested but whose face-extraction pass
-            # raised (see face_manager.tasks.process_video_faces).
-            self.num_videos_failed = VideoFile.objects.filter(face_extraction_failed=True).count()
-
-            # Per-collection breakdown -- scoped via ImageFile.collections
-            # (the "visible from" M2M), not Directory.collection (the
-            # single "home" FK), so a cross-collection duplicate photo is
-            # correctly counted in every collection it's visible from, not
-            # just the one that originally discovered it.
+            # Per-collection breakdown. Images: scoped via
+            # ImageFile.collections (the "visible from" M2M), not
+            # Directory.collection (the single "home" FK), so a cross-
+            # collection duplicate photo is correctly counted in every
+            # collection it's visible from, not just the one that
+            # originally discovered it. Videos: scoped via
+            # VideoFile.directory__collection -- there's no M2M-style
+            # "visible from" concept on the video side (see
+            # _compute_video_stats' own docstring), and resolving that
+            # FK at all required a real fix (create_video_file() never
+            # used to set Directory.collection -- see
+            # backfill_video_directory_collection, 2026-10-21).
             self.by_collection = []
             for collection in PhotoCollection.objects.all().order_by('name'):
                 image_qs = ImageFile.objects.filter(collections=collection)
                 face_qs = Face.objects.filter(source_image_file__collections=collection)
                 collection_stats = _compute_image_face_stats(image_qs, face_qs)
+
+                video_qs = VideoFile.objects.filter(directory__collection=collection)
+                collection_stats.update(_compute_video_stats(video_qs))
+
                 collection_stats['name'] = collection.name
                 collection_stats['is_default'] = collection.is_default
                 self.by_collection.append(collection_stats)

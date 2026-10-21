@@ -615,6 +615,13 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'filepopulator.find_similar_images',
         'schedule': crontab(minute='45', hour='*'),
     },
+   'merge_cross_collection_image_duplicates': {
+        # Offset 5 minutes after find_similar_images so a newly-
+        # discovered cross-collection duplicate from that same hourly
+        # run is already in SimilarImagePair by the time this looks.
+        'task': 'filepopulator.merge_cross_collection_image_duplicates',
+        'schedule': crontab(minute='50', hour='*'),
+    },
    'reencode_missing_faces': {
         'task': 'face_manager.reencode',
         'schedule': crontab(minute='20', hour='*'),

@@ -1096,6 +1096,45 @@ class StatsAndParametersTests(ApiTestCase):
         self.assertGreaterEqual(resp.data['num_imgs'], 2)
         self.assertGreaterEqual(resp.data['num_faces'], 2)
 
+    def test_stats_endpoint_by_collection_video_breakdown(self):
+        # Videos scope via VideoFile.directory__collection (no M2M
+        # "visible from" the way images have -- see
+        # _compute_video_stats' own docstring), relying on the real fix
+        # to create_video_file()'s directory resolution (2026-10-21).
+        from filepopulator.models import Directory, PhotoCollection, VideoFile
+
+        second = PhotoCollection.objects.create(
+            name='Video Collection', root_directory='/videos/stats_video_test',
+        )
+        second_dir = Directory.objects.create(dir_path='/videos/stats_video_test', collection=second)
+        VideoFile.objects.create(
+            filename='/videos/stats_video_test/a.mp4', directory=second_dir,
+            width=100, height=100, duration_seconds=3600, isProcessed=True,
+        )
+
+        default_collection = PhotoCollection.objects.get(is_default=True)
+        default_dir = Directory.objects.create(
+            dir_path='/videos/stats_video_default_test', collection=default_collection,
+        )
+        VideoFile.objects.create(
+            filename='/videos/stats_video_default_test/b.mp4', directory=default_dir,
+            width=100, height=100, duration_seconds=100, isProcessed=False,
+        )
+
+        resp = self.client.get("/api/server_stats/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        by_name = {row['name']: row for row in resp.data['by_collection']}
+        self.assertEqual(by_name['Video Collection']['num_videos'], 1)
+        self.assertEqual(by_name['Video Collection']['num_videos_processed'], 1)
+        self.assertEqual(by_name['Video Collection']['percent_video_processed'], '100.00%')
+
+        # The default-collection video (b.mp4, unprocessed) shows up in
+        # Default's own breakdown, not Video Collection's.
+        self.assertIn('Default', by_name)
+        default_filenames_total = by_name['Default']['num_videos']
+        self.assertGreaterEqual(default_filenames_total, 1)
+
     def test_stats_endpoint_video_fields_with_no_videos(self):
         """No VideoFile rows at all -- percentages must not divide by zero."""
         img = self.make_image()

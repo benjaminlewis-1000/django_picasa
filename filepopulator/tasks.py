@@ -11,6 +11,7 @@ import os
 # import scripts
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods, cleanup_orphaned_media_files
 from .video_scripts import add_videos_from_root_dir, delete_removed_videos, transcode_pending_videos
+from common.advisory_lock import advisory_lock
 
 if not settings.configured:
     settings.configure()
@@ -124,6 +125,25 @@ def find_similar_images():
 
     from .similarity import run_similarity_check
     run_similarity_check(limit=2000, log=settings.LOGGER.debug)
+
+@shared_task(ignore_result=True, name='filepopulator.merge_cross_collection_image_duplicates')
+def merge_cross_collection_image_duplicates():
+    # Recurring counterpart to the one-off merge_cross_collection_image_
+    # duplicates management command -- processes only pairs that aren't
+    # already resolved (find_unresolved_cross_collection_pairs), so a
+    # newly-discovered cross-collection duplicate (e.g. from a future
+    # collection being added, or ordinary ongoing ingestion) gets
+    # resolved automatically without anyone re-running the command by
+    # hand. See filepopulator/cross_collection_dedup.py for the full
+    # design.
+    with advisory_lock('filepopulator.merge_cross_collection_image_duplicates') as acquired:
+        if not acquired:
+            settings.LOGGER.debug("Already running cross-collection dedup, exiting.")
+            return
+
+        from .cross_collection_dedup import find_unresolved_cross_collection_pairs, resolve_pair
+        for pair in find_unresolved_cross_collection_pairs():
+            resolve_pair(pair, dry_run=False)
 
 @shared_task(ignore_result=True, name='filepopulator.cleanup_orphaned_media')
 def cleanup_orphaned_media():

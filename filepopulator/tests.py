@@ -38,7 +38,7 @@ from .models import ImageFile, Directory, DuplicateFile, FailedImageFile, PhotoC
 # from .forms import ImageFileForm, DirectoryForm
 from .scripts import create_image_file, add_from_root_dir, delete_removed_photos, update_dirs_datetime, check_file_mods, delete_old_thumbnails
 from .video_scripts import create_video_file, add_videos_from_root_dir, delete_removed_videos, _parse_exif_date, compute_video_content_hash
-from face_manager.models import Face
+from face_manager.models import Face, get_default_blank_person
 from common.open_img_oriented import apply_exif_orientation
 
 
@@ -2743,6 +2743,521 @@ class SimilarityTests(TestCase):
         self.assertEqual(pair.hamming_distance, 0)
 
 
+class CrossCollectionDedupClassifyTests(TestCase):
+    """classify_pair(): pure function, exactly reproduces the 4-bucket
+    logic validated against real production data 2026-10-21 (see
+    filepopulator/cross_collection_dedup.py's own docstring and
+    CLAUDE.md for the full investigation)."""
+
+    def _bare_image(self, name, date_taken, make, model):
+        directory, _ = Directory.objects.get_or_create(dir_path='/photos/classify_test')
+        path = f'/photos/classify_test/{name}.jpg'
+        img = ImageFile(
+            filename=path, directory=directory, thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=100, height=100, dateTaken=date_taken,
+            camera_make=make, camera_model=model,
+        )
+        ImageFile.objects.bulk_create([img])
+        return ImageFile.objects.get(filename=path)
+
+    def test_exact_metadata_match(self):
+        from filepopulator.cross_collection_dedup import classify_pair
+        from filepopulator.models import CrossCollectionImageDuplicate
+
+        when = timezone.now()
+        a = self._bare_image('a', when, 'samsung', 'SM-A326W')
+        b = self._bare_image('b', when, 'samsung', 'SM-A326W')
+        self.assertEqual(classify_pair(a, b), CrossCollectionImageDuplicate.REASON_EXACT_METADATA)
+
+    def test_one_side_missing_camera_info(self):
+        from filepopulator.cross_collection_dedup import classify_pair
+        from filepopulator.models import CrossCollectionImageDuplicate
+
+        a = self._bare_image('a', timezone.now(), 'samsung', 'SM-A326W')
+        b = self._bare_image('b', timezone.now() + timedelta(days=30), '', '')
+        self.assertEqual(classify_pair(a, b), CrossCollectionImageDuplicate.REASON_STRIPPED_EXIF)
+
+    def test_same_camera_different_datetaken_is_burst_signature(self):
+        from filepopulator.cross_collection_dedup import classify_pair
+        from filepopulator.models import CrossCollectionImageDuplicate
+
+        a = self._bare_image('a', timezone.now(), 'NIKON CORPORATION', 'NIKON D3100')
+        b = self._bare_image('b', timezone.now() + timedelta(seconds=4), 'NIKON CORPORATION', 'NIKON D3100')
+        self.assertEqual(classify_pair(a, b), CrossCollectionImageDuplicate.REASON_BURST_SIGNATURE)
+
+    def test_differing_camera_make_is_a_conflict(self):
+        from filepopulator.cross_collection_dedup import classify_pair
+        from filepopulator.models import CrossCollectionImageDuplicate
+
+        a = self._bare_image('a', timezone.now(), 'samsung', 'SM-A326W')
+        b = self._bare_image('b', timezone.now(), 'OLYMPUS IMAGING CORP.', 'C960Z')
+        self.assertEqual(classify_pair(a, b), CrossCollectionImageDuplicate.REASON_CAMERA_CONFLICT)
+
+
+class CrossCollectionFaceMatchingTests(TestCase):
+    """match_cross_collection_faces(): pure function, no DB. Mirrors the
+    same optimal-assignment-then-threshold-filter pattern already tested
+    for the duplicate-video case (merge_duplicate_videofiles.py)."""
+
+    def test_rescaled_overlapping_boxes_match(self):
+        from filepopulator.cross_collection_dedup import match_cross_collection_faces
+
+        primary_faces = [{'box': (100, 100, 200, 200)}]
+        # Same relative position, but secondary is half the resolution --
+        # needs scale_x=scale_y=2 to land back on the primary's box.
+        secondary_faces = [{'box': (50, 50, 100, 100)}]
+        matches = match_cross_collection_faces(primary_faces, secondary_faces, scale_x=2.0, scale_y=2.0)
+        self.assertEqual(matches, [(0, 0)])
+
+    def test_non_overlapping_boxes_do_not_match(self):
+        from filepopulator.cross_collection_dedup import match_cross_collection_faces
+
+        primary_faces = [{'box': (0, 0, 50, 50)}]
+        secondary_faces = [{'box': (500, 500, 550, 550)}]
+        matches = match_cross_collection_faces(primary_faces, secondary_faces, scale_x=1.0, scale_y=1.0)
+        self.assertEqual(matches, [])
+
+    def test_picks_the_globally_optimal_pairing_not_a_greedy_one(self):
+        from filepopulator.cross_collection_dedup import match_cross_collection_faces
+
+        # Two faces each side, at (roughly) swapped positions --
+        # confirms this uses real assignment, not "first match wins".
+        primary_faces = [{'box': (0, 0, 50, 50)}, {'box': (200, 200, 250, 250)}]
+        secondary_faces = [{'box': (200, 200, 250, 250)}, {'box': (0, 0, 50, 50)}]
+        matches = match_cross_collection_faces(primary_faces, secondary_faces, scale_x=1.0, scale_y=1.0)
+        self.assertEqual(set(matches), {(0, 1), (1, 0)})
+
+    def test_empty_either_side_returns_no_matches(self):
+        from filepopulator.cross_collection_dedup import match_cross_collection_faces
+
+        self.assertEqual(match_cross_collection_faces([], [{'box': (0, 0, 10, 10)}], 1.0, 1.0), [])
+        self.assertEqual(match_cross_collection_faces([{'box': (0, 0, 10, 10)}], [], 1.0, 1.0), [])
+
+
+@override_settings(MEDIA_ROOT="/tmp/filepopulator_cross_collection_test_media")
+class ResolveCrossCollectionPairTests(TestCase):
+    """resolve_pair(): the real end-to-end orchestration -- real
+    PhotoCollection/Directory/ImageFile/Face rows, real IOU matching and
+    DB writes (or not, for dry_run/needs-review)."""
+
+    def setUp(self):
+        self.collection_a = PhotoCollection.objects.get(is_default=True)
+        self.first_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.first_root, ignore_errors=True)
+        self.second_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.second_root, ignore_errors=True)
+        self.collection_b = PhotoCollection.objects.create(
+            name='Second Collection', root_directory=self.second_root,
+        )
+        # Shared across both sides of a pair by default -- two separate
+        # timezone.now() calls would never land on the same microsecond,
+        # which would wrongly push an otherwise-identical-metadata pair
+        # into the BURST_SIGNATURE bucket instead of EXACT_METADATA.
+        self.shared_date_taken = timezone.now()
+
+    def _make_image(self, name, collection, size_bytes, width=100, height=100,
+                     date_taken=None, make='samsung', model='SM-A326W'):
+        root = self.second_root if collection.pk == self.collection_b.pk else self.first_root
+        directory, _ = Directory.objects.get_or_create(dir_path=root, defaults={'collection': collection})
+        if directory.collection_id != collection.pk:
+            directory.collection = collection
+            directory.save()
+        path = os.path.join(root, f'{name}.jpg')
+        with open(path, 'wb') as f:
+            f.write(os.urandom(size_bytes))
+        img = ImageFile(
+            filename=path, directory=directory, thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=width, height=height, dateTaken=date_taken or self.shared_date_taken,
+            camera_make=make, camera_model=model,
+        )
+        ImageFile.objects.bulk_create([img])
+        img = ImageFile.objects.get(filename=path)
+        # Matches what the real ingestion pipeline does at save time
+        # (instance_clean_and_save()) -- bulk_create() bypasses it, so
+        # this fixture replicates it explicitly rather than leaving
+        # .collections permanently empty like a real ingested row never is.
+        img.collections.add(collection)
+        return img
+
+    def _make_face(self, image, box, person=None, validated=False):
+        bl, bt, br, bb = box
+        face = Face(
+            source_image_file=image, declared_name=person or get_default_blank_person(),
+            box_left=bl, box_top=bt, box_right=br, box_bottom=bb, validated=validated,
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.save()
+        return face
+
+    def _make_pair(self, image_a, image_b, distance=0):
+        from filepopulator.models import SimilarImagePair
+        SimilarImagePair.record(image_a.id, image_b.id, distance)
+        return SimilarImagePair.objects.get(
+            image_a_id=min(image_a.id, image_b.id), image_b_id=max(image_a.id, image_b.id),
+        )
+
+    def test_auto_merge_collapses_matched_faces_onto_the_larger_file(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+        from filepopulator.models import CrossCollectionImageDuplicate
+
+        small = self._make_image('small', self.collection_a, size_bytes=100)
+        big = self._make_image('big', self.collection_b, size_bytes=5000)
+        small_face = self._make_face(small, (10, 10, 30, 30))
+        big_face = self._make_face(big, (10, 10, 30, 30))
+        pair = self._make_pair(small, big)
+
+        stats = resolve_pair(pair, dry_run=False)
+
+        self.assertEqual(stats['status'], CrossCollectionImageDuplicate.STATUS_AUTO_MERGED)
+        self.assertEqual(stats['primary_id'], big.id)
+        self.assertEqual(stats['faces_matched'], 1)
+        # Matched, both bare/unvalidated -- lowest id wins as the tiebreak.
+        survivor_id = min(small_face.id, big_face.id)
+        loser_id = max(small_face.id, big_face.id)
+        self.assertTrue(Face.objects.filter(pk=survivor_id).exists())
+        self.assertFalse(Face.objects.filter(pk=loser_id).exists())
+        self.assertEqual(Face.objects.get(pk=survivor_id).source_image_file_id, big.id)
+
+        small.refresh_from_db()
+        self.assertTrue(small.isProcessed)
+        self.assertIn(self.collection_b, big.collections.all())
+
+        record = CrossCollectionImageDuplicate.objects.get(image_a_id=min(small.id, big.id), image_b_id=max(small.id, big.id))
+        self.assertEqual(record.status, CrossCollectionImageDuplicate.STATUS_AUTO_MERGED)
+        self.assertEqual(record.primary_image_id, big.id)
+
+    def test_unmatched_secondary_face_is_transferred_not_deleted(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+
+        small = self._make_image('small2', self.collection_a, size_bytes=100)
+        big = self._make_image('big2', self.collection_b, size_bytes=5000)
+        # Only the secondary (small, since it's the smaller file) has a
+        # face at all -- a detection only one side's extraction run found.
+        secondary_only_face = self._make_face(small, (10, 10, 30, 30))
+        pair = self._make_pair(small, big)
+
+        stats = resolve_pair(pair, dry_run=False)
+
+        self.assertEqual(stats['faces_transferred'], 1)
+        self.assertEqual(stats['faces_deleted'], 0)
+        secondary_only_face.refresh_from_db()
+        self.assertEqual(secondary_only_face.source_image_file_id, big.id)
+
+    def test_validated_face_always_survives_a_match(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+        from face_manager.models import Person
+
+        person = Person.objects.create(person_name='Real Person')
+        small = self._make_image('small3', self.collection_a, size_bytes=100)
+        big = self._make_image('big3', self.collection_b, size_bytes=5000)
+        # The validated face is on the SMALLER (non-primary) file -- it
+        # must still win and end up on the primary.
+        validated_face = self._make_face(small, (10, 10, 30, 30), person=person, validated=True)
+        unvalidated_face = self._make_face(big, (10, 10, 30, 30))
+        pair = self._make_pair(small, big)
+
+        resolve_pair(pair, dry_run=False)
+
+        self.assertTrue(Face.objects.filter(pk=validated_face.pk).exists())
+        self.assertFalse(Face.objects.filter(pk=unvalidated_face.pk).exists())
+        validated_face.refresh_from_db()
+        self.assertEqual(validated_face.source_image_file_id, big.id)
+
+    def test_needs_review_pair_touches_nothing(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+        from filepopulator.models import CrossCollectionImageDuplicate
+
+        a = self._make_image(
+            'burst_a', self.collection_a, size_bytes=100,
+            date_taken=timezone.now(), make='NIKON CORPORATION', model='NIKON D3100',
+        )
+        b = self._make_image(
+            'burst_b', self.collection_b, size_bytes=5000,
+            date_taken=timezone.now() + timedelta(seconds=4), make='NIKON CORPORATION', model='NIKON D3100',
+        )
+        face_a = self._make_face(a, (10, 10, 30, 30))
+        face_b = self._make_face(b, (10, 10, 30, 30))
+        pair = self._make_pair(a, b)
+
+        stats = resolve_pair(pair, dry_run=False)
+
+        self.assertEqual(stats['status'], CrossCollectionImageDuplicate.STATUS_NEEDS_REVIEW)
+        self.assertEqual(stats['reason'], CrossCollectionImageDuplicate.REASON_BURST_SIGNATURE)
+        # Both faces untouched, both images untouched.
+        self.assertTrue(Face.objects.filter(pk=face_a.pk).exists())
+        self.assertTrue(Face.objects.filter(pk=face_b.pk).exists())
+        a.refresh_from_db()
+        b.refresh_from_db()
+        self.assertFalse(a.isProcessed)
+        self.assertFalse(b.isProcessed)
+        self.assertNotIn(self.collection_b, a.collections.all())
+
+        record = CrossCollectionImageDuplicate.objects.get(image_a_id=min(a.id, b.id), image_b_id=max(a.id, b.id))
+        self.assertEqual(record.status, CrossCollectionImageDuplicate.STATUS_NEEDS_REVIEW)
+
+    def test_dry_run_writes_nothing(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+        from filepopulator.models import CrossCollectionImageDuplicate
+
+        small = self._make_image('small4', self.collection_a, size_bytes=100)
+        big = self._make_image('big4', self.collection_b, size_bytes=5000)
+        face_small = self._make_face(small, (10, 10, 30, 30))
+        face_big = self._make_face(big, (10, 10, 30, 30))
+        pair = self._make_pair(small, big)
+
+        stats = resolve_pair(pair, dry_run=True)
+
+        self.assertEqual(stats['status'], CrossCollectionImageDuplicate.STATUS_AUTO_MERGED)
+        self.assertEqual(stats['faces_matched'], 1)
+        # But nothing was actually written.
+        self.assertTrue(Face.objects.filter(pk=face_small.pk).exists())
+        self.assertTrue(Face.objects.filter(pk=face_big.pk).exists())
+        self.assertFalse(CrossCollectionImageDuplicate.objects.exists())
+
+    def test_rescales_boxes_for_different_resolutions(self):
+        from filepopulator.cross_collection_dedup import resolve_pair
+
+        # big is 2x the resolution of small -- a face at the same
+        # relative position should still match once rescaled.
+        small = self._make_image('small5', self.collection_a, size_bytes=100, width=100, height=100)
+        big = self._make_image('big5', self.collection_b, size_bytes=5000, width=200, height=200)
+        self._make_face(small, (10, 10, 30, 30))  # 10% of width, relative
+        self._make_face(big, (20, 20, 60, 60))  # same relative position at 2x scale
+        pair = self._make_pair(small, big)
+
+        stats = resolve_pair(pair, dry_run=False)
+        self.assertEqual(stats['faces_matched'], 1)
+
+
+class FindUnresolvedCrossCollectionPairsTests(TestCase):
+    """find_unresolved_cross_collection_pairs(): the candidate-selection
+    query shared by the management command and the recurring task."""
+
+    def setUp(self):
+        self.collection_a = PhotoCollection.objects.get(is_default=True)
+        self.second_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.second_root, ignore_errors=True)
+        self.collection_b = PhotoCollection.objects.create(
+            name='Find Unresolved Test', root_directory=self.second_root,
+        )
+
+    def _make_image(self, name, collection):
+        root = self.second_root if collection.pk == self.collection_b.pk else '/photos/find_unresolved_test'
+        directory, _ = Directory.objects.get_or_create(dir_path=root, defaults={'collection': collection})
+        if directory.collection_id != collection.pk:
+            directory.collection = collection
+            directory.save()
+        path = os.path.join(root, f'{name}.jpg')
+        img = ImageFile(
+            filename=path, directory=directory, thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=100, height=100,
+        )
+        ImageFile.objects.bulk_create([img])
+        return ImageFile.objects.get(filename=path)
+
+    def test_only_yields_cross_collection_exact_phash_pairs(self):
+        from filepopulator.models import SimilarImagePair
+        from filepopulator.cross_collection_dedup import find_unresolved_cross_collection_pairs
+
+        cross = self._make_image('cross_a', self.collection_a)
+        cross_other = self._make_image('cross_b', self.collection_b)
+        SimilarImagePair.record(cross.id, cross_other.id, 0)
+
+        same = self._make_image('same_a', self.collection_a)
+        same_other = self._make_image('same_b', self.collection_a)
+        SimilarImagePair.record(same.id, same_other.id, 0)
+
+        far = self._make_image('far_a', self.collection_a)
+        far_other = self._make_image('far_b', self.collection_b)
+        SimilarImagePair.record(far.id, far_other.id, 4)  # not exact -- excluded
+
+        results = list(find_unresolved_cross_collection_pairs())
+        result_id_sets = [{p.image_a_id, p.image_b_id} for p in results]
+        self.assertIn({cross.id, cross_other.id}, result_id_sets)
+        self.assertNotIn({same.id, same_other.id}, result_id_sets)
+        self.assertNotIn({far.id, far_other.id}, result_id_sets)
+
+    def test_already_decided_pairs_are_excluded(self):
+        from filepopulator.models import SimilarImagePair, CrossCollectionImageDuplicate
+        from filepopulator.cross_collection_dedup import find_unresolved_cross_collection_pairs
+
+        a = self._make_image('decided_a', self.collection_a)
+        b = self._make_image('decided_b', self.collection_b)
+        SimilarImagePair.record(a.id, b.id, 0)
+        lo, hi = sorted((a.id, b.id))
+        CrossCollectionImageDuplicate.objects.create(
+            image_a_id=lo, image_b_id=hi,
+            status=CrossCollectionImageDuplicate.STATUS_NEEDS_REVIEW,
+            reason=CrossCollectionImageDuplicate.REASON_CAMERA_CONFLICT,
+        )
+
+        results = list(find_unresolved_cross_collection_pairs())
+        result_id_sets = [{p.image_a_id, p.image_b_id} for p in results]
+        self.assertNotIn({a.id, b.id}, result_id_sets)
+
+
+class MergeCrossCollectionImageDuplicatesCommandTests(TestCase):
+    """The management command itself -- thin wrapper over
+    find_unresolved_cross_collection_pairs()/resolve_pair(), already
+    covered individually above; this just confirms the command wires
+    them together and reports sane totals."""
+
+    def setUp(self):
+        self.collection_a = PhotoCollection.objects.get(is_default=True)
+        self.second_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.second_root, ignore_errors=True)
+        self.collection_b = PhotoCollection.objects.create(
+            name='Command Test Collection', root_directory=self.second_root,
+        )
+
+    def test_command_resolves_a_real_candidate(self):
+        from filepopulator.models import SimilarImagePair, CrossCollectionImageDuplicate
+
+        directory_a, _ = Directory.objects.get_or_create(
+            dir_path='/photos/merge_command_test', defaults={'collection': self.collection_a},
+        )
+        img_a = ImageFile(
+            filename='/photos/merge_command_test/a.jpg', directory=directory_a, thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=100, height=100,
+        )
+        ImageFile.objects.bulk_create([img_a])
+        img_a = ImageFile.objects.get(filename='/photos/merge_command_test/a.jpg')
+
+        directory_b = Directory.objects.create(dir_path=self.second_root, collection=self.collection_b)
+        path_b = os.path.join(self.second_root, 'b.jpg')
+        with open(path_b, 'wb') as f:
+            f.write(os.urandom(2000))
+        img_b = ImageFile(
+            filename=path_b, directory=directory_b, thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=100, height=100,
+        )
+        ImageFile.objects.bulk_create([img_b])
+        img_b = ImageFile.objects.get(filename=path_b)
+
+        SimilarImagePair.record(img_a.id, img_b.id, 0)
+
+        call_command('merge_cross_collection_image_duplicates')
+
+        self.assertEqual(CrossCollectionImageDuplicate.objects.count(), 1)
+
+    def test_dry_run_leaves_no_decision_records(self):
+        from filepopulator.models import SimilarImagePair, CrossCollectionImageDuplicate
+
+        directory_a, _ = Directory.objects.get_or_create(
+            dir_path='/photos/merge_command_dry_test', defaults={'collection': self.collection_a},
+        )
+        img_a = ImageFile(
+            filename='/photos/merge_command_dry_test/a.jpg', directory=directory_a, thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=100, height=100,
+        )
+        ImageFile.objects.bulk_create([img_a])
+        img_a = ImageFile.objects.get(filename='/photos/merge_command_dry_test/a.jpg')
+
+        directory_b = Directory.objects.create(dir_path=self.second_root, collection=self.collection_b)
+        img_b = ImageFile(
+            filename=os.path.join(self.second_root, 'b.jpg'), directory=directory_b, thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=100, height=100,
+        )
+        ImageFile.objects.bulk_create([img_b])
+        img_b = ImageFile.objects.get(filename=os.path.join(self.second_root, 'b.jpg'))
+
+        SimilarImagePair.record(img_a.id, img_b.id, 0)
+
+        call_command('merge_cross_collection_image_duplicates', '--dry-run')
+
+        self.assertEqual(CrossCollectionImageDuplicate.objects.count(), 0)
+
+
+class MergeCrossCollectionImageDuplicatesTaskTests(TestCase):
+    """The recurring Celery task -- same underlying functions as the
+    command, already covered individually above; this just confirms the
+    task wires them together and respects its own advisory lock, same
+    contract as cleanup_orphaned_media's own lock test."""
+
+    def setUp(self):
+        self.collection_a = PhotoCollection.objects.get(is_default=True)
+        self.second_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.second_root, ignore_errors=True)
+        self.collection_b = PhotoCollection.objects.create(
+            name='Task Test Collection', root_directory=self.second_root,
+        )
+
+    def _make_pair(self, suffix):
+        directory_a, _ = Directory.objects.get_or_create(
+            dir_path='/photos/merge_task_test', defaults={'collection': self.collection_a},
+        )
+        img_a = ImageFile(
+            filename=f'/photos/merge_task_test/a{suffix}.jpg', directory=directory_a, thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=100, height=100,
+        )
+        ImageFile.objects.bulk_create([img_a])
+        img_a = ImageFile.objects.get(filename=f'/photos/merge_task_test/a{suffix}.jpg')
+
+        directory_b, _ = Directory.objects.get_or_create(
+            dir_path=self.second_root, defaults={'collection': self.collection_b},
+        )
+        path_b = os.path.join(self.second_root, f'b{suffix}.jpg')
+        img_b = ImageFile(
+            filename=path_b, directory=directory_b, thumbnail_small="",
+            pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(),
+            width=100, height=100,
+        )
+        ImageFile.objects.bulk_create([img_b])
+        img_b = ImageFile.objects.get(filename=path_b)
+
+        from filepopulator.models import SimilarImagePair
+        SimilarImagePair.record(img_a.id, img_b.id, 0)
+        return img_a, img_b
+
+    def test_task_resolves_pending_pairs_and_respects_the_lock(self):
+        from filepopulator.models import CrossCollectionImageDuplicate
+        from filepopulator.tasks import merge_cross_collection_image_duplicates
+
+        self._make_pair('1')
+        merge_cross_collection_image_duplicates()
+        self.assertEqual(CrossCollectionImageDuplicate.objects.count(), 1)
+
+        # While another session holds the lock, the task must do nothing.
+        self._make_pair('2')
+        cfg = connection.settings_dict
+        other = psycopg2.connect(
+            dbname=cfg['NAME'], user=cfg['USER'], password=cfg['PASSWORD'],
+            host=cfg['HOST'] or 'localhost', port=cfg['PORT'] or 5432,
+        )
+        other.autocommit = True
+        self.addCleanup(other.close)
+        key = zlib.crc32(b'filepopulator.merge_cross_collection_image_duplicates')
+        with other.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", [key])
+            self.assertTrue(cur.fetchone()[0])
+
+            merge_cross_collection_image_duplicates()
+            self.assertEqual(CrossCollectionImageDuplicate.objects.count(), 1)  # unchanged
+
+            cur.execute("SELECT pg_advisory_unlock(%s)", [key])
+
+        # Once free again, the second pair resolves too.
+        merge_cross_collection_image_duplicates()
+        self.assertEqual(CrossCollectionImageDuplicate.objects.count(), 2)
+
+
 class PhashComputationTests(TestCase):
     """Confirms phash is actually computed and stored during real image
     ingestion (not just exercised against bare rows above), and that two
@@ -3260,6 +3775,106 @@ class VideoIngestionTests(TestCase):
         self.assertFalse(VideoFile.objects.filter(filename=changing_path).exists())
         create_video_file(changing_path)
         self.assertTrue(VideoFile.objects.filter(filename=changing_path).exists())
+
+
+class VideoDirectoryCollectionTests(TestCase):
+    """create_video_file() resolves+sets Directory.collection on a newly
+    created video directory (2026-10-21 fix) -- previously a plain
+    get_or_create with no collection resolution at all, leaving every
+    video Directory permanently NULL. Mirrors PhotoCollectionTests'
+    image-side setup/assertions, since VideoFile.directory is the SAME
+    Directory model ImageFile uses -- no new field was needed, just the
+    missing resolve_for_path() call."""
+
+    def setUp(self):
+        self.default_collection = PhotoCollection.objects.get(is_default=True)
+        self.second_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.second_root, ignore_errors=True)
+        self.second_collection = PhotoCollection.objects.create(
+            name='Second Video Collection', root_directory=self.second_root,
+        )
+
+    def tearDown(self):
+        VideoFile.objects.all().delete()
+        FailedVideoFile.objects.all().delete()
+        Directory.objects.exclude(collection=self.default_collection).delete()
+
+    def _a_long_enough_fixture(self):
+        from django.conf import settings
+        video_dir = '/photos/video_samples'
+        for filename in sorted(os.listdir(video_dir)):
+            path = os.path.join(video_dir, filename)
+            from .video_scripts import _run_ffprobe
+            probe = _run_ffprobe(path)
+            duration = float(probe.get('format', {}).get('duration', 0) or 0)
+            if duration >= settings.MIN_VIDEO_DURATION_SECONDS:
+                return path
+        self.skipTest("No fixture video clears MIN_VIDEO_DURATION_SECONDS in this environment.")
+
+    def test_new_video_under_second_root_gets_that_collection(self):
+        fixture = self._a_long_enough_fixture()
+        dest = os.path.join(self.second_root, os.path.basename(fixture))
+        shutil.copy(fixture, dest)
+
+        create_video_file(dest)
+
+        video = VideoFile.objects.get(filename=dest)
+        self.assertEqual(video.directory.collection_id, self.second_collection.pk)
+
+    def test_video_under_unregistered_path_falls_back_to_default(self):
+        fixture = self._a_long_enough_fixture()
+        unregistered_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, unregistered_dir, ignore_errors=True)
+        dest = os.path.join(unregistered_dir, os.path.basename(fixture))
+        shutil.copy(fixture, dest)
+
+        create_video_file(dest)
+
+        video = VideoFile.objects.get(filename=dest)
+        self.assertEqual(video.directory.collection_id, self.default_collection.pk)
+
+    def test_backfill_resolves_preexisting_null_video_directory(self):
+        # Simulates a Directory created before the fix existed -- plain
+        # get_or_create, no collection ever resolved.
+        pre_existing_dir = Directory.objects.create(dir_path=self.second_root)
+        self.assertIsNone(pre_existing_dir.collection)
+
+        fixture = self._a_long_enough_fixture()
+        dest = os.path.join(self.second_root, os.path.basename(fixture))
+        shutil.copy(fixture, dest)
+        video = VideoFile.objects.create(
+            filename=dest, directory=pre_existing_dir, width=100, height=100, duration_seconds=10,
+        )
+
+        call_command('backfill_video_directory_collection')
+
+        pre_existing_dir.refresh_from_db()
+        self.assertEqual(pre_existing_dir.collection_id, self.second_collection.pk)
+
+    def test_backfill_dry_run_does_not_write(self):
+        pre_existing_dir = Directory.objects.create(dir_path=self.second_root)
+        VideoFile.objects.create(
+            filename=os.path.join(self.second_root, 'a.mp4'), directory=pre_existing_dir,
+            width=100, height=100, duration_seconds=10,
+        )
+
+        call_command('backfill_video_directory_collection', '--dry-run')
+
+        pre_existing_dir.refresh_from_db()
+        self.assertIsNone(pre_existing_dir.collection)
+
+    def test_backfill_does_not_touch_image_only_directories(self):
+        # A Directory with no VideoFile at all (NULL collection for some
+        # other, unrelated reason) must not be touched by this video-
+        # specific backfill.
+        image_only_dir = Directory.objects.create(dir_path=tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, image_only_dir.dir_path, ignore_errors=True)
+        self.assertIsNone(image_only_dir.collection)
+
+        call_command('backfill_video_directory_collection')
+
+        image_only_dir.refresh_from_db()
+        self.assertIsNone(image_only_dir.collection)
 
 
 @override_settings(VIDEO_TRANSCODE_ROOT='/tmp/video_transcode_test')

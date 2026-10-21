@@ -31,7 +31,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from .models import (
-    Directory, DuplicateVideoFile, FailedVideoFile, VideoFile, VIDEO_EXTENSION_REGEX,
+    Directory, DuplicateVideoFile, FailedVideoFile, PhotoCollection, VideoFile, VIDEO_EXTENSION_REGEX,
     guess_date_from_filename,
 )
 
@@ -307,7 +307,18 @@ def create_video_file(file_path):
     date_taken, date_taken_valid = _get_video_date_taken(file_path, exif)
 
     directory_path = os.path.dirname(file_path)
-    directory, _ = Directory.objects.get_or_create(dir_path=directory_path)
+    # Mirrors ImageFile._get_dir() -- resolves which PhotoCollection this
+    # path belongs to (longest-prefix match against every registered
+    # root_directory, falling back to the default collection) the one
+    # time this Directory row is first created. Added 2026-10-21: this
+    # was previously a plain get_or_create with no collection resolution
+    # at all, leaving every video Directory's collection permanently
+    # NULL -- see backfill_video_directory_collection for the one-time
+    # catch-up on rows created before this fix.
+    directory, created = Directory.objects.get_or_create(dir_path=directory_path)
+    if created:
+        directory.collection = PhotoCollection.resolve_for_path(directory_path)
+        directory.save()
 
     video.content_hash = content_hash
     video.directory = directory

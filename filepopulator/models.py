@@ -1636,3 +1636,85 @@ class SimilarImagePair(models.Model):
         )
 
 
+class CrossCollectionImageDuplicate(models.Model):
+    """Tracks the merge/review decision for one cross-collection exact-
+    phash SimilarImagePair (hamming_distance=0, image_a/image_b in
+    different PhotoCollections) -- the "same real photo ingested
+    separately into two collections" case (e.g. the user's own library
+    and a newly-added relative's archive both containing the same
+    family photo). Investigated 2026-10-21 against real production
+    data -- see CLAUDE.md for the full validation (sample sizes, false-
+    positive rate, why a second perceptual hash was tried and rejected).
+
+    Deliberately a SEPARATE model from SimilarImagePair, not new fields
+    on it -- SimilarImagePair is the general near-duplicate graph (every
+    hamming distance, same- or cross-collection), and only a narrow
+    slice of it (exact match, cross-collection) is ever a candidate for
+    this specific face-merge workflow.
+
+    Neither ImageFile row is ever deleted by this mechanism -- both are
+    real, distinct files. Only Face rows get merged (see
+    filepopulator/cross_collection_dedup.py); the non-primary image is
+    marked isProcessed=True so find_and_encode_faces() never
+    independently re-extracts it.
+
+    AUTO_MERGED is set the moment the merge actually runs (reason
+    EXACT_METADATA or STRIPPED_EXIF -- metadata agrees, or one side's
+    EXIF was stripped during some export, both judged safe). NEEDS_REVIEW
+    covers the two unsafe-to-auto-merge patterns found empirically: the
+    same real camera/model with a genuinely different dateTaken (a real
+    burst-shot signature, or occasionally a corrupted timestamp on an
+    otherwise-identical photo -- either way, not provably safe to
+    collapse automatically) and a real camera-make conflict (confirmed
+    against one real example: two near-blank/white images that
+    coincidentally hashed identically -- a genuine phash false positive,
+    not explainable by EXIF differences at all). DISMISSED is set once a
+    human reviews a NEEDS_REVIEW row via the (not-yet-built) frontend
+    tool and confirms the two images are genuinely different photos."""
+    STATUS_AUTO_MERGED = 'auto_merged'
+    STATUS_NEEDS_REVIEW = 'needs_review'
+    STATUS_DISMISSED = 'dismissed'
+    STATUS_CHOICES = [
+        (STATUS_AUTO_MERGED, 'Auto-merged'),
+        (STATUS_NEEDS_REVIEW, 'Needs review'),
+        (STATUS_DISMISSED, 'Dismissed (confirmed distinct)'),
+    ]
+
+    REASON_EXACT_METADATA = 'exact_metadata'
+    REASON_STRIPPED_EXIF = 'stripped_exif'
+    REASON_BURST_SIGNATURE = 'burst_signature'
+    REASON_CAMERA_CONFLICT = 'camera_conflict'
+    REASON_CHOICES = [
+        (REASON_EXACT_METADATA, 'dateTaken + camera make/model all match exactly'),
+        (REASON_STRIPPED_EXIF, 'One side is missing camera info (likely a re-export)'),
+        (REASON_BURST_SIGNATURE, 'Same camera/model, but dateTaken differs'),
+        (REASON_CAMERA_CONFLICT, 'Both sides have real, differing camera make'),
+    ]
+
+    # Always stored lo/hi (image_a_id < image_b_id), mirroring
+    # SimilarImagePair.record()'s own canonicalization -- same reasoning:
+    # the underlying SimilarImagePair can be rediscovered from either
+    # direction, so this needs to be order-independent too.
+    image_a = models.ForeignKey(ImageFile, on_delete=models.CASCADE, related_name='cross_collection_dup_as_a')
+    image_b = models.ForeignKey(ImageFile, on_delete=models.CASCADE, related_name='cross_collection_dup_as_b')
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES)
+    reason = models.CharField(max_length=16, choices=REASON_CHOICES)
+    primary_image = models.ForeignKey(
+        ImageFile, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='cross_collection_dup_primary_of',
+    )
+    faces_matched = models.IntegerField(default=0)
+    faces_transferred = models.IntegerField(default=0)
+    faces_deleted = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['image_a', 'image_b'], name='unique_cross_collection_image_duplicate')
+        ]
+
+    def __str__(self):
+        return f"CrossCollectionImageDuplicate({self.image_a_id}, {self.image_b_id}, {self.status})"
+
+
