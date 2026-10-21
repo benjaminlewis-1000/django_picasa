@@ -3319,6 +3319,95 @@ class MergeCrossCollectionImageDuplicatesCommandTests(TestCase):
         self.assertEqual(CrossCollectionImageDuplicate.objects.count(), 0)
 
 
+class BackfillMergedPrimaryIsProcessedTests(TestCase):
+    """backfill_merged_primary_isprocessed: catch-up for merges that ran
+    before resolve_pair() started marking primary isProcessed=True when
+    secondary already held real faces at merge time (2026-10-21, see
+    CLAUDE.md)."""
+
+    def _make_record(self, primary_is_processed, faces_matched, faces_transferred, status='auto_merged'):
+        from filepopulator.models import CrossCollectionImageDuplicate
+        directory, _ = Directory.objects.get_or_create(dir_path='/photos/backfill_isprocessed_test')
+        import uuid
+        suffix = uuid.uuid4().hex[:8]
+        primary = ImageFile(
+            filename=f'/photos/backfill_isprocessed_test/primary_{suffix}.jpg', directory=directory,
+            thumbnail_small="", pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(), width=100, height=100,
+            isProcessed=primary_is_processed,
+        )
+        secondary = ImageFile(
+            filename=f'/photos/backfill_isprocessed_test/secondary_{suffix}.jpg', directory=directory,
+            thumbnail_small="", pixel_hash=binascii.hexlify(os.urandom(16)).decode(),
+            file_hash=binascii.hexlify(os.urandom(16)).decode(), width=100, height=100,
+            isProcessed=True,  # always True post-merge, regardless of history -- see module docstring
+        )
+        ImageFile.objects.bulk_create([primary, secondary])
+        primary = ImageFile.objects.get(filename=primary.filename)
+        secondary = ImageFile.objects.get(filename=secondary.filename)
+        lo, hi = sorted((primary.id, secondary.id))
+        record = CrossCollectionImageDuplicate.objects.create(
+            image_a_id=lo, image_b_id=hi, status=status,
+            reason=CrossCollectionImageDuplicate.REASON_EXACT_METADATA,
+            primary_image=primary, faces_matched=faces_matched, faces_transferred=faces_transferred,
+        )
+        return primary, record
+
+    def test_marks_primary_processed_when_merge_record_shows_real_faces(self):
+        primary, _ = self._make_record(primary_is_processed=False, faces_matched=1, faces_transferred=0)
+
+        call_command('backfill_merged_primary_isprocessed')
+
+        primary.refresh_from_db()
+        self.assertTrue(primary.isProcessed)
+
+    def test_leaves_primary_unprocessed_when_merge_record_shows_no_faces(self):
+        # Proxy limitation, accepted: a secondary that was processed but
+        # genuinely found zero faces looks identical to "never
+        # processed" here -- primary is correctly left alone (a real,
+        # if likely-also-zero-yielding, redetection pass later, not a
+        # correctness risk).
+        primary, _ = self._make_record(primary_is_processed=False, faces_matched=0, faces_transferred=0)
+
+        call_command('backfill_merged_primary_isprocessed')
+
+        primary.refresh_from_db()
+        self.assertFalse(primary.isProcessed)
+
+    def test_already_processed_primary_is_left_alone(self):
+        primary, _ = self._make_record(primary_is_processed=True, faces_matched=1, faces_transferred=1)
+
+        call_command('backfill_merged_primary_isprocessed')  # must not error re-marking an already-True row
+
+        primary.refresh_from_db()
+        self.assertTrue(primary.isProcessed)
+
+    def test_needs_review_records_are_not_touched(self):
+        from filepopulator.models import CrossCollectionImageDuplicate
+        primary, _ = self._make_record(
+            primary_is_processed=False, faces_matched=0, faces_transferred=0,
+            status=CrossCollectionImageDuplicate.STATUS_NEEDS_REVIEW,
+        )
+        # needs_review records never have a primary_image in real usage,
+        # but confirm the status filter itself excludes them regardless.
+        CrossCollectionImageDuplicate.objects.filter(primary_image=primary).update(
+            faces_matched=5, faces_transferred=5,
+        )
+
+        call_command('backfill_merged_primary_isprocessed')
+
+        primary.refresh_from_db()
+        self.assertFalse(primary.isProcessed)
+
+    def test_dry_run_does_not_write(self):
+        primary, _ = self._make_record(primary_is_processed=False, faces_matched=1, faces_transferred=0)
+
+        call_command('backfill_merged_primary_isprocessed', '--dry-run')
+
+        primary.refresh_from_db()
+        self.assertFalse(primary.isProcessed)
+
+
 class MergeCrossCollectionImageDuplicatesTaskTests(TestCase):
     """The recurring Celery task -- same underlying functions as the
     command, already covered individually above; this just confirms the
