@@ -160,6 +160,42 @@ def merge_cross_collection_image_duplicates():
         for pair in find_unresolved_cross_collection_pairs():
             resolve_pair(pair, dry_run=False)
 
+@shared_task(ignore_result=True, name='filepopulator.backfill_owntracks_gps')
+def backfill_owntracks_gps():
+    # Recurring counterpart to the one-off backfill_owntracks_gps
+    # management command -- picks up each enabled camera's new/never-
+    # attempted photos automatically (backfill_camera_gps() already skips
+    # anything with an existing GpsEstimationAttempt record, so a
+    # recurring run naturally only ever touches genuinely new work; no
+    # camera_models= override here, so a camera newly toggled on via the
+    # frontend page is picked up on the very next run with no deploy
+    # needed). Capped per run -- each photo costs a real exiftool
+    # subprocess + an HTTP round trip to the OwnTracks service, not free
+    # -- but unlike geocode_new_images' 200 (sized against Nominatim's
+    # external ~1 req/sec rate limit), this service is self-hosted with
+    # no such constraint. Measured directly against production
+    # (2026-10-21): ~0.5s/photo for a quick skip (no usable offset tag),
+    # ~1.2s/photo for a real match (exiftool + HTTP). Even at the
+    # all-real-matches worst case, 1000/run is ~20min, comfortably inside
+    # the hourly cadence.
+    with advisory_lock('filepopulator.backfill_owntracks_gps') as acquired:
+        if not acquired:
+            settings.LOGGER.debug("Already running the OwnTracks GPS backfill, exiting.")
+            return
+
+        from .owntracks_gps import backfill_camera_gps, OwnTracksConfigError
+        try:
+            counts = backfill_camera_gps(limit=1000, log=settings.LOGGER.debug)
+        except OwnTracksConfigError as e:
+            # Not configured (OWNTRACKS_LOCATION_API_URL/_KEY) -- log once
+            # per run rather than crashing the task every hour.
+            settings.LOGGER.debug(f"OwnTracks GPS backfill not configured, skipping: {e}")
+            return
+        settings.LOGGER.info(
+            f"OwnTracks GPS backfill: matched {counts['matched']}, "
+            f"{counts['no_offset_tag']} no offset tag, {counts['no_nearby_point']} no nearby point."
+        )
+
 @shared_task(ignore_result=True, name='filepopulator.cleanup_orphaned_media')
 def cleanup_orphaned_media():
     # Weekly, not hourly/daily -- this walks every file in 5 real media

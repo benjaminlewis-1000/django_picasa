@@ -612,6 +612,10 @@ CELERY_BEAT_SCHEDULE = {
        'task': 'filepopulator.geocode_new_images',
        'schedule': crontab(minute='30', hour='*'),
    },
+   'backfill_owntracks_gps': {
+       'task': 'filepopulator.backfill_owntracks_gps',
+       'schedule': crontab(minute='5', hour='*'),
+   },
    'find_similar_images': {
         'task': 'filepopulator.find_similar_images',
         'schedule': crontab(minute='45', hour='*'),

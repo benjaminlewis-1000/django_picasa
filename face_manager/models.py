@@ -70,6 +70,22 @@ class Person(models.Model):
 
     gender = models.CharField(max_length=15, default="unknown")
 
+    # Opt-in toggle (same DB-backed-config shape as CameraGpsBackfillConfig
+    # -- frontend-editable, no deploy needed to change) -- when set, any
+    # photo with a VALIDATED face for this person is eligible for GPS
+    # estimation from that person's own OwnTracks location history
+    # (filepopulator/owntracks_gps.py's backfill_camera_gps()), regardless
+    # of which camera_model took the photo. A validated appearance means
+    # this specific person was confirmed physically present at that
+    # moment, which is actually a more direct signal than camera
+    # ownership (someone else's phone could have taken the photo).
+    # db_default (not just default) -- a stale, already-running worker
+    # process that still has the pre-migration field list would otherwise
+    # emit an INSERT omitting this column entirely, hitting the exact
+    # NOT-NULL-violation incident already documented in CLAUDE.md
+    # (face_extraction_timeout_count, 2026-09-18) for the same reason.
+    gps_backfill_source = models.BooleanField(default=False, db_default=False)
+
     # id field has a primary key
     def delete(self):
         # Protect the no face assigned person from

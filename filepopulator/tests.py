@@ -2643,6 +2643,73 @@ class BackfillGeocodingTests(TestCase):
         self.assertEqual(img_c.geocode.locality, 'Tacoma')
         self.assertNotEqual(img_c.geocode.locality, img_b.geocode.locality)
 
+    def test_image_at_already_cached_coordinate_is_relinked_with_no_nominatim_call(self):
+        # Real production bug (2026-10-21): an ImageFile whose (rounded)
+        # coordinate is ALREADY fully resolved in GeocodeCache (e.g. a
+        # second photo from an already-geocoded place, ingested after the
+        # first photo from that spot already cached+linked it) used to
+        # never get its own geocode FK set at all -- the per-coordinate
+        # loop only ever revisits a coordinate that's missing from the
+        # cache or lookup_failed=True, so an already-resolved coordinate
+        # was never looked at again by any future run. Now a standing,
+        # unconditional relink pass fixes this on every call, at zero
+        # Nominatim cost.
+        from filepopulator.models import GeocodeCache
+        GeocodeCache.objects.create(
+            lat=47.6062, lon=-122.3321, locality='Seattle', county='King',
+            state='Washington', country='United States',
+            display_name='Seattle, WA, USA',
+        )
+        img = self._make_bare_image_file("/tmp/geocode_test/relink1.jpg", 47.6062, -122.3321)
+        self.assertIsNone(img.geocode)
+
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise') as mock_reverse:
+            call_command('backfill_geocoding')
+            mock_reverse.assert_not_called()
+
+        img.refresh_from_db()
+        self.assertIsNotNone(img.geocode)
+        self.assertEqual(img.geocode.locality, 'Seattle')
+
+    def test_relink_dry_run_writes_nothing(self):
+        from filepopulator.models import GeocodeCache
+        GeocodeCache.objects.create(
+            lat=47.6062, lon=-122.3321, locality='Seattle', county='King',
+            state='Washington', country='United States',
+            display_name='Seattle, WA, USA',
+        )
+        img = self._make_bare_image_file("/tmp/geocode_test/relink2.jpg", 47.6062, -122.3321)
+
+        call_command('backfill_geocoding', '--dry-run')
+
+        img.refresh_from_db()
+        self.assertIsNone(img.geocode)
+
+    def test_image_at_a_failed_coordinate_is_not_relinked_goes_through_retry_instead(self):
+        # A lookup_failed=True cache row is a known-bad, not a resolved
+        # answer -- it must go through the normal retry path (a real
+        # reverse_geocode_precise call), not be silently "relinked" to a
+        # failed, contentless entry.
+        from filepopulator.models import GeocodeCache
+        GeocodeCache.objects.create(
+            lat=47.6062, lon=-122.3321, lookup_failed=True, lookup_error='simulated prior failure',
+        )
+        img = self._make_bare_image_file("/tmp/geocode_test/relink3.jpg", 47.6062, -122.3321)
+
+        fake_result = {
+            'locality': 'Seattle', 'county': 'King', 'state': 'Washington',
+            'country': 'United States', 'display_name': 'Seattle, WA, USA',
+            'raw_response': {'address': {}},
+        }
+        with mock.patch('filepopulator.geocode.reverse_geocode_precise', return_value=fake_result) as mock_reverse:
+            call_command('backfill_geocoding')
+            mock_reverse.assert_called_once()
+
+        img.refresh_from_db()
+        self.assertIsNotNone(img.geocode)
+        self.assertFalse(img.geocode.lookup_failed)
+        self.assertEqual(img.geocode.locality, 'Seattle')
+
 
 class SimilarityTests(TestCase):
     """Exercises phash-based near-duplicate detection
@@ -3482,6 +3549,49 @@ class MergeCrossCollectionImageDuplicatesTaskTests(TestCase):
         # Once free again, the second pair resolves too.
         merge_cross_collection_image_duplicates()
         self.assertEqual(CrossCollectionImageDuplicate.objects.count(), 2)
+
+
+class BackfillOwnTracksGpsTaskTests(TestCase):
+    """The recurring Celery task -- backfill_camera_gps() itself is
+    already thoroughly tested directly (see filepopulator/tests.py's
+    OwnTracks GPS backfill tests); this just confirms the task wires it
+    up correctly (right default args, respects its own advisory lock,
+    doesn't crash the whole task on OwnTracksConfigError)."""
+
+    def test_calls_backfill_with_a_run_limit_and_no_camera_override(self):
+        from filepopulator.tasks import backfill_owntracks_gps
+
+        with mock.patch('filepopulator.owntracks_gps.backfill_camera_gps') as mock_backfill:
+            mock_backfill.return_value = {'matched': 3, 'no_offset_tag': 1, 'no_nearby_point': 2}
+            backfill_owntracks_gps()
+
+        # No camera_models= override -- defaults to every camera currently
+        # enabled in CameraGpsBackfillConfig, so a camera toggled on via
+        # the frontend is picked up on the very next scheduled run.
+        mock_backfill.assert_called_once()
+        _, kwargs = mock_backfill.call_args
+        self.assertNotIn('camera_models', kwargs)
+        self.assertEqual(kwargs['limit'], 1000)
+
+    def test_concurrent_run_is_skipped(self):
+        from filepopulator.tasks import backfill_owntracks_gps
+
+        with mock.patch('filepopulator.tasks.advisory_lock') as mock_lock, \
+             mock.patch('filepopulator.owntracks_gps.backfill_camera_gps') as mock_backfill:
+            mock_lock.return_value.__enter__.return_value = False
+            backfill_owntracks_gps()
+
+        mock_backfill.assert_not_called()
+
+    def test_not_configured_is_a_no_op_not_a_crash(self):
+        from filepopulator.owntracks_gps import OwnTracksConfigError
+        from filepopulator.tasks import backfill_owntracks_gps
+
+        with mock.patch('filepopulator.owntracks_gps.backfill_camera_gps') as mock_backfill:
+            mock_backfill.side_effect = OwnTracksConfigError("not configured")
+            backfill_owntracks_gps()  # must not raise
+
+        mock_backfill.assert_called_once()
 
 
 class PhashComputationTests(TestCase):
@@ -4947,6 +5057,15 @@ class BackfillS23GpsTests(TestCase):
     def tearDown(self):
         ImageFile.objects.all().delete()
 
+    def _make_face(self, image, person, validated):
+        face = Face(
+            source_image_file=image, declared_name=person,
+            box_left=1, box_top=1, box_right=5, box_bottom=5, validated=validated,
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.save()
+        return face
+
     def _bare_image(self, camera_model, gps_lat_decimal=-999, filename=None, dateTaken=None):
         # ImageFile.save() -> _init_image() really opens the file (PIL),
         # so this needs a real tiny image on disk, not just a DB row --
@@ -5284,6 +5403,111 @@ class BackfillS23GpsTests(TestCase):
                 status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
             )
             call_command('backfill_owntracks_gps')
+
+    def test_validated_face_for_gps_backfill_source_person_is_eligible(self):
+        # A camera NOT in CameraGpsBackfillConfig at all -- eligibility
+        # here must come entirely from the verified-person path.
+        from face_manager.models import Person
+        img = self._bare_image('Totally Unenrolled Camera')
+        person = Person.objects.create(person_name='Benjamin Lewis', gps_backfill_source=True)
+        self._make_face(img, person, True)
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
+            )
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            counts = backfill_camera_gps()
+
+        self.assertEqual(counts['matched'], 1)
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, 40.1)
+
+    def test_unvalidated_face_for_gps_backfill_source_person_is_not_eligible(self):
+        # Only a CONFIRMED (validated) appearance is a real "this person
+        # was physically here" signal -- a mere proposed/unconfirmed
+        # candidate match isn't.
+        from face_manager.models import Person
+        img = self._bare_image('Totally Unenrolled Camera')
+        person = Person.objects.create(person_name='Benjamin Lewis', gps_backfill_source=True)
+        self._make_face(img, person, False)
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run') as mock_exiftool:
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            counts = backfill_camera_gps()
+
+        mock_exiftool.assert_not_called()
+        self.assertEqual(counts['matched'], 0)
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, -999)
+
+    def test_validated_face_for_non_backfill_source_person_is_not_eligible(self):
+        # The person must have gps_backfill_source=True specifically --
+        # a validated face for anyone else doesn't make a photo eligible.
+        from face_manager.models import Person
+        img = self._bare_image('Totally Unenrolled Camera')
+        person = Person.objects.create(person_name='Someone Else', gps_backfill_source=False)
+        self._make_face(img, person, True)
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run') as mock_exiftool:
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            counts = backfill_camera_gps()
+
+        mock_exiftool.assert_not_called()
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, -999)
+
+    def test_include_verified_person_false_excludes_it(self):
+        from face_manager.models import Person
+        img = self._bare_image('Totally Unenrolled Camera')
+        person = Person.objects.create(person_name='Benjamin Lewis', gps_backfill_source=True)
+        self._make_face(img, person, True)
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run') as mock_exiftool:
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            counts = backfill_camera_gps(include_verified_person=False)
+
+        mock_exiftool.assert_not_called()
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, -999)
+
+    def test_no_verified_person_management_command_flag(self):
+        from face_manager.models import Person
+        img = self._bare_image('Totally Unenrolled Camera')
+        person = Person.objects.create(person_name='Benjamin Lewis', gps_backfill_source=True)
+        self._make_face(img, person, True)
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run') as mock_exiftool:
+            call_command('backfill_owntracks_gps', '--no-verified-person')
+
+        mock_exiftool.assert_not_called()
+        img.refresh_from_db()
+        self.assertEqual(img.gps_lat_decimal, -999)
+
+    def test_eligible_via_both_camera_and_person_is_not_double_processed(self):
+        # ImageFile.objects.filter(eligibility, ...) must .distinct() --
+        # an image matching BOTH the camera allowlist AND the
+        # verified-person clause via more than one Face row shouldn't be
+        # joined into duplicate result rows.
+        from face_manager.models import Person
+        img = self._bare_image('Galaxy S23+')
+        person = Person.objects.create(person_name='Benjamin Lewis', gps_backfill_source=True)
+        self._make_face(img, person, True)
+        person2 = Person.objects.create(person_name='Also Tracked', gps_backfill_source=True)
+        self._make_face(img, person2, True)
+
+        with mock.patch('filepopulator.owntracks_gps.subprocess.run',
+                         return_value=self._exiftool_result('2026:10:16 14:46:17', '-04:00')), \
+             mock.patch('filepopulator.owntracks_gps.requests.get') as mock_get:
+            mock_get.return_value = mock.Mock(
+                status_code=200, json=lambda: {'latitude': 40.1, 'longitude': -111.9},
+            )
+            from filepopulator.owntracks_gps import backfill_camera_gps
+            counts = backfill_camera_gps()
+
+        self.assertEqual(counts['matched'], 1)
 
 
 class PhotoCollectionTests(TestCase):

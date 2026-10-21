@@ -188,18 +188,27 @@ def query_nearest_location(iso8601_datetime):
 
 
 def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
-                         retry_failed=False, dry_run=False, limit=None, log=print):
+                         retry_failed=False, dry_run=False, limit=None, log=print,
+                         include_verified_person=True):
     """One-time-per-photo (but safely re-runnable -- intended to end up
     as a recurring cron/Celery task, picking up each newly-opted-in
-    camera's new photos as they're ingested) backfill: for every photo
-    from an allowlisted camera still missing GPS, estimate it from
-    OwnTracks location history. Returns a dict of outcome counts.
+    camera's new photos as they're ingested) backfill: for every eligible
+    photo still missing GPS, estimate it from OwnTracks location history.
+    Returns a dict of outcome counts.
 
-    camera_models defaults to get_enabled_camera_models() (every camera
-    currently toggled on in CameraGpsBackfillConfig) -- a caller only
-    passes a narrower list to test/scope a single camera (see
-    --camera-model on the management command), never to permanently
-    widen scope beyond what's been explicitly opted in there.
+    A photo is eligible two independent ways (OR'd together):
+    - its camera_model is in camera_models (defaults to
+      get_enabled_camera_models(), every camera currently toggled on in
+      CameraGpsBackfillConfig) -- a caller only passes a narrower list to
+      test/scope a single camera (see --camera-model on the management
+      command), never to permanently widen scope beyond what's been
+      explicitly opted in there.
+    - include_verified_person=True (the default) and it has a VALIDATED
+      Face for any Person with gps_backfill_source=True -- a confirmed
+      appearance means that specific person was physically present at
+      that moment, which is actually a more direct signal than camera
+      ownership (someone else's phone could have taken the photo). See
+      Person.gps_backfill_source's own docstring.
 
     start_date/end_date (date objects) filter on dateTaken -- useful for
     a camera with years of history that predates OwnTracks tracking
@@ -217,14 +226,19 @@ def backfill_camera_gps(camera_models=None, start_date=None, end_date=None,
     model's own docstring for why. retry_failed=True re-includes rows
     whose existing attempt was 'no_nearby_point' specifically (never
     'no_offset_tag', which can't change)."""
+    from django.db.models import Q
     from filepopulator.models import GpsEstimationAttempt, ImageFile
 
     if camera_models is None:
         camera_models = get_enabled_camera_models()
 
+    eligibility = Q(camera_model__in=camera_models)
+    if include_verified_person:
+        eligibility |= Q(face__validated=True, face__declared_name__gps_backfill_source=True)
+
     qs = ImageFile.objects.filter(
-        camera_model__in=camera_models, gps_lat_decimal=-999,
-    ).order_by('dateTaken')
+        eligibility, gps_lat_decimal=-999,
+    ).distinct().order_by('dateTaken')
     if start_date:
         qs = qs.filter(dateTaken__date__gte=start_date)
     if end_date:

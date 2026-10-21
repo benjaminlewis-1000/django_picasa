@@ -457,11 +457,49 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
     retry_eligible, succeeded, failed, reused_nearby (a subset of
     succeeded that were resolved via the proximity check rather than a
     real Nominatim call), retried (how many of this run's attempts were
-    retries of a previous failure), retried_succeeded.
+    retries of a previous failure), retried_succeeded, relinked_from_cache
+    (see below).
     """
     from filepopulator.models import GeocodeCache, ImageFile
 
     has_gps = ImageFile.objects.exclude(gps_lat_decimal=-999).exclude(gps_lon_decimal=-999)
+
+    # Standing self-heal, runs on EVERY call (not just the Nominatim-bound
+    # work below) -- links any ImageFile with real GPS but no geocode FK
+    # whose (rounded) coordinate is ALREADY fully resolved in
+    # GeocodeCache. Without this, a second photo from an already-geocoded
+    # place (ingested after a first photo from that same spot already
+    # cached+linked it) sits with geocode=NULL forever: the per-
+    # coordinate loop below only ever revisits a coordinate that's
+    # missing from the cache or lookup_failed=True, so an
+    # already-resolved coordinate is otherwise never looked at again by
+    # ANY future run, no matter how many more photos land on it -- real,
+    # confirmed production gap (2026-10-21): 784 of 785 distinct
+    # unlinked coordinates in the Default collection were already sitting
+    # in GeocodeCache, just never linked to the newer photos that shared
+    # them. Pure DB lookup/update, no Nominatim calls, so it's not
+    # subject to `limit` and runs in full every time.
+    relink_qs = (
+        has_gps.filter(geocode__isnull=True)
+        .annotate(rlat=Round('gps_lat_decimal', GeocodeCache.ROUND_DECIMALS),
+                  rlon=Round('gps_lon_decimal', GeocodeCache.ROUND_DECIMALS))
+    )
+    cache_pk_by_coord = {
+        (lat, lon): pk
+        for lat, lon, pk in GeocodeCache.objects.filter(lookup_failed=False).values_list('lat', 'lon', 'pk')
+    }
+    relinked_from_cache = 0
+    for lat, lon in set(relink_qs.values_list('rlat', 'rlon')):
+        cache_pk = cache_pk_by_coord.get((lat, lon))
+        if cache_pk is None:
+            continue
+        if dry_run:
+            relinked_from_cache += relink_qs.filter(rlat=lat, rlon=lon).count()
+        else:
+            relinked_from_cache += relink_qs.filter(rlat=lat, rlon=lon).update(geocode_id=cache_pk)
+    log(f"{'Would link' if dry_run else 'Linked'} {relinked_from_cache} image(s) to an "
+        f"already-cached coordinate (no Nominatim call needed).")
+
     coords = (
         has_gps
         .annotate(rlat=Round('gps_lat_decimal', GeocodeCache.ROUND_DECIMALS),
@@ -484,6 +522,7 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
         'remaining': len(new_coords_todo), 'retry_eligible': len(retry_todo),
         'succeeded': 0, 'failed': 0, 'reused_nearby': 0,
         'retried': 0, 'retried_succeeded': 0,
+        'relinked_from_cache': relinked_from_cache,
     }
 
     if dry_run:
@@ -626,5 +665,6 @@ def run_geocoding_backfill(limit=None, dry_run=False, log=print):
 
     log(f"Done. {result['succeeded']} succeeded ({result['reused_nearby']} via nearby reuse, "
         f"no Nominatim call), {result['failed']} failed, {time.time() - start:.0f}s total. "
-        f"Retries: {result['retried']} attempted, {result['retried_succeeded']} now succeeded.")
+        f"Retries: {result['retried']} attempted, {result['retried_succeeded']} now succeeded. "
+        f"Also relinked {result['relinked_from_cache']} image(s) to an already-cached coordinate.")
     return result

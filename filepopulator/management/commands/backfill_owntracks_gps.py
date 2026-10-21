@@ -60,6 +60,11 @@ class Command(BaseCommand):
                  "re-attempts 'no_offset_tag' -- that can't change. By default, any photo with "
                  "an existing attempt record of either kind is skipped entirely.",
         )
+        parser.add_argument(
+            '--no-verified-person', action='store_true',
+            help="Don't include photos with a validated face for a Person with "
+                 "gps_backfill_source=True -- scope this run to the camera-model allowlist only.",
+        )
 
     def handle(self, *args, **options):
         camera_models = options['camera_model']
@@ -77,6 +82,7 @@ class Command(BaseCommand):
                 start_date=options['start_date'], end_date=options['end_date'],
                 retry_failed=options['retry_failed'],
                 dry_run=options['dry_run'], limit=options['limit'], log=self.stdout.write,
+                include_verified_person=not options['no_verified_person'],
             )
         except OwnTracksConfigError as e:
             raise CommandError(str(e))
