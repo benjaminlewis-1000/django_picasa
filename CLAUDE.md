@@ -23,6 +23,26 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   once, caught only because the user happened to notice a file hadn't shrunk).
 - A looser classification threshold specifically for faces with `.ignore` already in their reject
   list was brainstormed but never validated or built.
+- **On-demand retry workflow for failed IMAGES, mirroring the video one -- scoped but not built
+  (2026-10-22).** The video version (`VideoFaceExtractionViewSet`, `/api/video_face_extraction/`
+  -- list currently-failed videos + retry specific/all via Celery) was built and deployed the
+  same day; the user asked for the image equivalent and explicitly said to park it as a TODO
+  rather than build it immediately, after a real design wrinkle surfaced: unlike video, there
+  are two distinct "failed image" populations needing different retry mechanics, not one.
+  (1) `ImageFile.image_load_failed=True` (a row exists, but can't currently be decoded) --
+  the direct video analog, EXCEPT that this flag can be set by two different code paths with
+  different implications: `face_extract_encode.py`'s decode-failure branch (face extraction
+  couldn't open it) vs. `filepopulator/scripts.py`'s ingestion-time re-scan (a previously-good
+  photo that's since become unreadable on disk) -- the second path never touches `isProcessed`
+  at all, so a retry that only resets `isProcessed=False` and re-queues into
+  `find_and_encode_faces()` would silently no-op for that case; a real retry needs to re-attempt
+  the actual decode/save path, not just re-queue face extraction. (2) `FailedImageFile` rows --
+  files that never became an `ImageFile` at all (ingestion itself failed) -- retrying these means
+  re-running ingestion against a bare file path, not an id on an existing row, a meaningfully
+  different shape than either of the above. **Also found while scoping this**: the decode-failure
+  except block in `face_extract_encode.py` (~line 260) does NOT call `log_error()` -- a real gap
+  against the same-day "errors must bubble to ApplicationError" standing rule, worth fixing
+  whenever this TODO is picked up (or sooner, independently).
 - The ~8 real multi-hour digitized-tape videos (2000.mpg, Christine Funeral.mpg, etc., up to
   ~2.75hrs each) that hit `PER_VIDEO_TIMEOUT_SECONDS` (30min) during face extraction and fail
   outright -- worth considering splitting these into shorter chunks (e.g. via `ffmpeg -ss`/`-t`
