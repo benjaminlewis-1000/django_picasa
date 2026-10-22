@@ -4702,3 +4702,69 @@ class ProcessVideoFacesFailureTrackingTests(TestCase):
         error = ApplicationError.objects.get()
         self.assertEqual(error.source, 'face_manager.tasks.process_video_faces')
         self.assertIn(self.video.filename, error.message)
+
+
+class ProcessVideoFacesVideoIdsScopingTests(TestCase):
+    """process_video_faces(video_ids=...) -- the on-demand, frontend-
+    triggered reprocess path (api.views.VideoFaceExtractionViewSet).
+    Unlike the normal isProcessed=False backlog, this always forces a
+    redo of exactly the named videos, regardless of their current
+    isProcessed/face_extraction_failed state, and clears out any
+    existing Face rows (with their thumbnails) first so a reprocess
+    never leaves stale+fresh Face rows coexisting."""
+
+    def setUp(self):
+        from filepopulator.models import Directory, VideoFile
+        directory = Directory.objects.create(dir_path='/videos/video_ids_test')
+        self.already_processed = VideoFile.objects.create(
+            filename='/videos/video_ids_test/a.mp4', directory=directory,
+            width=100, height=100, duration_seconds=5, isProcessed=True,
+            face_extraction_failed=True, face_extraction_error='old failure',
+            face_extraction_timeout_count=2,
+        )
+        self.untouched = VideoFile.objects.create(
+            filename='/videos/video_ids_test/b.mp4', directory=directory,
+            width=100, height=100, duration_seconds=5, isProcessed=True,
+        )
+
+    def test_targeted_video_is_reprocessed_despite_already_processed(self):
+        from face_manager.tasks import process_video_faces
+        with patch('video_face_pipeline.VideoFaceExtractor') as MockExtractor:
+            MockExtractor.return_value.process_video.return_value = []
+            process_video_faces(video_ids=[self.already_processed.id])
+        self.already_processed.refresh_from_db()
+        MockExtractor.return_value.process_video.assert_called_once()
+        self.assertTrue(self.already_processed.isProcessed)
+        self.assertFalse(self.already_processed.face_extraction_failed)
+        self.assertIsNone(self.already_processed.face_extraction_error)
+        self.assertEqual(self.already_processed.face_extraction_timeout_count, 0)
+
+    def test_other_videos_are_not_touched(self):
+        from face_manager.tasks import process_video_faces
+        with patch('video_face_pipeline.VideoFaceExtractor') as MockExtractor:
+            MockExtractor.return_value.process_video.return_value = []
+            process_video_faces(video_ids=[self.already_processed.id])
+        self.assertEqual(MockExtractor.return_value.process_video.call_count, 1)
+        call_arg = MockExtractor.return_value.process_video.call_args[0][0]
+        self.assertEqual(call_arg.id, self.already_processed.id)
+
+    def test_existing_face_rows_and_thumbnails_are_deleted_before_reprocessing(self):
+        from face_manager.models import Face
+        from face_manager.tasks import process_video_faces
+        from django.core.files.base import ContentFile
+
+        face = Face(
+            source_video_file=self.already_processed,
+            box_top=0, box_bottom=10, box_left=0, box_right=10,
+        )
+        face.face_thumbnail.save('thumb.jpg', ContentFile(b'fake-thumb-bytes'), save=False)
+        face.save()
+        thumb_path = face.face_thumbnail.path
+        self.assertTrue(os.path.exists(thumb_path))
+
+        with patch('video_face_pipeline.VideoFaceExtractor') as MockExtractor:
+            MockExtractor.return_value.process_video.return_value = []
+            process_video_faces(video_ids=[self.already_processed.id])
+
+        self.assertFalse(Face.objects.filter(pk=face.pk).exists())
+        self.assertFalse(os.path.exists(thumb_path))

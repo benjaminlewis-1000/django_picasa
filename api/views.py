@@ -2193,6 +2193,94 @@ class ApplicationErrorViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(api_ser.ApplicationErrorSerializer(error).data)
 
 
+class VideoFaceExtractionViewSet(viewsets.ViewSet):
+    """On-demand, frontend-triggerable retry of videos that FAILED face
+    extraction (VideoFile.face_extraction_failed=True) -- per the
+    user's explicit request (not a management command): a list of
+    currently-failed videos the frontend can show (with a count and a
+    "reprocess all" / "reprocess this one" button), backed by this
+    list + create pair.
+
+    Deliberately scoped to already-failed videos only, never the
+    general backlog -- the user explicitly does NOT want a way to
+    re-trigger a video that already succeeded. `create()` rejects any
+    video_id that isn't currently face_extraction_failed=True, and
+    with no video_ids given at all, targets every currently-failed
+    video rather than the full isProcessed=False backlog.
+
+    Always dispatches via Celery (.delay()) rather than running
+    synchronously in the request -- a video can take minutes -- so
+    this always returns immediately with 202 and the real work
+    happens in the background (added to the normal celery queue). The
+    task's own advisory lock makes a duplicate trigger (e.g. the
+    frontend firing a second request while one is already running) a
+    safe no-op, not a real error, so no extra locking is done here."""
+
+    permission_classes = (IsAuthenticated,)
+
+    def list(self, request):
+        from filepopulator.models import VideoFile
+
+        failed = VideoFile.objects.filter(face_extraction_failed=True).order_by('-id')
+        rows = [
+            {
+                'id': v.id,
+                'filename': v.filename,
+                'duration_seconds': v.duration_seconds,
+                'face_extraction_error': v.face_extraction_error,
+                'face_extraction_timeout_count': v.face_extraction_timeout_count,
+            }
+            for v in failed
+        ]
+        return Response({'count': len(rows), 'results': rows})
+
+    def create(self, request):
+        from filepopulator.models import VideoFile
+        from face_manager.tasks import process_video_faces
+
+        video_ids = request.data.get('video_ids')
+        if video_ids is not None:
+            if not isinstance(video_ids, list) or not video_ids or not all(
+                isinstance(i, int) for i in video_ids
+            ):
+                return Response(
+                    {'error': 'video_ids must be a non-empty list of integers'},
+                    status=400,
+                )
+            failed_ids = set(
+                VideoFile.objects.filter(
+                    id__in=video_ids, face_extraction_failed=True
+                ).values_list('id', flat=True)
+            )
+            not_failed = [i for i in video_ids if i not in failed_ids]
+            if not_failed:
+                return Response(
+                    {
+                        'error': (
+                            'Can only reprocess videos that are currently marked '
+                            f'failed. Not currently failed (or unknown): {not_failed}'
+                        )
+                    },
+                    status=400,
+                )
+        else:
+            video_ids = list(
+                VideoFile.objects.filter(face_extraction_failed=True).values_list('id', flat=True)
+            )
+            if not video_ids:
+                return Response({'status': 'nothing to do', 'video_ids': []}, status=200)
+
+        max_runtime_seconds = request.data.get('max_runtime_seconds')
+        if max_runtime_seconds is not None and not isinstance(max_runtime_seconds, (int, float)):
+            return Response({'error': 'max_runtime_seconds must be a number'}, status=400)
+
+        process_video_faces.delay(max_runtime_seconds=max_runtime_seconds, video_ids=video_ids)
+        return Response(
+            {'status': 'queued', 'video_ids': video_ids, 'max_runtime_seconds': max_runtime_seconds},
+            status=202,
+        )
+
+
 class CameraGpsBackfillConfigViewSet(viewsets.ViewSet):
     """Backend for a frontend toggle page (same shape as the existing
     nearest-metro-override tool, built outside this repo) -- lets the

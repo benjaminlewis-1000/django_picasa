@@ -1228,6 +1228,121 @@ class ApplicationErrorApiTests(ApiTestCase):
         self.assertIsNotNone(error.dismissed_at)
 
 
+class VideoFaceExtractionApiTests(ApiTestCase):
+    """api.views.VideoFaceExtractionViewSet -- on-demand, frontend-
+    triggerable retry of videos that FAILED face extraction. List
+    surfaces the current failed-video backlog (count + rows); create
+    queues a retry, scoped to currently-failed videos only -- the user
+    explicitly does not want a way to re-trigger an already-succeeded
+    video. Always dispatches via Celery (mocked here, never actually
+    run), never synchronously -- these tests only check that the right
+    task call is queued with the right arguments, not real extraction
+    behavior (covered separately in face_manager.tests for
+    process_video_faces(video_ids=...) itself)."""
+
+    def _make_video(self, filename='/videos/trigger_test/a.mp4', **overrides):
+        directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(filename))
+        return VideoFile.objects.create(
+            filename=filename, directory=directory, width=640, height=480, duration_seconds=5,
+            **overrides,
+        )
+
+    def _make_failed_video(self, filename='/videos/trigger_test/failed.mp4'):
+        return self._make_video(
+            filename, isProcessed=True, face_extraction_failed=True,
+            face_extraction_error='boom',
+        )
+
+    def test_requires_auth(self):
+        resp = self.anon_client.post("/api/video_face_extraction/", {}, format='json')
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_list_requires_auth(self):
+        resp = self.anon_client.get("/api/video_face_extraction/")
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_list_returns_only_failed_videos(self):
+        failed = self._make_failed_video()
+        self._make_video('/videos/trigger_test/ok.mp4', isProcessed=True)  # succeeded, not listed
+        self._make_video('/videos/trigger_test/new.mp4', isProcessed=False)  # never processed, not listed
+
+        resp = self.client.get("/api/video_face_extraction/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['count'], 1)
+        self.assertEqual(resp.data['results'][0]['id'], failed.id)
+        self.assertEqual(resp.data['results'][0]['face_extraction_error'], 'boom')
+
+    @mock.patch('face_manager.tasks.process_video_faces.delay')
+    def test_trigger_with_no_body_queues_all_currently_failed_videos(self, mock_delay):
+        failed1 = self._make_failed_video('/videos/trigger_test/f1.mp4')
+        failed2 = self._make_failed_video('/videos/trigger_test/f2.mp4')
+        self._make_video('/videos/trigger_test/ok.mp4', isProcessed=True)
+
+        resp = self.client.post("/api/video_face_extraction/", {}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_202_ACCEPTED)
+        called_ids = mock_delay.call_args.kwargs['video_ids']
+        self.assertEqual(set(called_ids), {failed1.id, failed2.id})
+
+    @mock.patch('face_manager.tasks.process_video_faces.delay')
+    def test_trigger_with_no_body_and_nothing_failed_is_a_no_op(self, mock_delay):
+        self._make_video('/videos/trigger_test/ok.mp4', isProcessed=True)
+        resp = self.client.post("/api/video_face_extraction/", {}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        mock_delay.assert_not_called()
+
+    @mock.patch('face_manager.tasks.process_video_faces.delay')
+    def test_trigger_with_specific_failed_video_id(self, mock_delay):
+        failed = self._make_failed_video()
+        resp = self.client.post(
+            "/api/video_face_extraction/", {'video_ids': [failed.id]}, format='json'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_202_ACCEPTED)
+        mock_delay.assert_called_once_with(max_runtime_seconds=None, video_ids=[failed.id])
+
+    @mock.patch('face_manager.tasks.process_video_faces.delay')
+    def test_trigger_with_max_runtime_seconds(self, mock_delay):
+        failed = self._make_failed_video()
+        resp = self.client.post(
+            "/api/video_face_extraction/",
+            {'video_ids': [failed.id], 'max_runtime_seconds': 600}, format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_202_ACCEPTED)
+        mock_delay.assert_called_once_with(max_runtime_seconds=600, video_ids=[failed.id])
+
+    @mock.patch('face_manager.tasks.process_video_faces.delay')
+    def test_already_succeeded_video_id_is_rejected(self, mock_delay):
+        succeeded = self._make_video('/videos/trigger_test/ok.mp4', isProcessed=True)
+        resp = self.client.post(
+            "/api/video_face_extraction/", {'video_ids': [succeeded.id]}, format='json'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_delay.assert_not_called()
+
+    @mock.patch('face_manager.tasks.process_video_faces.delay')
+    def test_unknown_video_id_is_rejected(self, mock_delay):
+        resp = self.client.post(
+            "/api/video_face_extraction/", {'video_ids': [999999]}, format='json'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_delay.assert_not_called()
+
+    @mock.patch('face_manager.tasks.process_video_faces.delay')
+    def test_empty_video_ids_list_is_rejected(self, mock_delay):
+        resp = self.client.post(
+            "/api/video_face_extraction/", {'video_ids': []}, format='json'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_delay.assert_not_called()
+
+    @mock.patch('face_manager.tasks.process_video_faces.delay')
+    def test_non_integer_video_ids_rejected(self, mock_delay):
+        resp = self.client.post(
+            "/api/video_face_extraction/", {'video_ids': ['abc']}, format='json'
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_delay.assert_not_called()
+
+
 class CameraGpsBackfillConfigApiTests(ApiTestCase):
     """Backend for the camera-opt-in toggle page (mirrors the existing
     nearest-metro-override tool's split -- this repo provides the API,

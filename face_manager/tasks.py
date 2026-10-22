@@ -134,7 +134,7 @@ def process_faces():
         _log_task_crash('process_faces', e)
 
 @shared_task(ignore_result=True, name='face_manager.video_face_extraction')
-def process_video_faces(max_runtime_seconds=None):
+def process_video_faces(max_runtime_seconds=None, video_ids=None):
     """Phase 3: one Face row per union-merge track-group, per unprocessed
     VideoFile -- see face_manager/video_face_pipeline.py and CLAUDE.md's
     Phase 3 design. Same advisory-lock convention as face_extraction
@@ -151,13 +151,36 @@ def process_video_faces(max_runtime_seconds=None):
     block once a video's processing has actually finished). Used to run
     the full-library backfill in bounded windows (e.g. 2.5h) rather than
     pinning every core for days straight, with an external scheduler
-    re-invoking this after a cooldown gap."""
+    re-invoking this after a cooldown gap.
+
+    video_ids, if given, scopes this run to exactly those VideoFile ids
+    (an on-demand, frontend-triggered reprocess -- see
+    api.views.VideoFaceExtractionViewSet) instead of the normal
+    isProcessed=False backlog, and FORCES a redo regardless of current
+    isProcessed/face_extraction_failed state: each named video's
+    existing Face rows (if any) are deleted first (per-instance, not a
+    bulk queryset delete, so thumbnail files get cleaned up -- same
+    reasoning as ImageFile.delete()'s own fix elsewhere in this
+    codebase), and its failure/timeout bookkeeping is reset, before
+    reprocessing. max_runtime_seconds still applies the same way."""
     with advisory_lock('face_manager.video_face_extraction') as acquired:
         if not acquired:
             settings.LOGGER.debug("Video face extraction is locked, exiting.")
             return
 
-        unprocessed = VideoFile.objects.filter(isProcessed=False)
+        if video_ids:
+            targeted = VideoFile.objects.filter(id__in=video_ids)
+            for video in targeted:
+                for face in video.face_set.all():
+                    face.delete()
+                video.face_extraction_failed = False
+                video.face_extraction_error = None
+                video.face_extraction_timeout_count = 0
+                video.isProcessed = False
+                video.save()
+            unprocessed = VideoFile.objects.filter(id__in=video_ids)
+        else:
+            unprocessed = VideoFile.objects.filter(isProcessed=False)
         if not unprocessed.exists():
             settings.LOGGER.debug("No videos to extract faces from! Exiting.")
             return
