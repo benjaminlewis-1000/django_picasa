@@ -10,7 +10,7 @@ django-filter==26.1
 django-webpack-loader==3.2.4
 Django==6.1.1
 djangorestframework-queryfields==1.1.0
-djangorestframework==3.18.0
+djangorestframework==3.18.2
 drf-url-filters==0.5.1
 editdistance==0.8.1
 # ExifRead and piexif aren't imported directly anywhere in this codebase --
