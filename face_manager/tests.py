@@ -3339,6 +3339,114 @@ class BackfillLvfaceEncodingsTests(TestCase):
         self.assertIsNotNone(in_scope.face_encoding_lvface_b)
         self.assertIsNone(out_of_scope_face.face_encoding_lvface_b)
 
+    def test_confirmed_ignore_face_is_excluded(self):
+        # 2026-10-25: the original "veto gate" design deliberately kept
+        # .ignore/.realignore faces in scope; the actual direction
+        # (LVFace-B eventually replacing face_encoding_512 outright)
+        # means this sweep should now follow the same exclusion
+        # face_encoding_512 itself already follows.
+        from face_manager.models import get_default_blank_person
+        ignore_person = make_person(settings.SOFT_IGNORE_NAME)
+        ignored_face = self._face_with_kps(declared_name=ignore_person)
+        real_face = self._face_with_kps(declared_name=get_default_blank_person())
+        with patch('lvface.embed_from_image_array', return_value=np.full(512, 0.6, dtype=np.float32)):
+            self.extractor._backfill_lvface_encodings()
+        ignored_face.refresh_from_db()
+        real_face.refresh_from_db()
+        self.assertIsNone(ignored_face.face_encoding_lvface_b)
+        self.assertIsNotNone(real_face.face_encoding_lvface_b)
+
+    def _make_video_face(self, **overrides):
+        from filepopulator.models import Directory, VideoFile
+        directory, _ = Directory.objects.get_or_create(dir_path='/videos/lvface_backfill_test')
+        video_path = '/tmp/lvface_backfill_test_video.mp4'
+        with open(video_path, 'wb') as f:
+            f.write(b'not a real video, existence is all this sweep checks')
+        self.addCleanup(lambda: os.path.exists(video_path) and os.remove(video_path))
+        video = VideoFile.objects.create(filename=video_path, directory=directory, width=640, height=480)
+        from face_manager.models import get_default_blank_person
+        face = Face(
+            declared_name=overrides.pop('declared_name', None) or get_default_blank_person(),
+            source_video_file=video,
+            box_left=1, box_top=1, box_right=10, box_bottom=10,
+            video_thumbnail_frame_seconds=12.3,
+            kps=[1.0] * 10,
+            **overrides,
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.save()
+        return face
+
+    def test_video_sourced_face_is_encoded_via_frame_extraction(self):
+        face = self._make_video_face()
+        fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with patch('video_face_pipeline.ffprobe_info', return_value=(640, 480, 30.0, None, 0, None, None)), \
+             patch('video_face_pipeline.extract_frame_near_timestamp', return_value=fake_frame) as mock_extract, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.7, dtype=np.float32)) as mock_lv:
+            self.extractor._backfill_lvface_encodings()
+        mock_extract.assert_called_once()
+        # input_is_bgr=True for the video path (the frame comes straight
+        # from cv2/PyAV, unlike the image path's PIL-sourced RGB array).
+        self.assertIs(mock_lv.call_args.kwargs.get('input_is_bgr'), True)
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_b, [0.7] * 512)
+
+    def test_video_face_with_no_decodable_frame_is_left_unencoded(self):
+        face = self._make_video_face()
+        with patch('video_face_pipeline.ffprobe_info', return_value=(640, 480, 30.0, None, 0, None, None)), \
+             patch('video_face_pipeline.extract_frame_near_timestamp', return_value=None), \
+             patch('lvface.embed_from_image_array') as mock_lv:
+            self.extractor._backfill_lvface_encodings()
+        mock_lv.assert_not_called()
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    def test_confirmed_ignore_video_face_is_excluded(self):
+        ignore_person = make_person(settings.SOFT_IGNORE_NAME)
+        face = self._make_video_face(declared_name=ignore_person)
+        with patch('video_face_pipeline.ffprobe_info', return_value=(640, 480, 30.0, None, 0, None, None)), \
+             patch('video_face_pipeline.extract_frame_near_timestamp') as mock_extract, \
+             patch('lvface.embed_from_image_array'):
+            self.extractor._backfill_lvface_encodings()
+        mock_extract.assert_not_called()
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    def test_collection_scoped_call_skips_video_sub_pass_entirely(self):
+        # collection is an image-only concept (PhotoCollection/
+        # Directory.collection) -- a collection-scoped call has nothing
+        # to say about video faces, so the video sub-pass must not run
+        # at all for one, rather than silently sweeping the whole
+        # unscoped video backlog.
+        face = self._make_video_face()
+        default_collection = self.image.directory.collection
+        with patch('video_face_pipeline.ffprobe_info') as mock_ffprobe, \
+             patch('lvface.embed_from_image_array'):
+            self.extractor._backfill_lvface_encodings(collection=default_collection)
+        mock_ffprobe.assert_not_called()
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    def test_image_sub_pass_runs_before_video_sub_pass_within_shared_budget(self):
+        image_face = self._face_with_kps()
+        video_face = self._make_video_face()
+
+        times = iter([0, 0, 15])  # start_time, image-pass check (ok), video-pass check (over budget)
+
+        def fake_time():
+            return next(times, 5)
+
+        with patch('time.time', side_effect=fake_time), \
+             patch('video_face_pipeline.ffprobe_info') as mock_ffprobe, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.8, dtype=np.float32)):
+            self.extractor._backfill_lvface_encodings(max_runtime_seconds=10)
+
+        image_face.refresh_from_db()
+        video_face.refresh_from_db()
+        self.assertIsNotNone(image_face.face_encoding_lvface_b)
+        mock_ffprobe.assert_not_called()
+        self.assertIsNone(video_face.face_encoding_lvface_b)
+
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class DedupeOverlappingFacesTests(TestCase):

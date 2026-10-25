@@ -1004,45 +1004,67 @@ class FaceExtractor(object):
         picture (live extraction populates it for new faces going
         forward; this covers the gap).
 
-        Deliberately does NOT exclude .ignore/.realignore declared
-        faces the way the insightface re-encode above does -- those are
-        exactly the population classify_unassigned()'s LVFace veto gate
-        needs to score query faces against for an opted-in person (see
-        Person.use_lvface_verification), unlike face_encoding_512 (which
-        is deliberately CLEARED for confirmed .ignore/.realignore faces
-        to save space, since nothing re-compares against them the same
-        way).
+        Excludes confirmed .ignore/.realignore faces, the same as the
+        insightface re-encode above (2026-10-25: the original design
+        deliberately kept these, to feed a possible future LVFace veto
+        gate scored against a person's confirmed-wrong examples -- but
+        the actual direction settled on is LVFace-B eventually replacing
+        face_encoding_512 outright, same usage pattern, so it follows
+        the same "don't bother encoding confirmed junk" rule
+        face_encoding_512 itself already follows -- that field is
+        cleared, not populated, for these faces, since nothing
+        re-compares against them under normal classification).
 
-        Scoped to image-sourced faces only for now -- video-sourced
-        faces (source_video_file) are a known, not-yet-handled gap, not
-        a design decision; revisit if/when a video face ever needs the
-        LVFace veto gate.
+        Covers both image- and video-sourced faces (2026-10-25 -- video
+        support added same day as the ignore-exclusion change above). A
+        video face has no standalone source file to decode the way an
+        image face does, so its embedding is recovered by re-extracting
+        the exact frame its thumbnail/box/kps already came from via
+        video_face_pipeline.extract_frame_near_timestamp() (the same,
+        already-hardened-through-3-real-bugs function backing the
+        video-face "large image" viewer) -- face.kps is stored in that
+        frame's own full-pixel coordinate space (see
+        VideoFaceExtractor._set_face_box_and_thumbnail), so no new
+        alignment logic is needed, just a straight
+        lvface.embed_from_image_array() call once the frame is in hand.
+        Video re-extraction is real decode work (a windowed scan, not a
+        free crop-replay the way the image path's kps-replay is), so
+        the video sub-pass runs only after the (usually cheaper, and
+        typically much smaller backlog) image sub-pass, sharing the
+        same overall time budget -- this naturally prioritizes the
+        image backlog finishing first, with video getting whatever time
+        remains, run over run.
 
-        max_runtime_seconds bounds one call's wall time (checked between
-        faces, never mid-face) -- see LVFACE_REENCODE_MAX_RUNTIME_SECONDS'
-        own comment for why. None means unbounded (used for the small,
-        collection-scoped call from apply_collection_floor_change).
+        max_runtime_seconds bounds one call's wall time across BOTH
+        sub-passes combined (checked between faces, never mid-face) --
+        see LVFACE_REENCODE_MAX_RUNTIME_SECONDS' own comment for why.
+        None means unbounded (used for the small, collection-scoped
+        call from apply_collection_floor_change).
 
-        No-ops entirely while settings.LVFACE_ENCODING_ENABLED is False
-        -- see that setting's own comment for why (held off pending a
-        comparison against insightface's own ArcFace ViT backbones)."""
+        No-ops entirely while settings.LVFACE_ENCODING_ENABLED is
+        False."""
         if not settings.LVFACE_ENCODING_ENABLED:
             return
 
-        faces = Face.objects.filter(
+        start_time = time.time()
+        exclude_names = [settings.SOFT_IGNORE_NAME, '.realignore']
+
+        image_faces = Face.objects.filter(
             face_encoding_lvface_b__isnull=True, kps__isnull=False, source_image_file__isnull=False,
+        ).exclude(
+            declared_name__person_name__in=exclude_names
         ).select_related('source_image_file__directory__collection')
         if collection is not None:
-            faces = faces.filter(source_image_file__directory__collection=collection)
+            image_faces = image_faces.filter(source_image_file__directory__collection=collection)
 
-        start_time = time.time()
-        for face in faces:
+        for face in image_faces:
             if max_runtime_seconds is not None and (time.time() - start_time) >= max_runtime_seconds:
                 settings.LOGGER.debug(
-                    f"_backfill_lvface_encodings: time budget ({max_runtime_seconds}s) reached, "
-                    "stopping -- the next scheduled run will pick up where this left off."
+                    f"_backfill_lvface_encodings: time budget ({max_runtime_seconds}s) reached "
+                    "during the image sub-pass, stopping -- the next scheduled run will pick up "
+                    "where this left off."
                 )
-                break
+                return
 
             img_obj = face.source_image_file
             if img_obj is None or not img_obj.filename or not os.path.exists(img_obj.filename):
@@ -1060,6 +1082,90 @@ class FaceExtractor(object):
                 embedding = lvface.embed_from_image_array(img, face.kps, input_is_bgr=False)
             except Exception as e:
                 settings.LOGGER.error(f"Cannot compute LVFace encoding for Face {face.id}: {e}")
+                continue
+            if embedding is None:
+                continue
+
+            face.face_encoding_lvface_b = embedding.tolist()
+            face.save(update_fields=['face_encoding_lvface_b'])
+
+        # collection is image-only (PhotoCollection/Directory.collection,
+        # see CLAUDE.md's "VideoFile has no PhotoCollection association"
+        # TODO) -- a collection-scoped call has nothing to say about
+        # video faces, so skip the video sub-pass entirely rather than
+        # silently sweeping the whole (unscoped) video backlog on a call
+        # meant to stay narrow.
+        if collection is not None:
+            return
+
+        from video_face_pipeline import ffprobe_info, extract_frame_near_timestamp
+
+        video_faces = Face.objects.filter(
+            face_encoding_lvface_b__isnull=True, kps__isnull=False, source_video_file__isnull=False,
+            video_thumbnail_frame_seconds__isnull=False,
+        ).exclude(
+            declared_name__person_name__in=exclude_names
+        ).select_related('source_video_file').order_by('source_video_file_id')
+
+        ffprobe_cache = {}
+        for face in video_faces:
+            if max_runtime_seconds is not None and (time.time() - start_time) >= max_runtime_seconds:
+                settings.LOGGER.debug(
+                    f"_backfill_lvface_encodings: time budget ({max_runtime_seconds}s) reached "
+                    "during the video sub-pass, stopping -- the next scheduled run will pick up "
+                    "where this left off."
+                )
+                return
+
+            video = face.source_video_file
+            if video is None or not video.filename or not os.path.exists(video.filename):
+                continue
+
+            if video.id not in ffprobe_cache:
+                try:
+                    ffprobe_cache[video.id] = ffprobe_info(video.filename)
+                except Exception as e:
+                    settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: ffprobe failed ({e}).")
+                    ffprobe_cache[video.id] = None
+            probed = ffprobe_cache[video.id]
+            if probed is None:
+                continue
+            width, height, avg_fps, probed_field_order, rotation, color_transfer, sar_scale_width = probed
+            field_order = video.field_order if video.field_order is not None else probed_field_order
+
+            box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
+            try:
+                face.face_thumbnail.open('rb')
+                thumb_bytes = face.face_thumbnail.read()
+            except Exception as e:
+                settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: no thumbnail ({e}).")
+                continue
+            finally:
+                try:
+                    face.face_thumbnail.close()
+                except Exception:
+                    pass
+            reference_bgr = cv2.imdecode(np.frombuffer(thumb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if reference_bgr is None:
+                continue
+
+            try:
+                frame = extract_frame_near_timestamp(
+                    video.filename, face.video_thumbnail_frame_seconds, avg_fps,
+                    field_order, rotation, box, reference_bgr,
+                    width=(sar_scale_width or width), height=height, color_transfer=color_transfer,
+                    sar_scale_width=sar_scale_width,
+                )
+            except Exception as e:
+                settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: frame extraction failed ({e}).")
+                continue
+            if frame is None:
+                continue
+
+            try:
+                embedding = lvface.embed_from_image_array(frame, face.kps, input_is_bgr=True)
+            except Exception as e:
+                settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: {e}")
                 continue
             if embedding is None:
                 continue
