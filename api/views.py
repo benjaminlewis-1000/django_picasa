@@ -2427,5 +2427,87 @@ class CameraGpsBackfillConfigViewSet(viewsets.ViewSet):
         return Response({'camera_model': config.camera_model, 'enabled': config.enabled})
 
 
+class WindowedClassificationConfigViewSet(viewsets.ViewSet):
+    """Backend for a frontend toggle page letting a human enable Person.
+    use_windowed_classification for a specific gallery -- the per-person
+    override built 2026-10-25 after a real false-positive investigation
+    (Leslie Williams) found that restricting sim_99th to gallery members
+    near the QUERY's own date substantially improves false-positive rate
+    for people whose gallery spans a wide date range with genuine
+    cross-era appearance drift, but does NOT generalize automatically
+    (validated to make things flat-to-worse for most large galleries) --
+    see Person.use_windowed_classification's own docstring. This is
+    deliberately a manually-curated, per-person toggle: turn it on only
+    for a gallery you've directly confirmed benefits (the same empirical
+    check described there), not as a blanket setting."""
+
+    permission_classes = (IsAuthenticated,)
+    serializer_class = api_ser.WindowedClassificationStatusSerializer
+
+    # Galleries below this many validated faces aren't listed by default
+    # (too little data for the toggle to plausibly matter) -- but an
+    # already-enabled person is always listed regardless of size, so
+    # toggling one off is never blocked by them later dropping below it.
+    MIN_GALLERY_SIZE = 50
+
+    def list(self, request):
+        from django.db.models import Count, Q
+
+        from face_manager.models import Person
+
+        people = (
+            Person.objects.annotate(
+                confirmed_count=Count('face_declared', filter=Q(face_declared__validated=True))
+            )
+            .filter(Q(confirmed_count__gte=self.MIN_GALLERY_SIZE) | Q(use_windowed_classification=True))
+            .exclude(person_name__in=[settings.BLANK_FACE_NAME] + list(settings.IGNORED_NAMES))
+            .order_by('-confirmed_count')
+        )
+        data = [
+            {
+                'person_id': p.id,
+                'person_name': p.person_name,
+                'confirmed_count': p.confirmed_count,
+                'use_windowed_classification': p.use_windowed_classification,
+                'classification_window_days': p.classification_window_days,
+            }
+            for p in people
+        ]
+        serializer = api_ser.WindowedClassificationStatusSerializer(data, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['post'])
+    def set_windowed(self, request):
+        # Accessible as <root>/api/windowed_classification_config/set_windowed/
+        # Accept: POST, body: {"person_id": N, "enabled": true, "window_days": 182}
+        # ("window_days" optional -- only updated if given, so toggling
+        # off and back on doesn't require re-specifying it.)
+        from face_manager.models import Person
+
+        payload = request.data
+        if 'person_id' not in payload or 'enabled' not in payload:
+            return render_404(request, 'Body must include "person_id" and "enabled".')
+        if not isinstance(payload['enabled'], bool):
+            return render_404(request, 'The "enabled" value must be a boolean.')
+
+        try:
+            person = Person.objects.get(id=payload['person_id'])
+        except Person.DoesNotExist:
+            return render_404(request, f'No Person with id {payload["person_id"]}.')
+
+        person.use_windowed_classification = payload['enabled']
+        if 'window_days' in payload:
+            if not isinstance(payload['window_days'], int) or payload['window_days'] <= 0:
+                return render_404(request, 'The "window_days" value must be a positive integer.')
+            person.classification_window_days = payload['window_days']
+        person.save()
+
+        return Response({
+            'person_id': person.id,
+            'use_windowed_classification': person.use_windowed_classification,
+            'classification_window_days': person.classification_window_days,
+        })
+
+
 # Mobile-app-facing views (ConfidentUnlabeledView, UnlabeledMobileInfo,
 # ResetFace, MobileNameList) live in api/mobile_views.py, not here.

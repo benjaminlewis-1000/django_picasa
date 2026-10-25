@@ -48,6 +48,12 @@ class faceAssigner():
         # that already tolerates being hours behind on classification.
         self.CACHE_MAX_AGE_DAYS = 3
         self.USE_MIN_VALUE=True
+        # Default empty -- real population happens in load_encodings()
+        # (a live DB read, never cached). Set here too so a test that
+        # constructs a faceAssigner directly and calls classify_
+        # unassigned() without going through load_encodings() doesn't hit
+        # an AttributeError.
+        self.windowed_people = {}
         if self.USE_MIN_VALUE:
             self.IGN_VALUE = 999
         else:
@@ -163,6 +169,14 @@ class faceAssigner():
         # CLAUDE.md for the real sampling-variance check done before
         # relying on this.
         self.COHESION_SAMPLE_CAP = 300
+
+        # Per-person windowed classification (Person.
+        # use_windowed_classification) falls back to the whole gallery
+        # when fewer than this many gallery members fall within the
+        # configured date window of the query -- same "not enough data
+        # to trust a narrower estimate" reasoning as the span_iqr_days
+        # fallback above.
+        self.MIN_WINDOW_SAMPLE = 5
 
         # How far below its own bucket threshold a face's closest-call
         # candidate needs to be before it's treated as "confidently far
@@ -549,6 +563,22 @@ class faceAssigner():
             except:
                 os.remove(self.ENCODINGS_PKL_FILE)
 
+        # Per-person windowed-classification override (Person.
+        # use_windowed_classification/classification_window_days) --
+        # always a live DB read, never cached in the pickle: it's a
+        # frontend-editable toggle that must take effect immediately,
+        # independent of whether the embedding cache itself is still
+        # valid. See the field's own docstring in models.py for the
+        # empirical investigation (2026-10-25) this came out of --
+        # validated per-person, not a general formula, since cohesion/
+        # span/both combined all failed to reliably predict who actually
+        # benefits.
+        self.windowed_people = dict(
+            Person.objects.filter(
+                use_windowed_classification=True, id__in=self.embedding_dict.keys()
+            ).values_list('id', 'classification_window_days')
+        )
+
         self._build_concatenated_gallery()
         self._build_video_concatenated_gallery()
         self._build_person_cache()
@@ -577,26 +607,49 @@ class faceAssigner():
         experimentally for the outlier-rejection analysis this design is
         based on; see CLAUDE.md. Cheap to rebuild (just concatenation, no
         DB access) every load_encodings() call, so it doesn't need its
-        own cache-invalidation logic."""
+        own cache-invalidation logic.
+
+        Also concatenates each gallery face's dateTakenUTC into
+        self.all_dates, same column alignment as all_embeddings/all_norms
+        -- used by classify_unassigned() to restrict a windowed-
+        classification candidate's comparison pool to gallery members
+        near the query's own date (see Person.use_windowed_classification).
+        Built for every candidate regardless of whether they're actually
+        windowed (cheap -- already-fetched data, no extra DB access)
+        rather than special-cased, to keep this function's one
+        responsibility (build the concatenated arrays) simple."""
         person_ids = list(self.embedding_dict.keys())
         self.gallery_offsets = {}
         cursor = 0
         embedding_chunks = []
         norm_chunks = []
+        date_chunks = []
         for person_id in person_ids:
             embeddings = self.embedding_dict[person_id]
             n = embeddings.shape[1]
             self.gallery_offsets[person_id] = (cursor, cursor + n)
             embedding_chunks.append(embeddings)
             norm_chunks.append(self.norm_dict[person_id])
+            # .get() with a zero-filled fallback: some tests build a
+            # faceAssigner by setting embedding_dict/norm_dict directly
+            # and calling this method without ever populating
+            # candidate_dict via load_encodings() -- harmless here, since
+            # windowed_people (also unset in that path) would be empty
+            # too, so these dates are never actually read.
+            if person_id in getattr(self, 'candidate_dict', {}):
+                date_chunks.append(self.candidate_dict[person_id]['dateTakenUTC'].to_numpy())
+            else:
+                date_chunks.append(np.zeros(n))
             cursor += n
 
         if embedding_chunks:
             self.all_embeddings = np.concatenate(embedding_chunks, axis=1)
             self.all_norms = np.concatenate(norm_chunks)
+            self.all_dates = np.concatenate(date_chunks)
         else:
             self.all_embeddings = np.zeros((512, 0))
             self.all_norms = np.zeros(0)
+            self.all_dates = np.zeros(0)
 
     def _build_video_concatenated_gallery(self):
         """Same technique as _build_concatenated_gallery(), over
@@ -852,9 +905,30 @@ class faceAssigner():
                 query_encoding @ self.all_video_embeddings
             ) / (self.all_video_norms * query_encoding_norm)
 
+        query_date = unassigned_face.dateTakenUTC
+
         for row_num, db_id in enumerate(candidate_ids):
             lo, hi = self.gallery_offsets[db_id]
             similarity = all_similarity[lo:hi]
+
+            # Per-person windowed classification (Person.
+            # use_windowed_classification/classification_window_days) --
+            # restrict the comparison pool to gallery members within the
+            # configured window of the QUERY's own date, instead of the
+            # whole gallery. Validated empirically (2026-10-25, see
+            # Person.use_windowed_classification's own docstring) as a
+            # real false-positive-rate improvement for specific people
+            # whose gallery spans a wide date range with genuine cross-
+            # era appearance drift -- deliberately per-person, not a
+            # general default, since no formula reliably predicts who
+            # benefits. Falls back to the full gallery if the query has
+            # no usable date or too few gallery members fall in-window.
+            window_days = self.windowed_people.get(db_id)
+            if window_days is not None and query_date:
+                date_slice = self.all_dates[lo:hi]
+                in_window = np.abs(date_slice - query_date) <= window_days * 86400
+                if in_window.sum() >= self.MIN_WINDOW_SAMPLE:
+                    similarity = similarity[in_window]
 
             sim_99th = np.percentile(similarity, 99)
 

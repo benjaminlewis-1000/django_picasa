@@ -86,6 +86,28 @@ class Person(models.Model):
     # (face_extraction_timeout_count, 2026-09-18) for the same reason.
     gps_backfill_source = models.BooleanField(default=False, db_default=False)
 
+    # Opt-in, frontend-editable per-person override for classify_unassigned()
+    # (face_manager/assign_faces.py) -- when set, sim_99th is computed only
+    # against this person's gallery faces within +/- classification_window_
+    # days of the QUERY face's own date, instead of the whole gallery.
+    # Validated empirically (2026-10-25) as a real, substantial false-
+    # positive-rate improvement for people whose gallery spans a wide date
+    # range with real cross-era appearance drift (aging, hairstyle/glasses
+    # changes) -- e.g. Leslie Williams, David Redd -- but NOT a universal
+    # win: tested broadly against the full large-gallery population and
+    # found to make FPR flat-to-worse for most people (including huge,
+    # healthy Lewis/Wilson family galleries), and actively worse for
+    # people whose gallery has a genuinely narrow date span (nothing to
+    # gain from windowing when there's no cross-era blending to filter
+    # out). No reliable automatic predictor was found across repeated
+    # attempts (cohesion alone, span alone, cohesion+span combined all
+    # over- or under-triggered against the real population) -- so this
+    # is deliberately a per-person, individually-validated toggle, not a
+    # formula-driven default. Same db_default reasoning as
+    # gps_backfill_source above.
+    use_windowed_classification = models.BooleanField(default=False, db_default=False)
+    classification_window_days = models.IntegerField(default=182, db_default=182)
+
     # id field has a primary key
     def delete(self):
         # Protect the no face assigned person from

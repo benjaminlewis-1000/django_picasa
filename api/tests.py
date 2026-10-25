@@ -1434,6 +1434,121 @@ class CameraGpsBackfillConfigApiTests(ApiTestCase):
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
 
+class WindowedClassificationConfigApiTests(ApiTestCase):
+    """Backend for the per-person windowed-classification toggle page --
+    see face_manager.models.Person.use_windowed_classification's own
+    docstring for what this controls (a manually-curated per-person
+    override, not a general default, per the real investigation that
+    motivated it)."""
+
+    def test_requires_auth(self):
+        resp = self.anon_client.get("/api/windowed_classification_config/")
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_list_excludes_small_galleries_by_default(self):
+        image = self.make_image()
+        small_person = Person.objects.create(person_name="Tiny Gallery")
+        for _ in range(3):
+            self.make_face(image, declared_name=small_person, validated=True)
+
+        resp = self.client.get("/api/windowed_classification_config/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        names = [row['person_name'] for row in resp.data]
+        self.assertNotIn("Tiny Gallery", names)
+
+    def test_list_includes_large_galleries_with_current_state(self):
+        image = self.make_image()
+        big_person = Person.objects.create(
+            person_name="Big Gallery", use_windowed_classification=True,
+            classification_window_days=90,
+        )
+        for _ in range(55):
+            self.make_face(image, declared_name=big_person, validated=True)
+
+        resp = self.client.get("/api/windowed_classification_config/")
+        row = next(r for r in resp.data if r['person_name'] == "Big Gallery")
+        self.assertEqual(row['confirmed_count'], 55)
+        self.assertTrue(row['use_windowed_classification'])
+        self.assertEqual(row['classification_window_days'], 90)
+
+    def test_list_includes_already_enabled_small_gallery(self):
+        # An enabled person shouldn't vanish from the list just because
+        # their gallery is below MIN_GALLERY_SIZE -- otherwise turning it
+        # back off would require already knowing their id out-of-band.
+        image = self.make_image()
+        small_enabled = Person.objects.create(
+            person_name="Small But Enabled", use_windowed_classification=True,
+        )
+        self.make_face(image, declared_name=small_enabled, validated=True)
+
+        resp = self.client.get("/api/windowed_classification_config/")
+        names = [row['person_name'] for row in resp.data]
+        self.assertIn("Small But Enabled", names)
+
+    def test_set_windowed_enables_and_sets_window_days(self):
+        person = Person.objects.create(person_name="To Enable")
+        resp = self.client.post(
+            "/api/windowed_classification_config/set_windowed/",
+            {"person_id": person.id, "enabled": True, "window_days": 60},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        person.refresh_from_db()
+        self.assertTrue(person.use_windowed_classification)
+        self.assertEqual(person.classification_window_days, 60)
+
+    def test_set_windowed_can_disable(self):
+        person = Person.objects.create(
+            person_name="To Disable", use_windowed_classification=True,
+        )
+        resp = self.client.post(
+            "/api/windowed_classification_config/set_windowed/",
+            {"person_id": person.id, "enabled": False},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        person.refresh_from_db()
+        self.assertFalse(person.use_windowed_classification)
+
+    def test_set_windowed_omitting_window_days_leaves_it_unchanged(self):
+        person = Person.objects.create(
+            person_name="Keep Window", classification_window_days=45,
+        )
+        resp = self.client.post(
+            "/api/windowed_classification_config/set_windowed/",
+            {"person_id": person.id, "enabled": True},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        person.refresh_from_db()
+        self.assertEqual(person.classification_window_days, 45)
+
+    def test_set_windowed_rejects_unknown_person(self):
+        resp = self.client.post(
+            "/api/windowed_classification_config/set_windowed/",
+            {"person_id": 999999, "enabled": True},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_set_windowed_rejects_non_positive_window_days(self):
+        person = Person.objects.create(person_name="Bad Window")
+        resp = self.client.post(
+            "/api/windowed_classification_config/set_windowed/",
+            {"person_id": person.id, "enabled": True, "window_days": 0},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_set_windowed_rejects_missing_fields(self):
+        resp = self.client.post(
+            "/api/windowed_classification_config/set_windowed/",
+            {"enabled": True},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+
 class MobileViewTests(ApiTestCase):
     """Tests for api/mobile_views.py -- split out of api/views.py, which
     had grown to mix these mobile-app-facing endpoints in with the
