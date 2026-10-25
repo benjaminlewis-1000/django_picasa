@@ -692,6 +692,7 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
         saved = Face.objects.get(source_image_file=img)
         self.assertIsNotNone(saved.face_encoding_512)
 
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
     def test_above_floor_stores_lvface_encoding_too(self):
         from filepopulator.models import PhotoCollection
         default = PhotoCollection.objects.get(is_default=True)
@@ -707,6 +708,23 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
         mock_lv.assert_called_once()
         self.assertEqual(mock_lv.call_args.kwargs.get('input_is_bgr'), False)
 
+    def test_lvface_disabled_by_default_never_attempts_encoding(self):
+        # settings.LVFACE_ENCODING_ENABLED is False by default (2026-10-25
+        # -- see that setting's own comment: held off pending an ArcFace
+        # ViT comparison). Confirms the real production default, not just
+        # the override used by the other tests in this class.
+        from filepopulator.models import PhotoCollection
+        default = PhotoCollection.objects.get(is_default=True)
+        img = self._make_image_in_collection(default, '/photos/gate_test_lvface_disabled/a.jpg')
+        face = self._fake_detection([100, 100, 200, 200], det_score=0.9)
+        with patch('lvface.embed_from_image_array') as mock_lv:
+            self.extractor.add_new_face(face, img, self._img_numpy())
+        mock_lv.assert_not_called()
+        saved = Face.objects.get(source_image_file=img)
+        self.assertIsNone(saved.face_encoding_lvface_b)
+        self.assertIsNotNone(saved.face_encoding_512)  # insightface's own encoding is unaffected
+
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
     def test_below_floor_never_attempts_lvface_encoding(self):
         # Matches face_encoding_512's own floor gating -- a detection
         # that never gets a real insightface embedding shouldn't pay
@@ -723,6 +741,7 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
         saved = Face.objects.get(source_image_file=img)
         self.assertIsNone(saved.face_encoding_lvface_b)
 
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
     def test_lvface_failure_is_non_fatal_and_leaves_insightface_encoding_intact(self):
         from filepopulator.models import PhotoCollection
         default = PhotoCollection.objects.get(is_default=True)
@@ -3161,6 +3180,7 @@ class UpdateExistingFaceLvfaceEncodingTests(TestCase):
             age=30, gender=0,
         )
 
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
     def test_matching_box_stores_lvface_encoding(self):
         face = self._existing_face()
         new_data = self._new_data([10, 10, 50, 50])
@@ -3170,6 +3190,17 @@ class UpdateExistingFaceLvfaceEncodingTests(TestCase):
         self.assertEqual(face.face_encoding_lvface_b, [0.6] * 512)
         self.assertEqual(mock_lv.call_args.kwargs.get('input_is_bgr'), False)
 
+    def test_lvface_disabled_by_default_never_attempts_encoding(self):
+        face = self._existing_face()
+        new_data = self._new_data([10, 10, 50, 50])
+        with patch('lvface.embed_from_image_array') as mock_lv:
+            self.extractor.update_existing_face_to_insightface(face, new_data, img_numpy=np.zeros((100, 100, 3)))
+        mock_lv.assert_not_called()
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+        self.assertIsNotNone(face.face_encoding_512)
+
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
     def test_no_img_numpy_skips_lvface_without_error(self):
         face = self._existing_face()
         new_data = self._new_data([10, 10, 50, 50])
@@ -3180,6 +3211,7 @@ class UpdateExistingFaceLvfaceEncodingTests(TestCase):
         self.assertIsNone(face.face_encoding_lvface_b)
         self.assertIsNotNone(face.face_encoding_512)
 
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
     def test_lvface_failure_is_non_fatal(self):
         face = self._existing_face()
         new_data = self._new_data([10, 10, 50, 50])
@@ -3190,12 +3222,14 @@ class UpdateExistingFaceLvfaceEncodingTests(TestCase):
         self.assertIsNotNone(face.face_encoding_512)
 
 
-@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media", LVFACE_ENCODING_ENABLED=True)
 class BackfillLvfaceEncodingsTests(TestCase):
     """FaceExtractor._backfill_lvface_encodings() -- the catch-up sweep
     for Face.face_encoding_lvface_b, run automatically at the end of
     reencode_missing_faces(). Mocks lvface.embed_from_image_array
-    entirely to stay fast."""
+    entirely to stay fast. LVFACE_ENCODING_ENABLED is overridden True
+    class-wide here -- this class tests the sweep's own logic, not the
+    (separately-tested) master on/off switch itself."""
 
     def setUp(self):
         self.image = make_image()
@@ -3214,6 +3248,15 @@ class BackfillLvfaceEncodingsTests(TestCase):
             self.extractor._backfill_lvface_encodings()
         face.refresh_from_db()
         self.assertEqual(face.face_encoding_lvface_b, [0.4] * 512)
+
+    @override_settings(LVFACE_ENCODING_ENABLED=False)
+    def test_disabled_by_default_is_a_full_no_op(self):
+        face = self._face_with_kps()
+        with patch('lvface.embed_from_image_array') as mock_lv:
+            self.extractor._backfill_lvface_encodings()
+        mock_lv.assert_not_called()
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
 
     def test_face_without_kps_is_skipped(self):
         face = make_face(self.image)
