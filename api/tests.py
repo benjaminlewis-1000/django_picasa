@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import shutil
 import tempfile
 import unittest
@@ -3165,6 +3166,89 @@ class SlideshowConfigViewSetTests(ApiTestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+class CsrfCookieViewTests(ApiTestCase):
+    """GET /api/csrf/ - exists solely to make Django issue a csrftoken
+    cookie, since nothing else in this project ever does (see the
+    view's own docstring). Without it, SlideshowConfigViewSet's
+    POST/PUT 403s with a missing-CSRF-cookie error that's invisible
+    until someone actually tries to save."""
+
+    def test_anonymous_request_still_gets_a_csrf_cookie(self):
+        resp = self.anon_client.get('/api/csrf/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn('csrftoken', resp.cookies)
+
+    def test_authenticated_request_also_gets_a_csrf_cookie(self):
+        resp = self.client.get('/api/csrf/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn('csrftoken', resp.cookies)
+
+
+class PersonListLightweightTests(ApiTestCase):
+    """GET /api/person_list/?lightweight=true - a cheap alternate response
+    shape on the SAME endpoint facewires already uses (rather than a
+    second person-listing endpoint), for net_slideshow's settings page
+    People autocomplete: just name + face count, sorted by face count
+    descending, skipping the heavy live-count/sentinel-breakdown work
+    the default (unparameterized) response does for the admin sidebar."""
+
+    def test_anonymous_cannot_use_lightweight_mode_either(self):
+        resp = self.anon_client.get('/api/person_list/?lightweight=true')
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_anything_other_than_literal_true_falls_back_to_the_default_response(self):
+        # Matches the rest of this file's own boolean query param
+        # convention (params.get('x', '').lower() == 'true' - see
+        # 'flagged'/'date'/'fast'/'highlight_box' above) rather than a
+        # bare truthy check, so e.g. a stray ?lightweight=0 doesn't
+        # silently switch callers expecting the full response shape.
+        resp = self.client.get('/api/person_list/?lightweight=0')
+        results = json.loads(resp.content)['results']
+        self.assertTrue(results)
+        self.assertIn('num_possibilities', results[0])
+
+    def test_people_are_sorted_by_face_count_descending(self):
+        image = self.make_image()
+        popular, _ = Person.objects.get_or_create(person_name='Popular Person')
+        rare, _ = Person.objects.get_or_create(person_name='Rare Person')
+        self.make_face(image, declared_name=popular, box_left=1, box_top=1, box_right=10, box_bottom=10)
+        self.make_face(image, declared_name=popular, box_left=11, box_top=1, box_right=20, box_bottom=10)
+        self.make_face(image, declared_name=rare, box_left=21, box_top=1, box_right=30, box_bottom=10)
+
+        resp = self.client.get('/api/person_list/?lightweight=true')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        results = json.loads(resp.content)['results']
+        names = [r['person_name'] for r in results]
+        self.assertLess(names.index('Popular Person'), names.index('Rare Person'))
+        by_name = {r['person_name']: r['num_faces'] for r in results}
+        self.assertEqual(by_name['Popular Person'], 2)
+        self.assertEqual(by_name['Rare Person'], 1)
+
+    def test_sentinel_names_are_excluded(self):
+        resp = self.client.get('/api/person_list/?lightweight=true')
+        names = [r['person_name'] for r in json.loads(resp.content)['results']]
+        for sentinel in settings.IGNORED_NAMES:
+            self.assertNotIn(sentinel, names)
+
+    def test_lightweight_entries_have_no_extra_fields(self):
+        self.make_image()
+        resp = self.client.get('/api/person_list/?lightweight=true')
+        for entry in json.loads(resp.content)['results']:
+            self.assertEqual(set(entry.keys()), {'person_name', 'num_faces'})
+
+    def test_default_response_is_unaffected_by_the_new_param(self):
+        # Regression guard: adding the lightweight branch must not
+        # change what facewires' existing unparameterized calls get
+        # back - num_possibilities/url/id/etc. are still there.
+        resp = self.client.get('/api/person_list/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        results = json.loads(resp.content)['results']
+        self.assertTrue(results)
+        entry = results[0]
+        for field in ('id', 'url', 'num_faces', 'num_possibilities', 'num_unverified_faces'):
+            self.assertIn(field, entry)
+
+
 class ActiveSlideshowConfigViewTests(ApiTestCase):
     """GET /api/slideshow/active_config/ - slideshow-key reachable,
     same permission class as filteredImagesView."""
@@ -3484,6 +3568,29 @@ class SlideshowPaginationTests(ApiTestCase):
         self.assertEqual(ids1 & ids2, set())
         self.assertEqual(ids1 | ids2, {img.id for img in images})
 
+    def test_fresh_seeds_differ_even_with_the_global_random_module_pinned(self):
+        # Regression test: picasa/settings.py deliberately reseeds the
+        # GLOBAL random module to today.year*10000+month*100+day at
+        # import time (for unrelated reproducibility elsewhere) - every
+        # gunicorn worker does this independently at its own startup
+        # (no --preload), so without worker-process-local entropy here,
+        # two workers that happen to reach this code after the same
+        # number of prior random.* calls would mint byte-identical
+        # "random" seeds. Confirmed live in production: genuinely
+        # separate requests, seconds apart, different cf-ray ids,
+        # returned the exact same seed. Simulates the settings.py reseed
+        # directly (rather than needing multiple real processes) and
+        # confirms two back-to-back calls still diverge - the fix was
+        # switching the seed string's source from random.choice to
+        # secrets.choice (OS CSPRNG, unaffected by random.seed()).
+        self._make_images(5)
+        seeds = []
+        for _ in range(2):
+            random.seed(20261024)  # same fixed value settings.py uses for "today"
+            resp = self.anon_client.get(f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}')
+            seeds.append(resp.json()['seed'])
+        self.assertNotEqual(seeds[0], seeds[1])
+
     def test_not_ready_video_is_excluded_from_items_and_total_count(self):
         directory = Directory.objects.create(dir_path='/videos/pagination_test')
         VideoFile.objects.create(
@@ -3507,6 +3614,16 @@ class SlideshowPaginationTests(ApiTestCase):
         self.assertEqual(set(data['full_data'].keys()), {str(i['id']) for i in data['items']})
         for entry in data['full_data'].values():
             self.assertIn('sig', entry)
+
+    def test_response_is_marked_uncacheable(self):
+        # Regression test: this response had no caching headers of any
+        # kind, which let a plain browser reload (not a hard refresh)
+        # get served a stale cached response instead of hitting the
+        # network - landing on the exact same "random" order every
+        # reload rather than a fresh shuffle each time.
+        self._make_images(5)
+        resp = self.anon_client.get(f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}')
+        self.assertEqual(resp.headers.get('Cache-Control'), 'no-store')
 
 
 class SlideshowMediaSigTests(ApiTestCase):

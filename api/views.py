@@ -13,6 +13,8 @@ from django.db.models import Q
 from django.http import HttpResponse, Http404, FileResponse
 from django.shortcuts import render
 from django.shortcuts import render
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import ensure_csrf_cookie
 from django_filters.rest_framework import DjangoFilterBackend
 from face_manager.models import Person, Face
 from face_manager.live_counts import compute_live_face_counts
@@ -46,6 +48,7 @@ import mimetypes
 import os
 import PIL
 import random
+import secrets
 import re
 import requests
 import string
@@ -398,6 +401,28 @@ class PersonListView(APIView):
     permission_classes = (IsAuthenticated,)
     def get(self, request, *args, **kwargs):
         params = self.request.query_params
+
+        # ?lightweight=true - net_slideshow's settings page People picker
+        # (autocomplete sorted by face count) is the only caller of this
+        # branch. The full response below computes num_possibilities/
+        # num_unverified_faces/video-image splits via a threaded live-
+        # count fan-out plus extra per-sentinel queries, purpose-built
+        # for the facewires admin sidebar - none of which this picker
+        # uses. This is one plain annotate(Count(...)) aggregate query
+        # instead, excludes the blank/.ignore sentinel rows (meaningless
+        # as slideshow filters), and skips straight to returning, so it
+        # can't regress anything the default (unparemeterized) response
+        # already does for existing callers.
+        if params.get('lightweight', '').lower() == 'true':
+            people = (
+                Person.objects.exclude(person_name__in=settings.IGNORED_NAMES)
+                .annotate(num_faces=Count('face_declared'))
+                .order_by('-num_faces', 'person_name')
+                .values('person_name', 'num_faces')
+            )
+            results = [{'person_name': p['person_name'], 'num_faces': p['num_faces']} for p in people]
+            js = {'count': len(results), 'next': None, 'previous': None, 'results': results}
+            return HttpResponse(json.dumps(js), content_type='application/json')
 
         all_people = list(Person.objects.all())
         num_people = len(all_people)
@@ -1761,11 +1786,25 @@ class filteredImagesView(APIView):
             # skip entries from earlier ones) without keeping any
             # server-side session state: the client generates a seed once
             # and resends it on every subsequent page request for this same
-            # slideshow run. random.Random(seed) is a separate, private PRNG
-            # instance - this never touches (or is affected by) any other
-            # random.* call elsewhere in the process.
+            # slideshow run. random.Random(seed) below is a separate,
+            # private PRNG instance - this never touches (or is affected
+            # by) any other random.* call elsewhere in the process.
+            #
+            # The seed STRING itself, though, must NOT be drawn from the
+            # global `random` module - picasa/settings.py deliberately
+            # reseeds that to today.year*10000+month*100+day at import
+            # time (for unrelated reproducibility elsewhere), which is
+            # constant for the whole day and gets re-run identically in
+            # every gunicorn worker (no --preload, so each worker imports
+            # settings.py independently at its own startup). That made
+            # every worker's global PRNG start in lockstep, so two workers
+            # that happened to reach this line after the same number of
+            # prior random.* calls would mint the EXACT SAME "random"
+            # seed - confirmed live (identical seeds on genuinely separate
+            # requests seconds apart). secrets.choice draws from the OS's
+            # CSPRNG, completely unaffected by that global reseed.
             seed = params.get('seed') or ''.join(
-                random.choice(string.ascii_letters + string.digits) for _ in range(16)
+                secrets.choice(string.ascii_letters + string.digits) for _ in range(16)
             )
             random.Random(seed).shuffle(entries)
 
@@ -1866,7 +1905,17 @@ class filteredImagesView(APIView):
                     'sig': _slideshow_current_sig('video', video.id),
                 }
             js['video_data'] = video_data
-        return HttpResponse(json.dumps(js), content_type='application/json')
+        response = HttpResponse(json.dumps(js), content_type='application/json')
+        # Carries a fresh random shuffle (or the next page of one) on
+        # every call with no explicit seed - nothing here is safe to
+        # reuse from a cache. Without this, a plain F5/reload (not a
+        # hard refresh) can get served a stale cached response by the
+        # browser's own heuristics instead of hitting the network at
+        # all, since this response previously had no cache directives
+        # of any kind for a browser to go on - landing you on the exact
+        # same shuffled order every reload instead of a fresh one.
+        response['Cache-Control'] = 'no-store'
+        return response
 
 
 _RANGE_HEADER_RE = re.compile(r'bytes=(\d*)-(\d*)$')
@@ -2094,6 +2143,29 @@ class ParameterViewSet(viewsets.ViewSet):
             instance.img_server_pw = None
         serializer = api_ser.ParameterSerializer(instance=instance, many=False)
         return Response(serializer.data)
+
+class CsrfCookieView(APIView):
+    """GET /api/csrf/ -- exists purely to make Django issue a `csrftoken`
+    cookie (CSRF_COOKIE_DOMAIN is '.exploretheworld.tech', so it's
+    readable from every subdomain, including net_slideshow's settings
+    page). Nothing else in this project ever renders a template with
+    {% csrf_token %} or otherwise calls get_token(), so without this,
+    a session-authenticated POST/PUT (SlideshowConfigViewSet,
+    ScheduleRuleViewSet) has no cookie to read a matching X-CSRFToken
+    header from and always 403s with "CSRF token missing" -- the list/
+    retrieve GETs those same forms rely on aren't CSRF-protected at
+    all, so this failure is invisible until the first actual save.
+    Deliberately open to anyone (not just authenticated users): the
+    cookie itself is harmless without a session to pair it with, and
+    the frontend should be able to fetch this before Authelia login
+    has even happened."""
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    @method_decorator(ensure_csrf_cookie)
+    def get(self, request, *args, **kwargs):
+        return Response({'detail': 'ok'})
+
 
 class SlideshowConfigViewSet(viewsets.ModelViewSet):
     """CRUD for named slideshow configs (net_slideshow's settings page) -
