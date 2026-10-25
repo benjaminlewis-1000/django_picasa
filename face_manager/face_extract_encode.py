@@ -15,6 +15,7 @@ import common
 import cv2
 import hashlib
 import insightface
+import lvface
 import numpy as np
 import os
 import time
@@ -105,6 +106,21 @@ class FaceExtractor(object):
         # known box for a fresh single-pass detection. Matches the value
         # validated experimentally against real production faces.
         self.reencode_crop_margin_mult = 0.6
+
+        # Default per-call time budget for _backfill_lvface_encodings()
+        # when invoked from the scheduled hourly face_manager.reencode
+        # task (face_manager/tasks.py) -- left under the hour between
+        # scheduled runs so the task actually returns and the lock
+        # releases, rather than holding it for the full ~2-3 days the
+        # real backlog needs in one go. The existing-faces backlog is
+        # large (see Face.face_encoding_lvface_b's own comment), so this
+        # naturally spreads the one-time backfill across many scheduled
+        # runs rather than needing a separate management command --
+        # each run just picks up wherever face_encoding_lvface_b__isnull
+        # still finds work, no checkpoint state needed. None (unbounded)
+        # is used for the collection-scoped call from
+        # apply_collection_floor_change, where the eligible set is small.
+        self.LVFACE_REENCODE_MAX_RUNTIME_SECONDS = 3000
 
     @staticmethod
     def _build_detector():
@@ -381,7 +397,7 @@ class FaceExtractor(object):
                             continue
                         existing_data = existing_faces[int(ex_idx)]
                         new_data = detected_faces[int(det_idx)]
-                        self.update_existing_face_to_insightface(existing_data, new_data)
+                        self.update_existing_face_to_insightface(existing_data, new_data, img_numpy)
                         matched_existing_idcs.add(int(ex_idx))
                         matched_detect_idcs.add(int(det_idx))
 
@@ -530,8 +546,8 @@ class FaceExtractor(object):
             face_obj.reencoded = True
             face_obj.save()
 
-    def update_existing_face_to_insightface(self, existing_face, new_data):
-        
+    def update_existing_face_to_insightface(self, existing_face, new_data, img_numpy=None):
+
         if not type(existing_face) == Face:
             raise TypeError(f"Existing face must be of type face_manager.models.Face, is {type(existing_face)}")
         if not type(new_data) == insightface.app.common.Face:
@@ -575,6 +591,24 @@ class FaceExtractor(object):
         existing_face.detected_age = detected_age
         existing_face.detected_gender = detected_gender
         existing_face.reencoded = True
+
+        # LVFace-B embedding, computed alongside insightface's own at
+        # extraction time -- see Face.face_encoding_lvface_b's own
+        # comment. img_numpy is the same already-decoded RGB (PIL-
+        # sourced) array find_and_encode_faces() already has on hand,
+        # so this is pure extra inference cost, no extra decode.
+        # Failure here is non-fatal (left NULL, caught by the
+        # _backfill_lvface_encodings() catch-up sweep later) -- a
+        # second embedding model failing shouldn't block the primary
+        # insightface save this function exists for.
+        if img_numpy is not None:
+            try:
+                lv_embedding = lvface.embed_from_image_array(img_numpy, existing_face.kps, input_is_bgr=False)
+                if lv_embedding is not None:
+                    existing_face.face_encoding_lvface_b = lv_embedding.tolist()
+            except Exception as e:
+                settings.LOGGER.error(f"LVFace encoding failed for Face (updating existing): {e}")
+
         existing_face.save()
 
     def add_new_face(self, insight_detected_face, img_obj, img_numpy):
@@ -646,6 +680,20 @@ class FaceExtractor(object):
         # existed.
         if not below_collection_floor(img_obj.directory.collection, new_face.det_score, new_face.relative_size):
             new_face.face_encoding_512 = insight_detected_face['embedding'].tolist()
+
+            # LVFace-B embedding, same floor gating as insightface's own
+            # above -- a below-floor detection never participates in
+            # classify_unassigned() comparisons at all (see the floor
+            # explanation above), so there's no reason to pay LVFace-B's
+            # real inference cost for it either. Non-fatal on failure --
+            # see update_existing_face_to_insightface()'s matching
+            # comment for why.
+            try:
+                lv_embedding = lvface.embed_from_image_array(img_numpy, new_face.kps, input_is_bgr=False)
+                if lv_embedding is not None:
+                    new_face.face_encoding_lvface_b = lv_embedding.tolist()
+            except Exception as e:
+                settings.LOGGER.error(f"LVFace encoding failed for new Face: {e}")
 
         new_face.source_image_file = img_obj
         new_face.dateTakenUTC = img_obj.dateTakenUTC
@@ -784,7 +832,7 @@ class FaceExtractor(object):
         # Use a secure hash algorithm like SHA256
         return hashlib.sha256(combined_data).hexdigest()
 
-    def reencode_missing_faces(self, collection=None):
+    def reencode_missing_faces(self, collection=None, lvface_max_runtime_seconds='default'):
         """
         collection=None (default) sweeps every eligible face library-wide
         (the scheduled face_manager.reencode task's shape); passing a
@@ -942,6 +990,74 @@ class FaceExtractor(object):
                 face.kps = self._flatten_kps(abs_kps)
             face.reencoded = True
             face.save()
+
+        if lvface_max_runtime_seconds == 'default':
+            lvface_max_runtime_seconds = self.LVFACE_REENCODE_MAX_RUNTIME_SECONDS
+        self._backfill_lvface_encodings(collection=collection, max_runtime_seconds=lvface_max_runtime_seconds)
+
+    def _backfill_lvface_encodings(self, collection=None, max_runtime_seconds=None):
+        """Catches up Face.face_encoding_lvface_b for any face missing
+        it -- both the large one-time backlog from before this field
+        existed, and any face whose earlier encoding attempt failed.
+        See that field's own docstring in models.py for the full
+        picture (live extraction populates it for new faces going
+        forward; this covers the gap).
+
+        Deliberately does NOT exclude .ignore/.realignore declared
+        faces the way the insightface re-encode above does -- those are
+        exactly the population classify_unassigned()'s LVFace veto gate
+        needs to score query faces against for an opted-in person (see
+        Person.use_lvface_verification), unlike face_encoding_512 (which
+        is deliberately CLEARED for confirmed .ignore/.realignore faces
+        to save space, since nothing re-compares against them the same
+        way).
+
+        Scoped to image-sourced faces only for now -- video-sourced
+        faces (source_video_file) are a known, not-yet-handled gap, not
+        a design decision; revisit if/when a video face ever needs the
+        LVFace veto gate.
+
+        max_runtime_seconds bounds one call's wall time (checked between
+        faces, never mid-face) -- see LVFACE_REENCODE_MAX_RUNTIME_SECONDS'
+        own comment for why. None means unbounded (used for the small,
+        collection-scoped call from apply_collection_floor_change)."""
+        faces = Face.objects.filter(
+            face_encoding_lvface_b__isnull=True, kps__isnull=False, source_image_file__isnull=False,
+        ).select_related('source_image_file__directory__collection')
+        if collection is not None:
+            faces = faces.filter(source_image_file__directory__collection=collection)
+
+        start_time = time.time()
+        for face in faces:
+            if max_runtime_seconds is not None and (time.time() - start_time) >= max_runtime_seconds:
+                settings.LOGGER.debug(
+                    f"_backfill_lvface_encodings: time budget ({max_runtime_seconds}s) reached, "
+                    "stopping -- the next scheduled run will pick up where this left off."
+                )
+                break
+
+            img_obj = face.source_image_file
+            if img_obj is None or not img_obj.filename or not os.path.exists(img_obj.filename):
+                continue
+
+            try:
+                img = common.open_img_oriented(img_obj.filename, as_numpy=True)
+            except Exception as e:
+                settings.LOGGER.error(f"Cannot compute LVFace encoding for Face {face.id}: failed to open image ({e}).")
+                continue
+            if img is None or len(img.shape) != 3:
+                continue
+
+            try:
+                embedding = lvface.embed_from_image_array(img, face.kps, input_is_bgr=False)
+            except Exception as e:
+                settings.LOGGER.error(f"Cannot compute LVFace encoding for Face {face.id}: {e}")
+                continue
+            if embedding is None:
+                continue
+
+            face.face_encoding_lvface_b = embedding.tolist()
+            face.save(update_fields=['face_encoding_lvface_b'])
 
         # print(insight_detected_face)
 # def extract_faces(filename: str) -> dict:

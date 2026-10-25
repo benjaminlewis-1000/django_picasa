@@ -108,6 +108,39 @@ class Person(models.Model):
     use_windowed_classification = models.BooleanField(default=False, db_default=False)
     classification_window_days = models.IntegerField(default=182, db_default=182)
 
+    # Opt-in, per-person second-opinion veto gate for classify_unassigned()
+    # -- when set, a candidate match for this person that ALREADY passed
+    # the normal insightface-based gate (bucket threshold + margin/
+    # det_score) must ALSO clear a similarity check against a second,
+    # independently-trained embedding model (LVFace-B, a ViT-based face
+    # recognition model, github.com/bytedance/LVFace) before being
+    # accepted -- a real match fails only one way (insightface accepts,
+    # LVFace vetoes), never the reverse (LVFace is never used to accept a
+    # candidate insightface itself rejected). Built 2026-10-25 after a
+    # real investigation (see CLAUDE.md): Leslie Williams' gallery showed
+    # an ~87% false-positive rate on random sampling even after the
+    # windowed-classification fix above, and LVFace-B was found, via
+    # repeated empirical validation at two sample sizes against her real
+    # confirmed false-positive cases, to separate them far more cleanly
+    # than insightface alone (known-bad candidates scored 0.40-0.50 under
+    # insightface -- comfortably past her threshold -- but only 0.16-0.33
+    # under LVFace-B, well below her true-match distribution). LVFace-B
+    # was also directly compared against the smaller/larger published
+    # variants (S/L) on this same real data and found to be the best of
+    # the three -- bigger isn't automatically better here, likely because
+    # all published LVFace sizes share the same (smaller) Glint360K
+    # training set rather than scaling data with capacity.
+    #
+    # Deliberately per-person, not a global default, matching
+    # use_windowed_classification's own reasoning: this has only been
+    # empirically validated for Leslie Williams so far, not the broader
+    # population, and real compute cost (LVFace-B inference is far slower
+    # than insightface's) makes a global rollout something to earn
+    # gallery-by-gallery, not assume. See face_manager/lvface.py for the
+    # embedding/veto implementation and LVFACE_VETO_THRESHOLD's own
+    # comment for where that constant came from.
+    use_lvface_verification = models.BooleanField(default=False, db_default=False)
+
     # id field has a primary key
     def delete(self):
         # Protect the no face assigned person from
@@ -195,6 +228,30 @@ class Face(models.Model):
     reencoded = models.BooleanField(default=False)
 
     face_encoding_512 = ArrayField(
+                            SingleFloatField(),
+                            size=512, blank=True, null=True
+                        )
+
+    # LVFace-B (ViT) embedding -- see Person.use_lvface_verification's own
+    # docstring for the full investigation. Populated going forward by
+    # the live extraction pipeline (face_extract_encode.py, right
+    # alongside face_encoding_512 -- same kps-based alignment, no extra
+    # detection needed) for EVERY newly-detected face, not just opted-in
+    # galleries -- per the user's explicit call (2026-10-25) that having
+    # this ready for the whole library is worth the ongoing extraction
+    # cost, even though only one person (so far) has the veto gate
+    # itself turned on. Existing faces predating this field are covered
+    # by the one-time `backfill_lvface_encoding` management command
+    # (same resumable/checkpointed shape as backfill_det_score) --
+    # expect that to take 2-3 days of continuous single-threaded CPU
+    # time for the full ~638k-face library, since LVFace-B inference
+    # (~0.3-0.4s/face on CPU) is far more expensive than insightface's
+    # own lightweight detector. NULL means "not yet backfilled" (a real,
+    # temporary gap during the backfill's run), not "intentionally
+    # skipped" -- classify_unassigned() treats a NULL query or gallery
+    # embedding here the same way it already treats a NULL det_score:
+    # skip the LVFace half of the gate rather than blocking outright.
+    face_encoding_lvface_b = ArrayField(
                             SingleFloatField(),
                             size=512, blank=True, null=True
                         )
