@@ -785,6 +785,24 @@ WEB_NATIVE_CODECS = {'h264', 'vp9'}
 # cheaper to (repeatedly, harmlessly) rule out than a normal one.
 MIN_VIDEO_DURATION_SECONDS = 3
 
+# Master off switch for ALL LVFace-B encoding (face_manager/lvface.py) --
+# both the live extraction-time calls (add_new_face()/
+# update_existing_face_to_insightface() in face_extract_encode.py) and
+# the backfill sweep (FaceExtractor._backfill_lvface_encodings(), run
+# automatically at the end of the hourly reencode_missing_faces() task).
+# Deliberately False for now (2026-10-25): LVFace-B was validated as a
+# real improvement over insightface alone for a hard real case (see
+# CLAUDE.md), but before committing the live pipeline (and the ~2-3 day
+# one-time backfill of the existing library) to it, the user wants to
+# also benchmark insightface's own ArcFace ViT backbones (arcface_torch,
+# trained on the much larger WebFace42M vs. LVFace's Glint360K) against
+# the same real known-hard cases, in case more training data (not just
+# bigger model capacity, which LVFace-S/B/L already tested and found
+# non-monotonic) is what actually matters. Flip to True once that
+# comparison is done and a model is chosen -- no other code change
+# needed, both call sites already check this.
+LVFACE_ENCODING_ENABLED = False
+
 # How long a row's file can be missing from disk before
 # delete_removed_photos()/delete_removed_videos() actually deletes it,
 # rather than deleting the moment a single scan finds it gone. A bulk

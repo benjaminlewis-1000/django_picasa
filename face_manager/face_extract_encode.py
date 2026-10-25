@@ -601,7 +601,7 @@ class FaceExtractor(object):
         # _backfill_lvface_encodings() catch-up sweep later) -- a
         # second embedding model failing shouldn't block the primary
         # insightface save this function exists for.
-        if img_numpy is not None:
+        if settings.LVFACE_ENCODING_ENABLED and img_numpy is not None:
             try:
                 lv_embedding = lvface.embed_from_image_array(img_numpy, existing_face.kps, input_is_bgr=False)
                 if lv_embedding is not None:
@@ -689,9 +689,10 @@ class FaceExtractor(object):
             # see update_existing_face_to_insightface()'s matching
             # comment for why.
             try:
-                lv_embedding = lvface.embed_from_image_array(img_numpy, new_face.kps, input_is_bgr=False)
-                if lv_embedding is not None:
-                    new_face.face_encoding_lvface_b = lv_embedding.tolist()
+                if settings.LVFACE_ENCODING_ENABLED:
+                    lv_embedding = lvface.embed_from_image_array(img_numpy, new_face.kps, input_is_bgr=False)
+                    if lv_embedding is not None:
+                        new_face.face_encoding_lvface_b = lv_embedding.tolist()
             except Exception as e:
                 settings.LOGGER.error(f"LVFace encoding failed for new Face: {e}")
 
@@ -1020,7 +1021,14 @@ class FaceExtractor(object):
         max_runtime_seconds bounds one call's wall time (checked between
         faces, never mid-face) -- see LVFACE_REENCODE_MAX_RUNTIME_SECONDS'
         own comment for why. None means unbounded (used for the small,
-        collection-scoped call from apply_collection_floor_change)."""
+        collection-scoped call from apply_collection_floor_change).
+
+        No-ops entirely while settings.LVFACE_ENCODING_ENABLED is False
+        -- see that setting's own comment for why (held off pending a
+        comparison against insightface's own ArcFace ViT backbones)."""
+        if not settings.LVFACE_ENCODING_ENABLED:
+            return
+
         faces = Face.objects.filter(
             face_encoding_lvface_b__isnull=True, kps__isnull=False, source_image_file__isnull=False,
         ).select_related('source_image_file__directory__collection')
