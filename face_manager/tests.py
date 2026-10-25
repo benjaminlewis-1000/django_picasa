@@ -3188,6 +3188,38 @@ class ReencodeMissingFacesTests(TestCase):
         self.assertIsNone(face.face_encoding_512)
         self.assertIsNone(face.face_encoding_lvface_b)
 
+    def test_below_floor_face_never_enters_the_per_face_loop_at_all(self):
+        # Distinguishes "excluded by the SQL query itself" (the real
+        # point of the below_collection_floor() SQL mirror added
+        # 2026-10-25 -- previously tens of thousands of permanently-
+        # below-floor rows were fetched and iterated every single
+        # hourly run just to be skipped) from merely "fetched, then
+        # skipped in Python" -- if the SQL filter is doing its job, the
+        # per-face loop body (and its own redundant below_collection_
+        # floor() safety-net call) should never even run for this row.
+        from filepopulator.models import Directory, PhotoCollection
+        low_fidelity = PhotoCollection.objects.create(
+            name='Low Fidelity SQL Filter', root_directory='/photos/reencode_sql_floor_test',
+            min_face_det_score=0.6,
+        )
+        directory = Directory.objects.create(dir_path='/photos/reencode_sql_floor_test', collection=low_fidelity)
+        below_floor_image = ImageFile.objects.create(
+            filename=self.image.filename, directory=directory,
+            width=self.image.width, height=self.image.height,
+            pixel_hash='reencode-sql-floor-hash', file_hash='reencode-sql-floor-fhash',
+        )
+        person = make_person("Sql Floor Excluded")
+        face = make_face(below_floor_image, declared_name=person, det_score=0.5)
+        face.face_encoding_512 = None
+        face.kps = [1.0] * 10
+        face.face_encoding_lvface_b = None
+        face.save()
+
+        with patch('face_manager.face_extract_encode.below_collection_floor') as mock_floor_check:
+            self.extractor.reencode_missing_faces()
+
+        mock_floor_check.assert_not_called()
+
     @override_settings(LVFACE_ENCODING_ENABLED=True)
     def test_confirmed_ignore_face_excluded_from_lvface_too(self):
         ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
