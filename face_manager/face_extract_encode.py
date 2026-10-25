@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 from django.conf import settings
-from django.db.models import Q
+from django.db.models import F, Q
 from face_manager.models import Person, Face
 from filepopulator.models import ImageFile, below_collection_floor
 from insightface.app import FaceAnalysis
@@ -944,11 +944,33 @@ class FaceExtractor(object):
         start_time = time.time()
         lvface_enabled = settings.LVFACE_ENCODING_ENABLED
 
+        # SQL-level mirror of below_collection_floor() (filepopulator/
+        # models.py) -- a face permanently below its collection's floor
+        # would always be skipped by the per-face check further down
+        # anyway, but with a real collection configured (currently just
+        # "Lewis Parents"), that's tens of thousands of rows fetched and
+        # discarded on every single hourly run for no reason. Pushing
+        # the same comparison into the query itself means those rows are
+        # never fetched at all. Kept as an exact field-for-field
+        # translation of below_collection_floor()'s own logic (NULL
+        # floor/NULL collection/NULL metric all mean "not below floor",
+        # same as there) -- the per-face Python check below is left in
+        # place too, as a cheap redundant safety net in case this SQL
+        # version and that function's own logic ever drift apart.
+        not_below_det_floor = (
+            Q(source_image_file__directory__collection__min_face_det_score__isnull=True)
+            | Q(det_score__isnull=False, det_score__gte=F('source_image_file__directory__collection__min_face_det_score'))
+        )
+        not_below_size_floor = (
+            Q(source_image_file__directory__collection__min_face_relative_size__isnull=True)
+            | Q(relative_size__isnull=False, relative_size__gte=F('source_image_file__directory__collection__min_face_relative_size'))
+        )
+
         faces_to_process = Face.objects.filter(
             Q(face_encoding_512__isnull=True) | Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
             | Q(face_encoding_lvface_b__isnull=True),
             source_image_file__isnull=False,
-        ).exclude(
+        ).filter(not_below_det_floor, not_below_size_floor).exclude(
             declared_name__person_name__in=[settings.SOFT_IGNORE_NAME, '.realignore']
         ).select_related('source_image_file__directory__collection')
         if collection is not None:
