@@ -708,11 +708,13 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
         mock_lv.assert_called_once()
         self.assertEqual(mock_lv.call_args.kwargs.get('input_is_bgr'), False)
 
-    def test_lvface_disabled_by_default_never_attempts_encoding(self):
-        # settings.LVFACE_ENCODING_ENABLED is False by default (2026-10-25
-        # -- see that setting's own comment: held off pending an ArcFace
-        # ViT comparison). Confirms the real production default, not just
-        # the override used by the other tests in this class.
+    @override_settings(LVFACE_ENCODING_ENABLED=False)
+    def test_lvface_disabled_never_attempts_encoding(self):
+        # settings.LVFACE_ENCODING_ENABLED is True in production now
+        # (2026-10-25 -- LVFace-B validated, see that setting's own
+        # comment), but the disabled path must still work correctly
+        # (e.g. if ever flipped back off) -- exercised here via an
+        # explicit override rather than relying on the current default.
         from filepopulator.models import PhotoCollection
         default = PhotoCollection.objects.get(is_default=True)
         img = self._make_image_in_collection(default, '/photos/gate_test_lvface_disabled/a.jpg')
@@ -3190,7 +3192,8 @@ class UpdateExistingFaceLvfaceEncodingTests(TestCase):
         self.assertEqual(face.face_encoding_lvface_b, [0.6] * 512)
         self.assertEqual(mock_lv.call_args.kwargs.get('input_is_bgr'), False)
 
-    def test_lvface_disabled_by_default_never_attempts_encoding(self):
+    @override_settings(LVFACE_ENCODING_ENABLED=False)
+    def test_lvface_disabled_never_attempts_encoding(self):
         face = self._existing_face()
         new_data = self._new_data([10, 10, 50, 50])
         with patch('lvface.embed_from_image_array') as mock_lv:
