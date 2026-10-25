@@ -107,7 +107,10 @@ class FaceExtractor(object):
         # validated experimentally against real production faces.
         self.reencode_crop_margin_mult = 0.6
 
-        # Default per-call time budget for _backfill_lvface_encodings()
+        # Default per-call time budget for reencode_missing_faces()'s
+        # combined image loop (insightface + LVFace-B together, see that
+        # method's own docstring) and the video-only
+        # _backfill_lvface_video_encodings() sub-pass that follows it,
         # when invoked from the scheduled hourly face_manager.reencode
         # task (face_manager/tasks.py) -- left under the hour between
         # scheduled runs so the task actually returns and the lock
@@ -598,7 +601,8 @@ class FaceExtractor(object):
         # sourced) array find_and_encode_faces() already has on hand,
         # so this is pure extra inference cost, no extra decode.
         # Failure here is non-fatal (left NULL, caught by the
-        # _backfill_lvface_encodings() catch-up sweep later) -- a
+        # reencode_missing_faces()/_backfill_lvface_video_encodings()
+        # catch-up sweep later) -- a
         # second embedding model failing shouldn't block the primary
         # insightface save this function exists for.
         if settings.LVFACE_ENCODING_ENABLED and img_numpy is not None:
@@ -845,13 +849,22 @@ class FaceExtractor(object):
         embedding yet to re-check live, so it needs an actual re-encode
         rather than just a comparison).
 
+        Catches up BOTH embeddings an image-sourced face can be missing --
+        insightface's face_encoding_512 and LVFace-B's
+        face_encoding_lvface_b -- in a single combined pass per face
+        (2026-10-25, merged from two previously-separate sequential sweeps
+        that each opened and decoded the same image independently for any
+        face missing both; see Face.face_encoding_lvface_b's own docstring
+        in models.py for why LVFace-B exists at all). A face needing
+        NEITHER encoding (or below its collection's current detection
+        floor -- see below) is skipped before ever touching the
+        filesystem, using only fields already loaded with the row itself.
+
         Re-encode faces that have no *usable* face_encoding_512 but are no
         longer declared .ignore/.realignore -- e.g. a confirmed-ignore face
         whose embedding was cleared to save storage, then reassigned away
         from that sentinel because it turned out to be a real person after
-        all.
-
-        "No usable embedding" means either NULL, or the
+        all. "No usable embedding" means either NULL, or the
         settings.NON_DETECTED_FACE_ENCODING sentinel ([-999]*512) that
         update_list_of_no_matching_detects() stamps onto a face whose
         existing box wasn't matched to any detection during a full-image
@@ -869,7 +882,7 @@ class FaceExtractor(object):
         face's *box* came from the modern insightface pipeline, which is
         orthogonal to whether it currently has a usable embedding.
 
-        Two paths, in order of preference:
+        Two paths for insightface, in order of preference:
           1. If the face has stored `kps` (5 landmark points, in the source
              image's own pixel coordinate space -- see Face.kps), replay
              the exact original alignment directly through the recognition
@@ -892,25 +905,65 @@ class FaceExtractor(object):
              for a face already this hard to redetect in isolation, that's
              unlikely to do meaningfully better and costs far more (a
              full-image pass takes seconds; a small crop takes well under
-             one).
+             one). A successful crop+redetect recovers `kps` as a side
+             effect -- when that happens, this same face becomes newly
+             eligible for LVFace-B too, in this same already-open image,
+             without waiting for a later run to notice.
 
         A face that still finds no detection in its crop gets
         settings.REENCODE_DEFAULT_ENCODING (a neutral, valid, unit-norm
         vector) rather than being left NULL -- NULL is exactly what this
         method selects on, so leaving it NULL would retry it forever on
         every future run.
+
+        LVFace-B needs `kps` already present (never redetects on its own,
+        unlike insightface's crop+redetect fallback above) and respects
+        the same below_collection_floor() gate and
+        settings.LVFACE_ENCODING_ENABLED master switch as the live
+        extraction pipeline (add_new_face()/
+        update_existing_face_to_insightface()) -- a face below its
+        collection's floor, or with LVFace encoding disabled entirely,
+        never gets a face_encoding_lvface_b, matching face_encoding_512's
+        own gating exactly (LVFace-B is meant to eventually replace that
+        field outright, same usage pattern -- see
+        Person.use_lvface_verification's docstring).
+
+        lvface_max_runtime_seconds bounds this method's TOTAL wall time
+        (checked between faces in the merged image loop, never mid-face;
+        'default' resolves to self.LVFACE_REENCODE_MAX_RUNTIME_SECONDS) --
+        whatever's left after the image loop finishes or is cut off is
+        passed on to the video-only LVFace-B sub-pass
+        (_backfill_lvface_video_encodings()) that runs after it, so one
+        call's total runtime is bounded the same way it always was, not
+        doubled by adding video on top. None means unbounded (used for
+        the small, collection-scoped call from
+        apply_collection_floor_change).
         """
-        faces_to_reencode = Face.objects.filter(
+        if lvface_max_runtime_seconds == 'default':
+            lvface_max_runtime_seconds = self.LVFACE_REENCODE_MAX_RUNTIME_SECONDS
+        start_time = time.time()
+        lvface_enabled = settings.LVFACE_ENCODING_ENABLED
+
+        faces_to_process = Face.objects.filter(
             Q(face_encoding_512__isnull=True) | Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
+            | Q(face_encoding_lvface_b__isnull=True),
+            source_image_file__isnull=False,
         ).exclude(
             declared_name__person_name__in=[settings.SOFT_IGNORE_NAME, '.realignore']
         ).select_related('source_image_file__directory__collection')
         if collection is not None:
-            faces_to_reencode = faces_to_reencode.filter(source_image_file__directory__collection=collection)
+            faces_to_process = faces_to_process.filter(source_image_file__directory__collection=collection)
 
         rec_model = self.app.app.models['recognition']
 
-        for face in faces_to_reencode:
+        for face in faces_to_process:
+            if lvface_max_runtime_seconds is not None and (time.time() - start_time) >= lvface_max_runtime_seconds:
+                settings.LOGGER.debug(
+                    f"reencode_missing_faces: time budget ({lvface_max_runtime_seconds}s) reached, "
+                    "stopping -- the next scheduled run will pick up where this left off."
+                )
+                break
+
             img_obj = face.source_image_file
             if img_obj is None or not img_obj.filename or not os.path.exists(img_obj.filename):
                 settings.LOGGER.error(f"Cannot re-encode Face {face.id}: source image missing or unset.")
@@ -918,11 +971,24 @@ class FaceExtractor(object):
 
             # Checked live against the collection's CURRENT thresholds,
             # not a stored flag -- see below_collection_floor()'s own
-            # docstring for why. Without this, this sweep would
-            # immediately re-encode every PhotoCollection-floor-skipped
-            # face on its very next (hourly) run, defeating the entire
-            # point of skipping them in the first place.
-            if below_collection_floor(img_obj.directory.collection, face.det_score, face.relative_size):
+            # docstring for why. Gates BOTH encodings: a face below its
+            # collection's floor deliberately never gets a real
+            # embedding of either kind.
+            below_floor = below_collection_floor(img_obj.directory.collection, face.det_score, face.relative_size)
+
+            needs_insight = not below_floor and (
+                face.face_encoding_512 is None or face.face_encoding_512 == settings.NON_DETECTED_FACE_ENCODING
+            )
+            needs_lvface = (
+                lvface_enabled and not below_floor
+                and face.face_encoding_lvface_b is None and face.kps is not None
+            )
+
+            if not needs_insight and not needs_lvface:
+                # Below floor, or already has everything it's currently
+                # eligible for (e.g. a real insightface embedding but no
+                # kps to ever support an LVFace-B one without a fresh
+                # detection) -- never worth opening the image.
                 continue
 
             try:
@@ -934,101 +1000,120 @@ class FaceExtractor(object):
                 settings.LOGGER.error(f"Cannot re-encode Face {face.id}: image failed to decode.")
                 continue
 
-            if face.kps is not None:
-                kps_arr = np.array(face.kps, dtype=np.float32).reshape(5, 2)
-                insight_face = insightface.app.common.Face(kps=kps_arr)
-                embedding = rec_model.get(img, insight_face)
-                face.face_encoding_512 = embedding.tolist()
-                face.reencoded = True
+            insight_touched = False
+
+            if needs_insight:
+                if face.kps is not None:
+                    kps_arr = np.array(face.kps, dtype=np.float32).reshape(5, 2)
+                    insight_face = insightface.app.common.Face(kps=kps_arr)
+                    embedding = rec_model.get(img, insight_face)
+                    face.face_encoding_512 = embedding.tolist()
+                    face.reencoded = True
+                    insight_touched = True
+                else:
+                    h, w, _ = img.shape
+                    bl, bt, br, bb = face.box_left, face.box_top, face.box_right, face.box_bottom
+                    if bl is None or br is None or br <= bl or bb <= bt:
+                        settings.LOGGER.error(f"Cannot re-encode Face {face.id}: invalid stored box.")
+                    else:
+                        box_w, box_h = br - bl, bb - bt
+                        mx = int(box_w * self.reencode_crop_margin_mult)
+                        my = int(box_h * self.reencode_crop_margin_mult)
+                        cl, ct = max(0, bl - mx), max(0, bt - my)
+                        cr, cb = min(w, br + mx), min(h, bb + my)
+                        crop = img[ct:cb, cl:cr]
+
+                        if crop.shape[0] < 20 or crop.shape[1] < 20:
+                            face.face_encoding_512 = settings.REENCODE_DEFAULT_ENCODING
+                            insight_touched = True
+                        else:
+                            dets = self.app.app.get(crop)
+                            if len(dets) == 0:
+                                face.face_encoding_512 = settings.REENCODE_DEFAULT_ENCODING
+                                insight_touched = True
+                            else:
+                                # Several faces may be found in the crop
+                                # (e.g. a neighboring face partly included
+                                # by the margin) -- the one closest to the
+                                # crop's center is our known face, since
+                                # we cropped symmetrically around its own
+                                # box.
+                                crop_cx, crop_cy = crop.shape[1] / 2, crop.shape[0] / 2
+                                best, best_dist = None, None
+                                for d in dets:
+                                    dl, dt, dr, db = d['bbox']
+                                    dcx, dcy = (dl + dr) / 2, (dt + db) / 2
+                                    dist = (dcx - crop_cx) ** 2 + (dcy - crop_cy) ** 2
+                                    if best_dist is None or dist < best_dist:
+                                        best_dist, best = dist, d
+
+                                face.face_encoding_512 = best['embedding'].tolist()
+                                # Translate the freshly-detected kps from
+                                # crop-local back to the source image's
+                                # absolute coordinates (matching how
+                                # add_new_face()/
+                                # update_existing_face_to_insightface()
+                                # store them), so a FUTURE re-encode of
+                                # this same face can use the exact-replay
+                                # path above instead of cropping again.
+                                if best['kps'] is not None:
+                                    abs_kps = np.array(best['kps'], dtype=float) + np.array([cl, ct])
+                                    face.kps = self._flatten_kps(abs_kps)
+                                face.reencoded = True
+                                insight_touched = True
+
+            # Re-check now that the insight step above may have just
+            # recovered kps for a face that had none before -- the image
+            # is already open, so this is a free win rather than waiting
+            # for a later run to notice.
+            if not needs_lvface and lvface_enabled and not below_floor and face.face_encoding_lvface_b is None and face.kps is not None:
+                needs_lvface = True
+
+            lvface_touched = False
+            if needs_lvface:
+                try:
+                    lv_embedding = lvface.embed_from_image_array(img, face.kps, input_is_bgr=False)
+                except Exception as e:
+                    settings.LOGGER.error(f"Cannot compute LVFace encoding for Face {face.id}: {e}")
+                    lv_embedding = None
+                if lv_embedding is not None:
+                    face.face_encoding_lvface_b = lv_embedding.tolist()
+                    lvface_touched = True
+
+            if insight_touched:
                 face.save()
-                continue
+            elif lvface_touched:
+                face.save(update_fields=['face_encoding_lvface_b'])
 
-            h, w, _ = img.shape
-            bl, bt, br, bb = face.box_left, face.box_top, face.box_right, face.box_bottom
-            if bl is None or br is None or br <= bl or bb <= bt:
-                settings.LOGGER.error(f"Cannot re-encode Face {face.id}: invalid stored box.")
-                continue
+        elapsed = time.time() - start_time
+        remaining_budget = (
+            None if lvface_max_runtime_seconds is None else max(0, lvface_max_runtime_seconds - elapsed)
+        )
+        if remaining_budget != 0:
+            self._backfill_lvface_video_encodings(collection=collection, max_runtime_seconds=remaining_budget)
 
-            box_w, box_h = br - bl, bb - bt
-            mx = int(box_w * self.reencode_crop_margin_mult)
-            my = int(box_h * self.reencode_crop_margin_mult)
-            cl, ct = max(0, bl - mx), max(0, bt - my)
-            cr, cb = min(w, br + mx), min(h, bb + my)
-            crop = img[ct:cb, cl:cr]
+    def _backfill_lvface_video_encodings(self, collection=None, max_runtime_seconds=None):
+        """Catches up Face.face_encoding_lvface_b for video-sourced faces
+        missing it -- the video-only counterpart to reencode_missing_
+        faces()'s own merged image-side insightface+LVFace-B sweep (see
+        that method's docstring; the two used to share one function
+        before the image/video logic was split out, 2026-10-25).
 
-            if crop.shape[0] < 20 or crop.shape[1] < 20:
-                face.face_encoding_512 = settings.REENCODE_DEFAULT_ENCODING
-                face.save()
-                continue
-
-            dets = self.app.app.get(crop)
-            if len(dets) == 0:
-                face.face_encoding_512 = settings.REENCODE_DEFAULT_ENCODING
-                face.save()
-                continue
-
-            # Several faces may be found in the crop (e.g. a neighboring
-            # face partly included by the margin) -- the one closest to
-            # the crop's center is our known face, since we cropped
-            # symmetrically around its own box.
-            crop_cx, crop_cy = crop.shape[1] / 2, crop.shape[0] / 2
-            best, best_dist = None, None
-            for d in dets:
-                dl, dt, dr, db = d['bbox']
-                dcx, dcy = (dl + dr) / 2, (dt + db) / 2
-                dist = (dcx - crop_cx) ** 2 + (dcy - crop_cy) ** 2
-                if best_dist is None or dist < best_dist:
-                    best_dist, best = dist, d
-
-            face.face_encoding_512 = best['embedding'].tolist()
-            # Translate the freshly-detected kps from crop-local back to
-            # the source image's absolute coordinates (matching how
-            # add_new_face()/update_existing_face_to_insightface() store
-            # them), so a FUTURE re-encode of this same face can use the
-            # exact-replay path above instead of cropping again.
-            if best['kps'] is not None:
-                abs_kps = np.array(best['kps'], dtype=float) + np.array([cl, ct])
-                face.kps = self._flatten_kps(abs_kps)
-            face.reencoded = True
-            face.save()
-
-        if lvface_max_runtime_seconds == 'default':
-            lvface_max_runtime_seconds = self.LVFACE_REENCODE_MAX_RUNTIME_SECONDS
-        self._backfill_lvface_encodings(collection=collection, max_runtime_seconds=lvface_max_runtime_seconds)
-
-    def _backfill_lvface_encodings(self, collection=None, max_runtime_seconds=None):
-        """Catches up Face.face_encoding_lvface_b for any face missing
-        it -- both the large one-time backlog from before this field
-        existed, and any face whose earlier encoding attempt failed.
-        See that field's own docstring in models.py for the full
-        picture (live extraction populates it for new faces going
-        forward; this covers the gap).
-
-        Excludes confirmed .ignore/.realignore faces, the same as the
-        insightface re-encode above (2026-10-25: the original design
-        deliberately kept these, to feed a possible future LVFace veto
-        gate scored against a person's confirmed-wrong examples -- but
-        the actual direction settled on is LVFace-B eventually replacing
+        Excludes confirmed .ignore/.realignore faces, the same reasoning
+        as the image side (LVFace-B is meant to eventually replace
         face_encoding_512 outright, same usage pattern, so it follows
         the same "don't bother encoding confirmed junk" rule
-        face_encoding_512 itself already follows -- that field is
-        cleared, not populated, for these faces, since nothing
-        re-compares against them under normal classification).
+        face_encoding_512 itself already follows).
 
-        Also respects each image face's collection detection floor
-        (below_collection_floor(), same check the insightface re-encode
-        above already makes) for the same reason -- a face below its
-        collection's current floor deliberately never gets a real
-        face_encoding_512 either (see add_new_face()'s own comment), so
-        LVFace-B shouldn't end up with broader coverage than the field
-        it's meant to replace. No video equivalent exists yet
+        No PhotoCollection-floor equivalent exists for video yet
         (VideoFile has no PhotoCollection association at all -- a known,
-        separate gap, see CLAUDE.md), so the video sub-pass below has no
-        floor check to make.
+        separate gap, see CLAUDE.md) -- collection is image-only, so a
+        collection-scoped call (from apply_collection_floor_change) has
+        nothing to say about video faces and skips this sub-pass
+        entirely rather than silently sweeping the whole unscoped video
+        backlog on a call meant to stay narrow.
 
-        Covers both image- and video-sourced faces (2026-10-25 -- video
-        support added same day as the ignore-exclusion change above). A
-        video face has no standalone source file to decode the way an
+        A video face has no standalone source file to decode the way an
         image face does, so its embedding is recovered by re-extracting
         the exact frame its thumbnail/box/kps already came from via
         video_face_pipeline.extract_frame_near_timestamp() (the same,
@@ -1038,87 +1123,22 @@ class FaceExtractor(object):
         VideoFaceExtractor._set_face_box_and_thumbnail), so no new
         alignment logic is needed, just a straight
         lvface.embed_from_image_array() call once the frame is in hand.
-        Video re-extraction is real decode work (a windowed scan, not a
-        free crop-replay the way the image path's kps-replay is), so
-        the video sub-pass runs only after the (usually cheaper, and
-        typically much smaller backlog) image sub-pass, sharing the
-        same overall time budget -- this naturally prioritizes the
-        image backlog finishing first, with video getting whatever time
-        remains, run over run.
 
-        max_runtime_seconds bounds one call's wall time across BOTH
-        sub-passes combined (checked between faces, never mid-face) --
-        see LVFACE_REENCODE_MAX_RUNTIME_SECONDS' own comment for why.
-        None means unbounded (used for the small, collection-scoped
-        call from apply_collection_floor_change).
+        max_runtime_seconds bounds this sub-pass's own wall time (checked
+        between faces, never mid-face) -- reencode_missing_faces() passes
+        whatever's left of its own overall budget after the image loop,
+        so one top-level call's total runtime stays bounded the same way
+        it always has. None means unbounded.
 
         No-ops entirely while settings.LVFACE_ENCODING_ENABLED is
         False."""
         if not settings.LVFACE_ENCODING_ENABLED:
             return
+        if collection is not None:
+            return
 
         start_time = time.time()
         exclude_names = [settings.SOFT_IGNORE_NAME, '.realignore']
-
-        image_faces = Face.objects.filter(
-            face_encoding_lvface_b__isnull=True, kps__isnull=False, source_image_file__isnull=False,
-        ).exclude(
-            declared_name__person_name__in=exclude_names
-        ).select_related('source_image_file__directory__collection')
-        if collection is not None:
-            image_faces = image_faces.filter(source_image_file__directory__collection=collection)
-
-        for face in image_faces:
-            if max_runtime_seconds is not None and (time.time() - start_time) >= max_runtime_seconds:
-                settings.LOGGER.debug(
-                    f"_backfill_lvface_encodings: time budget ({max_runtime_seconds}s) reached "
-                    "during the image sub-pass, stopping -- the next scheduled run will pick up "
-                    "where this left off."
-                )
-                return
-
-            img_obj = face.source_image_file
-            if img_obj is None or not img_obj.filename or not os.path.exists(img_obj.filename):
-                continue
-
-            # Checked live against the collection's CURRENT thresholds,
-            # same as the insightface re-encode above (see
-            # below_collection_floor()'s own docstring for why) -- a
-            # face below its collection's floor deliberately never gets
-            # a real face_encoding_512 either, and LVFace-B is meant to
-            # eventually replace that field's usage pattern outright, so
-            # it follows the exact same gate rather than ending up with
-            # broader coverage than the field it's meant to replace.
-            if below_collection_floor(img_obj.directory.collection, face.det_score, face.relative_size):
-                continue
-
-            try:
-                img = common.open_img_oriented(img_obj.filename, as_numpy=True)
-            except Exception as e:
-                settings.LOGGER.error(f"Cannot compute LVFace encoding for Face {face.id}: failed to open image ({e}).")
-                continue
-            if img is None or len(img.shape) != 3:
-                continue
-
-            try:
-                embedding = lvface.embed_from_image_array(img, face.kps, input_is_bgr=False)
-            except Exception as e:
-                settings.LOGGER.error(f"Cannot compute LVFace encoding for Face {face.id}: {e}")
-                continue
-            if embedding is None:
-                continue
-
-            face.face_encoding_lvface_b = embedding.tolist()
-            face.save(update_fields=['face_encoding_lvface_b'])
-
-        # collection is image-only (PhotoCollection/Directory.collection,
-        # see CLAUDE.md's "VideoFile has no PhotoCollection association"
-        # TODO) -- a collection-scoped call has nothing to say about
-        # video faces, so skip the video sub-pass entirely rather than
-        # silently sweeping the whole (unscoped) video backlog on a call
-        # meant to stay narrow.
-        if collection is not None:
-            return
 
         from video_face_pipeline import ffprobe_info, extract_frame_near_timestamp
 
@@ -1133,9 +1153,8 @@ class FaceExtractor(object):
         for face in video_faces:
             if max_runtime_seconds is not None and (time.time() - start_time) >= max_runtime_seconds:
                 settings.LOGGER.debug(
-                    f"_backfill_lvface_encodings: time budget ({max_runtime_seconds}s) reached "
-                    "during the video sub-pass, stopping -- the next scheduled run will pick up "
-                    "where this left off."
+                    f"_backfill_lvface_video_encodings: time budget ({max_runtime_seconds}s) reached, "
+                    "stopping -- the next scheduled run will pick up where this left off."
                 )
                 return
 
