@@ -26,6 +26,7 @@ router.register(r'schedule_rules', views.ScheduleRuleViewSet)
 router.register(r'camera_gps_backfill_config', views.CameraGpsBackfillConfigViewSet, basename='camera_gps_backfill_config')
 router.register(r'application_errors', views.ApplicationErrorViewSet, basename='application_errors')
 router.register(r'video_face_extraction', views.VideoFaceExtractionViewSet, basename='video_face_extraction')
+router.register(r'windowed_classification_config', views.WindowedClassificationConfigViewSet, basename='windowed_classification_config')
 # router.register(r'request-token', obtain_auth_token)
 
 # TODO: Add a 'Help' section or something. 

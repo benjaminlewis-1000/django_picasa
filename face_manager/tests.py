@@ -22,6 +22,7 @@ from io import BytesIO
 
 import cv2
 import numpy as np
+import pandas as pd
 import psycopg2
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -1852,6 +1853,151 @@ class ClassifyUnassignedBucketGateTests(TestCase):
         # path, not a confident accept, for the identical similarity
         # value that DID pass for the large-gallery candidate above.
         mock_set.assert_called_once_with(self.small_person.id, 1, self.mid_similarity)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class WindowedClassificationTests(TestCase):
+    """Person.use_windowed_classification -- restricts sim_99th to
+    gallery members within classification_window_days of the QUERY's
+    own date, instead of the whole gallery. Built to fix a real,
+    validated false-positive pattern (2026-10-25, see the field's own
+    docstring): a candidate that coincidentally resembles a temporally-
+    distant subset of a person's gallery (e.g. a much older/younger-
+    looking era) can clear the whole-gallery p99 even though it looks
+    nothing like that person's photos from NEAR the query's own date.
+
+    Gallery here is two clusters of the SAME person, 2000 days apart,
+    at two different cosine similarities to a FIXED query vector
+    ([1,0,0,...]): a "close" cluster (cosine 0.65, clears the bucket
+    threshold) and a "distant" cluster (cosine 0.05, does not). The
+    query's own dateTakenUTC (not its embedding) is what varies between
+    the "false candidate" and "true positive" scenarios -- exactly
+    matching the real mechanism (the query's actual photo date decides
+    which gallery members are temporally relevant), rather than
+    varying the query embedding itself."""
+
+    def _gallery_member_at_similarity(self, sim):
+        # A unit vector whose cosine similarity to the fixed query
+        # [1,0,0,...] is exactly `sim`.
+        v = np.zeros(512)
+        v[0] = sim
+        v[1] = np.sqrt(1 - sim ** 2)
+        return v
+
+    def setUp(self):
+        self.assigner = faceAssigner()
+        self.person = make_person("Windowed Person")
+        self.control_person = make_person("Non-windowed Person")
+        self.assigner.likely_people_ids = [self.person.id, self.control_person.id]
+        self.assigner.num_likely_people = 2
+
+        self.EARLY_DATE = 0.0
+        self.LATE_DATE = 2000 * 86400.0  # 2000 days later
+        self.close_sim = 0.65   # clears the <50-gallery bucket threshold (0.558)
+        self.distant_sim = 0.05  # does not clear it
+
+        # "close" cluster (dated EARLY) is a genuinely good match to the
+        # fixed query; "distant" cluster (dated LATE) is not.
+        close_embs = [self._gallery_member_at_similarity(self.close_sim) for _ in range(10)]
+        distant_embs = [self._gallery_member_at_similarity(self.distant_sim) for _ in range(10)]
+        embeddings = np.array(close_embs + distant_embs).T  # 512 x 20
+        dates = np.array([self.EARLY_DATE] * 10 + [self.LATE_DATE] * 10)
+
+        self.assigner.embedding_dict = {
+            self.person.id: embeddings,
+            self.control_person.id: embeddings.copy(),
+        }
+        self.assigner.norm_dict = {
+            self.person.id: np.ones(20),
+            self.control_person.id: np.ones(20),
+        }
+        self.assigner.candidate_dict = {
+            self.person.id: pd.DataFrame({'dateTakenUTC': dates}),
+            self.control_person.id: pd.DataFrame({'dateTakenUTC': dates}),
+        }
+        self.assigner._build_concatenated_gallery()
+
+        self.person.use_windowed_classification = True
+        self.person.classification_window_days = 182
+        self.person.save()
+        self.assigner.windowed_people = {self.person.id: 182}
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+
+        # The fixed query vector, shared by every test -- what varies is
+        # only the query's own dateTakenUTC.
+        query_vec = np.zeros(512)
+        query_vec[0] = 1.0
+        self.query_face = make_face(img, declared_name=blank_person)
+        self.query_face.face_encoding_512 = query_vec.tolist()
+        self.query_face.save()
+
+    def test_false_candidate_rejected_when_windowed_but_would_pass_unwindowed(self):
+        # Query is dated LATE (matching the "distant"/dissimilar
+        # cluster) but coincidentally resembles the temporally-UNrelated
+        # "close" cluster (dated EARLY) well enough to clear the whole-
+        # gallery p99 -- the real Leslie Williams failure shape (a
+        # stranger who happens to resemble an old/different-era photo).
+        self.query_face.dateTakenUTC = self.LATE_DATE
+        self.query_face.rejected_fields = [self.person.id, self.assigner.ignore_person_id]
+        self.query_face.save()
+
+        # Sanity check first: WITHOUT windowing (the control person,
+        # identical gallery/dates, just not opted in), this exact query
+        # DOES get accepted -- confirms the test actually exercises the
+        # failure mode windowing is meant to fix, not a strawman.
+        with patch.object(Face, "set_possible_person") as mock_set:
+            self.assigner.classify_unassigned(self.query_face)
+        mock_set.assert_called_once_with(self.control_person.id, 1, self.close_sim, save=False)
+
+        # WITH windowing: only the temporally-relevant "distant" cluster
+        # (dated LATE, matching the query's own date) is considered --
+        # correctly rejected instead.
+        self.query_face.declared_name = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        self.query_face.rejected_fields = [self.control_person.id, self.assigner.ignore_person_id]
+        self.query_face.save()
+        with patch.object(Face, "set_possible_person") as mock_set:
+            self.assigner.classify_unassigned(self.query_face)
+        mock_set.assert_called_once_with(self.person.id, 1, self.distant_sim)
+
+    def test_true_positive_still_accepted_when_windowed(self):
+        # Query dated EARLY, matching the genuinely-similar "close"
+        # cluster -- windowing restricts to exactly that cluster and
+        # still accepts.
+        self.query_face.dateTakenUTC = self.EARLY_DATE
+        self.query_face.rejected_fields = [self.control_person.id, self.assigner.ignore_person_id]
+        self.query_face.save()
+        with patch.object(Face, "set_possible_person") as mock_set:
+            self.assigner.classify_unassigned(self.query_face)
+        mock_set.assert_called_once_with(self.person.id, 1, self.close_sim, save=False)
+
+    def test_falls_back_to_full_gallery_when_too_few_in_window(self):
+        # A narrower window than any date gap present leaves <
+        # MIN_WINDOW_SAMPLE (5) members in-window -- falls back to the
+        # full gallery rather than computing a near-meaningless
+        # percentile over a handful of points. Query dated well past
+        # BOTH clusters with a tight window, so neither cluster
+        # qualifies (not just a 1-day window around the exact LATE
+        # cluster date, which would still trivially include all 10
+        # same-dated LATE members).
+        self.assigner.windowed_people = {self.person.id: 10}  # 10-day window
+        self.query_face.dateTakenUTC = self.LATE_DATE + 1000 * 86400  # 1000 days past LATE
+        self.query_face.rejected_fields = [self.control_person.id, self.assigner.ignore_person_id]
+        self.query_face.save()
+        with patch.object(Face, "set_possible_person") as mock_set:
+            self.assigner.classify_unassigned(self.query_face)
+        # Falls back to the full (unwindowed) gallery -- same as the
+        # control-person case above, accepted via the close cluster.
+        mock_set.assert_called_once_with(self.person.id, 1, self.close_sim, save=False)
+
+    def test_no_usable_query_date_falls_back_to_full_gallery(self):
+        self.query_face.dateTakenUTC = 0  # the field's own "no real date" default
+        self.query_face.rejected_fields = [self.control_person.id, self.assigner.ignore_person_id]
+        self.query_face.save()
+        with patch.object(Face, "set_possible_person") as mock_set:
+            self.assigner.classify_unassigned(self.query_face)
+        mock_set.assert_called_once_with(self.person.id, 1, self.close_sim, save=False)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")

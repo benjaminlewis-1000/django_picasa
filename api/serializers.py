@@ -560,3 +560,16 @@ class CameraGpsBackfillStatusSerializer(serializers.Serializer):
     total = serializers.IntegerField()
     missing_gps = serializers.IntegerField()
     enabled = serializers.BooleanField()
+
+
+class WindowedClassificationStatusSerializer(serializers.Serializer):
+    """One row per Person eligible for the windowed-classification
+    override toggle -- see face_manager.models.Person.
+    use_windowed_classification's own docstring for what this controls
+    and why it's a manually-curated per-person toggle, not a general
+    default."""
+    person_id = serializers.IntegerField()
+    person_name = serializers.CharField()
+    confirmed_count = serializers.IntegerField()
+    use_windowed_classification = serializers.BooleanField()
+    classification_window_days = serializers.IntegerField()
