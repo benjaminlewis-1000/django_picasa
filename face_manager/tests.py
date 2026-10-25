@@ -3081,6 +3081,190 @@ class ReencodeMissingFacesTests(TestCase):
         self.assertAlmostEqual(float(np.linalg.norm(vec)), 1.0, places=6)
         self.assertEqual(len(set(vec.tolist())), 1, "Every component should be identical/uniform")
 
+    # --- Merged LVFace-B image-side coverage (2026-10-25) ---------------
+    # reencode_missing_faces() used to call a separate _backfill_lvface_
+    # encodings() sweep at the end, which opened and decoded the same
+    # image a SECOND time for any face missing both encodings. Now both
+    # encodings are handled together, per face, in this same loop -- see
+    # the method's own docstring for the full reasoning. These tests
+    # cover the merge itself; the pre-existing tests above already cover
+    # the insightface-only branching logic, which is unchanged.
+
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
+    def test_face_needing_only_lvface_gets_it_without_touching_insight(self):
+        person = make_person("Only Needs Lvface")
+        face = make_face(self.image, declared_name=person)
+        face.face_encoding_512 = [0.5] * 512  # already real, float32-exact
+        face.kps = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        face.face_encoding_lvface_b = None
+        face.reencoded = False
+        face.save()
+
+        with patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)) as mock_lv:
+            self.extractor.reencode_missing_faces()
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_b, [0.4] * 512)
+        self.assertEqual(face.face_encoding_512, [0.5] * 512)  # untouched
+        self.assertFalse(face.reencoded)  # insight never ran
+        self.mock_face_analysis.get.assert_not_called()
+        mock_lv.assert_called_once()
+
+    def test_face_needing_neither_is_skipped_without_opening_the_image(self):
+        # The exact scenario that motivated this merge: a face with a
+        # real insightface embedding but no kps (so it can never
+        # qualify for LVFace-B without a fresh detection) must not pay
+        # for a single image decode.
+        person = make_person("Needs Nothing")
+        face = make_face(self.image, declared_name=person)
+        face.face_encoding_512 = [0.5] * 512
+        face.kps = None
+        face.face_encoding_lvface_b = None
+        face.save()
+
+        with patch('common.open_img_oriented') as mock_open:
+            self.extractor.reencode_missing_faces()
+
+        mock_open.assert_not_called()
+        self.mock_face_analysis.get.assert_not_called()
+
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
+    def test_crop_redetect_recovering_kps_also_triggers_lvface_in_same_pass(self):
+        # A face with no kps at all (needs insight's crop-redetect path)
+        # whose redetection succeeds recovers kps as a side effect --
+        # that should make it newly eligible for LVFace-B too, using the
+        # SAME already-open image, rather than waiting for a future run.
+        person = make_person("Recovers Kps")
+        face = self._face_missing_encoding(
+            declared_name=person, box_left=100, box_top=100, box_right=140, box_bottom=140
+        )
+        self.assertIsNone(face.kps)
+
+        crop_local_kps = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]])
+        self.mock_face_analysis.get.return_value = [
+            {'bbox': [0, 0, 40, 40], 'kps': crop_local_kps, 'embedding': np.full(512, 0.3)},
+        ]
+
+        with patch('lvface.embed_from_image_array', return_value=np.full(512, 0.55, dtype=np.float32)) as mock_lv:
+            self.extractor.reencode_missing_faces()
+
+        face.refresh_from_db()
+        self.assertIsNotNone(face.kps)  # recovered by the crop-redetect path
+        self.assertEqual(face.face_encoding_lvface_b, [0.55] * 512)
+        mock_lv.assert_called_once()
+        # The recovered (absolute-coordinate) kps is what LVFace-B should
+        # have been called with, not the raw crop-local values.
+        called_kps = mock_lv.call_args.args[1]
+        np.testing.assert_array_equal(np.asarray(called_kps).reshape(-1), np.array(face.kps))
+
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
+    def test_image_face_below_collection_floor_excluded_from_both_encodings(self):
+        from filepopulator.models import Directory, PhotoCollection
+        low_fidelity = PhotoCollection.objects.create(
+            name='Low Fidelity Reencode', root_directory='/photos/reencode_floor_test',
+            min_face_det_score=0.6,
+        )
+        directory = Directory.objects.create(dir_path='/photos/reencode_floor_test', collection=low_fidelity)
+        below_floor_image = ImageFile.objects.create(
+            filename=self.image.filename, directory=directory,
+            width=self.image.width, height=self.image.height,
+            pixel_hash='reencode-floor-hash', file_hash='reencode-floor-fhash',
+        )
+        person = make_person("Below Floor Reencode")
+        face = make_face(below_floor_image, declared_name=person, det_score=0.5)
+        face.face_encoding_512 = None
+        face.kps = [1.0] * 10
+        face.face_encoding_lvface_b = None
+        face.save()
+
+        with patch('common.open_img_oriented') as mock_open, \
+             patch('lvface.embed_from_image_array') as mock_lv:
+            self.extractor.reencode_missing_faces()
+
+        mock_open.assert_not_called()
+        self.mock_face_analysis.get.assert_not_called()
+        mock_lv.assert_not_called()
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_512)
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
+    def test_confirmed_ignore_face_excluded_from_lvface_too(self):
+        ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        face = make_face(self.image, declared_name=ignore_person)
+        face.face_encoding_512 = None
+        face.kps = [1.0] * 10
+        face.face_encoding_lvface_b = None
+        face.save()
+
+        with patch('lvface.embed_from_image_array') as mock_lv:
+            self.extractor.reencode_missing_faces()
+
+        mock_lv.assert_not_called()
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    @override_settings(LVFACE_ENCODING_ENABLED=False)
+    def test_lvface_disabled_skips_lvface_but_insight_still_runs(self):
+        person = make_person("Lvface Off")
+        face = self._face_missing_encoding(declared_name=person, box_left=10, box_top=10, box_right=30, box_bottom=30)
+        face.kps = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0]
+        face.save()
+        self.mock_face_analysis.models = {
+            'recognition': MagicMock(get=MagicMock(return_value=np.full(512, 0.7))),
+        }
+
+        with patch('lvface.embed_from_image_array') as mock_lv:
+            self.extractor.reencode_missing_faces()
+
+        mock_lv.assert_not_called()
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.7] * 512)
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
+    def test_time_budget_shared_across_combined_loop(self):
+        person_a = make_person("Budget Face A")
+        person_b = make_person("Budget Face B")
+        face_a = make_face(self.image, declared_name=person_a)
+        face_a.face_encoding_512 = [0.5] * 512
+        face_a.kps = [1.0] * 10
+        face_a.face_encoding_lvface_b = None
+        face_a.save()
+        face_b = make_face(self.image, declared_name=person_b)
+        face_b.face_encoding_512 = [0.5] * 512
+        face_b.kps = [1.0] * 10
+        face_b.face_encoding_lvface_b = None
+        face_b.save()
+
+        times = iter([0, 0, 1000])  # start_time, first face check (ok), second face check (over budget)
+
+        def fake_time():
+            return next(times, 1000)
+
+        with patch('lvface.embed_from_image_array', return_value=np.full(512, 0.2, dtype=np.float32)) as mock_lv, \
+             patch('time.time', side_effect=fake_time):
+            self.extractor.reencode_missing_faces(lvface_max_runtime_seconds=10)
+
+        self.assertEqual(mock_lv.call_count, 1)
+
+    def test_remaining_budget_is_passed_to_video_subpass(self):
+        # After the image loop finishes, whatever's left of the overall
+        # budget should be handed to the video-only sub-pass, not a
+        # fresh full budget -- otherwise one call's worst-case total
+        # runtime would silently double.
+        times = iter([0, 30])  # start_time, elapsed-check right after the (empty) image loop
+
+        def fake_time():
+            return next(times, 30)
+
+        with patch('time.time', side_effect=fake_time), \
+             patch.object(self.extractor, '_backfill_lvface_video_encodings') as mock_video:
+            self.extractor.reencode_missing_faces(lvface_max_runtime_seconds=100)
+
+        mock_video.assert_called_once()
+        self.assertEqual(mock_video.call_args.kwargs.get('max_runtime_seconds'), 70)
+
 
 class LVFaceModuleTests(TestCase):
     """face_manager.lvface -- the LVFace-B (ViT) embedding helper. Mocks
@@ -3226,172 +3410,19 @@ class UpdateExistingFaceLvfaceEncodingTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media", LVFACE_ENCODING_ENABLED=True)
-class BackfillLvfaceEncodingsTests(TestCase):
-    """FaceExtractor._backfill_lvface_encodings() -- the catch-up sweep
-    for Face.face_encoding_lvface_b, run automatically at the end of
-    reencode_missing_faces(). Mocks lvface.embed_from_image_array
-    entirely to stay fast. LVFACE_ENCODING_ENABLED is overridden True
-    class-wide here -- this class tests the sweep's own logic, not the
-    (separately-tested) master on/off switch itself."""
+class BackfillLvfaceVideoEncodingsTests(TestCase):
+    """FaceExtractor._backfill_lvface_video_encodings() -- the video-only
+    LVFace-B catch-up sweep, called automatically at the end of
+    reencode_missing_faces() with whatever time budget remains after its
+    own merged image-side insightface+LVFace-B pass (see that method's
+    own tests in ReencodeMissingFacesTests, and its docstring). Mocks
+    lvface.embed_from_image_array entirely to stay fast. LVFACE_ENCODING_
+    ENABLED is overridden True class-wide here -- this class tests the
+    sweep's own logic, not the (separately-tested) master on/off switch
+    itself."""
 
     def setUp(self):
-        self.image = make_image()
         self.extractor = FaceExtractor.__new__(FaceExtractor)
-
-    def _face_with_kps(self, **overrides):
-        face = make_face(self.image, **overrides)
-        face.kps = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
-        face.face_encoding_lvface_b = None
-        face.save()
-        return face
-
-    def test_fills_in_missing_lvface_encoding(self):
-        face = self._face_with_kps()
-        with patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
-            self.extractor._backfill_lvface_encodings()
-        face.refresh_from_db()
-        self.assertEqual(face.face_encoding_lvface_b, [0.4] * 512)
-
-    @override_settings(LVFACE_ENCODING_ENABLED=False)
-    def test_disabled_by_default_is_a_full_no_op(self):
-        face = self._face_with_kps()
-        with patch('lvface.embed_from_image_array') as mock_lv:
-            self.extractor._backfill_lvface_encodings()
-        mock_lv.assert_not_called()
-        face.refresh_from_db()
-        self.assertIsNone(face.face_encoding_lvface_b)
-
-    def test_face_without_kps_is_skipped(self):
-        face = make_face(self.image)
-        face.kps = None
-        face.face_encoding_lvface_b = None
-        face.save()
-        with patch('lvface.embed_from_image_array') as mock_lv:
-            self.extractor._backfill_lvface_encodings()
-        mock_lv.assert_not_called()
-        face.refresh_from_db()
-        self.assertIsNone(face.face_encoding_lvface_b)
-
-    def test_face_already_encoded_is_left_alone(self):
-        face = self._face_with_kps()
-        face.face_encoding_lvface_b = [0.1] * 512
-        face.save()
-        with patch('lvface.embed_from_image_array') as mock_lv:
-            self.extractor._backfill_lvface_encodings()
-        mock_lv.assert_not_called()
-
-    def test_lvface_none_result_leaves_face_unencoded_without_crashing(self):
-        face = self._face_with_kps()
-        with patch('lvface.embed_from_image_array', return_value=None):
-            self.extractor._backfill_lvface_encodings()
-        face.refresh_from_db()
-        self.assertIsNone(face.face_encoding_lvface_b)
-
-    def test_time_budget_stops_the_sweep_between_faces(self):
-        face_a = self._face_with_kps()
-        face_b = self._face_with_kps()
-
-        call_count = {'n': 0}
-        times = iter([0, 0, 1000])  # start_time, first check (ok), second check (over budget)
-
-        def fake_time():
-            return next(times, 1000)
-
-        with patch('lvface.embed_from_image_array', return_value=np.full(512, 0.2, dtype=np.float32)) as mock_lv, \
-             patch('time.time', side_effect=fake_time):
-            self.extractor._backfill_lvface_encodings(max_runtime_seconds=10)
-
-        # Only the first face should have been processed before the
-        # (mocked) clock crossed the budget.
-        self.assertEqual(mock_lv.call_count, 1)
-
-    def test_collection_scoping_filters_to_that_collections_images(self):
-        from filepopulator.models import Directory, PhotoCollection
-        other_collection = PhotoCollection.objects.create(
-            name='Other Collection LVFace', root_directory='/photos/lvface_other_collection',
-        )
-        # A real on-disk image isn't needed here -- _backfill_lvface_
-        # encodings() filters by collection BEFORE ever touching the
-        # filesystem, so a different Directory/ImageFile pointed at
-        # self.image's own real fixture file is enough to exercise the
-        # scoping itself.
-        other_directory = Directory.objects.create(
-            dir_path='/photos/lvface_other_collection', collection=other_collection,
-        )
-        other_image = ImageFile.objects.create(
-            filename=self.image.filename, directory=other_directory,
-            width=self.image.width, height=self.image.height,
-            pixel_hash='other-scope-hash', file_hash='other-scope-fhash',
-        )
-
-        in_scope = self._face_with_kps()  # belongs to self.image's (default) collection
-        out_of_scope_face = make_face(other_image)
-        out_of_scope_face.kps = [1.0] * 10
-        out_of_scope_face.face_encoding_lvface_b = None
-        out_of_scope_face.save()
-
-        default_collection = self.image.directory.collection
-        with patch('lvface.embed_from_image_array', return_value=np.full(512, 0.3, dtype=np.float32)):
-            self.extractor._backfill_lvface_encodings(collection=default_collection)
-
-        in_scope.refresh_from_db()
-        out_of_scope_face.refresh_from_db()
-        self.assertIsNotNone(in_scope.face_encoding_lvface_b)
-        self.assertIsNone(out_of_scope_face.face_encoding_lvface_b)
-
-    def test_face_below_collection_floor_is_excluded(self):
-        # Matches face_encoding_512's own floor gating in the
-        # insightface re-encode above and in add_new_face() -- a
-        # detection that never gets a real insightface embedding
-        # shouldn't get an LVFace-B one either (2026-10-25, found via
-        # real production data: the "Lewis Parents" collection's own
-        # 0.6 det_score floor accounted for the entire 77K-face
-        # insightface backlog, and this sweep was encoding those same
-        # faces with LVFace-B before this gate was added).
-        from filepopulator.models import Directory, PhotoCollection
-        low_fidelity = PhotoCollection.objects.create(
-            name='Low Fidelity LVFace Backfill', root_directory='/photos/lvface_floor_test',
-            min_face_det_score=0.6,
-        )
-        directory = Directory.objects.create(dir_path='/photos/lvface_floor_test', collection=low_fidelity)
-        below_floor_image = ImageFile.objects.create(
-            filename=self.image.filename, directory=directory,
-            width=self.image.width, height=self.image.height,
-            pixel_hash='floor-test-hash', file_hash='floor-test-fhash',
-        )
-        below_floor_face = make_face(below_floor_image, det_score=0.5)
-        below_floor_face.kps = [1.0] * 10
-        below_floor_face.face_encoding_lvface_b = None
-        below_floor_face.save()
-
-        above_floor_face = self._face_with_kps()  # belongs to self.image's (default, no floor) collection
-
-        with patch('lvface.embed_from_image_array', return_value=np.full(512, 0.9, dtype=np.float32)) as mock_lv:
-            self.extractor._backfill_lvface_encodings()
-
-        below_floor_face.refresh_from_db()
-        above_floor_face.refresh_from_db()
-        self.assertIsNone(below_floor_face.face_encoding_lvface_b)
-        self.assertIsNotNone(above_floor_face.face_encoding_lvface_b)
-        # Only the above-floor face should ever have reached inference.
-        self.assertEqual(mock_lv.call_count, 1)
-
-    def test_confirmed_ignore_face_is_excluded(self):
-        # 2026-10-25: the original "veto gate" design deliberately kept
-        # .ignore/.realignore faces in scope; the actual direction
-        # (LVFace-B eventually replacing face_encoding_512 outright)
-        # means this sweep should now follow the same exclusion
-        # face_encoding_512 itself already follows.
-        from face_manager.models import get_default_blank_person
-        ignore_person = make_person(settings.SOFT_IGNORE_NAME)
-        ignored_face = self._face_with_kps(declared_name=ignore_person)
-        real_face = self._face_with_kps(declared_name=get_default_blank_person())
-        with patch('lvface.embed_from_image_array', return_value=np.full(512, 0.6, dtype=np.float32)):
-            self.extractor._backfill_lvface_encodings()
-        ignored_face.refresh_from_db()
-        real_face.refresh_from_db()
-        self.assertIsNone(ignored_face.face_encoding_lvface_b)
-        self.assertIsNotNone(real_face.face_encoding_lvface_b)
 
     def _make_video_face(self, **overrides):
         from filepopulator.models import Directory, VideoFile
@@ -3420,7 +3451,7 @@ class BackfillLvfaceEncodingsTests(TestCase):
         with patch('video_face_pipeline.ffprobe_info', return_value=(640, 480, 30.0, None, 0, None, None)), \
              patch('video_face_pipeline.extract_frame_near_timestamp', return_value=fake_frame) as mock_extract, \
              patch('lvface.embed_from_image_array', return_value=np.full(512, 0.7, dtype=np.float32)) as mock_lv:
-            self.extractor._backfill_lvface_encodings()
+            self.extractor._backfill_lvface_video_encodings()
         mock_extract.assert_called_once()
         # input_is_bgr=True for the video path (the frame comes straight
         # from cv2/PyAV, unlike the image path's PIL-sourced RGB array).
@@ -3433,7 +3464,7 @@ class BackfillLvfaceEncodingsTests(TestCase):
         with patch('video_face_pipeline.ffprobe_info', return_value=(640, 480, 30.0, None, 0, None, None)), \
              patch('video_face_pipeline.extract_frame_near_timestamp', return_value=None), \
              patch('lvface.embed_from_image_array') as mock_lv:
-            self.extractor._backfill_lvface_encodings()
+            self.extractor._backfill_lvface_video_encodings()
         mock_lv.assert_not_called()
         face.refresh_from_db()
         self.assertIsNone(face.face_encoding_lvface_b)
@@ -3444,45 +3475,45 @@ class BackfillLvfaceEncodingsTests(TestCase):
         with patch('video_face_pipeline.ffprobe_info', return_value=(640, 480, 30.0, None, 0, None, None)), \
              patch('video_face_pipeline.extract_frame_near_timestamp') as mock_extract, \
              patch('lvface.embed_from_image_array'):
-            self.extractor._backfill_lvface_encodings()
+            self.extractor._backfill_lvface_video_encodings()
         mock_extract.assert_not_called()
         face.refresh_from_db()
         self.assertIsNone(face.face_encoding_lvface_b)
 
-    def test_collection_scoped_call_skips_video_sub_pass_entirely(self):
+    def test_collection_scoped_call_skips_entirely(self):
         # collection is an image-only concept (PhotoCollection/
         # Directory.collection) -- a collection-scoped call has nothing
-        # to say about video faces, so the video sub-pass must not run
-        # at all for one, rather than silently sweeping the whole
-        # unscoped video backlog.
+        # to say about video faces, so this sweep must not run at all
+        # for one, rather than silently sweeping the whole unscoped
+        # video backlog.
+        from filepopulator.models import PhotoCollection
         face = self._make_video_face()
-        default_collection = self.image.directory.collection
+        default_collection = PhotoCollection.objects.get(is_default=True)
         with patch('video_face_pipeline.ffprobe_info') as mock_ffprobe, \
              patch('lvface.embed_from_image_array'):
-            self.extractor._backfill_lvface_encodings(collection=default_collection)
+            self.extractor._backfill_lvface_video_encodings(collection=default_collection)
         mock_ffprobe.assert_not_called()
         face.refresh_from_db()
         self.assertIsNone(face.face_encoding_lvface_b)
 
-    def test_image_sub_pass_runs_before_video_sub_pass_within_shared_budget(self):
-        image_face = self._face_with_kps()
-        video_face = self._make_video_face()
+    def test_time_budget_stops_the_sweep_between_faces(self):
+        face_a = self._make_video_face()
+        face_b = self._make_video_face()
 
-        times = iter([0, 0, 15])  # start_time, image-pass check (ok), video-pass check (over budget)
+        times = iter([0, 0, 1000])  # start_time, first check (ok), second check (over budget)
 
         def fake_time():
-            return next(times, 5)
+            return next(times, 1000)
 
-        with patch('time.time', side_effect=fake_time), \
-             patch('video_face_pipeline.ffprobe_info') as mock_ffprobe, \
-             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.8, dtype=np.float32)):
-            self.extractor._backfill_lvface_encodings(max_runtime_seconds=10)
+        with patch('video_face_pipeline.ffprobe_info', return_value=(640, 480, 30.0, None, 0, None, None)), \
+             patch('video_face_pipeline.extract_frame_near_timestamp', return_value=np.zeros((480, 640, 3), dtype=np.uint8)), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.2, dtype=np.float32)) as mock_lv, \
+             patch('time.time', side_effect=fake_time):
+            self.extractor._backfill_lvface_video_encodings(max_runtime_seconds=10)
 
-        image_face.refresh_from_db()
-        video_face.refresh_from_db()
-        self.assertIsNotNone(image_face.face_encoding_lvface_b)
-        mock_ffprobe.assert_not_called()
-        self.assertIsNone(video_face.face_encoding_lvface_b)
+        # Only the first face should have been processed before the
+        # (mocked) clock crossed the budget.
+        self.assertEqual(mock_lv.call_count, 1)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
