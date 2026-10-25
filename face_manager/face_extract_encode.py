@@ -938,7 +938,37 @@ class FaceExtractor(object):
         doubled by adding video on top. None means unbounded (used for
         the small, collection-scoped call from
         apply_collection_floor_change).
+
+        Wrapped in a Postgres advisory lock (common.advisory_lock) so at
+        most one invocation of this method -- from ANY entry point (the
+        scheduled Celery task, a direct manage.py shell call, a
+        management command), not just other Celery tasks of the same
+        name -- ever runs at once. Same reasoning as find_and_encode_
+        faces()'s own lock (see that method's docstring): found
+        2026-10-25 when a manual manage.py shell call and the scheduled
+        face_manager.reencode task ran fully concurrently with zero
+        mutual awareness, each building its own separate FaceExtractor
+        (and separate insightface/LVFace-B ONNX sessions), stacking
+        memory on top of each other -- the task wrapper's own pre-
+        existing overlap check only ever looked for other Celery tasks
+        of the same name, invisible to a direct call bypassing Celery
+        entirely. One shared lock name regardless of `collection` --
+        same simplicity as find_and_encode_faces()'s lock -- means a
+        collection-scoped call from apply_collection_floor_change will
+        skip (logging a warning) if the library-wide sweep happens to
+        be running at that moment, rather than racing it; the regular
+        sweep will still reach that collection's newly-eligible faces
+        on its own shortly after, just without the usual immediacy.
         """
+        with common.advisory_lock('face_manager.reencode_missing_faces') as acquired:
+            if not acquired:
+                settings.LOGGER.warning(
+                    "reencode_missing_faces() already running elsewhere -- skipping this run."
+                )
+                return
+            self._reencode_missing_faces_locked(collection=collection, lvface_max_runtime_seconds=lvface_max_runtime_seconds)
+
+    def _reencode_missing_faces_locked(self, collection=None, lvface_max_runtime_seconds='default'):
         if lvface_max_runtime_seconds == 'default':
             lvface_max_runtime_seconds = self.LVFACE_REENCODE_MAX_RUNTIME_SECONDS
         start_time = time.time()
@@ -977,6 +1007,7 @@ class FaceExtractor(object):
             faces_to_process = faces_to_process.filter(source_image_file__directory__collection=collection)
 
         rec_model = self.app.app.models['recognition']
+        processed_count = 0
 
         for face in faces_to_process:
             if lvface_max_runtime_seconds is not None and (time.time() - start_time) >= lvface_max_runtime_seconds:
@@ -1013,6 +1044,33 @@ class FaceExtractor(object):
                 # detection) -- never worth opening the image.
                 continue
 
+            if processed_count > 0 and processed_count % self.REINIT_DETECTOR_EVERY_N_IMAGES == 0:
+                # Bounds ONNXRuntime's CPU memory arena growth, same
+                # reasoning as find_and_encode_faces()'s own periodic
+                # rebuild (see REINIT_DETECTOR_EVERY_N_IMAGES's own
+                # comment) -- an arena grows to the largest allocation
+                # ever seen by a session and never shrinks back down for
+                # that session's lifetime. This loop never used to run
+                # long enough for that to matter on its own; the
+                # 2026-10-25 image/video-LVFace merge changed that (a
+                # single run can now process the library's entire
+                # multi-hundred-thousand-face backlog) -- confirmed via
+                # real production data: an unbounded manual run grew to
+                # 13+ GB RSS within the hour. Rebuilds both insightface's
+                # detector/recognition session AND LVFace-B's own
+                # separate ONNX session (lvface.reset_session()) --
+                # LVFace-B processes far more faces per run than
+                # insightface does now, so its session is at least as
+                # likely to be the dominant contributor.
+                self.app = None
+                self.app = self._build_detector()
+                rec_model = self.app.app.models['recognition']
+                lvface.reset_session()
+                settings.LOGGER.debug(
+                    f"reencode_missing_faces(): reinitialized detector/LVFace session after "
+                    f"{processed_count} images this run."
+                )
+
             try:
                 img = common.open_img_oriented(img_obj.filename, as_numpy=True)
             except Exception as e:
@@ -1021,6 +1079,7 @@ class FaceExtractor(object):
             if img is None or len(img.shape) != 3:
                 settings.LOGGER.error(f"Cannot re-encode Face {face.id}: image failed to decode.")
                 continue
+            processed_count += 1
 
             insight_touched = False
 
@@ -1106,6 +1165,13 @@ class FaceExtractor(object):
                 face.save()
             elif lvface_touched:
                 face.save(update_fields=['face_encoding_lvface_b'])
+
+            # Covers this face's own native allocations (image decode,
+            # ONNX inference buffers) before moving to the next --
+            # mirrors find_and_encode_faces()'s own per-iteration call,
+            # see _trim_malloc_arena()'s own comment for why this is
+            # needed at all alongside the periodic session rebuild above.
+            _trim_malloc_arena()
 
         elapsed = time.time() - start_time
         remaining_budget = (

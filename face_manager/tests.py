@@ -3297,6 +3297,95 @@ class ReencodeMissingFacesTests(TestCase):
         mock_video.assert_called_once()
         self.assertEqual(mock_video.call_args.kwargs.get('max_runtime_seconds'), 70)
 
+    def test_skips_entirely_when_advisory_lock_already_held(self):
+        # Regression test for a real production incident (2026-10-25): a
+        # manual manage.py shell call and the scheduled face_manager.
+        # reencode task ran fully concurrently with zero mutual
+        # awareness (the task wrapper's own overlap check only looked
+        # for other Celery tasks of the same name, invisible to a direct
+        # call), each building its own separate FaceExtractor/ONNX
+        # sessions and stacking memory until the container neared its
+        # cgroup limit. reencode_missing_faces() now holds a Postgres
+        # advisory lock (common/advisory_lock.py, same pattern as
+        # find_and_encode_faces()'s own lock -- see that test's own
+        # comment for why a genuinely separate connection is needed to
+        # simulate real contention) for its whole run; while another
+        # session holds it, this call must do nothing at all.
+        person = make_person("Lock Contention")
+        face = self._face_missing_encoding(declared_name=person, box_left=10, box_top=10, box_right=30, box_bottom=30)
+        face.kps = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0]
+        face.save()
+        self.mock_face_analysis.models = {
+            'recognition': MagicMock(get=MagicMock(return_value=np.full(512, 0.5))),
+        }
+
+        cfg = connection.settings_dict
+        other = psycopg2.connect(
+            dbname=cfg['NAME'], user=cfg['USER'], password=cfg['PASSWORD'],
+            host=cfg['HOST'] or 'localhost', port=cfg['PORT'] or 5432,
+        )
+        other.autocommit = True
+        try:
+            key = zlib.crc32(b'face_manager.reencode_missing_faces')
+            with other.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", [key])
+                self.assertTrue(cur.fetchone()[0])
+
+                self.extractor.reencode_missing_faces()
+
+                face.refresh_from_db()
+                self.assertIsNone(face.face_encoding_512)
+                self.mock_face_analysis.get.assert_not_called()
+
+                cur.execute("SELECT pg_advisory_unlock(%s)", [key])
+        finally:
+            other.close()
+
+        # Once free again, a normal run still works.
+        self.extractor.reencode_missing_faces()
+        face.refresh_from_db()
+        self.assertIsNotNone(face.face_encoding_512)
+
+    def test_periodic_reinit_bounds_memory_growth(self):
+        # Regression test for a real production incident (2026-10-25):
+        # the merged image loop can now run for a long time against a
+        # very large backlog (previously this method never ran long
+        # enough for ONNXRuntime's arena growth to matter) -- confirmed
+        # via real data, an unbounded manual run grew to 13+ GB RSS
+        # within the hour. Mirrors find_and_encode_faces()'s own
+        # periodic-rebuild mitigation. Faces here are set up to need
+        # ONLY LVFace-B (real face_encoding_512 already present) so this
+        # stays focused purely on confirming the rebuild happens at the
+        # right counts, without needing the rebuilt mock detector to
+        # also support a real insight re-encode.
+        self.extractor.REINIT_DETECTOR_EVERY_N_IMAGES = 2
+        faces = []
+        for i in range(3):
+            person = make_person(f"Reinit Face {i}")
+            face = make_face(
+                self.image, declared_name=person,
+                box_left=10, box_top=10, box_right=30, box_bottom=30,
+            )
+            face.face_encoding_512 = [0.5] * 512
+            face.kps = [1.0] * 10
+            face.face_encoding_lvface_b = None
+            face.save()
+            faces.append(face)
+
+        with patch.object(self.extractor, '_build_detector', return_value=MagicMock()) as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.3, dtype=np.float32)), \
+             patch('lvface.reset_session') as mock_reset:
+            self.extractor.reencode_missing_faces()
+
+        # 3 faces processed, REINIT_DETECTOR_EVERY_N_IMAGES=2 -> the
+        # check at processed_count==2 (0-indexed boundary, i.e. right
+        # before the 3rd face) fires exactly once.
+        mock_build.assert_called_once()
+        mock_reset.assert_called_once()
+        for face in faces:
+            face.refresh_from_db()
+            self.assertEqual(face.face_encoding_lvface_b, [0.3] * 512)
+
 
 class LVFaceModuleTests(TestCase):
     """face_manager.lvface -- the LVFace-B (ViT) embedding helper. Mocks

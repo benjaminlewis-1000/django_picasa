@@ -42,6 +42,21 @@ def _get_session():
     return _session
 
 
+def reset_session():
+    """Drops the cached session so the next embed_from_image_array()/
+    embed_from_path() call rebuilds a fresh one. Same reasoning as
+    FaceExtractor._build_detector()'s own periodic-rebuild comment --
+    ONNXRuntime's CPU memory arena grows to the largest allocation ever
+    seen by a session and never shrinks back down for that session's
+    lifetime, so a long-running loop that never rebuilds this session
+    (e.g. reencode_missing_faces()'s combined image loop, found
+    2026-10-25 to grow into double-digit GB RSS over a multi-hour run)
+    needs a way to periodically start fresh. A no-op if no session has
+    been built yet."""
+    global _session
+    _session = None
+
+
 def embed_from_image_array(img, kps, input_is_bgr=True):
     """Computes an LVFace-B embedding for one face, given the already-
     decoded source image and that face's 5-point kps (flattened
