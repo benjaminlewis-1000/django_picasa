@@ -277,21 +277,18 @@ def process_video_faces(max_runtime_seconds=None, video_ids=None):
 
 @shared_task(ignore_result=True, name='face_manager.reencode')
 def reencode_missing_faces():
-    i = celery_app.control.inspect()
-    active_tasks = i.active()
-    num_this_task_running = 0
-    for k in active_tasks.keys():
-        tasks = active_tasks[k]
-        if len(tasks) != 0:
-            for tt in tasks:
-                if tt['name'] == 'face_manager.reencode':
-                    num_this_task_running += 1
-
-    if num_this_task_running > 1:
-        settings.LOGGER.debug("Reencode is locked, exiting.")
-        settings.LOGGER.warning("Reencode locked!")
-        return
-
+    # Overlap protection used to live here as a celery_app.control.
+    # inspect().active() check -- a check-then-act race (two tasks
+    # starting close together can each see "0 others running" before
+    # either registers), and one that only covered other Celery
+    # invocations of this same task, not a direct manage.py shell/
+    # management-command call (confirmed as a real gap 2026-10-25: a
+    # manual call and this scheduled task ran fully concurrently, each
+    # building its own separate FaceExtractor/ONNX sessions, stacking
+    # memory on top of each other). FaceExtractor.reencode_missing_
+    # faces() itself now holds a Postgres advisory lock for its whole
+    # run (see common/advisory_lock.py), which is atomic and covers
+    # every entry point, so this task no longer needs its own check.
     try:
         extractor = FaceExtractor()
         extractor.reencode_missing_faces()
