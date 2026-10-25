@@ -1015,6 +1015,17 @@ class FaceExtractor(object):
         cleared, not populated, for these faces, since nothing
         re-compares against them under normal classification).
 
+        Also respects each image face's collection detection floor
+        (below_collection_floor(), same check the insightface re-encode
+        above already makes) for the same reason -- a face below its
+        collection's current floor deliberately never gets a real
+        face_encoding_512 either (see add_new_face()'s own comment), so
+        LVFace-B shouldn't end up with broader coverage than the field
+        it's meant to replace. No video equivalent exists yet
+        (VideoFile has no PhotoCollection association at all -- a known,
+        separate gap, see CLAUDE.md), so the video sub-pass below has no
+        floor check to make.
+
         Covers both image- and video-sourced faces (2026-10-25 -- video
         support added same day as the ignore-exclusion change above). A
         video face has no standalone source file to decode the way an
@@ -1068,6 +1079,17 @@ class FaceExtractor(object):
 
             img_obj = face.source_image_file
             if img_obj is None or not img_obj.filename or not os.path.exists(img_obj.filename):
+                continue
+
+            # Checked live against the collection's CURRENT thresholds,
+            # same as the insightface re-encode above (see
+            # below_collection_floor()'s own docstring for why) -- a
+            # face below its collection's floor deliberately never gets
+            # a real face_encoding_512 either, and LVFace-B is meant to
+            # eventually replace that field's usage pattern outright, so
+            # it follows the exact same gate rather than ending up with
+            # broader coverage than the field it's meant to replace.
+            if below_collection_floor(img_obj.directory.collection, face.det_score, face.relative_size):
                 continue
 
             try:

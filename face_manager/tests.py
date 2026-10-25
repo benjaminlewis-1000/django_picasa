@@ -3339,6 +3339,43 @@ class BackfillLvfaceEncodingsTests(TestCase):
         self.assertIsNotNone(in_scope.face_encoding_lvface_b)
         self.assertIsNone(out_of_scope_face.face_encoding_lvface_b)
 
+    def test_face_below_collection_floor_is_excluded(self):
+        # Matches face_encoding_512's own floor gating in the
+        # insightface re-encode above and in add_new_face() -- a
+        # detection that never gets a real insightface embedding
+        # shouldn't get an LVFace-B one either (2026-10-25, found via
+        # real production data: the "Lewis Parents" collection's own
+        # 0.6 det_score floor accounted for the entire 77K-face
+        # insightface backlog, and this sweep was encoding those same
+        # faces with LVFace-B before this gate was added).
+        from filepopulator.models import Directory, PhotoCollection
+        low_fidelity = PhotoCollection.objects.create(
+            name='Low Fidelity LVFace Backfill', root_directory='/photos/lvface_floor_test',
+            min_face_det_score=0.6,
+        )
+        directory = Directory.objects.create(dir_path='/photos/lvface_floor_test', collection=low_fidelity)
+        below_floor_image = ImageFile.objects.create(
+            filename=self.image.filename, directory=directory,
+            width=self.image.width, height=self.image.height,
+            pixel_hash='floor-test-hash', file_hash='floor-test-fhash',
+        )
+        below_floor_face = make_face(below_floor_image, det_score=0.5)
+        below_floor_face.kps = [1.0] * 10
+        below_floor_face.face_encoding_lvface_b = None
+        below_floor_face.save()
+
+        above_floor_face = self._face_with_kps()  # belongs to self.image's (default, no floor) collection
+
+        with patch('lvface.embed_from_image_array', return_value=np.full(512, 0.9, dtype=np.float32)) as mock_lv:
+            self.extractor._backfill_lvface_encodings()
+
+        below_floor_face.refresh_from_db()
+        above_floor_face.refresh_from_db()
+        self.assertIsNone(below_floor_face.face_encoding_lvface_b)
+        self.assertIsNotNone(above_floor_face.face_encoding_lvface_b)
+        # Only the above-floor face should ever have reached inference.
+        self.assertEqual(mock_lv.call_count, 1)
+
     def test_confirmed_ignore_face_is_excluded(self):
         # 2026-10-25: the original "veto gate" design deliberately kept
         # .ignore/.realignore faces in scope; the actual direction
