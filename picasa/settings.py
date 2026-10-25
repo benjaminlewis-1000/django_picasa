@@ -790,18 +790,19 @@ MIN_VIDEO_DURATION_SECONDS = 3
 # update_existing_face_to_insightface() in face_extract_encode.py) and
 # the backfill sweep (FaceExtractor._backfill_lvface_encodings(), run
 # automatically at the end of the hourly reencode_missing_faces() task).
-# Deliberately False for now (2026-10-25): LVFace-B was validated as a
-# real improvement over insightface alone for a hard real case (see
-# CLAUDE.md), but before committing the live pipeline (and the ~2-3 day
-# one-time backfill of the existing library) to it, the user wants to
-# also benchmark insightface's own ArcFace ViT backbones (arcface_torch,
-# trained on the much larger WebFace42M vs. LVFace's Glint360K) against
-# the same real known-hard cases, in case more training data (not just
-# bigger model capacity, which LVFace-S/B/L already tested and found
-# non-monotonic) is what actually matters. Flip to True once that
-# comparison is done and a model is chosen -- no other code change
-# needed, both call sites already check this.
-LVFACE_ENCODING_ENABLED = False
+# Enabled 2026-10-25: LVFace-B was validated as a real improvement over
+# insightface alone for a hard real case (Leslie Williams's known-bad
+# false positives, see CLAUDE.md) across two independent sample sizes.
+# The planned comparison against insightface's own ArcFace ViT backbones
+# (arcface_torch, trained on WebFace42M) was dropped -- investigated and
+# confirmed those checkpoints were never actually published (the public
+# OneDrive/Baidu distribution only has older ResNet checkpoints from
+# 2021; the ViT/WF42M numbers in arcface_torch's README are training
+# recipes and benchmark results only, no released weights, and training
+# one from scratch isn't worth it here). LVFace-B is the best validated
+# option available, so live extraction and the backfill sweep both
+# start encoding it now.
+LVFACE_ENCODING_ENABLED = True
 
 # How long a row's file can be missing from disk before
 # delete_removed_photos()/delete_removed_videos() actually deletes it,
