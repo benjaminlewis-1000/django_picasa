@@ -3485,8 +3485,10 @@ class ReencodeMissingFacesTests(TestCase):
     def test_shard_filters_to_matching_ids_only(self):
         # Core correctness property of the parallel backfill (2026-10-25,
         # see backfill_lvface_parallel.py): shard_index/total_shards
-        # must partition faces by id % total_shards so every face is
-        # covered by EXACTLY one shard, never zero or more than one.
+        # must partition faces (via _shard_annotation()'s hash, not
+        # plain id % total_shards -- see that function's own comment
+        # for why) so every face is covered by EXACTLY one shard, never
+        # zero or more than one.
         faces = []
         for i in range(6):
             person = make_person(f"Shard Face {i}")
@@ -3504,10 +3506,10 @@ class ReencodeMissingFacesTests(TestCase):
                 self.extractor.reencode_missing_faces(shard_index=shard_index, total_shards=total_shards)
 
         # Every face is covered by exactly one of the 3 shard runs above
-        # (its own id % total_shards) -- confirms the partition has no
-        # gaps, without needing to separately prove no face is visited
-        # twice (a face's id only ever matches one shard_index by
-        # construction, so double-processing isn't reachable here).
+        # (its own hashed shard assignment) -- confirms the partition
+        # has no gaps, without needing to separately prove no face is
+        # visited twice (a face's hash only ever matches one shard_index
+        # by construction, so double-processing isn't reachable here).
         for face in faces:
             face.refresh_from_db()
             self.assertEqual(face.face_encoding_512, [0.4] * 512)
@@ -3527,10 +3529,14 @@ class ReencodeMissingFacesTests(TestCase):
         }
 
         # Hold the OTHER shard's lock (the one this face does NOT belong
-        # to) -- face.id is auto-increment, so this is computed rather
-        # than assumed, to stay correct regardless of what id it lands
-        # on.
-        face_shard = face.id % 2
+        # to) -- computed via the real shard annotation (a HASHTEXT-
+        # based hash, not plain id % total_shards -- see
+        # _shard_annotation()'s own comment for why), not assumed, to
+        # stay correct regardless of what id this face lands on.
+        from face_manager.face_extract_encode import _shard_annotation
+        face_shard = Face.objects.filter(id=face.id).annotate(
+            _shard=_shard_annotation(2)
+        ).values_list('_shard', flat=True).first()
         held_shard = 1 - face_shard
 
         cfg = connection.settings_dict
@@ -3942,8 +3948,9 @@ class BackfillLvfaceVideoEncodingsTests(TestCase):
     def test_shard_filters_to_matching_ids_only(self):
         # Added 2026-10-26 once the parallel image backfill was already
         # running well -- video faces have a real id, just like image
-        # faces, so the same id % total_shards partition applies
-        # unchanged. Every face must be covered by exactly one shard.
+        # faces, so the same hash-based shard partition (_shard_
+        # annotation()) applies unchanged. Every face must be covered
+        # by exactly one shard.
         faces = [self._make_video_face() for _ in range(6)]
         total_shards = 3
         fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
