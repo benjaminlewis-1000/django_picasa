@@ -23,6 +23,7 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from api.models import ScheduleRule, SlideshowConfig, resolve_active_slideshow_config
+from api.throttles import AccessKeyMediaThrottle
 from face_manager.models import Face, Person
 from filepopulator.models import GeocodeCache, ImageFile, Directory, VideoFile
 from filepopulator.scripts import create_image_file
@@ -542,6 +543,52 @@ class KeyedImageViewTests(ApiTestCase):
     def test_missing_id_rejected(self):
         resp = self.client.get("/api/keyed_image/face_array/")
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class KeyedImageViewThrottleTests(ApiTestCase):
+    """api/throttles.py -- real bug fixed 2026-10-26: these throttles
+    never actually checked request.user.is_authenticated despite the
+    module's own comment claiming session-authenticated requests never
+    hit them. Rates are patched directly on the throttle classes'
+    THROTTLE_RATES, not via override_settings(REST_FRAMEWORK=...) --
+    DRF's SimpleRateThrottle binds THROTTLE_RATES to api_settings.
+    DEFAULT_THROTTLE_RATES once at import time, so overriding the
+    Django setting later doesn't actually propagate into it (a known
+    DRF gotcha, confirmed the hard way: an override_settings version
+    of this test silently used the real 30/min rate instead)."""
+
+    def setUp(self):
+        super().setUp()
+        from django.core.cache import cache
+        cache.clear()
+        self.image = self.make_image()
+        self.face = self.make_face(self.image)
+
+    def test_authenticated_session_is_never_throttled(self):
+        for _ in range(5):
+            resp = self.client.get(f"/api/keyed_image/face_array/?id={self.face.id}")
+            self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    @mock.patch.object(AccessKeyMediaThrottle, 'THROTTLE_RATES', {'access_key_media': '2/min'})
+    def test_unauthenticated_access_key_path_is_throttled(self):
+        url = f"/api/keyed_image/face_array/?id={self.face.id}&access_key={settings.RANDOM_ACCESS_KEY}"
+        self.assertEqual(self.anon_client.get(url).status_code, status.HTTP_200_OK)
+        self.assertEqual(self.anon_client.get(url).status_code, status.HTTP_200_OK)
+        resp = self.anon_client.get(url)
+        self.assertEqual(resp.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    @mock.patch.object(AccessKeyMediaThrottle, 'THROTTLE_RATES', {'access_key_media': '2/min'})
+    def test_unauthenticated_sig_slideshow_path_uses_the_higher_rate(self):
+        # type='slideshow' is sig-gated, not access_key-gated -- it must
+        # keep using slideshow_media's own (much higher) rate, never
+        # AccessKeyMediaThrottle's, even though the latter is patched
+        # down to 2/min here.
+        from api.views import _slideshow_current_sig
+        sig = _slideshow_current_sig('image', self.image.id)
+        url = f"/api/keyed_image/slideshow/?id={self.image.id}&sig={sig}"
+        for _ in range(5):
+            resp = self.anon_client.get(url)
+            self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
     def test_face_array_applies_clahe_equalization(self):
         # face_array now decodes, CLAHE-equalizes (common.clahe_equalize_bgr
