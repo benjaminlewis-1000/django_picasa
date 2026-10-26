@@ -107,8 +107,17 @@ class FaceExtractor(object):
     # real cost: rebuilding the detector AND forcing LVFace-B's own
     # session to reload from disk on its next use) -- net real
     # throughput win, per the user's own request after seeing the
-    # parallel backfill's real numbers.
-    REENCODE_REINIT_EVERY_N_IMAGES = 150
+    # parallel backfill's real numbers. Raised 150 -> 500 on 2026-10-25
+    # after real production monitoring held steady at 13.74GiB/48GiB
+    # container-wide (2.9-3.1GB/worker) across multiple checks at 150 --
+    # still a wide margin under the 14GB/worker budget, so a further
+    # 3.3x reduction in reinit frequency was judged safe without a new
+    # intermediate data point. Not pushed straight to 1000 since this
+    # is a one-way ratchet mid-run (lowering it back costs nothing, but
+    # there's no real data yet on arena growth rate per image at this
+    # multiplier) -- revisit once 500 has run long enough to show its
+    # own plateau.
+    REENCODE_REINIT_EVERY_N_IMAGES = 500
 
     def __init__(self):
         super(FaceExtractor, self).__init__()
