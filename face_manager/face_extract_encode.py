@@ -1243,17 +1243,20 @@ class FaceExtractor(object):
         remaining_budget = (
             None if lvface_max_runtime_seconds is None else max(0, lvface_max_runtime_seconds - elapsed)
         )
-        # Video has no sharding support of its own (no per-face
-        # partition key cheap enough to filter on the way id % N is for
-        # images) -- only ever run it from an unsharded call, so
-        # multiple parallel shard workers can't all redundantly race the
-        # same video backlog with no lock between them. Left to the
-        # regular (unsharded) hourly task, same as before sharding
-        # existed.
-        if remaining_budget != 0 and shard_index is None:
-            self._backfill_lvface_video_encodings(collection=collection, max_runtime_seconds=remaining_budget)
+        # Video faces have a real id just like image faces, so the same
+        # Mod(F('id'), total_shards) partition works identically --
+        # sharded here the same way as the image sweep above, each
+        # shard's own lock (reencode_missing_faces()'s own docstring)
+        # already prevents two shards from ever racing the same video
+        # face, so there's no coordination gap to worry about.
+        if remaining_budget != 0:
+            self._backfill_lvface_video_encodings(
+                collection=collection, max_runtime_seconds=remaining_budget,
+                shard_index=shard_index, total_shards=total_shards,
+            )
 
-    def _backfill_lvface_video_encodings(self, collection=None, max_runtime_seconds=None):
+    def _backfill_lvface_video_encodings(self, collection=None, max_runtime_seconds=None,
+                                          shard_index=None, total_shards=None):
         """Catches up Face.face_encoding_lvface_b for video-sourced faces
         missing it -- the video-only counterpart to reencode_missing_
         faces()'s own merged image-side insightface+LVFace-B sweep (see
@@ -1291,6 +1294,13 @@ class FaceExtractor(object):
         so one top-level call's total runtime stays bounded the same way
         it always has. None means unbounded.
 
+        shard_index/total_shards (added 2026-10-26, once the parallel
+        image backfill was already running well, to stop leaving the
+        whole video backlog completely untouched while that backfill
+        holds reencode_missing_faces()'s own marker lock) partitions by
+        Face.id % total_shards, same mechanism as the image sweep above
+        -- a real id, no different from an image face's.
+
         No-ops entirely while settings.LVFACE_ENCODING_ENABLED is
         False."""
         if not settings.LVFACE_ENCODING_ENABLED:
@@ -1309,6 +1319,10 @@ class FaceExtractor(object):
         ).exclude(
             declared_name__person_name__in=exclude_names
         ).select_related('source_video_file').order_by('source_video_file_id')
+        if shard_index is not None and total_shards is not None:
+            video_faces = video_faces.annotate(
+                _shard=Mod(F('id'), total_shards)
+            ).filter(_shard=shard_index)
 
         ffprobe_cache = {}
         for face in video_faces:

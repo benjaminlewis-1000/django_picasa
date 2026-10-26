@@ -3337,6 +3337,27 @@ class ReencodeMissingFacesTests(TestCase):
         mock_video.assert_called_once()
         self.assertEqual(mock_video.call_args.kwargs.get('max_runtime_seconds'), 70)
 
+    def test_sharded_call_also_shards_the_video_subpass(self):
+        # Real behavior change, 2026-10-26: video used to be skipped
+        # entirely for any sharded call (left for the unsharded hourly
+        # task, which in turn defers to the parallel backfill's own
+        # marker lock -- net result, the whole video backlog sat frozen
+        # the entire time the parallel backfill was running). Now a
+        # sharded call also runs its own slice of video.
+        times = iter([0, 30])
+        def fake_time():
+            return next(times, 30)
+
+        with patch('time.time', side_effect=fake_time), \
+             patch.object(self.extractor, '_backfill_lvface_video_encodings') as mock_video:
+            self.extractor.reencode_missing_faces(
+                lvface_max_runtime_seconds=100, shard_index=2, total_shards=5,
+            )
+
+        mock_video.assert_called_once()
+        self.assertEqual(mock_video.call_args.kwargs.get('shard_index'), 2)
+        self.assertEqual(mock_video.call_args.kwargs.get('total_shards'), 5)
+
     def test_skips_entirely_when_advisory_lock_already_held(self):
         # Regression test for a real production incident (2026-10-25): a
         # manual manage.py shell call and the scheduled face_manager.
@@ -3882,6 +3903,25 @@ class BackfillLvfaceVideoEncodingsTests(TestCase):
         # Only the first face should have been processed before the
         # (mocked) clock crossed the budget.
         self.assertEqual(mock_lv.call_count, 1)
+
+    def test_shard_filters_to_matching_ids_only(self):
+        # Added 2026-10-26 once the parallel image backfill was already
+        # running well -- video faces have a real id, just like image
+        # faces, so the same id % total_shards partition applies
+        # unchanged. Every face must be covered by exactly one shard.
+        faces = [self._make_video_face() for _ in range(6)]
+        total_shards = 3
+        fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with patch('video_face_pipeline.ffprobe_info', return_value=(640, 480, 30.0, None, 0, None, None)), \
+             patch('video_face_pipeline.extract_frame_near_timestamp', return_value=fake_frame), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.6, dtype=np.float32)):
+            for shard_index in range(total_shards):
+                self.extractor._backfill_lvface_video_encodings(
+                    shard_index=shard_index, total_shards=total_shards,
+                )
+        for face in faces:
+            face.refresh_from_db()
+            self.assertEqual(face.face_encoding_lvface_b, [0.6] * 512)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
