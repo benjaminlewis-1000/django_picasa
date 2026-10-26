@@ -16,7 +16,7 @@ from django.shortcuts import render
 from django_filters.rest_framework import DjangoFilterBackend
 from face_manager.models import Person, Face
 from face_manager.live_counts import compute_live_face_counts
-from filepopulator.models import ImageFile, Directory, VideoFile
+from filepopulator.models import ImageFile, Directory, VideoFile, PhotoCollection
 from io import BytesIO
 from PIL import Image, ExifTags, ImageDraw
 from queue import Queue
@@ -2434,6 +2434,71 @@ class WindowedClassificationConfigViewSet(viewsets.ViewSet):
             'person_id': person.id,
             'use_windowed_classification': person.use_windowed_classification,
             'classification_window_days': person.classification_window_days,
+        })
+
+
+class PhotoCollectionConfigViewSet(viewsets.ViewSet):
+    """Backend for a frontend settings page letting a human tune a
+    PhotoCollection's detection floors -- see filepopulator.models.
+    PhotoCollection's own docstring for what min_face_det_score/
+    min_face_relative_size gate. Deliberately narrow (list + one
+    write action), same reasoning as PersonViewSet above: name/
+    root_directory/is_default are read-only here (and in the Django
+    admin page for this model) since changing them doesn't re-scope
+    already-ingested images. Setting either floor triggers
+    PhotoCollection.save()'s own apply_collection_floor_change()
+    dispatch automatically -- no special handling needed here."""
+
+    permission_classes = (IsAuthenticated,)
+    serializer_class = api_ser.PhotoCollectionFloorStatusSerializer
+
+    def list(self, request):
+        collections = PhotoCollection.objects.all().order_by('name')
+        data = [
+            {
+                'collection_id': c.id,
+                'name': c.name,
+                'root_directory': c.root_directory,
+                'is_default': c.is_default,
+                'min_face_det_score': c.min_face_det_score,
+                'min_face_relative_size': c.min_face_relative_size,
+            }
+            for c in collections
+        ]
+        serializer = api_ser.PhotoCollectionFloorStatusSerializer(data, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['post'])
+    def set_floors(self, request):
+        # Accessible as <root>/api/photo_collection_config/set_floors/
+        # Accept: POST, body: {"collection_id": N, "min_face_det_score": 0.6,
+        # "min_face_relative_size": null} -- either floor key is optional
+        # (only updated if present); passing null clears that floor.
+        payload = request.data
+        if 'collection_id' not in payload:
+            return render_404(request, 'Body must include "collection_id".')
+
+        try:
+            collection = PhotoCollection.objects.get(id=payload['collection_id'])
+        except PhotoCollection.DoesNotExist:
+            return render_404(request, f'No PhotoCollection with id {payload["collection_id"]}.')
+
+        for field in ('min_face_det_score', 'min_face_relative_size'):
+            if field not in payload:
+                continue
+            value = payload[field]
+            if value is not None:
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    return render_404(request, f'"{field}" must be a number or null.')
+                if not (0.0 <= value <= 1.0):
+                    return render_404(request, f'"{field}" must be between 0 and 1.')
+            setattr(collection, field, value)
+        collection.save()
+
+        return Response({
+            'collection_id': collection.id,
+            'min_face_det_score': collection.min_face_det_score,
+            'min_face_relative_size': collection.min_face_relative_size,
         })
 
 
