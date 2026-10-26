@@ -1319,6 +1319,44 @@ class TaskCrashLoggingTests(TestCase):
         error = ApplicationError.objects.get()
         self.assertEqual(error.source, 'face_manager.tasks.reencode_missing_faces')
 
+    def test_reencode_missing_faces_task_skips_when_parallel_backfill_active(self):
+        # Regression test for a real production incident (2026-10-25):
+        # the one-time parallel backfill (backfill_lvface_parallel)
+        # shards the backlog under per-shard lock names, deliberately
+        # different from this task's own plain lock name, so the two
+        # were never mutually exclusive -- this task ran fully
+        # concurrently with the parallel backfill's supervisor, doing
+        # real, redundant work on the same backlog while competing with
+        # it for the exact CPU/memory headroom the supervisor was
+        # trying to budget around. Both now coordinate via a shared
+        # marker lock (see face_manager.tasks.reencode_missing_faces'
+        # own comment and backfill_lvface_parallel.py's).
+        from face_manager.tasks import reencode_missing_faces
+        cfg = connection.settings_dict
+        other = psycopg2.connect(
+            dbname=cfg['NAME'], user=cfg['USER'], password=cfg['PASSWORD'],
+            host=cfg['HOST'] or 'localhost', port=cfg['PORT'] or 5432,
+        )
+        other.autocommit = True
+        try:
+            key = zlib.crc32(b'face_manager.reencode_missing_faces.parallel_backfill_active')
+            with other.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", [key])
+                self.assertTrue(cur.fetchone()[0])
+
+                with patch('face_manager.tasks.FaceExtractor') as mock_extractor_cls:
+                    reencode_missing_faces()
+                mock_extractor_cls.assert_not_called()
+
+                cur.execute("SELECT pg_advisory_unlock(%s)", [key])
+        finally:
+            other.close()
+
+        # Once free again, the task runs normally.
+        with patch('face_manager.tasks.FaceExtractor') as mock_extractor_cls:
+            reencode_missing_faces()
+        mock_extractor_cls.assert_called_once()
+
     def test_clear_ignored_encodings_crash_is_recorded(self):
         from common.models import ApplicationError
         from face_manager.tasks import clear_ignored_encodings
