@@ -2572,7 +2572,7 @@ class ClassificationInvariantCheckTests(TestCase):
         person = make_person("Retried Match")
         assigner = faceAssigner()
 
-        def fake_classify(f):
+        def fake_classify(f, **kwargs):
             # Simulate a successful classification on retry.
             f.poss_ident1 = person
             f.save()
@@ -2609,7 +2609,7 @@ class ClassificationInvariantCheckTests(TestCase):
         face = self._make_leftover_face()
         assigner = faceAssigner()
 
-        def fake_classify(f):
+        def fake_classify(f, **kwargs):
             person = make_person("Retried Match For Race Test")
             f.poss_ident1 = person
             f.save()

@@ -280,6 +280,26 @@ class faceAssigner():
         # cohesion/span stats).
         self.MIN_VIDEO_SUBGALLERY_SIZE = 3
 
+        # execute()'s real bottleneck, confirmed empirically 2026-10-26:
+        # classify_unassigned()'s one-matmul-per-face gallery comparison
+        # (query_encoding @ self.all_embeddings, a (512,) @ (512, N) GEMV
+        # against the whole ~300k-face gallery) is already vectorized
+        # ACROSS CANDIDATES, but not across FACES -- a redo_all=True run
+        # (110k+ faces) pays that GEMV cost once per face, serially.
+        # Benchmarked against real production embeddings (302,944-face
+        # gallery), uncontended: batching CLASSIFY_BATCH_SIZE faces'
+        # encodings into one (M, 512) @ (512, N) GEMM call instead of M
+        # separate GEMV calls gave an 8x speedup on the matmul itself
+        # (16.36s -> 2.05s for 300 faces), bit-identical result (max abs
+        # diff ~1e-15, ordinary float rounding) -- BLAS is far more
+        # efficient per-FLOP on one big matrix-matrix multiply than on
+        # many repeated matrix-vector ones. 200 chosen as a balance: the
+        # temporary (M, N) similarity matrix costs ~484MB at M=200
+        # against this gallery's real size, trivial against this
+        # container's memory budget, while still giving BLAS a
+        # meaningfully large batch to work with.
+        self.CLASSIFY_BATCH_SIZE = 200
+
         # self.bogus_date = datetime(1990, 1, 1) # Very few images before that
         # self.bogus_date_utc = time.mktime(self.bogus_date.timetuple())
         self.ignore_person = Person.objects.filter(person_name=settings.SOFT_IGNORE_NAME)[0]
@@ -729,10 +749,123 @@ class faceAssigner():
         # real cost to doing it unconditionally.
         self.load_encodings()
 
-        for u_img in tqdm(unassigned.iterator()):
-            self._classify_one_safely(u_img.id, u_img)
+        batch = []
+        progress = tqdm(total=num_unassigned)
+        for u_img in unassigned.iterator():
+            batch.append(u_img)
+            if len(batch) >= self.CLASSIFY_BATCH_SIZE:
+                self._classify_batch_safely(batch)
+                progress.update(len(batch))
+                batch = []
+        if batch:
+            self._classify_batch_safely(batch)
+            progress.update(len(batch))
+        progress.close()
 
         self._verify_classification_invariant()
+
+    def _classify_batch_safely(self, faces):
+        """Batches the two genuinely expensive steps in classify_
+        unassigned() across every face in `faces`, instead of paying
+        them once per face:
+
+        1. The full-gallery matmul (see CLASSIFY_BATCH_SIZE's own
+           comment) -- one (M, 512) @ (512, N) GEMM instead of M GEMVs.
+        2. The per-candidate np.percentile(..., 99) call -- confirmed
+           empirically (2026-10-26) to be the NEXT bottleneck once (1)
+           was fixed (~0.045s/face vs. the matmul's ~0.0078s/face,
+           against a real 446-candidate gallery). Flips the loop order:
+           instead of "for each face: for each candidate: percentile"
+           (M*P calls), do "for each candidate (P, fixed): percentile
+           across every face in the batch at once" via
+           np.percentile(batch_slice, 99, axis=1) -- one vectorized
+           call per candidate instead of one per (face, candidate)
+           pair. Windowed candidates (Person.use_windowed_classification
+           -- a documented minority) can't share one call across faces,
+           since the comparison pool depends on each face's own query
+           date; those fall back to a per-face loop, scoped to just
+           that one candidate across the batch, not all P of them.
+
+        Per-face rejected candidates (Face.rejected_fields) are handled
+        by masking that face's own row to -inf for each rejected
+        person's column -- not literal 0, since a real similarity can
+        be small or negative, so 0 could look like a plausible match
+        against some loose threshold. -inf is mathematically inert
+        no matter the threshold: it can never satisfy `sim_99th -
+        threshold >= margin_floor`, never win an argmax, and never be
+        picked as the "closest call" for the ignore-weight calculation
+        (threshold - (-inf) = +inf, which np.min() correctly never
+        selects as long as at least one real candidate exists).
+
+        Everything past this point -- the det_score/margin gate,
+        candidate ranking, the save -- stays exactly as classify_
+        unassigned() already does it, unchanged; only the similarity/
+        percentile computation is batched, by passing each face's
+        finished row through to the existing per-face method."""
+        encodings = np.stack([np.array(f.face_encoding_512) for f in faces])
+        norms = np.linalg.norm(encodings, axis=1)
+        batch_similarity = (
+            (encodings @ self.all_embeddings) / (self.all_norms[None, :] * norms[:, None])
+        )
+
+        person_ids = list(self.likely_people_ids)
+        person_col = {pid: i for i, pid in enumerate(person_ids)}
+        num_people = len(person_ids)
+        num_faces = len(faces)
+
+        sim99 = np.empty((num_faces, num_people))
+        thresholds = np.empty(num_people)
+
+        for col, db_id in enumerate(person_ids):
+            lo, hi = self.gallery_offsets[db_id]
+            thresholds[col] = self.threshold_dict.get(
+                db_id, self._p99_threshold_for_gallery_size(hi - lo)
+            )
+            window_days = self.windowed_people.get(db_id)
+            if window_days is None:
+                sim99[:, col] = np.percentile(batch_similarity[:, lo:hi], 99, axis=1)
+            else:
+                date_slice = self.all_dates[lo:hi]
+                for row in range(num_faces):
+                    similarity = batch_similarity[row, lo:hi]
+                    query_date = faces[row].dateTakenUTC
+                    if query_date:
+                        in_window = np.abs(date_slice - query_date) <= window_days * 86400
+                        if in_window.sum() >= self.MIN_WINDOW_SAMPLE:
+                            similarity = similarity[in_window]
+                    sim99[row, col] = np.percentile(similarity, 99)
+
+        # Video-sourced queries: a minority within the batch AND a
+        # minority of candidates (those with a trusted video sub-
+        # gallery, see MIN_VIDEO_SUBGALLERY_SIZE) -- cheap to handle as
+        # a small per-face loop rather than batching, same reasoning
+        # classify_unassigned() itself already used for this part.
+        if self.all_video_embeddings.shape[1] > 0:
+            for row, face in enumerate(faces):
+                if face.source_video_file_id is None:
+                    continue
+                video_similarity = (
+                    encodings[row] @ self.all_video_embeddings
+                ) / (self.all_video_norms * norms[row])
+                for db_id, (v_lo, v_hi) in self.video_gallery_offsets.items():
+                    col = person_col.get(db_id)
+                    if col is None:
+                        continue
+                    video_sim_99th = np.percentile(video_similarity[v_lo:v_hi], 99)
+                    sim99[row, col] = max(sim99[row, col], video_sim_99th)
+
+        for row, face in enumerate(faces):
+            rejected_ids = face.rejected_fields if face.rejected_fields is not None else []
+            row_sim99 = sim99[row].copy()
+            for rid in rejected_ids:
+                col = person_col.get(rid)
+                if col is not None:
+                    row_sim99[col] = -np.inf
+            self._classify_one_safely(
+                face.id, face,
+                precomputed_similarity=batch_similarity[row],
+                precomputed_candidates=(person_ids, row_sim99, thresholds),
+            )
 
     def _verify_classification_invariant(self):
         """Safety net, run at the end of every execute() call: a face
@@ -799,9 +932,13 @@ class faceAssigner():
             from common.error_log import log_error
             log_error('face_manager.assign_faces.execute', message)
 
-    def _classify_one_safely(self, face_id, face):
+    def _classify_one_safely(self, face_id, face, precomputed_similarity=None, precomputed_candidates=None):
         try:
-            self.classify_unassigned(face)
+            self.classify_unassigned(
+                face,
+                precomputed_similarity=precomputed_similarity,
+                precomputed_candidates=precomputed_candidates,
+            )
         except Exception as e:
             # A failure classifying one face must not abort the entire
             # scheduled run -- every other already-queued face in this
@@ -814,7 +951,7 @@ class faceAssigner():
 
 
 
-    def classify_unassigned(self, unassigned_face: Face, debug_face_id = None) -> None:
+    def classify_unassigned(self, unassigned_face: Face, debug_face_id = None, precomputed_similarity=None, precomputed_candidates=None) -> None:
         """
         DOCSTRING
         """
@@ -862,105 +999,134 @@ class faceAssigner():
             unassigned_face.set_possible_person(self._cached_person(self.ignore_person_id), 1, 1.0)
             return
 
-        candidate_id_arr = np.array(candidate_ids)
-
-        # Pre-populate a metrics array. Bug fix: this used to be sized to
-        # self.num_likely_people (the *full* candidate roster) rather than
-        # len(candidate_ids) (this face's roster minus whatever's already
-        # been rejected for it) -- whenever a rejection had shrunk the
-        # candidate list, the array's tail rows were left as stale
-        # np.zeros() padding representing no real person. That padding
-        # could pollute np.max()/np.argmax() below (a real similarity can
-        # be negative, so a padded 0 can look like the best match), and
-        # np.argmax() over the full-size array could return an index
-        # beyond the end of the smaller candidate_id_arr, raising
-        # IndexError -- which, since execute()'s per-face try/except was
-        # commented out, aborted the *entire* scheduled assign_faces run,
-        # not just this one face. Sizing to len(candidate_ids) keeps every
-        # row real and every index in bounds.
-        #
-        # Columns: [sim_99th, per_candidate_threshold, db_id]. The gate
-        # and ranking both use sim_99th now, not sim_max -- see
-        # BUCKET_BOUNDARIES/BUCKET_THRESHOLDS above for why a flat
-        # sim_max gate was replaced with a gallery-size-calibrated
-        # percentile.
-        metrics_array = np.zeros((len(candidate_ids), 3))
-
-        # One big matmul against the whole gallery (all likely people,
-        # not just this face's candidate_ids -- cheap either way, and
-        # simpler than rebuilding a filtered matrix per face) instead of
-        # a separate small np.dot() per candidate. Each candidate's
-        # slice is then just cheap array indexing via gallery_offsets.
-        all_similarity = (query_encoding @ self.all_embeddings) / (self.all_norms * query_encoding_norm)
-
-        # Video-sourced query: also compare against each candidate's
-        # video-only sub-gallery, where one exists (see
-        # MIN_VIDEO_SUBGALLERY_SIZE/_build_video_concatenated_gallery()).
-        # Computed once here (zero cost for an image-sourced query, which
-        # never touches this) rather than per-candidate below.
+        # Used below regardless of which branch builds metrics_array
+        # (effective_det_floor's video/image choice is a property of
+        # the query face itself, not of how its candidates were
+        # computed).
         is_video_query = unassigned_face.source_video_file_id is not None
-        all_video_similarity = None
-        if is_video_query and self.all_video_embeddings.shape[1] > 0:
-            all_video_similarity = (
-                query_encoding @ self.all_video_embeddings
-            ) / (self.all_video_norms * query_encoding_norm)
 
-        query_date = unassigned_face.dateTakenUTC
-
-        for row_num, db_id in enumerate(candidate_ids):
-            lo, hi = self.gallery_offsets[db_id]
-            similarity = all_similarity[lo:hi]
-
-            # Per-person windowed classification (Person.
-            # use_windowed_classification/classification_window_days) --
-            # restrict the comparison pool to gallery members within the
-            # configured window of the QUERY's own date, instead of the
-            # whole gallery. Validated empirically (2026-10-25, see
-            # Person.use_windowed_classification's own docstring) as a
-            # real false-positive-rate improvement for specific people
-            # whose gallery spans a wide date range with genuine cross-
-            # era appearance drift -- deliberately per-person, not a
-            # general default, since no formula reliably predicts who
-            # benefits. Falls back to the full gallery if the query has
-            # no usable date or too few gallery members fall in-window.
-            window_days = self.windowed_people.get(db_id)
-            if window_days is not None and query_date:
-                date_slice = self.all_dates[lo:hi]
-                in_window = np.abs(date_slice - query_date) <= window_days * 86400
-                if in_window.sum() >= self.MIN_WINDOW_SAMPLE:
-                    similarity = similarity[in_window]
-
-            sim_99th = np.percentile(similarity, 99)
-
-            # Take whichever of "this candidate's full gallery" or "this
-            # candidate's video-only exemplars" scores this query higher
-            # -- real investigation, 2026-10-13 (see
-            # VIDEO_DET_SCORE_FLOOR's comment): video-vs-video similarity
-            # for a genuine match runs measurably higher than video-vs-
-            # image, so a video query gets an extra, same-source-type
-            # path to clear the SAME threshold rather than a lowered bar.
-            # Never applies to an image-sourced query (all_video_similarity
-            # stays None), so the already-tuned image classification path
-            # is completely unaffected.
-            if all_video_similarity is not None and db_id in self.video_gallery_offsets:
-                v_lo, v_hi = self.video_gallery_offsets[db_id]
-                video_sim_99th = np.percentile(all_video_similarity[v_lo:v_hi], 99)
-                sim_99th = max(sim_99th, video_sim_99th)
-
-            # threshold_dict (built in load_encodings(), see its own
-            # comment) already includes the size-only bucket threshold
-            # PLUS the per-person cohesion/span nudge -- falls back to the
-            # plain bucket threshold only for a candidate somehow missing
-            # from it (shouldn't happen in practice: every id in
-            # gallery_offsets came from the same load_encodings() pass
-            # that populates threshold_dict), rather than raising.
-            candidate_threshold = self.threshold_dict.get(
-                db_id, self._p99_threshold_for_gallery_size(hi - lo)
+        # _classify_batch_safely() precomputes this face's whole row --
+        # the gallery-wide similarity AND every candidate's sim_99th,
+        # already max'd against its video sub-gallery where applicable,
+        # already masked to -inf for this face's own rejected candidates
+        # (see that method's own docstring for the real, measured
+        # speedup and why -inf rather than 0) -- in one vectorized pass
+        # across the whole batch. candidate_id_arr spans the FULL
+        # likely-people roster in that case (not just this face's
+        # non-rejected candidate_ids), since the -inf masking already
+        # makes a rejected row mathematically unable to win any
+        # downstream comparison -- it doesn't need to be filtered out
+        # of the array as well. A direct caller (the invariant-check
+        # retry, direct tests, etc.) still gets everything computed
+        # fresh below, scoped to just this face's own candidate_ids.
+        if precomputed_candidates is not None:
+            precomputed_person_ids, precomputed_sim99, precomputed_thresholds = precomputed_candidates
+            candidate_id_arr = np.array(precomputed_person_ids)
+            metrics_array = np.stack(
+                [precomputed_sim99, precomputed_thresholds, candidate_id_arr.astype(float)], axis=1
             )
+        else:
+            candidate_id_arr = np.array(candidate_ids)
 
-            metrics_array[row_num, :] = [sim_99th, candidate_threshold, db_id]
-            if self.DEBUG and db_id == debug_face_id and debug_face_id is not None:
-                print("Row values: ", metrics_array[row_num, :])
+            # Pre-populate a metrics array. Bug fix: this used to be sized to
+            # self.num_likely_people (the *full* candidate roster) rather than
+            # len(candidate_ids) (this face's roster minus whatever's already
+            # been rejected for it) -- whenever a rejection had shrunk the
+            # candidate list, the array's tail rows were left as stale
+            # np.zeros() padding representing no real person. That padding
+            # could pollute np.max()/np.argmax() below (a real similarity can
+            # be negative, so a padded 0 can look like the best match), and
+            # np.argmax() over the full-size array could return an index
+            # beyond the end of the smaller candidate_id_arr, raising
+            # IndexError -- which, since execute()'s per-face try/except was
+            # commented out, aborted the *entire* scheduled assign_faces run,
+            # not just this one face. Sizing to len(candidate_ids) keeps every
+            # row real and every index in bounds.
+            #
+            # Columns: [sim_99th, per_candidate_threshold, db_id]. The gate
+            # and ranking both use sim_99th now, not sim_max -- see
+            # BUCKET_BOUNDARIES/BUCKET_THRESHOLDS above for why a flat
+            # sim_max gate was replaced with a gallery-size-calibrated
+            # percentile.
+            metrics_array = np.zeros((len(candidate_ids), 3))
+
+            # One big matmul against the whole gallery (all likely people,
+            # not just this face's candidate_ids -- cheap either way, and
+            # simpler than rebuilding a filtered matrix per face) instead of
+            # a separate small np.dot() per candidate. Each candidate's
+            # slice is then just cheap array indexing via gallery_offsets.
+            if precomputed_similarity is not None:
+                all_similarity = precomputed_similarity
+            else:
+                all_similarity = (query_encoding @ self.all_embeddings) / (self.all_norms * query_encoding_norm)
+
+            # Video-sourced query: also compare against each candidate's
+            # video-only sub-gallery, where one exists (see
+            # MIN_VIDEO_SUBGALLERY_SIZE/_build_video_concatenated_gallery()).
+            # Computed once here (zero cost for an image-sourced query, which
+            # never touches this) rather than per-candidate below.
+            all_video_similarity = None
+            if is_video_query and self.all_video_embeddings.shape[1] > 0:
+                all_video_similarity = (
+                    query_encoding @ self.all_video_embeddings
+                ) / (self.all_video_norms * query_encoding_norm)
+
+            query_date = unassigned_face.dateTakenUTC
+
+            for row_num, db_id in enumerate(candidate_ids):
+                lo, hi = self.gallery_offsets[db_id]
+                similarity = all_similarity[lo:hi]
+
+                # Per-person windowed classification (Person.
+                # use_windowed_classification/classification_window_days) --
+                # restrict the comparison pool to gallery members within the
+                # configured window of the QUERY's own date, instead of the
+                # whole gallery. Validated empirically (2026-10-25, see
+                # Person.use_windowed_classification's own docstring) as a
+                # real false-positive-rate improvement for specific people
+                # whose gallery spans a wide date range with genuine cross-
+                # era appearance drift -- deliberately per-person, not a
+                # general default, since no formula reliably predicts who
+                # benefits. Falls back to the full gallery if the query has
+                # no usable date or too few gallery members fall in-window.
+                window_days = self.windowed_people.get(db_id)
+                if window_days is not None and query_date:
+                    date_slice = self.all_dates[lo:hi]
+                    in_window = np.abs(date_slice - query_date) <= window_days * 86400
+                    if in_window.sum() >= self.MIN_WINDOW_SAMPLE:
+                        similarity = similarity[in_window]
+
+                sim_99th = np.percentile(similarity, 99)
+
+                # Take whichever of "this candidate's full gallery" or "this
+                # candidate's video-only exemplars" scores this query higher
+                # -- real investigation, 2026-10-13 (see
+                # VIDEO_DET_SCORE_FLOOR's comment): video-vs-video similarity
+                # for a genuine match runs measurably higher than video-vs-
+                # image, so a video query gets an extra, same-source-type
+                # path to clear the SAME threshold rather than a lowered bar.
+                # Never applies to an image-sourced query (all_video_similarity
+                # stays None), so the already-tuned image classification path
+                # is completely unaffected.
+                if all_video_similarity is not None and db_id in self.video_gallery_offsets:
+                    v_lo, v_hi = self.video_gallery_offsets[db_id]
+                    video_sim_99th = np.percentile(all_video_similarity[v_lo:v_hi], 99)
+                    sim_99th = max(sim_99th, video_sim_99th)
+
+                # threshold_dict (built in load_encodings(), see its own
+                # comment) already includes the size-only bucket threshold
+                # PLUS the per-person cohesion/span nudge -- falls back to the
+                # plain bucket threshold only for a candidate somehow missing
+                # from it (shouldn't happen in practice: every id in
+                # gallery_offsets came from the same load_encodings() pass
+                # that populates threshold_dict), rather than raising.
+                candidate_threshold = self.threshold_dict.get(
+                    db_id, self._p99_threshold_for_gallery_size(hi - lo)
+                )
+
+                metrics_array[row_num, :] = [sim_99th, candidate_threshold, db_id]
+                if self.DEBUG and db_id == debug_face_id and debug_face_id is not None:
+                    print("Row values: ", metrics_array[row_num, :])
 
         # Combined det_score + margin gate -- see DET_SCORE_FLOOR/
         # CANDIDATE_MARGIN_FLOOR's own comment in __init__ for the full
