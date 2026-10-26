@@ -86,6 +86,30 @@ class FaceExtractor(object):
     # of too rarely is a repeat of this incident.
     REINIT_DETECTOR_EVERY_N_IMAGES = 25
 
+    # reencode_missing_faces()'s own reinit threshold, deliberately
+    # separate from REINIT_DETECTOR_EVERY_N_IMAGES above rather than
+    # sharing it -- that constant was tuned for find_and_encode_faces()'s
+    # own, more memory-hungry workload (full multi-scale pyramidal
+    # detection against a whole image, often several faces at once).
+    # reencode_missing_faces()'s per-face work is lighter (a kps-replay
+    # or small-crop redetect, plus one LVFace-B embed), and -- more
+    # importantly -- when run as a shard of the one-time parallel
+    # backfill (backfill_lvface_parallel), each worker is pinned to only
+    # ~5 CPU cores, which empirically keeps ONNXRuntime's own arena
+    # growth much smaller per worker to begin with (observed 2026-10-25:
+    # worker RSS plateaus around 3-3.7GB under that setup, vs. the
+    # ~12-14GB an unconstrained single process reached before this fix
+    # existed at all -- see REINIT_DETECTOR_EVERY_N_IMAGES's own
+    # comment for that incident). Real spare memory headroom (48GB
+    # container limit, see docker-compose.yaml) comfortably supports
+    # reinitializing less often here, trading a little more worst-case
+    # per-worker memory for less reinit overhead (each reinit pays a
+    # real cost: rebuilding the detector AND forcing LVFace-B's own
+    # session to reload from disk on its next use) -- net real
+    # throughput win, per the user's own request after seeing the
+    # parallel backfill's real numbers.
+    REENCODE_REINIT_EVERY_N_IMAGES = 150
+
     def __init__(self):
         super(FaceExtractor, self).__init__()
 
@@ -1073,7 +1097,7 @@ class FaceExtractor(object):
                 # detection) -- never worth opening the image.
                 continue
 
-            if processed_count > 0 and processed_count % self.REINIT_DETECTOR_EVERY_N_IMAGES == 0:
+            if processed_count > 0 and processed_count % self.REENCODE_REINIT_EVERY_N_IMAGES == 0:
                 # Bounds ONNXRuntime's CPU memory arena growth, same
                 # reasoning as find_and_encode_faces()'s own periodic
                 # rebuild (see REINIT_DETECTOR_EVERY_N_IMAGES's own
@@ -1085,9 +1109,13 @@ class FaceExtractor(object):
                 # single run can now process the library's entire
                 # multi-hundred-thousand-face backlog) -- confirmed via
                 # real production data: an unbounded manual run grew to
-                # 13+ GB RSS within the hour. Rebuilds both insightface's
-                # detector/recognition session AND LVFace-B's own
-                # separate ONNX session (lvface.reset_session()) --
+                # 13+ GB RSS within the hour. Uses its own, higher
+                # REENCODE_REINIT_EVERY_N_IMAGES threshold (see that
+                # constant's own comment for why) rather than sharing
+                # find_and_encode_faces()'s tighter one. Rebuilds both
+                # insightface's detector/recognition session AND
+                # LVFace-B's own separate ONNX session
+                # (lvface.reset_session()) --
                 # LVFace-B processes far more faces per run than
                 # insightface does now, so its session is at least as
                 # likely to be the dominant contributor.

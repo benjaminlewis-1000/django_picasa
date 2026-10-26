@@ -3398,7 +3398,7 @@ class ReencodeMissingFacesTests(TestCase):
         # stays focused purely on confirming the rebuild happens at the
         # right counts, without needing the rebuilt mock detector to
         # also support a real insight re-encode.
-        self.extractor.REINIT_DETECTOR_EVERY_N_IMAGES = 2
+        self.extractor.REENCODE_REINIT_EVERY_N_IMAGES = 2
         faces = []
         for i in range(3):
             person = make_person(f"Reinit Face {i}")
@@ -3417,7 +3417,7 @@ class ReencodeMissingFacesTests(TestCase):
              patch('lvface.reset_session') as mock_reset:
             self.extractor.reencode_missing_faces()
 
-        # 3 faces processed, REINIT_DETECTOR_EVERY_N_IMAGES=2 -> the
+        # 3 faces processed, REENCODE_REINIT_EVERY_N_IMAGES=2 -> the
         # check at processed_count==2 (0-indexed boundary, i.e. right
         # before the 3rd face) fires exactly once.
         mock_build.assert_called_once()
