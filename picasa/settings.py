@@ -527,8 +527,15 @@ REST_FRAMEWORK = {
         # The shared, unscoped RANDOM_ACCESS_KEY path (KeyedImageView's
         # face_array/face_source/face_highlight/full_small types when
         # unauthenticated) -- lower trust than the sig-gated slideshow
-        # path above, so a tighter rate. See api/throttles.py.
-        'access_key_media': '30/min',
+        # path above, so a tighter rate. Tightened 30 -> 2/min
+        # 2026-10-26 after confirming real production traffic
+        # (facewire.exploretheworld.tech) no longer needs this path at
+        # all -- the frontend's crossOrigin="use-credentials" fix is
+        # live, confirmed via a real 321-request/~40s burst with zero
+        # 429s (the Redis-backed throttle itself was separately
+        # confirmed to enforce precisely by then, so that's a genuine
+        # auth-bypass result, not a fluke). See api/throttles.py.
+        'access_key_media': '2/min',
     },
 }
 
