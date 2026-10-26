@@ -3320,43 +3320,78 @@ class ReencodeMissingFacesTests(TestCase):
 
         self.assertEqual(mock_lv.call_count, 1)
 
-    def test_remaining_budget_is_passed_to_video_subpass(self):
-        # After the image loop finishes, whatever's left of the overall
-        # budget should be handed to the video-only sub-pass, not a
-        # fresh full budget -- otherwise one call's worst-case total
-        # runtime would silently double.
-        times = iter([0, 30])  # start_time, elapsed-check right after the (empty) image loop
+    def _make_video_face(self, **overrides):
+        # Mirrors BackfillLvfaceVideoEncodingsTests' own helper -- kept
+        # as a small, separate copy rather than a shared fixture, since
+        # these two test classes exercise different entry points
+        # (reencode_missing_faces()'s own combined queryset here, vs.
+        # _backfill_lvface_video_encodings() directly there).
+        from filepopulator.models import Directory, VideoFile
+        directory, _ = Directory.objects.get_or_create(dir_path='/videos/reencode_combined_test')
+        video_path = '/tmp/reencode_combined_test_video.mp4'
+        with open(video_path, 'wb') as f:
+            f.write(b'not a real video, existence is all this sweep checks')
+        self.addCleanup(lambda: os.path.exists(video_path) and os.remove(video_path))
+        video = VideoFile.objects.create(filename=video_path, directory=directory, width=640, height=480)
+        face = Face(
+            declared_name=overrides.pop('declared_name', None) or get_default_blank_person(),
+            source_video_file=video,
+            box_left=1, box_top=1, box_right=10, box_bottom=10,
+            video_thumbnail_frame_seconds=12.3,
+            kps=[1.0] * 10,
+            **overrides,
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
+        face.save()
+        return face
 
-        def fake_time():
-            return next(times, 30)
+    def test_video_faces_are_included_in_the_combined_sweep(self):
+        # Real behavior change, 2026-10-26: video used to require a
+        # completely separate sub-pass call that only ever ran AFTER
+        # the image loop fully finished -- for an unbounded (shard)
+        # call, that meant video never got touched until a shard's
+        # entire image backlog was already drained (confirmed stuck at
+        # 0 progress in real production for this exact reason). Image
+        # and video faces are now unioned into one combined, randomly-
+        # ordered queryset, so a call that processes anything at all
+        # can reach video faces too, regardless of image backlog size.
+        video_face = self._make_video_face()
+        with patch('video_face_pipeline.ffprobe_info', return_value=(640, 480, 30.0, None, 0, None, None)), \
+             patch('video_face_pipeline.extract_frame_near_timestamp', return_value=np.zeros((480, 640, 3), dtype=np.uint8)), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.5, dtype=np.float32)):
+            self.extractor.reencode_missing_faces()
+        video_face.refresh_from_db()
+        self.assertEqual(video_face.face_encoding_lvface_b, [0.5] * 512)
 
-        with patch('time.time', side_effect=fake_time), \
-             patch.object(self.extractor, '_backfill_lvface_video_encodings') as mock_video:
-            self.extractor.reencode_missing_faces(lvface_max_runtime_seconds=100)
+    def test_sharded_call_only_processes_video_faces_in_its_own_shard(self):
+        # The combined queryset's Mod(F('id'), total_shards) partition
+        # applies uniformly to both face types -- every video face must
+        # still be covered by exactly one of the shard runs below.
+        video_faces = [self._make_video_face() for _ in range(6)]
+        total_shards = 3
+        with patch('video_face_pipeline.ffprobe_info', return_value=(640, 480, 30.0, None, 0, None, None)), \
+             patch('video_face_pipeline.extract_frame_near_timestamp', return_value=np.zeros((480, 640, 3), dtype=np.uint8)), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.6, dtype=np.float32)):
+            for shard_index in range(total_shards):
+                self.extractor.reencode_missing_faces(shard_index=shard_index, total_shards=total_shards)
+        for face in video_faces:
+            face.refresh_from_db()
+            self.assertEqual(face.face_encoding_lvface_b, [0.6] * 512)
 
-        mock_video.assert_called_once()
-        self.assertEqual(mock_video.call_args.kwargs.get('max_runtime_seconds'), 70)
-
-    def test_sharded_call_also_shards_the_video_subpass(self):
-        # Real behavior change, 2026-10-26: video used to be skipped
-        # entirely for any sharded call (left for the unsharded hourly
-        # task, which in turn defers to the parallel backfill's own
-        # marker lock -- net result, the whole video backlog sat frozen
-        # the entire time the parallel backfill was running). Now a
-        # sharded call also runs its own slice of video.
-        times = iter([0, 30])
-        def fake_time():
-            return next(times, 30)
-
-        with patch('time.time', side_effect=fake_time), \
-             patch.object(self.extractor, '_backfill_lvface_video_encodings') as mock_video:
-            self.extractor.reencode_missing_faces(
-                lvface_max_runtime_seconds=100, shard_index=2, total_shards=5,
-            )
-
-        mock_video.assert_called_once()
-        self.assertEqual(mock_video.call_args.kwargs.get('shard_index'), 2)
-        self.assertEqual(mock_video.call_args.kwargs.get('total_shards'), 5)
+    def test_collection_scoped_call_never_includes_video(self):
+        # collection is an image-only concept (no PhotoCollection
+        # association for VideoFile, see CLAUDE.md) -- a collection-
+        # scoped call (e.g. apply_collection_floor_change) must never
+        # touch the video backlog, same as before this change.
+        from filepopulator.models import PhotoCollection
+        video_face = self._make_video_face()
+        default_collection = PhotoCollection.objects.get(is_default=True)
+        with patch('video_face_pipeline.ffprobe_info') as mock_ffprobe, \
+             patch('lvface.embed_from_image_array'):
+            self.extractor.reencode_missing_faces(collection=default_collection)
+        mock_ffprobe.assert_not_called()
+        video_face.refresh_from_db()
+        self.assertIsNone(video_face.face_encoding_lvface_b)
 
     def test_skips_entirely_when_advisory_lock_already_held(self):
         # Regression test for a real production incident (2026-10-25): a
