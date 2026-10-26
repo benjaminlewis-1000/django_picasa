@@ -519,7 +519,11 @@ REST_FRAMEWORK = {
     # else sets throttle_classes.
     'DEFAULT_THROTTLE_RATES': {
         'slideshow_list': '30/min',
-        'slideshow_media': '180/min',
+        # Tightened 180 -> 60/min 2026-10-26, per the user's own call --
+        # the real kiosk (net_slideshow) cycles through photos on a
+        # multi-second interval, nowhere near 180/min; 60/min still
+        # leaves real headroom for that real use case.
+        'slideshow_media': '60/min',
         # The shared, unscoped RANDOM_ACCESS_KEY path (KeyedImageView's
         # face_array/face_source/face_highlight/full_small types when
         # unauthenticated) -- lower trust than the sig-gated slideshow
