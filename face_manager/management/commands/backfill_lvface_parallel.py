@@ -97,13 +97,24 @@ def _available_memory_gb():
     is SMALLER of (a) the host's own available memory (/proc/meminfo's
     MemAvailable -- this reflects the host's view even from inside a
     container under the default cgroup setup, not a container-scoped
-    figure) and (b) this container's own cgroup v2 memory headroom
-    (memory.max - memory.current). Using only (a) would be a real bug:
-    the host could show plenty of room while this container's own
-    mem_limit (docker-compose.yaml) is the actual thing that kills a
-    new worker first. Falls back to host-only if the cgroup v2 files
-    aren't present (e.g. a cgroup v1 host, or not running in a
-    container at all)."""
+    figure) and (b) this container's own cgroup v2 memory headroom.
+    Using only (a) would be a real bug: the host could show plenty of
+    room while this container's own mem_limit (docker-compose.yaml) is
+    the actual thing that kills a new worker first. Falls back to
+    host-only if the cgroup v2 files aren't present (e.g. a cgroup v1
+    host, or not running in a container at all).
+
+    Real incident, 2026-10-25: a naive memory.max - memory.current
+    treated this container's own page cache (built up from reading
+    thousands of image files during the backfill itself) as if it
+    were genuinely unavailable memory, pinning the supervisor at
+    min_workers for hours despite plenty of real headroom (docker
+    stats showing ~9GB/48GB used the whole time). cgroup v2's
+    memory.current includes file-backed page cache, most of which is
+    `inactive_file` -- memory the kernel will reclaim instantly under
+    real pressure, before ever considering an OOM kill. Subtracting it
+    back out (matching what `docker stats` itself already does) is
+    what actually reflects the binding ceiling."""
     host_available_gb = None
     with open('/proc/meminfo') as f:
         for line in f:
@@ -121,7 +132,16 @@ def _available_memory_gb():
         cgroup_max_gb = int(raw_max) / (1024 ** 3)
         with open('/sys/fs/cgroup/memory.current') as f:
             cgroup_current_gb = int(f.read().strip()) / (1024 ** 3)
-        cgroup_available_gb = max(0.0, cgroup_max_gb - cgroup_current_gb)
+        reclaimable_gb = 0.0
+        try:
+            with open('/sys/fs/cgroup/memory.stat') as f:
+                for line in f:
+                    if line.startswith('inactive_file '):
+                        reclaimable_gb = int(line.split()[1]) / (1024 ** 3)
+                        break
+        except (FileNotFoundError, ValueError):
+            pass
+        cgroup_available_gb = max(0.0, cgroup_max_gb - cgroup_current_gb + reclaimable_gb)
         return min(host_available_gb, cgroup_available_gb)
     except (FileNotFoundError, ValueError):
         return host_available_gb
