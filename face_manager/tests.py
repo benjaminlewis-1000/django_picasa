@@ -3563,6 +3563,58 @@ class BackfillLvfaceParallelHelperTests(TestCase):
             result = _available_memory_gb()
         self.assertAlmostEqual(result, 2.0, places=3)
 
+    def test_available_memory_gb_adds_back_reclaimable_page_cache(self):
+        from face_manager.management.commands.backfill_lvface_parallel import _available_memory_gb
+        meminfo = "MemTotal:       65000000 kB\nMemAvailable:   40000000 kB\n"
+        # memory.current says only ~2GB left (10GB max, 8GB current), but
+        # 5GB of that 8GB is reclaimable page cache -- the real incident
+        # this guards against (2026-10-25): a naive memory.max -
+        # memory.current treated that cache as genuinely unavailable,
+        # keeping the supervisor pinned near its floor for hours despite
+        # real headroom existing. Real available should be 2GB + 5GB = 7GB.
+        cgroup_max = str(10 * 1024 ** 3)
+        cgroup_current = str(8 * 1024 ** 3)
+        memory_stat = f"anon {3 * 1024 ** 3}\nfile {5 * 1024 ** 3}\ninactive_file {5 * 1024 ** 3}\n"
+        contents = {
+            '/proc/meminfo': meminfo,
+            '/sys/fs/cgroup/memory.max': cgroup_max,
+            '/sys/fs/cgroup/memory.current': cgroup_current,
+            '/sys/fs/cgroup/memory.stat': memory_stat,
+        }
+
+        def fake_open(path, *a, **kw):
+            if path not in contents:
+                raise FileNotFoundError(path)
+            return io.StringIO(contents[path])
+
+        with patch('builtins.open', side_effect=fake_open):
+            result = _available_memory_gb()
+        self.assertAlmostEqual(result, 7.0, places=3)
+
+    def test_available_memory_gb_cgroup_math_survives_missing_memory_stat(self):
+        from face_manager.management.commands.backfill_lvface_parallel import _available_memory_gb
+        meminfo = "MemTotal:       65000000 kB\nMemAvailable:   40000000 kB\n"
+        # memory.stat itself missing (e.g. an older/different cgroup
+        # setup) must not abort the whole cgroup calculation -- it should
+        # just treat reclaimable cache as 0, not fall all the way back to
+        # host-only.
+        cgroup_max = str(10 * 1024 ** 3)
+        cgroup_current = str(8 * 1024 ** 3)
+        contents = {
+            '/proc/meminfo': meminfo,
+            '/sys/fs/cgroup/memory.max': cgroup_max,
+            '/sys/fs/cgroup/memory.current': cgroup_current,
+        }
+
+        def fake_open(path, *a, **kw):
+            if path not in contents:
+                raise FileNotFoundError(path)
+            return io.StringIO(contents[path])
+
+        with patch('builtins.open', side_effect=fake_open):
+            result = _available_memory_gb()
+        self.assertAlmostEqual(result, 2.0, places=3)
+
     def test_available_memory_gb_falls_back_to_host_without_cgroup_v2(self):
         from face_manager.management.commands.backfill_lvface_parallel import _available_memory_gb
         meminfo = "MemTotal:       65000000 kB\nMemAvailable:   20000000 kB\n"
