@@ -3,7 +3,7 @@ import admin_thumbnails
 
 # Register your models here.
 
-from .models import ImageFile, Directory
+from .models import ImageFile, Directory, PhotoCollection
 
 # Set the thumbnail style for the image files. thumbnail_big/medium were
 # removed 2026-10-08 (zero real consumers -- see CLAUDE.md); the admin
@@ -62,9 +62,24 @@ class DirectoryAdmin(admin.ModelAdmin):
     # May be nice one day to include a link to all 
     # images in this directory, but I don't want to do that right now.
 
+class PhotoCollectionAdmin(admin.ModelAdmin):
+    empty_value_display = '-empty-'
+    list_display = ('name', 'root_directory', 'is_default', 'min_face_det_score', 'min_face_relative_size')
+    # root_directory/is_default are structural -- changing them doesn't
+    # re-scope already-ingested images (Directory.collection is only
+    # resolved once, at Directory creation time, via resolve_for_path())
+    # and could silently orphan a collection's existing content, so
+    # they're read-only here rather than editable by accident. The two
+    # face-detection floors are the actual point of this admin page --
+    # PhotoCollection.save() already dispatches apply_collection_floor_
+    # change() on a real change, same as any other save() path, so
+    # editing them here needs no special handling.
+    readonly_fields = ('name', 'root_directory', 'is_default', 'created_at', 'updated_at')
+
 # Make these class extensions the default for displaying these
 # types in the admin panel.
 admin.site.register(ImageFile, ImageFileAdmin)
 admin.site.register(Directory, DirectoryAdmin)
+admin.site.register(PhotoCollection, PhotoCollectionAdmin)
 
 
