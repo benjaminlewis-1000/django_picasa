@@ -1549,6 +1549,112 @@ class WindowedClassificationConfigApiTests(ApiTestCase):
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
 
+class PhotoCollectionConfigApiTests(ApiTestCase):
+    """Backend for a frontend settings page letting a human tune a
+    PhotoCollection's detection floors -- see filepopulator.models.
+    PhotoCollection.min_face_det_score/min_face_relative_size's own
+    docstring for what these gate."""
+
+    def _make_collection(self, **kwargs):
+        from filepopulator.models import PhotoCollection
+        import uuid
+        defaults = {'name': f'Test Collection {uuid.uuid4()}', 'root_directory': f'/tmp/{uuid.uuid4()}'}
+        defaults.update(kwargs)
+        return PhotoCollection.objects.create(**defaults)
+
+    def test_requires_auth(self):
+        resp = self.anon_client.get("/api/photo_collection_config/")
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_list_includes_current_floors(self):
+        collection = self._make_collection(min_face_det_score=0.6, min_face_relative_size=0.05)
+        resp = self.client.get("/api/photo_collection_config/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        row = next(r for r in resp.data if r['collection_id'] == collection.id)
+        self.assertEqual(row['name'], collection.name)
+        self.assertEqual(row['root_directory'], collection.root_directory)
+        self.assertFalse(row['is_default'])
+        self.assertAlmostEqual(row['min_face_det_score'], 0.6)
+        self.assertAlmostEqual(row['min_face_relative_size'], 0.05)
+
+    def test_list_includes_unset_floors_as_null(self):
+        collection = self._make_collection()
+        resp = self.client.get("/api/photo_collection_config/")
+        row = next(r for r in resp.data if r['collection_id'] == collection.id)
+        self.assertIsNone(row['min_face_det_score'])
+        self.assertIsNone(row['min_face_relative_size'])
+
+    def test_set_floors_updates_both(self):
+        collection = self._make_collection()
+        resp = self.client.post(
+            "/api/photo_collection_config/set_floors/",
+            {"collection_id": collection.id, "min_face_det_score": 0.6, "min_face_relative_size": 0.04},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        collection.refresh_from_db()
+        self.assertAlmostEqual(collection.min_face_det_score, 0.6)
+        self.assertAlmostEqual(collection.min_face_relative_size, 0.04)
+
+    def test_set_floors_updates_only_the_field_given(self):
+        collection = self._make_collection(min_face_det_score=0.6, min_face_relative_size=0.04)
+        resp = self.client.post(
+            "/api/photo_collection_config/set_floors/",
+            {"collection_id": collection.id, "min_face_det_score": 0.7},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        collection.refresh_from_db()
+        self.assertAlmostEqual(collection.min_face_det_score, 0.7)
+        self.assertAlmostEqual(collection.min_face_relative_size, 0.04)
+
+    def test_set_floors_null_clears_a_floor(self):
+        collection = self._make_collection(min_face_det_score=0.6, min_face_relative_size=0.04)
+        resp = self.client.post(
+            "/api/photo_collection_config/set_floors/",
+            {"collection_id": collection.id, "min_face_det_score": None},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        collection.refresh_from_db()
+        self.assertIsNone(collection.min_face_det_score)
+        self.assertAlmostEqual(collection.min_face_relative_size, 0.04)
+
+    def test_set_floors_rejects_out_of_range_value(self):
+        collection = self._make_collection()
+        resp = self.client.post(
+            "/api/photo_collection_config/set_floors/",
+            {"collection_id": collection.id, "min_face_det_score": 1.5},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_set_floors_rejects_non_numeric_value(self):
+        collection = self._make_collection()
+        resp = self.client.post(
+            "/api/photo_collection_config/set_floors/",
+            {"collection_id": collection.id, "min_face_det_score": "high"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_set_floors_rejects_unknown_collection(self):
+        resp = self.client.post(
+            "/api/photo_collection_config/set_floors/",
+            {"collection_id": 999999, "min_face_det_score": 0.6},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_set_floors_rejects_missing_collection_id(self):
+        resp = self.client.post(
+            "/api/photo_collection_config/set_floors/",
+            {"min_face_det_score": 0.6},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+
 class MobileViewTests(ApiTestCase):
     """Tests for api/mobile_views.py -- split out of api/views.py, which
     had grown to mix these mobile-app-facing endpoints in with the

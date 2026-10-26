@@ -573,3 +573,18 @@ class WindowedClassificationStatusSerializer(serializers.Serializer):
     confirmed_count = serializers.IntegerField()
     use_windowed_classification = serializers.BooleanField()
     classification_window_days = serializers.IntegerField()
+
+
+class PhotoCollectionFloorStatusSerializer(serializers.Serializer):
+    """One row per PhotoCollection -- see filepopulator.models.
+    PhotoCollection's own docstring for what min_face_det_score/
+    min_face_relative_size gate. name/root_directory/is_default are
+    included for display only (read-only here, same as the Django
+    admin page for this model) -- only the two floors are ever written
+    via set_floors()."""
+    collection_id = serializers.IntegerField()
+    name = serializers.CharField()
+    root_directory = serializers.CharField()
+    is_default = serializers.BooleanField()
+    min_face_det_score = serializers.FloatField(allow_null=True)
+    min_face_relative_size = serializers.FloatField(allow_null=True)
