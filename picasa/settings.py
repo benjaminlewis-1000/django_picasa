@@ -532,6 +532,31 @@ REST_FRAMEWORK = {
     },
 }
 
+# Real incident, 2026-10-26: with no CACHES setting, Django defaults to
+# LocMemCache -- a per-PROCESS in-memory cache, not shared across
+# gunicorn's multiple worker processes (--workers 4). DRF's
+# SimpleRateThrottle stores its request history in this cache, so the
+# "30/min" rates above were only ever being enforced per-worker,
+# independently -- confirmed empirically: 150 rapid anonymous requests
+# got only 35 throttled instead of ~30 (115 slipped through, ~3.8x the
+# configured rate, consistent with near-even round-robin distribution
+# across 4 isolated caches). Pointed at the Redis instance already
+# running for Celery (task_redis/task_redis_dev) instead -- a real
+# shared backend, so the configured rate means what it says regardless
+# of worker count. DB index 1, not 0, to keep this logically separate
+# from Celery's own broker usage on the same Redis instance (no actual
+# collision risk either way -- Celery's keys are already its own
+# namespace -- just cleaner).
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': f'redis://{REDIS_HOST}:6379/1',
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+        },
+    },
+}
+
 
 # Internationalization
 # https://docs.djangoproject.com/en/2.2/topics/i18n/
