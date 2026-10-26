@@ -142,10 +142,10 @@ class FaceExtractor(object):
         self.reencode_crop_margin_mult = 0.6
 
         # Default per-call time budget for reencode_missing_faces()'s
-        # combined image loop (insightface + LVFace-B together, see that
-        # method's own docstring) and the video-only
-        # _backfill_lvface_video_encodings() sub-pass that follows it,
-        # when invoked from the scheduled hourly face_manager.reencode
+        # combined image+video loop (insightface + LVFace-B for images,
+        # LVFace-B for video, all folded into one randomly-ordered
+        # queryset -- see that method's own docstring), when invoked
+        # from the scheduled hourly face_manager.reencode
         # task (face_manager/tasks.py) -- left under the hour between
         # scheduled runs so the task actually returns and the lock
         # releases, rather than holding it for the full ~2-3 days the
@@ -979,13 +979,15 @@ class FaceExtractor(object):
         Person.use_lvface_verification's docstring).
 
         lvface_max_runtime_seconds bounds this method's TOTAL wall time
-        (checked between faces in the merged image loop, never mid-face;
-        'default' resolves to self.LVFACE_REENCODE_MAX_RUNTIME_SECONDS) --
-        whatever's left after the image loop finishes or is cut off is
-        passed on to the video-only LVFace-B sub-pass
-        (_backfill_lvface_video_encodings()) that runs after it, so one
-        call's total runtime is bounded the same way it always was, not
-        doubled by adding video on top. None means unbounded (used for
+        (checked between faces in the single combined image+video loop,
+        never mid-face; 'default' resolves to self.
+        LVFACE_REENCODE_MAX_RUNTIME_SECONDS). Image and video faces
+        eligible for this call are unioned into ONE randomly-ordered
+        queryset (2026-10-26) rather than image running to completion
+        before video ever gets a turn -- see the query construction
+        below for why a plain per-type shuffle-then-concatenate
+        wouldn't actually fix that (video would still trail behind on
+        average). None means unbounded (used for
         the small, collection-scoped call from
         apply_collection_floor_change).
 
@@ -1025,6 +1027,109 @@ class FaceExtractor(object):
                 shard_index=shard_index, total_shards=total_shards,
             )
 
+    def _video_faces_queryset(self, shard_index=None, total_shards=None):
+        """The video-sourced-faces-missing-LVFace-B queryset, shared by
+        _backfill_lvface_video_encodings() (the standalone/test-facing
+        entry point) and _reencode_missing_faces_locked()'s own
+        interleaved driver -- kept in one place so the two can't drift
+        out of sync with each other.
+
+        order_by('?') rather than the video-locality-friendly
+        source_video_file_id order used before 2026-10-26 -- video
+        faces were added to this backlog much later than most image
+        faces, so they skew toward the high end of the id range;
+        without randomizing, a shard's own queryset would process its
+        (lower-id) faces in a systematically age-biased order, which
+        matters now that this project's many same-day deploy restarts
+        mean a shard's real progress is often whatever got done before
+        the next restart, not a guaranteed full run to completion.
+        Costs a real sort, but only over this shard's own already-
+        filtered subset (hundreds-to-low-thousands of rows at the
+        current 50-shard split), nothing like the ~14s full-110k-row
+        sort seen elsewhere in this project for an unfiltered table.
+        The ffprobe_cache this trades away locality for is keyed by
+        video id and lives for the whole call, so a scattered order
+        just means more distinct cache entries alive at once, not
+        repeated ffprobe calls for the same video -- not a real cost."""
+        video_faces = Face.objects.filter(
+            face_encoding_lvface_b__isnull=True, kps__isnull=False, source_video_file__isnull=False,
+            video_thumbnail_frame_seconds__isnull=False,
+        ).exclude(
+            declared_name__person_name__in=[settings.SOFT_IGNORE_NAME, '.realignore']
+        ).select_related('source_video_file').order_by('?')
+        if shard_index is not None and total_shards is not None:
+            video_faces = video_faces.annotate(
+                _shard=Mod(F('id'), total_shards)
+            ).filter(_shard=shard_index)
+        return video_faces
+
+    def _reencode_one_video_face(self, face, ffprobe_cache):
+        """Encodes a single video-sourced face's LVFace-B embedding and
+        saves it -- the per-face body shared by _backfill_lvface_video_
+        encodings() and _reencode_missing_faces_locked()'s interleaved
+        driver. ffprobe_cache is the CALLER's dict (keyed by video id),
+        so repeated calls for faces from the same video within one run
+        still only probe that video once, same as before this was
+        extracted. Any failure is logged and simply leaves this face's
+        encoding unset for a later run to retry -- never raises."""
+        from video_face_pipeline import ffprobe_info, extract_frame_near_timestamp
+
+        video = face.source_video_file
+        if video is None or not video.filename or not os.path.exists(video.filename):
+            return
+
+        if video.id not in ffprobe_cache:
+            try:
+                ffprobe_cache[video.id] = ffprobe_info(video.filename)
+            except Exception as e:
+                settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: ffprobe failed ({e}).")
+                ffprobe_cache[video.id] = None
+        probed = ffprobe_cache[video.id]
+        if probed is None:
+            return
+        width, height, avg_fps, probed_field_order, rotation, color_transfer, sar_scale_width = probed
+        field_order = video.field_order if video.field_order is not None else probed_field_order
+
+        box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
+        try:
+            face.face_thumbnail.open('rb')
+            thumb_bytes = face.face_thumbnail.read()
+        except Exception as e:
+            settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: no thumbnail ({e}).")
+            return
+        finally:
+            try:
+                face.face_thumbnail.close()
+            except Exception:
+                pass
+        reference_bgr = cv2.imdecode(np.frombuffer(thumb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if reference_bgr is None:
+            return
+
+        try:
+            frame = extract_frame_near_timestamp(
+                video.filename, face.video_thumbnail_frame_seconds, avg_fps,
+                field_order, rotation, box, reference_bgr,
+                width=(sar_scale_width or width), height=height, color_transfer=color_transfer,
+                sar_scale_width=sar_scale_width,
+            )
+        except Exception as e:
+            settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: frame extraction failed ({e}).")
+            return
+        if frame is None:
+            return
+
+        try:
+            embedding = lvface.embed_from_image_array(frame, face.kps, input_is_bgr=True)
+        except Exception as e:
+            settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: {e}")
+            return
+        if embedding is None:
+            return
+
+        face.face_encoding_lvface_b = embedding.tolist()
+        face.save(update_fields=['face_encoding_lvface_b'])
+
     def _reencode_missing_faces_locked(self, collection=None, lvface_max_runtime_seconds='default',
                                         shard_index=None, total_shards=None):
         if lvface_max_runtime_seconds == 'default':
@@ -1054,22 +1159,66 @@ class FaceExtractor(object):
             | Q(relative_size__isnull=False, relative_size__gte=F('source_image_file__directory__collection__min_face_relative_size'))
         )
 
-        faces_to_process = Face.objects.filter(
-            Q(face_encoding_512__isnull=True) | Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
-            | Q(face_encoding_lvface_b__isnull=True),
-            source_image_file__isnull=False,
-        ).filter(not_below_det_floor, not_below_size_floor).exclude(
-            declared_name__person_name__in=[settings.SOFT_IGNORE_NAME, '.realignore']
-        ).select_related('source_image_file__directory__collection')
+        image_q = (
+            Q(source_image_file__isnull=False)
+            & (
+                Q(face_encoding_512__isnull=True) | Q(face_encoding_512=settings.NON_DETECTED_FACE_ENCODING)
+                | Q(face_encoding_lvface_b__isnull=True)
+            )
+            & not_below_det_floor & not_below_size_floor
+        )
         if collection is not None:
-            faces_to_process = faces_to_process.filter(source_image_file__directory__collection=collection)
+            image_q &= Q(source_image_file__directory__collection=collection)
+
+        # Video faces folded into this SAME combined, randomly-ordered
+        # queryset (2026-10-26) rather than processed as a separate
+        # pass after image, or even as a separate same-ratio-every-time
+        # interleaved stream -- both are just Face rows (mutually
+        # exclusive by the model's own CheckConstraint), so one shuffle
+        # over their union naturally gives video a share of attention
+        # proportional to its REAL fraction of this shard's combined
+        # backlog, rather than an artificial fixed count ratio skewed
+        # by two separately-shuffled lists (e.g. "shuffle images, then
+        # shuffle videos" would still put every video behind every
+        # image on average -- union-then-shuffle doesn't have that
+        # problem). collection is image-only (no PhotoCollection
+        # concept for video, see CLAUDE.md), so a collection-scoped
+        # call never includes video, same as before this change.
+        video_q = None
+        if lvface_enabled and collection is None:
+            video_q = Q(
+                source_video_file__isnull=False, face_encoding_lvface_b__isnull=True,
+                kps__isnull=False, video_thumbnail_frame_seconds__isnull=False,
+            )
+
+        faces_to_process = Face.objects.filter(
+            image_q if video_q is None else (image_q | video_q)
+        ).exclude(
+            declared_name__person_name__in=[settings.SOFT_IGNORE_NAME, '.realignore']
+        ).select_related('source_image_file__directory__collection', 'source_video_file')
         if shard_index is not None and total_shards is not None:
             faces_to_process = faces_to_process.annotate(
                 _shard=Mod(F('id'), total_shards)
             ).filter(_shard=shard_index)
+        # Randomized for two reasons: (1) video faces were added to this
+        # backlog much later than most image faces, so without this
+        # they'd skew toward the high end of the id range and get
+        # processed disproportionately late within any one run; (2)
+        # this project's many same-day deploy restarts mean a shard's
+        # real completed-so-far set is often whatever got done before
+        # the next restart, not a guaranteed full run to completion --
+        # randomizing makes that partial progress a representative
+        # cross-section of the whole combined backlog rather than
+        # systematically favoring low ids. Costs a real sort, but only
+        # over this shard's own already-filtered subset (low thousands
+        # of rows at the current 50-shard split), nothing like the
+        # ~14s full-110k-row sort seen elsewhere in this project for an
+        # unfiltered table.
+        faces_to_process = faces_to_process.order_by('?')
 
         rec_model = self.app.app.models['recognition']
         processed_count = 0
+        ffprobe_cache = {}
 
         for face in faces_to_process:
             if lvface_max_runtime_seconds is not None and (time.time() - start_time) >= lvface_max_runtime_seconds:
@@ -1078,6 +1227,11 @@ class FaceExtractor(object):
                     "stopping -- the next scheduled run will pick up where this left off."
                 )
                 break
+
+            if face.source_video_file_id is not None:
+                self._reencode_one_video_face(face, ffprobe_cache)
+                _trim_malloc_arena()
+                continue
 
             img_obj = face.source_image_file
             if img_obj is None or not img_obj.filename or not os.path.exists(img_obj.filename):
@@ -1239,29 +1393,15 @@ class FaceExtractor(object):
             # needed at all alongside the periodic session rebuild above.
             _trim_malloc_arena()
 
-        elapsed = time.time() - start_time
-        remaining_budget = (
-            None if lvface_max_runtime_seconds is None else max(0, lvface_max_runtime_seconds - elapsed)
-        )
-        # Video faces have a real id just like image faces, so the same
-        # Mod(F('id'), total_shards) partition works identically --
-        # sharded here the same way as the image sweep above, each
-        # shard's own lock (reencode_missing_faces()'s own docstring)
-        # already prevents two shards from ever racing the same video
-        # face, so there's no coordination gap to worry about.
-        if remaining_budget != 0:
-            self._backfill_lvface_video_encodings(
-                collection=collection, max_runtime_seconds=remaining_budget,
-                shard_index=shard_index, total_shards=total_shards,
-            )
-
     def _backfill_lvface_video_encodings(self, collection=None, max_runtime_seconds=None,
                                           shard_index=None, total_shards=None):
         """Catches up Face.face_encoding_lvface_b for video-sourced faces
-        missing it -- the video-only counterpart to reencode_missing_
-        faces()'s own merged image-side insightface+LVFace-B sweep (see
-        that method's docstring; the two used to share one function
-        before the image/video logic was split out, 2026-10-25).
+        missing it -- a standalone entry point kept for direct/test use;
+        reencode_missing_faces() itself no longer calls this (2026-10-26)
+        -- it folds video faces directly into its own combined, randomly-
+        ordered queryset instead (see that method's own docstring for
+        why), using the same _reencode_one_video_face()/
+        _video_faces_queryset() helpers this method delegates to.
 
         Excludes confirmed .ignore/.realignore faces, the same reasoning
         as the image side (LVFace-B is meant to eventually replace
@@ -1288,11 +1428,8 @@ class FaceExtractor(object):
         alignment logic is needed, just a straight
         lvface.embed_from_image_array() call once the frame is in hand.
 
-        max_runtime_seconds bounds this sub-pass's own wall time (checked
-        between faces, never mid-face) -- reencode_missing_faces() passes
-        whatever's left of its own overall budget after the image loop,
-        so one top-level call's total runtime stays bounded the same way
-        it always has. None means unbounded.
+        max_runtime_seconds bounds this call's own wall time (checked
+        between faces, never mid-face). None means unbounded.
 
         shard_index/total_shards (added 2026-10-26, once the parallel
         image backfill was already running well, to stop leaving the
@@ -1309,20 +1446,7 @@ class FaceExtractor(object):
             return
 
         start_time = time.time()
-        exclude_names = [settings.SOFT_IGNORE_NAME, '.realignore']
-
-        from video_face_pipeline import ffprobe_info, extract_frame_near_timestamp
-
-        video_faces = Face.objects.filter(
-            face_encoding_lvface_b__isnull=True, kps__isnull=False, source_video_file__isnull=False,
-            video_thumbnail_frame_seconds__isnull=False,
-        ).exclude(
-            declared_name__person_name__in=exclude_names
-        ).select_related('source_video_file').order_by('source_video_file_id')
-        if shard_index is not None and total_shards is not None:
-            video_faces = video_faces.annotate(
-                _shard=Mod(F('id'), total_shards)
-            ).filter(_shard=shard_index)
+        video_faces = self._video_faces_queryset(shard_index=shard_index, total_shards=total_shards)
 
         ffprobe_cache = {}
         for face in video_faces:
@@ -1332,62 +1456,8 @@ class FaceExtractor(object):
                     "stopping -- the next scheduled run will pick up where this left off."
                 )
                 return
-
-            video = face.source_video_file
-            if video is None or not video.filename or not os.path.exists(video.filename):
-                continue
-
-            if video.id not in ffprobe_cache:
-                try:
-                    ffprobe_cache[video.id] = ffprobe_info(video.filename)
-                except Exception as e:
-                    settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: ffprobe failed ({e}).")
-                    ffprobe_cache[video.id] = None
-            probed = ffprobe_cache[video.id]
-            if probed is None:
-                continue
-            width, height, avg_fps, probed_field_order, rotation, color_transfer, sar_scale_width = probed
-            field_order = video.field_order if video.field_order is not None else probed_field_order
-
-            box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
-            try:
-                face.face_thumbnail.open('rb')
-                thumb_bytes = face.face_thumbnail.read()
-            except Exception as e:
-                settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: no thumbnail ({e}).")
-                continue
-            finally:
-                try:
-                    face.face_thumbnail.close()
-                except Exception:
-                    pass
-            reference_bgr = cv2.imdecode(np.frombuffer(thumb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if reference_bgr is None:
-                continue
-
-            try:
-                frame = extract_frame_near_timestamp(
-                    video.filename, face.video_thumbnail_frame_seconds, avg_fps,
-                    field_order, rotation, box, reference_bgr,
-                    width=(sar_scale_width or width), height=height, color_transfer=color_transfer,
-                    sar_scale_width=sar_scale_width,
-                )
-            except Exception as e:
-                settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: frame extraction failed ({e}).")
-                continue
-            if frame is None:
-                continue
-
-            try:
-                embedding = lvface.embed_from_image_array(frame, face.kps, input_is_bgr=True)
-            except Exception as e:
-                settings.LOGGER.error(f"Cannot compute LVFace encoding for video Face {face.id}: {e}")
-                continue
-            if embedding is None:
-                continue
-
-            face.face_encoding_lvface_b = embedding.tolist()
-            face.save(update_fields=['face_encoding_lvface_b'])
+            self._reencode_one_video_face(face, ffprobe_cache)
+            _trim_malloc_arena()
 
         # print(insight_detected_face)
 # def extract_faces(filename: str) -> dict:
