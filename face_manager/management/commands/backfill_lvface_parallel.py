@@ -37,10 +37,12 @@ than the naive CPU-core math alone would suggest (24 cores / ~4 cores-
 per-worker could otherwise imply 4-6). Both constraints are sized
 below and the supervisor takes whichever is more restrictive.
 
-Sharding: the backlog is split by Face.id % total_shards (see
-FaceExtractor.reencode_missing_faces()'s own shard_index/total_shards
-docstring) -- a disjoint, deterministic partition, not a live work
-queue. Each shard is its own `reencode_missing_faces_shard` subprocess,
+Sharding: the backlog is split by a hash of Face.id, not a plain
+Face.id % total_shards (see FaceExtractor._shard_annotation()'s own
+comment for why -- a real, production-confirmed even/odd id imbalance
+in the remaining image backlog made plain modulo badly uneven for any
+even total_shards). A disjoint, deterministic partition either way,
+not a live work queue. Each shard is its own `reencode_missing_faces_shard` subprocess,
 holding its own distinctly-named advisory lock (so shards never block
 each other, but relaunching an already-running shard is a safe no-op).
 
