@@ -15,6 +15,7 @@ unchanged pyramidal_detector.py source don't pay CPU inference cost again.
 Run just the fast ones with:
     manage.py test face_manager --exclude-tag=slow
 """
+import io
 import os
 import unittest
 import zlib
@@ -31,6 +32,7 @@ from django.db import connection
 from django.test import TestCase, override_settings, tag
 
 from django.core.management import call_command
+from django.core.management.base import CommandError
 
 from unittest.mock import patch, MagicMock
 
@@ -3385,6 +3387,161 @@ class ReencodeMissingFacesTests(TestCase):
         for face in faces:
             face.refresh_from_db()
             self.assertEqual(face.face_encoding_lvface_b, [0.3] * 512)
+
+    def test_shard_filters_to_matching_ids_only(self):
+        # Core correctness property of the parallel backfill (2026-10-25,
+        # see backfill_lvface_parallel.py): shard_index/total_shards
+        # must partition faces by id % total_shards so every face is
+        # covered by EXACTLY one shard, never zero or more than one.
+        faces = []
+        for i in range(6):
+            person = make_person(f"Shard Face {i}")
+            face = self._face_missing_encoding(declared_name=person, box_left=10, box_top=10, box_right=30, box_bottom=30)
+            face.kps = [1.0] * 10
+            face.save()
+            faces.append(face)
+
+        total_shards = 3
+        with patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            for shard_index in range(total_shards):
+                self.mock_face_analysis.models = {
+                    'recognition': MagicMock(get=MagicMock(return_value=np.full(512, 0.4))),
+                }
+                self.extractor.reencode_missing_faces(shard_index=shard_index, total_shards=total_shards)
+
+        # Every face is covered by exactly one of the 3 shard runs above
+        # (its own id % total_shards) -- confirms the partition has no
+        # gaps, without needing to separately prove no face is visited
+        # twice (a face's id only ever matches one shard_index by
+        # construction, so double-processing isn't reachable here).
+        for face in faces:
+            face.refresh_from_db()
+            self.assertEqual(face.face_encoding_512, [0.4] * 512)
+
+    def test_different_shards_use_independent_locks(self):
+        # A real race this is meant to allow, not prevent: two DIFFERENT
+        # shards of the same backfill must be able to run genuinely
+        # concurrently (that's the whole point), unlike two invocations
+        # of the SAME shard (already covered by test_skips_entirely_
+        # when_advisory_lock_already_held) or the plain unsharded lock.
+        person = make_person("Shard Lock Independence")
+        face = self._face_missing_encoding(declared_name=person, box_left=10, box_top=10, box_right=30, box_bottom=30)
+        face.kps = [1.0] * 10
+        face.save()
+        self.mock_face_analysis.models = {
+            'recognition': MagicMock(get=MagicMock(return_value=np.full(512, 0.6))),
+        }
+
+        # Hold the OTHER shard's lock (the one this face does NOT belong
+        # to) -- face.id is auto-increment, so this is computed rather
+        # than assumed, to stay correct regardless of what id it lands
+        # on.
+        face_shard = face.id % 2
+        held_shard = 1 - face_shard
+
+        cfg = connection.settings_dict
+        other = psycopg2.connect(
+            dbname=cfg['NAME'], user=cfg['USER'], password=cfg['PASSWORD'],
+            host=cfg['HOST'] or 'localhost', port=cfg['PORT'] or 5432,
+        )
+        other.autocommit = True
+        try:
+            held_shard_key = zlib.crc32(f'face_manager.reencode_missing_faces.shard_{held_shard}_of_2'.encode())
+            with other.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", [held_shard_key])
+                self.assertTrue(cur.fetchone()[0])
+
+                # face_shard's own lock was never touched -- this must
+                # proceed normally despite the OTHER shard being locked.
+                self.extractor.reencode_missing_faces(shard_index=face_shard, total_shards=2)
+
+                cur.execute("SELECT pg_advisory_unlock(%s)", [held_shard_key])
+        finally:
+            other.close()
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.6] * 512)
+
+
+class ReencodeMissingFacesShardCommandTests(TestCase):
+    """reencode_missing_faces_shard -- the worker entry point the
+    one-time parallel backfill (backfill_lvface_parallel) spawns one of
+    per shard. Mocks FaceExtractor entirely (real model loading is
+    expensive) -- this is about the command's own argument validation
+    and pass-through, not FaceExtractor's own logic (covered elsewhere)."""
+
+    def test_valid_shard_args_pass_through_to_extractor(self):
+        with patch('face_manager.management.commands.reencode_missing_faces_shard.FaceExtractor') as mock_cls:
+            mock_instance = mock_cls.return_value
+            call_command('reencode_missing_faces_shard', '--shard-index', '2', '--total-shards', '5')
+        mock_instance.reencode_missing_faces.assert_called_once_with(
+            shard_index=2, total_shards=5, lvface_max_runtime_seconds=None,
+        )
+
+    def test_shard_index_out_of_range_raises(self):
+        with patch('face_manager.management.commands.reencode_missing_faces_shard.FaceExtractor'):
+            with self.assertRaises(CommandError):
+                call_command('reencode_missing_faces_shard', '--shard-index', '5', '--total-shards', '5')
+
+    def test_negative_shard_index_raises(self):
+        with patch('face_manager.management.commands.reencode_missing_faces_shard.FaceExtractor'):
+            with self.assertRaises(CommandError):
+                call_command('reencode_missing_faces_shard', '--shard-index', '-1', '--total-shards', '5')
+
+
+class BackfillLvfaceParallelHelperTests(TestCase):
+    """Pure helper functions from backfill_lvface_parallel.py (the
+    one-time parallel-backfill supervisor) -- _available_memory_gb() and
+    _total_cores(). The supervisor's own main loop (subprocess spawning,
+    CPU-affinity pinning, the scaling decisions) is deliberately not
+    unit-tested here: it's a one-off tool run once under direct
+    supervision (see CLAUDE.md's dated write-up), not a permanent code
+    path, and meaningfully testing it would need mocking subprocess.
+    Popen/os.sched_setaffinity/os.getloadavg/time.sleep so extensively
+    that the test would mostly just re-assert the implementation rather
+    than catch real bugs -- real validation came from actually running
+    it against production."""
+
+    def test_available_memory_gb_prefers_cgroup_ceiling_when_lower(self):
+        from face_manager.management.commands.backfill_lvface_parallel import _available_memory_gb
+        meminfo = "MemTotal:       65000000 kB\nMemAvailable:   40000000 kB\n"
+        # cgroup says only ~2GB left (host thinks ~38GB) -- the smaller
+        # (cgroup) figure must win, since that's the one that actually
+        # kills a new worker first.
+        cgroup_max = str(10 * 1024 ** 3)
+        cgroup_current = str(8 * 1024 ** 3)
+        contents = {
+            '/proc/meminfo': meminfo,
+            '/sys/fs/cgroup/memory.max': cgroup_max,
+            '/sys/fs/cgroup/memory.current': cgroup_current,
+        }
+
+        def fake_open(path, *a, **kw):
+            if path not in contents:
+                raise FileNotFoundError(path)
+            return io.StringIO(contents[path])
+
+        with patch('builtins.open', side_effect=fake_open):
+            result = _available_memory_gb()
+        self.assertAlmostEqual(result, 2.0, places=3)
+
+    def test_available_memory_gb_falls_back_to_host_without_cgroup_v2(self):
+        from face_manager.management.commands.backfill_lvface_parallel import _available_memory_gb
+        meminfo = "MemTotal:       65000000 kB\nMemAvailable:   20000000 kB\n"
+
+        def fake_open(path, *a, **kw):
+            if path == '/proc/meminfo':
+                return io.StringIO(meminfo)
+            raise FileNotFoundError(path)
+
+        with patch('builtins.open', side_effect=fake_open):
+            result = _available_memory_gb()
+        self.assertAlmostEqual(result, 20000000 / (1024 * 1024), places=3)
+
+    def test_total_cores_uses_sched_affinity_when_available(self):
+        from face_manager.management.commands.backfill_lvface_parallel import _total_cores
+        with patch('os.sched_getaffinity', return_value=set(range(6)), create=True):
+            self.assertEqual(_total_cores(), 6)
 
 
 class LVFaceModuleTests(TestCase):

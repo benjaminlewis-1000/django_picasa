@@ -76,16 +76,28 @@ services:
     # Real incident, 2026-10-05: a celery worker running face_extraction
     # grew to 55GB+ RSS (no container limit existed to stop it), twice --
     # the second time exhausting the whole host's memory AND its 8GB
-    # swap, requiring a manual kill. Caps this container's own cgroup at
-    # 32GB RAM with zero additional swap allowance (memswap_limit equal
-    # to mem_limit, not double it, which is Docker's default when only
+    # swap, requiring a manual kill. Caps this container's own cgroup
+    # with zero additional swap allowance (memswap_limit equal to
+    # mem_limit, not double it, which is Docker's default when only
     # mem_limit is set) -- a runaway process now gets OOM-killed within
     # this container's own cgroup well before it can take down the host
-    # or other services sharing it. 32GB is a deliberate ceiling, not a
-    # measured requirement -- normal operation uses nowhere near this;
-    # revisit if a legitimate workload ever needs more.
-    mem_limit: 32g
-    memswap_limit: 32g
+    # or other services sharing it.
+    #
+    # Raised 32g -> 48g (2026-10-25) for the one-time parallel LVFace-B
+    # backfill (backfill_lvface_parallel) -- a single worker's own RSS
+    # plateaus around ~12-14GB even with its periodic session-reinit fix
+    # (see FaceExtractor.REINIT_DETECTOR_EVERY_N_IMAGES), so 32GB only
+    # ever safely fit about 1 worker alongside this container's own
+    # routine baseline (gunicorn/celery). 48GB was chosen over the
+    # user's own originally-offered 56GB specifically to preserve real
+    # headroom for the rest of this host (62GB total, many other real
+    # services sharing it) -- 56GB would have left only ~6GB combined
+    # for everything else, a real host-level-OOM risk; 48GB leaves
+    # ~14GB. Not a measured requirement for routine (non-backfill)
+    # operation, which uses nowhere near this -- revisit downward once
+    # the backfill is done if there's ever a reason to.
+    mem_limit: 48g
+    memswap_limit: 48g
 #    labels:
 #
 #      - "traefik.enable=true"

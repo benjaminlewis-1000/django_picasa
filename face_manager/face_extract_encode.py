@@ -2,6 +2,7 @@
 
 from django.conf import settings
 from django.db.models import F, Q
+from django.db.models.functions import Mod
 from face_manager.models import Person, Face
 from filepopulator.models import ImageFile, below_collection_floor
 from insightface.app import FaceAnalysis
@@ -837,8 +838,24 @@ class FaceExtractor(object):
         # Use a secure hash algorithm like SHA256
         return hashlib.sha256(combined_data).hexdigest()
 
-    def reencode_missing_faces(self, collection=None, lvface_max_runtime_seconds='default'):
+    def reencode_missing_faces(self, collection=None, lvface_max_runtime_seconds='default',
+                                shard_index=None, total_shards=None):
         """
+        shard_index/total_shards (2026-10-25, for the one-time parallel
+        backfill -- see management/commands/backfill_lvface_parallel.py
+        and reencode_missing_faces_shard.py): when both are set, scopes
+        this call to just the faces whose id % total_shards ==
+        shard_index, using a correspondingly distinct advisory lock name
+        (so independent shards never block each other, but two
+        invocations of the SAME shard still can't race) -- a disjoint,
+        deterministic partition of the id space, not a real-time
+        work-queue, which is fine for this purpose since id is already
+        effectively uncorrelated with how expensive a given face is to
+        process. None/None (the default, used by the scheduled hourly
+        task and apply_collection_floor_change) means the original
+        single, library-wide lock and no id filtering -- unaffected by
+        this parameter's existence.
+
         collection=None (default) sweeps every eligible face library-wide
         (the scheduled face_manager.reencode task's shape); passing a
         specific filepopulator.models.PhotoCollection scopes the sweep to
@@ -960,15 +977,23 @@ class FaceExtractor(object):
         sweep will still reach that collection's newly-eligible faces
         on its own shortly after, just without the usual immediacy.
         """
-        with common.advisory_lock('face_manager.reencode_missing_faces') as acquired:
+        if shard_index is not None and total_shards is not None:
+            lock_name = f'face_manager.reencode_missing_faces.shard_{shard_index}_of_{total_shards}'
+        else:
+            lock_name = 'face_manager.reencode_missing_faces'
+        with common.advisory_lock(lock_name) as acquired:
             if not acquired:
                 settings.LOGGER.warning(
-                    "reencode_missing_faces() already running elsewhere -- skipping this run."
+                    f"reencode_missing_faces() ({lock_name}) already running elsewhere -- skipping this run."
                 )
                 return
-            self._reencode_missing_faces_locked(collection=collection, lvface_max_runtime_seconds=lvface_max_runtime_seconds)
+            self._reencode_missing_faces_locked(
+                collection=collection, lvface_max_runtime_seconds=lvface_max_runtime_seconds,
+                shard_index=shard_index, total_shards=total_shards,
+            )
 
-    def _reencode_missing_faces_locked(self, collection=None, lvface_max_runtime_seconds='default'):
+    def _reencode_missing_faces_locked(self, collection=None, lvface_max_runtime_seconds='default',
+                                        shard_index=None, total_shards=None):
         if lvface_max_runtime_seconds == 'default':
             lvface_max_runtime_seconds = self.LVFACE_REENCODE_MAX_RUNTIME_SECONDS
         start_time = time.time()
@@ -1005,6 +1030,10 @@ class FaceExtractor(object):
         ).select_related('source_image_file__directory__collection')
         if collection is not None:
             faces_to_process = faces_to_process.filter(source_image_file__directory__collection=collection)
+        if shard_index is not None and total_shards is not None:
+            faces_to_process = faces_to_process.annotate(
+                _shard=Mod(F('id'), total_shards)
+            ).filter(_shard=shard_index)
 
         rec_model = self.app.app.models['recognition']
         processed_count = 0
@@ -1177,7 +1206,14 @@ class FaceExtractor(object):
         remaining_budget = (
             None if lvface_max_runtime_seconds is None else max(0, lvface_max_runtime_seconds - elapsed)
         )
-        if remaining_budget != 0:
+        # Video has no sharding support of its own (no per-face
+        # partition key cheap enough to filter on the way id % N is for
+        # images) -- only ever run it from an unsharded call, so
+        # multiple parallel shard workers can't all redundantly race the
+        # same video backlog with no lock between them. Left to the
+        # regular (unsharded) hourly task, same as before sharding
+        # existed.
+        if remaining_budget != 0 and shard_index is None:
             self._backfill_lvface_video_encodings(collection=collection, max_runtime_seconds=remaining_budget)
 
     def _backfill_lvface_video_encodings(self, collection=None, max_runtime_seconds=None):
