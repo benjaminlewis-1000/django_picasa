@@ -67,9 +67,10 @@ import sys
 import time
 
 from django.conf import settings
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Q
 
+from common.advisory_lock import advisory_lock
 from face_manager.models import Face
 
 # Observed empirically (2026-10-25, see this file's own module
@@ -164,6 +165,30 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        # Held for this supervisor's ENTIRE lifetime, not just a single
+        # acquire-check -- the regular scheduled face_manager.reencode
+        # task (face_manager/tasks.py) tries to acquire this exact same
+        # marker lock before doing any of its own work, and skips
+        # cleanly if it can't. Without this, the two would run fully
+        # concurrently: that task has a different (plain, unsharded)
+        # lock name from any of this supervisor's per-shard locks, so
+        # they were never mutually exclusive, and the scheduled task
+        # would do real, uncoordinated, REDUNDANT work on the same
+        # backlog this supervisor is already covering, directly
+        # competing with it for the exact CPU/memory headroom this
+        # supervisor's own scaling decisions are trying to budget
+        # around (confirmed as a real, live resource-contention source
+        # 2026-10-25).
+        with advisory_lock('face_manager.reencode_missing_faces.parallel_backfill_active') as acquired:
+            if not acquired:
+                raise CommandError(
+                    "Another instance of the parallel backfill (or the regular scheduled "
+                    "face_manager.reencode task) is already active -- refusing to start a "
+                    "second one."
+                )
+            self._run(options)
+
+    def _run(self, options):
         total_shards = options['total_shards']
         min_workers = options['min_workers']
         max_workers = min(options['max_workers'], total_shards)

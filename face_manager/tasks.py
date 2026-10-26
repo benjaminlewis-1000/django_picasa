@@ -288,12 +288,35 @@ def reencode_missing_faces():
     # memory on top of each other). FaceExtractor.reencode_missing_
     # faces() itself now holds a Postgres advisory lock for its whole
     # run (see common/advisory_lock.py), which is atomic and covers
-    # every entry point, so this task no longer needs its own check.
-    try:
-        extractor = FaceExtractor()
-        extractor.reencode_missing_faces()
-    except Exception as e:
-        _log_task_crash('reencode_missing_faces', e)
+    # every entry point, so this task no longer needs its own check
+    # for THAT specific collision.
+    #
+    # A second, real collision found the same day: the one-time
+    # parallel backfill (backfill_lvface_parallel) shards the backlog
+    # under per-shard lock names, which are deliberately different from
+    # this task's own plain lock name so they never block each other --
+    # but that also means this task was free to run concurrently and do
+    # real, uncoordinated, REDUNDANT work on the same backlog the
+    # parallel backfill was already covering, while competing with it
+    # for the exact CPU/memory headroom the parallel backfill's own
+    # supervisor was trying to budget around. Guarded here with a
+    # SEPARATE, shared "is the parallel backfill active at all" marker
+    # lock -- the supervisor holds it for its whole run; this task
+    # tries to acquire it too (for the duration of its own run, so a
+    # supervisor starting mid-task has to wait its turn as well, not
+    # just the other direction) and skips entirely if it can't.
+    with advisory_lock('face_manager.reencode_missing_faces.parallel_backfill_active') as acquired:
+        if not acquired:
+            settings.LOGGER.info(
+                "reencode_missing_faces: the one-time parallel backfill is active -- "
+                "skipping this scheduled run rather than competing with it."
+            )
+            return
+        try:
+            extractor = FaceExtractor()
+            extractor.reencode_missing_faces()
+        except Exception as e:
+            _log_task_crash('reencode_missing_faces', e)
 
 @shared_task(ignore_result=True, name='face_manager.apply_collection_floor_change')
 def apply_collection_floor_change(collection_id):
