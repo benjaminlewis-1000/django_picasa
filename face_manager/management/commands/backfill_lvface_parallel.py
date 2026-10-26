@@ -148,6 +148,20 @@ class Command(BaseCommand):
         parser.add_argument('--reserved-memory-gb', type=float, default=DEFAULT_RESERVED_MEMORY_GB)
         parser.add_argument('--check-interval-seconds', type=int, default=600)
         parser.add_argument('--poll-interval-seconds', type=int, default=30)
+        parser.add_argument(
+            '--scale-down-confirmations', type=int, default=3,
+            help=(
+                "Scaling up acts immediately on any single headroom check "
+                "that shows more room. Scaling down only acts once a lower "
+                "target has been computed this many CONSECUTIVE checks in a "
+                "row -- a transient dip (e.g. right after this supervisor's "
+                "own restart, or a brief spike elsewhere on the host) "
+                "shouldn't kill a worker that's mid-shard and about to be "
+                "productive again. Resets to 0 the moment a check shows "
+                "enough room again, so it's consecutive pressure, not a "
+                "running total."
+            ),
+        )
 
     def handle(self, *args, **options):
         total_shards = options['total_shards']
@@ -157,6 +171,7 @@ class Command(BaseCommand):
         reserved_memory_gb = options['reserved_memory_gb']
         check_interval = options['check_interval_seconds']
         poll_interval = options['poll_interval_seconds']
+        scale_down_confirmations = options['scale_down_confirmations']
 
         total_cores = _total_cores()
         usable_cores = max(0, total_cores - reserved_cores)
@@ -172,6 +187,7 @@ class Command(BaseCommand):
         workers = {}  # shard_index -> (Popen, assigned_core_list)
         next_core = 0
         last_headroom_check = 0.0
+        consecutive_low_target = 0
 
         def log_progress():
             running = sorted(workers.keys())
@@ -255,25 +271,46 @@ class Command(BaseCommand):
                 target = compute_target_worker_count()
                 last_headroom_check = time.time()
 
+                # Scaling up is immediate -- act on this single reading.
                 while len(workers) < target:
                     pending = [i for i, s in shard_status.items() if s == 'pending']
                     if not pending:
                         break
                     launch(pending[0])
 
-                while len(workers) > target:
-                    victim = next(iter(workers))
-                    proc, cores = workers[victim]
-                    self.stdout.write(f"Scaling down: stopping shard {victim}/{total_shards} (pid {proc.pid}).")
+                # Scaling down needs CONSECUTIVE pressure (see
+                # --scale-down-confirmations' own help text) -- a single
+                # low reading (e.g. right after this supervisor's own
+                # restart, before the kernel has caught up reporting
+                # memory the just-killed processes already released;
+                # confirmed as a real, repeatable pattern 2026-10-25)
+                # must not kill a worker that's mid-shard and about to
+                # be productive again.
+                if len(workers) > target:
+                    consecutive_low_target += 1
+                    self.stdout.write(
+                        f"Target ({target}) below current workers ({len(workers)}) -- "
+                        f"{consecutive_low_target}/{scale_down_confirmations} consecutive checks."
+                    )
                     self.stdout.flush()
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=10)
-                    del workers[victim]
-                    shard_status[victim] = 'pending'
+                else:
+                    consecutive_low_target = 0
+
+                if consecutive_low_target >= scale_down_confirmations:
+                    consecutive_low_target = 0
+                    while len(workers) > target:
+                        victim = next(iter(workers))
+                        proc, cores = workers[victim]
+                        self.stdout.write(f"Scaling down: stopping shard {victim}/{total_shards} (pid {proc.pid}).")
+                        self.stdout.flush()
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=10)
+                        del workers[victim]
+                        shard_status[victim] = 'pending'
 
                 log_progress()
 
