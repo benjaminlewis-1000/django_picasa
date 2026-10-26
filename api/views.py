@@ -53,7 +53,7 @@ import re
 import requests
 import string
 from .permissions import HasSlideshowKeyOrAuthenticated
-from .throttles import SlideshowListThrottle, SlideshowMediaThrottle
+from .throttles import SlideshowListThrottle, SlideshowMediaThrottle, AccessKeyMediaThrottle
 import threading
 import threading
 import time
@@ -1352,7 +1352,21 @@ def _extract_video_face_frame_fast(face):
 class KeyedImageView(APIView):
 
     permission_classes = [AllowAny]
-    throttle_classes = [SlideshowMediaThrottle]
+
+    def get_throttles(self):
+        # type='slideshow' is sig-gated (a per-photo, time-boxed
+        # token -- the real kiosk's own normal continuous traffic, see
+        # SlideshowMediaThrottle's own docstring); every other type
+        # here is gated by the shared, unscoped RANDOM_ACCESS_KEY when
+        # unauthenticated, a lower-trust path that gets the tighter
+        # AccessKeyMediaThrottle instead. self.kwargs is already
+        # populated by dispatch() before get_throttles() is called
+        # (DRF's initial() -> check_throttles() runs before get()
+        # itself). Both throttle classes skip entirely for an
+        # authenticated session regardless of type.
+        if self.kwargs.get('type') == 'slideshow':
+            return [SlideshowMediaThrottle()]
+        return [AccessKeyMediaThrottle()]
 
     def get(self, request, *args, **kwargs):
         '''

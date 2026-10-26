@@ -520,6 +520,11 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'slideshow_list': '30/min',
         'slideshow_media': '180/min',
+        # The shared, unscoped RANDOM_ACCESS_KEY path (KeyedImageView's
+        # face_array/face_source/face_highlight/full_small types when
+        # unauthenticated) -- lower trust than the sig-gated slideshow
+        # path above, so a tighter rate. See api/throttles.py.
+        'access_key_media': '30/min',
     },
 }
 
