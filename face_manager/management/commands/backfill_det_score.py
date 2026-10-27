@@ -9,7 +9,7 @@ from django.core.management.base import BaseCommand
 from insightface.app import FaceAnalysis
 
 import common
-from face_extract_encode import FaceExtractor
+from face_extract_encode import FaceExtractor, _kps_matches_box
 from face_manager.models import Face, Person
 from pyramidal_detector import PyramidalDetector
 
@@ -134,6 +134,25 @@ class Command(BaseCommand):
                                  "them. Substantially more images to decode+detect -- expect a "
                                  "correspondingly longer run."
                              ))
+        parser.add_argument('--recheck-mismatched', action='store_true',
+                             help=(
+                                 "Instead of targeting faces missing det_score, re-verify every "
+                                 "ALREADY-POPULATED (kps, det_score) pair against its own face's "
+                                 "stored box, and re-match/clear whichever ones fail -- cleanup for "
+                                 "the real bug fixed 2026-10-26 (see CLAUDE.md): this command's own "
+                                 "pre-fix IOU<0.3 threshold could accept a detection whose bbox "
+                                 "cleared the bar against the wrong face's box on a crowded photo, "
+                                 "silently saving a kps/det_score that belonged to a different face "
+                                 "entirely. Confirmed in production: ~360k faces (46% of everything "
+                                 "with both fields) affected. Ignores --all-faces/.ignore scoping "
+                                 "entirely -- every face with both fields set is a candidate, "
+                                 "regardless of poss_ident1/declared_name. A face that re-matches "
+                                 "cleanly under the now-fixed logic gets its kps/det_score "
+                                 "corrected in place; one that doesn't match anything at all gets "
+                                 "both fields nulled (reverting to 'not yet backfilled', so it's "
+                                 "picked up by a normal --all-faces run later) rather than left "
+                                 "holding a known-wrong value."
+                             ))
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
@@ -141,38 +160,53 @@ class Command(BaseCommand):
         single_pass = options['single_pass']
         cut_list_arg = options['cut_list']
         all_faces = options['all_faces']
-
-        if all_faces:
-            trigger_faces = Face.objects.filter(
-                det_score__isnull=True, source_image_file__isnull=False,
-            ).select_related('source_image_file')
-        else:
-            ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
-            trigger_faces = Face.objects.filter(
-                poss_ident1=ignore_person, det_score__isnull=True, source_image_file__isnull=False,
-            ).select_related('source_image_file')
+        recheck_mismatched = options['recheck_mismatched']
 
         by_image = defaultdict(list)
-        seen_face_ids = set()
-        for face in trigger_faces:
-            by_image[face.source_image_file].append(face)
-            seen_face_ids.add(face.id)
 
-        # Extend each triggered image to every OTHER face on it that's
-        # also missing det_score, regardless of poss_ident1/declared_name
-        # -- per the user's explicit request (2026-09-18). The detector
-        # already runs against the whole image regardless of which
-        # .ignore face triggered processing it, so backfilling a
-        # non-ignore face's det_score here is free (no extra detect
-        # call), not a separate pass. This does NOT change which images
-        # get processed -- .ignore faces still drive that -- only which
-        # faces on an already-triggered image get saved.
-        image_ids = [img.pk for img in by_image.keys()]
-        extra_faces = Face.objects.filter(
-            source_image_file_id__in=image_ids, det_score__isnull=True,
-        ).exclude(id__in=seen_face_ids).select_related('source_image_file')
-        for face in extra_faces:
-            by_image[face.source_image_file].append(face)
+        if recheck_mismatched:
+            # Every face with both fields already set is a candidate --
+            # the mismatch itself isn't expressible as a simple SQL
+            # filter (it's a geometric relationship between two sets of
+            # columns), so this scans and filters in Python. One-time
+            # cleanup pass, not a hot path.
+            candidates = Face.objects.filter(
+                kps__isnull=False, box_left__isnull=False, source_image_file__isnull=False,
+            ).select_related('source_image_file')
+            for face in candidates.iterator(chunk_size=5000):
+                if not _kps_matches_box(face.kps, face.box_left, face.box_top, face.box_right, face.box_bottom):
+                    by_image[face.source_image_file].append(face)
+        else:
+            if all_faces:
+                trigger_faces = Face.objects.filter(
+                    det_score__isnull=True, source_image_file__isnull=False,
+                ).select_related('source_image_file')
+            else:
+                ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+                trigger_faces = Face.objects.filter(
+                    poss_ident1=ignore_person, det_score__isnull=True, source_image_file__isnull=False,
+                ).select_related('source_image_file')
+
+            seen_face_ids = set()
+            for face in trigger_faces:
+                by_image[face.source_image_file].append(face)
+                seen_face_ids.add(face.id)
+
+            # Extend each triggered image to every OTHER face on it that's
+            # also missing det_score, regardless of poss_ident1/declared_name
+            # -- per the user's explicit request (2026-09-18). The detector
+            # already runs against the whole image regardless of which
+            # .ignore face triggered processing it, so backfilling a
+            # non-ignore face's det_score here is free (no extra detect
+            # call), not a separate pass. This does NOT change which images
+            # get processed -- .ignore faces still drive that -- only which
+            # faces on an already-triggered image get saved.
+            image_ids = [img.pk for img in by_image.keys()]
+            extra_faces = Face.objects.filter(
+                source_image_file_id__in=image_ids, det_score__isnull=True,
+            ).exclude(id__in=seen_face_ids).select_related('source_image_file')
+            for face in extra_faces:
+                by_image[face.source_image_file].append(face)
 
         image_list = list(by_image.items())
         if limit is not None:
@@ -192,6 +226,33 @@ class Command(BaseCommand):
         matched = unmatched = decode_failed = timed_out = 0
         t0 = time.time()
 
+        def mark_unmatched(face):
+            nonlocal unmatched
+            unmatched += 1
+            if recheck_mismatched and not dry_run:
+                # This face's existing kps/det_score are already known-
+                # wrong (that's why it's a recheck candidate) and nothing
+                # in this redetection pass can be trusted as a real
+                # replacement -- revert to "not yet backfilled" (NULL)
+                # rather than leave a known-bad value in place. A normal
+                # --all-faces run picks it up again later.
+                face.det_score = None
+                face.kps = None
+                face.save(update_fields=['det_score', 'kps'])
+
+        def clear_known_bad_on_failure(image_faces):
+            # Recheck mode only: these faces were already confirmed
+            # mismatched by the pre-filter before this image was ever
+            # opened -- a decode/timeout failure here means we simply
+            # couldn't reconfirm a replacement, not that the existing
+            # value is actually fine. Clear anyway rather than leave a
+            # known-bad kps/det_score sitting untouched.
+            if recheck_mismatched and not dry_run:
+                for face in image_faces:
+                    face.det_score = None
+                    face.kps = None
+                    face.save(update_fields=['det_score', 'kps'])
+
         for idx, (img_obj, image_faces) in enumerate(image_list):
             try:
                 signal.signal(signal.SIGALRM, _raise_image_timeout)
@@ -200,6 +261,7 @@ class Command(BaseCommand):
                     img_numpy = common.open_img_oriented(img_obj.filename, as_numpy=True)
                     if img_numpy is None:
                         decode_failed += len(image_faces)
+                        clear_known_bad_on_failure(image_faces)
                         continue
                     detections = app.get(img_numpy)
                 finally:
@@ -207,9 +269,11 @@ class Command(BaseCommand):
             except _ImageTimeout:
                 self.stdout.write(f"  TIMEOUT on {img_obj.filename} -- skipping")
                 timed_out += len(image_faces)
+                clear_known_bad_on_failure(image_faces)
                 continue
             except Exception:
                 decode_failed += len(image_faces)
+                clear_known_bad_on_failure(image_faces)
                 continue
 
             det_boxes = torch.tensor(
@@ -222,16 +286,31 @@ class Command(BaseCommand):
                     dtype=torch.float32,
                 )
                 if len(detections) == 0:
-                    unmatched += 1
+                    mark_unmatched(face)
                     continue
                 ious = bops.box_iou(stored_box, det_boxes)[0]
                 best_idx = int(torch.argmax(ious))
                 if float(ious[best_idx]) < 0.3:
-                    unmatched += 1
+                    mark_unmatched(face)
+                    continue
+                best_det = detections[best_idx]
+                # Real bug found 2026-10-26 (see CLAUDE.md): a 0.3 IOU
+                # threshold is loose enough to accept a spurious match in
+                # a crowded photo -- a tiny box can coincidentally clear
+                # 0.3 against a NEARBY BUT WRONG detection, especially
+                # when this face's own stored box was itself already
+                # imprecise. Confirmed in production: ~360k faces (46% of
+                # everything with both kps and box) ended up with a kps
+                # unrelated to its own box this way. Same sanity check
+                # face_extract_encode.py's exact-replay path now uses --
+                # verify the matched detection's kps actually lands near
+                # THIS face's own box before trusting it, not just that
+                # the matched detection's OWN bbox cleared the IOU bar.
+                if not _kps_matches_box(best_det['kps'], face.box_left, face.box_top, face.box_right, face.box_bottom):
+                    mark_unmatched(face)
                     continue
                 matched += 1
                 if not dry_run:
-                    best_det = detections[best_idx]
                     face.det_score = float(best_det.det_score)
                     face.kps = FaceExtractor._flatten_kps(best_det['kps'])
                     # update_fields here is also what keeps Face.save()
