@@ -5825,6 +5825,105 @@ class BackfillVerifiedKpsTests(TestCase):
         # but still saved (kps/det_score AND lvface, per the unverified-faces-are-saved-too design)
         self.assertEqual(bystander_face.face_encoding_lvface_b, [0.4] * 512)
 
+    def test_per_person_target_skips_images_once_a_person_is_satisfied(self):
+        # Give self.person 5 PRE-EXISTING lvface_b faces (simulating an
+        # earlier run already having satisfied part of the quota), then
+        # a per-person-target of 5 should skip any NEW image whose only
+        # targeted face is self.person -- the detector should never even
+        # be called for it.
+        for _ in range(5):
+            f = make_face(self.image, declared_name=self.person,
+                           box_left=1, box_top=1, box_right=20, box_bottom=20)
+            f.face_encoding_lvface_b = [0.5] * 512
+            f.save()
+
+        target_face = self._make_face_with_encoding([30, 30, 50, 50], [0.6] * 512)
+        fake_dets = [self._FakeDetection([30, 30, 50, 50], 0.9, [[40.0, 40.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command(
+                'backfill_verified_kps', f'--person-ids={self.person.id}',
+                '--per-person-target=5',
+            )
+            mock_build.return_value.get.assert_not_called()
+
+        target_face.refresh_from_db()
+        self.assertIsNone(target_face.kps)
+
+    def test_per_person_target_still_processes_an_unsatisfied_person(self):
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command(
+                'backfill_verified_kps', f'--person-ids={self.person.id}',
+                '--per-person-target=5',
+            )
+        face.refresh_from_db()
+        self.assertIsNotNone(face.kps)
+
+    def test_per_person_target_exempts_ignore_sentinel(self):
+        # self._make_face_with_encoding() is what makes an image qualify
+        # as a trigger image at all (a real face_encoding_512 somewhere
+        # on it) -- a plain make_face() alone, as used for the 10
+        # pre-existing .ignore faces below, never triggers anything.
+        trigger_face = self._make_face_with_encoding([200, 200, 240, 240], [0.6] * 512)
+        ignore_person = make_person('.ignore')
+        for _ in range(10):
+            f = make_face(self.image, declared_name=ignore_person,
+                           box_left=1, box_top=1, box_right=20, box_bottom=20)
+            f.face_encoding_lvface_b = [0.5] * 512
+            f.save()
+
+        ignore_face = make_face(
+            self.image, declared_name=ignore_person,
+            box_left=30, box_top=30, box_right=50, box_bottom=50,
+        )
+        fake_dets = [
+            self._FakeDetection([200, 200, 240, 240], 0.9, [[220.0, 220.0]] * 5, [0.6] * 512),
+            self._FakeDetection([30, 30, 50, 50], 0.85, [[40.0, 40.0]] * 5, [0.2] * 512),
+        ]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command(
+                'backfill_verified_kps', f'--person-ids={ignore_person.id}',
+                '--per-person-target=5',
+            )
+        ignore_face.refresh_from_db()
+        self.assertIsNotNone(ignore_face.kps)
+
+    def test_max_new_faces_stops_the_run_early(self):
+        images = [make_image(f) for f in ("naming/good/1.JPG", "naming/good/2.jpg", "naming/good/3.JPEG")]
+        faces = []
+        for img in images:
+            f = make_face(
+                img, declared_name=self.person,
+                box_left=10, box_top=10, box_right=50, box_bottom=50,
+            )
+            f.face_encoding_512 = [0.6] * 512
+            f.save()
+            faces.append(f)
+
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps', '--max-new-faces=1')
+
+        kps_set_count = sum(1 for f in faces if Face.objects.get(id=f.id).kps is not None)
+        self.assertEqual(kps_set_count, 1)
+
     def test_lvface_sizes_flag_restricts_which_sizes_are_backfilled(self):
         face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
         fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]

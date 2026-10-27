@@ -60,7 +60,7 @@ from scipy.optimize import linear_sum_assignment
 import common
 import lvface
 from face_extract_encode import FaceExtractor, _kps_matches_box
-from face_manager.models import Face
+from face_manager.models import Face, Person
 from django.db.models.expressions import RawSQL
 from filepopulator.models import ImageFile
 from pyramidal_detector import PyramidalDetector
@@ -153,6 +153,23 @@ class Command(BaseCommand):
                                   "requirement) -- lets a run be redirected at specific "
                                   "under-represented people/negative-pool sentinels instead of "
                                   "working through the full trigger population in random order.")
+        parser.add_argument('--per-person-target', type=int, default=None,
+                             help="With --person-ids: once a (non-.ignore/.realignore) targeted "
+                                  "person already has this many faces with face_encoding_lvface_b "
+                                  "set, skip any image whose ONLY targeted faces are that "
+                                  "already-satisfied person -- moves on to other under-"
+                                  "represented people instead of exhaustively processing every "
+                                  "image for whoever happens to come up first. Checked live "
+                                  "against the DB (not an in-process cache), so it stays correct "
+                                  "across multiple concurrently-running shards. .ignore/"
+                                  "/.realignore are exempt from this cap (there's no such thing "
+                                  "as 'enough' negative-pool faces at this investigation's scale) "
+                                  "-- only --max-new-faces bounds those.")
+        parser.add_argument('--max-new-faces', type=int, default=None,
+                             help="Stop this invocation once it has newly backfilled this many "
+                                  "faces (saved at least one LVFace size) -- a hard per-shard "
+                                  "budget, for a bounded investigation sample rather than an "
+                                  "exhaustive run.")
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
@@ -163,8 +180,13 @@ class Command(BaseCommand):
         person_ids = None
         if options['person_ids']:
             person_ids = [int(s.strip()) for s in options['person_ids'].split(',') if s.strip()]
+        per_person_target = options['per_person_target']
+        max_new_faces = options['max_new_faces']
 
         sentinel = list(settings.NON_DETECTED_FACE_ENCODING)
+        unlimited_person_ids = set(
+            Person.objects.filter(person_name__in=['.ignore', '.realignore']).values_list('id', flat=True)
+        )
 
         # Deliberately queried at the Face level first, not
         # ImageFile.objects.filter(face__...).exclude(face__...) -- that
@@ -208,8 +230,13 @@ class Command(BaseCommand):
 
         stats = defaultdict(int)
         t0 = time.time()
+        new_faces_this_run = 0
 
         for idx, img_id in enumerate(image_ids):
+            if max_new_faces is not None and new_faces_this_run >= max_new_faces:
+                self.stdout.write(f"  --max-new-faces={max_new_faces} reached -- stopping")
+                break
+
             img_obj = ImageFile.objects.select_related('directory__collection').get(id=img_id)
             image_faces = list(Face.objects.filter(source_image_file=img_obj))
             if not image_faces:
@@ -226,6 +253,28 @@ class Command(BaseCommand):
             if all(f.kps is not None for f in image_faces):
                 stats['already_done'] += len(image_faces)
                 continue
+
+            # Per-person quota: once every (non-sentinel) targeted person
+            # on this image already has enough lvface-backfilled faces,
+            # skip the whole image WITHOUT decoding/detecting -- the real
+            # point of this check is to stop paying detection cost on
+            # whoever happens to come up first in random order, and move
+            # on to other under-represented people instead. Checked live
+            # against the DB (not a cached in-process count) so this
+            # stays correct even with several shards running at once.
+            if per_person_target is not None and person_ids is not None:
+                relevant_pids = {
+                    f.declared_name_id for f in image_faces
+                    if f.declared_name_id in person_ids and f.declared_name_id not in unlimited_person_ids
+                }
+                if relevant_pids and all(
+                    Face.objects.filter(
+                        declared_name_id=pid, face_encoding_lvface_b__isnull=False,
+                    ).count() >= per_person_target
+                    for pid in relevant_pids
+                ):
+                    stats['quota_satisfied_skip'] += len(image_faces)
+                    continue
 
             try:
                 signal.signal(signal.SIGALRM, _raise_image_timeout)
@@ -334,6 +383,7 @@ class Command(BaseCommand):
                     continue
 
                 stats[f'saved_{tier}'] += 1
+                any_lvface_saved = False
                 for size in lvface_sizes:
                     try:
                         emb = lvface.embed_from_image_array(
@@ -347,6 +397,9 @@ class Command(BaseCommand):
                     field = f'face_encoding_lvface_{size.lower()}'
                     setattr(face, field, emb.tolist())
                     face.save(update_fields=[field])
+                    any_lvface_saved = True
+                if any_lvface_saved:
+                    new_faces_this_run += 1
 
             for r in range(len(image_faces)):
                 if r not in matched_rows:
@@ -358,12 +411,13 @@ class Command(BaseCommand):
                 remaining = len(image_ids) - (idx + 1)
                 eta_min = remaining / rate / 60 if rate else float('inf')
                 self.stdout.write(
-                    f"  ...{idx+1}/{len(image_ids)} images ({rate:.2f} img/s, ETA {eta_min:.0f}min) -- "
+                    f"  ...{idx+1}/{len(image_ids)} images ({rate:.2f} img/s, ETA {eta_min:.0f}min, "
+                    f"new_faces_this_run={new_faces_this_run}) -- "
                     + ", ".join(f"{k}={v}" for k, v in sorted(stats.items()))
                 )
 
         elapsed = time.time() - t0
         self.stdout.write(
-            f"DONE: {len(image_ids)} images, {elapsed:.0f}s. "
+            f"DONE: {len(image_ids)} images, {elapsed:.0f}s, new_faces_this_run={new_faces_this_run}. "
             + ", ".join(f"{k}={v}" for k, v in sorted(stats.items()))
         )
