@@ -2972,6 +2972,44 @@ class ReencodeMissingFacesTests(TestCase):
         self.assertEqual(face.face_encoding_512, [0.4] * 512)
         self.assertTrue(face.reencoded)
 
+    def test_mismatched_kps_is_discarded_in_favor_of_crop_redetect(self):
+        # Real bug, found 2026-10-26 via a real investigation (see
+        # CLAUDE.md): a stored kps can end up unrelated to its own face's
+        # box (confirmed in production: ~360k faces, 46% of everything
+        # with both fields -- traced to backfill_det_score's own IOU
+        # matching, separately fixed). Blindly exact-replaying such a kps
+        # encodes the wrong crop with high confidence instead of a real
+        # face. This face's kps (centroid ~900,900) is nowhere near its
+        # own box (10,10,40,40) -- the exact-replay path (rec_model.get)
+        # must NOT be used; the crop-redetect fallback (self.app.app.get)
+        # must run instead and recover a fresh, box-consistent kps.
+        person = make_person("Mismatched Kps Face")
+        face = make_face(
+            self.image, declared_name=person,
+            box_left=10, box_top=10, box_right=40, box_bottom=40,
+        )
+        face.face_encoding_512 = list(settings.NON_DETECTED_FACE_ENCODING)
+        face.kps = [900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0]
+        face.save()
+
+        buggy_recognition = MagicMock(get=MagicMock(return_value=np.full(512, 0.5, dtype=np.float32)))
+        self.mock_face_analysis.models = {'recognition': buggy_recognition}
+        self.mock_face_analysis.get.return_value = [
+            {'bbox': [0, 0, 30, 30], 'kps': np.full((5, 2), 15.0), 'embedding': np.full(512, 0.7)},
+        ]
+
+        self.extractor.reencode_missing_faces()
+
+        face.refresh_from_db()
+        buggy_recognition.get.assert_not_called()
+        self.assertEqual(face.face_encoding_512, [0.7] * 512)
+        # Recovered kps is freshly translated from the crop-redetect
+        # fallback, no longer the stale/mismatched value.
+        self.assertNotEqual(face.kps, [900.0] * 10)
+        kps_arr = np.array(face.kps).reshape(5, 2)
+        cx, cy = kps_arr[:, 0].mean(), kps_arr[:, 1].mean()
+        self.assertTrue(10 <= cx <= 40 and 10 <= cy <= 40)
+
     def test_non_detected_sentinel_on_ignore_face_is_still_excluded(self):
         ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
         face = make_face(self.image, declared_name=ignore_person)
@@ -4873,6 +4911,24 @@ class BackfillDetScoreTests(TestCase):
         face.refresh_from_db()
         self.assertIsNone(face.det_score)
 
+    def test_detection_with_box_matching_iou_but_kps_elsewhere_is_rejected(self):
+        # Real bug, found 2026-10-26: a 0.3 IOU threshold is loose enough
+        # that a detection whose bbox clears it against this face's
+        # stored box can still carry kps that are nowhere near either --
+        # confirmed in production (~360k already-corrupted faces, 46% of
+        # everything with both fields). This should be treated as
+        # unmatched, not silently saved.
+        face = self._make_ignore_face([10, 10, 50, 50])
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.91, kps=[[900.0, 900.0]] * 5)]
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_det_score')
+        face.refresh_from_db()
+        self.assertIsNone(face.det_score)
+        self.assertIsNone(face.kps)
+
     def test_dry_run_does_not_save(self):
         face = self._make_ignore_face([10, 10, 50, 50])
         fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.91)]
@@ -4888,8 +4944,8 @@ class BackfillDetScoreTests(TestCase):
         face1 = self._make_ignore_face([10, 10, 50, 50])
         face2 = self._make_ignore_face([200, 200, 260, 260])
         fake_dets = [
-            self._FakeDetection([10, 10, 50, 50], 0.80),
-            self._FakeDetection([200, 200, 260, 260], 0.65),
+            self._FakeDetection([10, 10, 50, 50], 0.80, kps=[[30.0, 30.0]] * 5),
+            self._FakeDetection([200, 200, 260, 260], 0.65, kps=[[230.0, 230.0]] * 5),
         ]
         with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
                    return_value=np.zeros((1000, 1000, 3))), \
@@ -4917,8 +4973,8 @@ class BackfillDetScoreTests(TestCase):
         )
         self.assertIsNone(confirmed_face.det_score)
         fake_dets = [
-            self._FakeDetection([10, 10, 50, 50], 0.80),
-            self._FakeDetection([200, 200, 260, 260], 0.75),
+            self._FakeDetection([10, 10, 50, 50], 0.80, kps=[[30.0, 30.0]] * 5),
+            self._FakeDetection([200, 200, 260, 260], 0.75, kps=[[230.0, 230.0]] * 5),
         ]
         with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
                    return_value=np.zeros((1000, 1000, 3))), \
@@ -4984,6 +5040,68 @@ class BackfillDetScoreTests(TestCase):
             call_command('backfill_det_score', '--all-faces')
         untouched_face.refresh_from_db()
         self.assertAlmostEqual(untouched_face.det_score, 0.88, places=4)
+
+    def test_recheck_mismatched_corrects_a_kps_that_doesnt_match_its_box(self):
+        # --recheck-mismatched: cleanup for the real bug (2026-10-26) --
+        # a face whose ALREADY-STORED kps doesn't correspond to its own
+        # box (regardless of det_score being populated or not) should be
+        # found by the scan, redetected, and corrected if a clean match
+        # is found this time.
+        face = self._make_ignore_face([10, 10, 50, 50])
+        face.det_score = 0.5
+        face.kps = [900.0] * 10  # nowhere near the box -- a mismatch
+        face.save()
+        fake_kps = [[30.0, 30.0]] * 5
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.93, kps=fake_kps)]
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_det_score', '--recheck-mismatched')
+        face.refresh_from_db()
+        self.assertAlmostEqual(face.det_score, 0.93, places=4)
+        self.assertEqual(face.kps, [v for pair in fake_kps for v in pair])
+
+    def test_recheck_mismatched_clears_fields_when_no_clean_match_found(self):
+        face = self._make_ignore_face([10, 10, 50, 50])
+        face.det_score = 0.5
+        face.kps = [900.0] * 10
+        face.save()
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = []
+            call_command('backfill_det_score', '--recheck-mismatched')
+        face.refresh_from_db()
+        self.assertIsNone(face.det_score)
+        self.assertIsNone(face.kps)
+
+    def test_recheck_mismatched_leaves_already_consistent_faces_alone(self):
+        face = self._make_ignore_face([10, 10, 50, 50])
+        face.det_score = 0.87
+        face.kps = [30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0]
+        face.save()
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented') as mock_open, \
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            call_command('backfill_det_score', '--recheck-mismatched')
+        mock_open.assert_not_called()
+        face.refresh_from_db()
+        self.assertAlmostEqual(face.det_score, 0.87, places=4)
+        self.assertEqual(face.kps, [30.0] * 10)
+
+    def test_recheck_mismatched_dry_run_does_not_clear_or_save(self):
+        face = self._make_ignore_face([10, 10, 50, 50])
+        face.det_score = 0.5
+        face.kps = [900.0] * 10
+        face.save()
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = []
+            call_command('backfill_det_score', '--recheck-mismatched', '--dry-run')
+        face.refresh_from_db()
+        self.assertAlmostEqual(face.det_score, 0.5, places=4)
+        self.assertEqual(face.kps, [900.0] * 10)
 
     def test_single_pass_flag_restricts_detector_to_one_pass(self):
         # cut_list=[1,3] (the default, matching the live pipeline exactly)

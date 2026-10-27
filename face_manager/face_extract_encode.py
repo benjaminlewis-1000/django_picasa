@@ -88,6 +88,36 @@ def _shard_annotation(total_shards):
     return RawSQL('MOD(ABS(HASHTEXT(face_manager_face.id::text)), %s)', (total_shards,))
 
 
+def _kps_matches_box(kps_flat, box_left, box_top, box_right, box_bottom):
+    """Sanity check before trusting a stored Face.kps for exact-replay
+    re-encoding: does its centroid actually fall near the face's own
+    stored box? Found necessary 2026-10-26 via a real investigation
+    (see CLAUDE.md) -- update_list_of_no_matching_detects() rewrites a
+    face's box (clamping it to the image's current dimensions) and sets
+    reencoded=True whenever a reprocessing pass finds no matching fresh
+    detection, but never touches kps, leaving a now-stale kps paired
+    with a different box. A real production sweep found this affects
+    ~35% of reencoded faces, with kps sometimes thousands of pixels
+    from the box it's nominally for -- confirmed visually via several
+    garbage crops (background/hair/shoulder instead of a face) once
+    norm_crop() was fed one of these mismatched kps. The exact-replay
+    path's whole point is reproducing a face's TRUE alignment cheaply;
+    replaying a kps that belongs to a different detection just encodes
+    the wrong crop with high confidence instead of a face in the first
+    place.
+
+    Threshold is deliberately generous (centroid within one box-width/
+    -height of the box's own center) -- this only needs to catch a kps
+    that's unrelated to the box (the real, confirmed failure mode), not
+    penalize ordinary pose variation where a real face's own kps can
+    legitimately sit somewhat off-center within a loosely-fit box."""
+    kps_arr = np.asarray(kps_flat, dtype=float).reshape(5, 2)
+    cx, cy = kps_arr[:, 0].mean(), kps_arr[:, 1].mean()
+    box_w, box_h = box_right - box_left, box_bottom - box_top
+    box_cx, box_cy = (box_left + box_right) / 2, (box_top + box_bottom) / 2
+    return abs(cx - box_cx) <= box_w and abs(cy - box_cy) <= box_h
+
+
 class FaceExtractor(object):
     """docstring for FaceExtractor"""
 
@@ -1339,7 +1369,25 @@ class FaceExtractor(object):
             insight_touched = False
 
             if needs_insight:
-                if face.kps is not None:
+                usable_kps = (
+                    face.kps is not None
+                    and _kps_matches_box(face.kps, face.box_left, face.box_top, face.box_right, face.box_bottom)
+                )
+                if face.kps is not None and not usable_kps:
+                    settings.LOGGER.warning(
+                        f"Face {face.id}: stored kps doesn't match its own box -- "
+                        f"discarding it and falling back to crop-redetect instead of "
+                        f"replaying a mismatched alignment."
+                    )
+                    # Clear it outright rather than just skipping the replay
+                    # branch above -- otherwise, if the crop-redetect fallback
+                    # below also fails to find anything (invalid box, tiny
+                    # crop, zero detections), the same bad kps would still be
+                    # sitting on this face and get picked up unexamined by
+                    # the LVFace opportunistic-recovery check right after
+                    # this block (`face.kps is not None`).
+                    face.kps = None
+                if usable_kps:
                     kps_arr = np.array(face.kps, dtype=np.float32).reshape(5, 2)
                     insight_face = insightface.app.common.Face(kps=kps_arr)
                     embedding = rec_model.get(img, insight_face)
