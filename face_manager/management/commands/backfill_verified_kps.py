@@ -181,6 +181,18 @@ class Command(BaseCommand):
             if not image_faces:
                 continue
 
+            # Makes the command safely resumable/relaunchable: without
+            # this, restarting (e.g. to change --lvface-sizes) would
+            # re-run detection on every already-finished image, wasting
+            # all prior progress instead of building on it. An image
+            # where every face already has kps is treated as fully done
+            # and skipped -- cheap (no DB-array fetch needed beyond what
+            # Face.objects.filter() already loaded), no detection cost
+            # paid for images already resolved by an earlier run.
+            if all(f.kps is not None for f in image_faces):
+                stats['already_done'] += len(image_faces)
+                continue
+
             try:
                 signal.signal(signal.SIGALRM, _raise_image_timeout)
                 signal.alarm(PER_IMAGE_TIMEOUT_SECONDS)
