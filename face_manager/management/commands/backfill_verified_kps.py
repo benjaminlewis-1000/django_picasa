@@ -104,10 +104,21 @@ def _l2norm(a):
 
 
 def _build_full_detector():
-    """A real, production-identical detector -- unlike backfill_det_
-    score's detection-only one, this needs the recognition module too
-    (to verify a match against the face's own stored embedding)."""
-    face_analysis = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+    """Unlike backfill_det_score's detection-only detector, this one also
+    needs the recognition module (to verify a match against the face's
+    own stored embedding). It deliberately does NOT need genderage or
+    either landmark module (landmark_3d_68/landmark_2d_106) -- nothing
+    in this command reads detected_age/detected_gender or the 68/106-
+    point landmark sets, only bbox/kps/det_score (from detection) and
+    the embedding (from recognition). The plain default
+    FaceAnalysis(name='buffalo_l') loads all 5 modules unconditionally;
+    restricting allowed_modules avoids paying for the 3 unused ones on
+    every single detection call, same real optimization already found
+    and validated for backfill_det_score.py (see CLAUDE.md)."""
+    face_analysis = FaceAnalysis(
+        name='buffalo_l', providers=['CPUExecutionProvider'],
+        allowed_modules=['detection', 'recognition'],
+    )
     face_analysis.prepare(ctx_id=-1)
     return PyramidalDetector(detector=face_analysis, iou_thresh=IOU_THRESH)
 
