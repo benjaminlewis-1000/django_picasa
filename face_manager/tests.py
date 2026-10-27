@@ -5781,6 +5781,131 @@ class BackfillVerifiedKpsTests(TestCase):
         self.assertEqual(mock_lv.call_args.kwargs.get('size'), 'B')
 
 
+class BackfillLvfaceTargetedTests(TestCase):
+    """backfill_lvface_targeted -- the kps-replay-only LVFace backfill
+    used for the LVFace-vs-insightface investigation. No detection at
+    all: trusts the face's own already-verified kps directly."""
+
+    def setUp(self):
+        self.image = make_image()
+        self.real_person = make_person("Targeted LVFace Real Person")
+        self.ignore_person = make_person(".ignore")
+        self.blank_person = make_person("_NO_FACE_ASSIGNED_")
+
+    def _make_verified_face(self, declared_name, **overrides):
+        defaults = dict(kps=[20, 20, 30, 20, 25, 25, 20, 30, 30, 30])
+        defaults.update(overrides)
+        return make_face(self.image, declared_name=declared_name, **defaults)
+
+    def test_confirmed_person_face_gets_embedded(self):
+        face = self._make_verified_face(self.real_person)
+        with patch('face_manager.management.commands.backfill_lvface_targeted.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.3, dtype=np.float32)):
+            call_command('backfill_lvface_targeted')
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_s, [0.3] * 512)
+        self.assertEqual(face.face_encoding_lvface_b, [0.3] * 512)
+        self.assertEqual(face.face_encoding_lvface_l, [0.3] * 512)
+
+    def test_confirmed_ignore_face_gets_embedded(self):
+        face = self._make_verified_face(self.ignore_person)
+        with patch('face_manager.management.commands.backfill_lvface_targeted.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.5, dtype=np.float32)):
+            call_command('backfill_lvface_targeted')
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_b, [0.5] * 512)
+
+    def test_blank_sentinel_face_is_skipped(self):
+        face = self._make_verified_face(self.blank_person)
+        with patch('face_manager.management.commands.backfill_lvface_targeted.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.5, dtype=np.float32)) as mock_lv:
+            call_command('backfill_lvface_targeted')
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+        mock_lv.assert_not_called()
+
+    def test_face_without_kps_is_never_a_candidate(self):
+        face = make_face(self.image, declared_name=self.real_person, kps=None)
+        with patch('face_manager.management.commands.backfill_lvface_targeted.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.5, dtype=np.float32)) as mock_lv:
+            call_command('backfill_lvface_targeted')
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+        mock_lv.assert_not_called()
+
+    def test_already_embedded_face_is_not_recomputed(self):
+        face = self._make_verified_face(self.real_person)
+        face.face_encoding_lvface_s = [0.9] * 512
+        face.face_encoding_lvface_b = [0.9] * 512
+        face.face_encoding_lvface_l = [0.9] * 512
+        face.save()
+        with patch('face_manager.management.commands.backfill_lvface_targeted.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.5, dtype=np.float32)) as mock_lv:
+            call_command('backfill_lvface_targeted')
+        mock_lv.assert_not_called()
+
+    def test_uses_the_faces_own_stored_kps_not_a_fresh_detection(self):
+        face = self._make_verified_face(self.real_person, kps=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        with patch('face_manager.management.commands.backfill_lvface_targeted.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.5, dtype=np.float32)) as mock_lv:
+            call_command('backfill_lvface_targeted', '--lvface-sizes=B')
+        passed_kps = mock_lv.call_args.args[1]
+        self.assertEqual(list(passed_kps), face.kps)
+
+    def test_lvface_sizes_flag_restricts_which_fields_are_written(self):
+        face = self._make_verified_face(self.real_person)
+        with patch('face_manager.management.commands.backfill_lvface_targeted.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.5, dtype=np.float32)):
+            call_command('backfill_lvface_targeted', '--lvface-sizes=B')
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_b, [0.5] * 512)
+        self.assertIsNone(face.face_encoding_lvface_s)
+        self.assertIsNone(face.face_encoding_lvface_l)
+
+    def test_dry_run_does_not_save(self):
+        face = self._make_verified_face(self.real_person)
+        with patch('face_manager.management.commands.backfill_lvface_targeted.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.5, dtype=np.float32)) as mock_lv:
+            call_command('backfill_lvface_targeted', '--dry-run')
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+        mock_lv.assert_not_called()
+
+    def test_decode_failure_is_counted_not_fatal(self):
+        face = self._make_verified_face(self.real_person)
+        with patch('face_manager.management.commands.backfill_lvface_targeted.common.open_img_oriented',
+                   return_value=None):
+            call_command('backfill_lvface_targeted')
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    def test_sharding_covers_every_trigger_image_exactly_once(self):
+        image2 = make_image("naming/good/2.jpg")
+        self._make_verified_face(self.real_person)
+        make_face(image2, declared_name=self.real_person,
+                  kps=[20, 20, 30, 20, 25, 25, 20, 30, 30, 30])
+        seen_image_ids = set()
+        with patch('face_manager.management.commands.backfill_lvface_targeted.common.open_img_oriented',
+                   return_value=np.zeros((100, 100, 3))), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.5, dtype=np.float32)):
+            for shard in range(2):
+                call_command('backfill_lvface_targeted', f'--shard-index={shard}', '--total-shards=2')
+        from face_manager.models import Face as FaceModel
+        embedded_image_ids = set(
+            FaceModel.objects.filter(face_encoding_lvface_b__isnull=False)
+            .values_list('source_image_file_id', flat=True)
+        )
+        self.assertEqual(embedded_image_ids, {self.image.id, image2.id})
+
+
 class BackfillVideoDetScoreTests(TestCase):
     """backfill_video_det_score management command: re-extracts the
     exact frame a video face's thumbnail/box came from, redetects in a
