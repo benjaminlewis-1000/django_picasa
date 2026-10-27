@@ -831,19 +831,29 @@ MIN_VIDEO_DURATION_SECONDS = 3
 # update_existing_face_to_insightface() in face_extract_encode.py) and
 # the backfill sweep (FaceExtractor._backfill_lvface_encodings(), run
 # automatically at the end of the hourly reencode_missing_faces() task).
-# Enabled 2026-10-25: LVFace-B was validated as a real improvement over
-# insightface alone for a hard real case (Leslie Williams's known-bad
-# false positives, see CLAUDE.md) across two independent sample sizes.
-# The planned comparison against insightface's own ArcFace ViT backbones
-# (arcface_torch, trained on WebFace42M) was dropped -- investigated and
-# confirmed those checkpoints were never actually published (the public
-# OneDrive/Baidu distribution only has older ResNet checkpoints from
-# 2021; the ViT/WF42M numbers in arcface_torch's README are training
-# recipes and benchmark results only, no released weights, and training
-# one from scratch isn't worth it here). LVFace-B is the best validated
-# option available, so live extraction and the backfill sweep both
-# start encoding it now.
-LVFACE_ENCODING_ENABLED = True
+# Disabled 2026-10-26, same day as enabling -- the "validated improvement"
+# behind enabling this (2026-10-25, see the commit that added this flag)
+# turned out not to hold up on closer, rigorous inspection. That earlier
+# investigation's "known-bad" sample was 6 hand-picked face ids, only 3
+# of which actually had poss_ident1 pointing at Leslie Williams at all
+# (one pointed at a different person entirely), and its "insightface
+# scored 0.40-0.50" claim came from each face's stale, already-stored
+# weight_1 rather than a value freshly computed against the same gallery
+# LVFace-B was tested against -- recomputing both sides fairly today
+# against her current gallery gives insightface p99 of only 0.18-0.26 for
+# those same 6 ids, not 0.40-0.50. Two much larger, properly-matched
+# tests (272-person population, 11,598 leave-one-out draws, 3000 real
+# known-negative faces; and a person-specific test for Leslie herself
+# against her real 846 confirmed-wrong-match history) both show
+# insightface clearly OUTPERFORMING LVFace-B, not the reverse (AUC 0.970
+# vs 0.737 population-wide; 0.998 vs 0.947 for Leslie specifically). The
+# veto gate this flag was meant to feed was never actually wired into
+# classify_unassigned() either -- nothing live was depending on this.
+# Turned off rather than left running a multi-day backfill for an
+# unvalidated feature. See CLAUDE.md for the full writeup. A rigorous
+# test against the larger published LVFace-L variant, done properly this
+# time, is planned before reconsidering this.
+LVFACE_ENCODING_ENABLED = False
 
 # How long a row's file can be missing from disk before
 # delete_removed_photos()/delete_removed_videos() actually deletes it,
