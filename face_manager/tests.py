@@ -6027,6 +6027,39 @@ class BackfillVerifiedKpsTests(TestCase):
         face.refresh_from_db()
         self.assertIsNotNone(face.kps)
 
+    def test_max_aspect_ratio_skips_panoramas_pixel_count_alone_misses(self):
+        # Real hang, same day: --max-image-pixels=25000000 let the real
+        # 22096x1088 (24,040,448 px, UNDER 25M) offender through a
+        # SECOND time, since raw pixel count can't distinguish a
+        # panorama from an ordinary large photo in the same MP range --
+        # aspect ratio (20.3:1 here) is the real distinguishing signal.
+        target_face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        ImageFile.objects.filter(id=self.image.id).update(width=22096, height=1088)
+
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            # Confirm pixel count ALONE would NOT have caught this real case.
+            self.assertLessEqual(22096 * 1088, 25_000_000)
+            call_command('backfill_verified_kps', '--max-aspect-ratio=2.5')
+            mock_build.return_value.get.assert_not_called()
+
+        target_face.refresh_from_db()
+        self.assertIsNone(target_face.kps)
+
+    def test_max_aspect_ratio_still_processes_a_normal_photo(self):
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        ImageFile.objects.filter(id=self.image.id).update(width=4000, height=3000)
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps', '--max-aspect-ratio=2.5')
+        face.refresh_from_db()
+        self.assertIsNotNone(face.kps)
+
     def test_below_collection_floor_skips_lvface_but_still_saves_kps(self):
         # Same real gate production's own pipeline already uses
         # (face_extract_encode.py) to decide whether a face is worth a

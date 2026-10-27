@@ -183,6 +183,12 @@ class Command(BaseCommand):
                                   "which no timeout can bound since that's a single "
                                   "uninterruptible C call. Independent of --max-faces-per-image, "
                                   "since such images can have very few cataloged faces.")
+        parser.add_argument('--max-aspect-ratio', type=float, default=None,
+                             help="Skip any image whose max(width,height)/min(width,height) "
+                                  "exceeds this, before even decoding -- a panorama's extreme "
+                                  "aspect ratio is a cleaner, more reliable signal than raw pixel "
+                                  "count alone (which can't distinguish a genuine panorama from "
+                                  "an ordinary large photo in the same megapixel range).")
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
@@ -197,6 +203,7 @@ class Command(BaseCommand):
         max_new_faces = options['max_new_faces']
         max_faces_per_image = options['max_faces_per_image']
         max_image_pixels = options['max_image_pixels']
+        max_aspect_ratio = options['max_aspect_ratio']
 
         sentinel = list(settings.NON_DETECTED_FACE_ENCODING)
         unlimited_person_ids = set(
@@ -310,6 +317,29 @@ class Command(BaseCommand):
             if max_image_pixels is not None and (img_obj.width or 0) * (img_obj.height or 0) > max_image_pixels:
                 stats['too_many_pixels_skip'] += len(image_faces)
                 continue
+
+            # Same panorama hang as above, but via ASPECT RATIO instead
+            # of raw pixel count -- found necessary the SAME day:
+            # --max-image-pixels=25000000 let the known 22096x1088
+            # (~24.04MP) offender through a SECOND time, since its total
+            # pixel count sits just under that threshold despite its
+            # extreme 20.3:1 aspect ratio. Raw pixel count conflates a
+            # genuine panorama with an ordinary large 20-24MP DSLR/phone
+            # photo (both can land in the same MP range); aspect ratio
+            # is the real distinguishing signal and separates MUCH more
+            # cleanly in this run's targeted population: only 67 of
+            # 79,077 images (0.08%) exceed a 2.5:1 ratio, vs. 883 at a
+            # merely-wide 2:1 -- ordinary photos (even wide phone shots)
+            # essentially never exceed 2:1, so 2.5 is a safe margin
+            # above that with no observed false-exclusion risk. Kept
+            # alongside --max-image-pixels (not a replacement) since a
+            # genuinely enormous but normally-proportioned image could
+            # still be slow for sheer size reasons, a different concern.
+            if max_aspect_ratio is not None and img_obj.width and img_obj.height:
+                aspect_ratio = max(img_obj.width, img_obj.height) / min(img_obj.width, img_obj.height)
+                if aspect_ratio > max_aspect_ratio:
+                    stats['too_wide_skip'] += len(image_faces)
+                    continue
 
             # Per-person quota: once every (non-sentinel) targeted person
             # on this image already has enough lvface-backfilled faces,
