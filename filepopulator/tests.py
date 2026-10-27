@@ -3239,7 +3239,11 @@ class ResolveCrossCollectionPairTests(TestCase):
         small = self._make_image('resc_small3', self.collection_a, size_bytes=100, width=100, height=200)
         big = self._make_image('resc_big3', self.collection_b, size_bytes=5000, width=200, height=400)  # 2x both axes
         kps = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
-        face = self._make_face(small, (10, 20, 30, 50), kps=kps)
+        # Box widened to actually bound these kps (x in [10,90], y in
+        # [20,100]) within face_kps_within_box_margin's 25% margin --
+        # the original (10,20,30,50) box was a geometrically-inconsistent
+        # placeholder from before that constraint existed.
+        face = self._make_face(small, (5, 15, 95, 105), kps=kps)
         pair = self._make_pair(small, big)
 
         resolve_pair(pair, dry_run=False)

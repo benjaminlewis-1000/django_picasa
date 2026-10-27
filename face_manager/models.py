@@ -1,5 +1,6 @@
 from django.db import models
 from django.db.models import Q
+from django.db.models.expressions import RawSQL
 from django.conf import settings
 from django.forms import ModelForm
 from django.core.validators import MinValueValidator, MaxValueValidator, RegexValidator
@@ -256,6 +257,24 @@ class Face(models.Model):
                             size=512, blank=True, null=True
                         )
 
+    # LVFace-S and LVFace-L (the smaller/larger published Glint360K
+    # variants, alongside B above) -- added 2026-10-26 to properly
+    # re-test which size is actually worth using, after the original
+    # B-only validation (see Person.use_lvface_verification's docstring)
+    # turned out to rest on a flawed, too-small sample. Same NULL-means-
+    # not-yet-backfilled semantics as face_encoding_lvface_b. Populated
+    # by the rigorous redetect+bipartite-match+verify backfill (see
+    # CLAUDE.md), not the live extraction pipeline -- these two sizes
+    # are investigation-only for now, not wired into any live gate.
+    face_encoding_lvface_s = ArrayField(
+                            SingleFloatField(),
+                            size=512, blank=True, null=True
+                        )
+    face_encoding_lvface_l = ArrayField(
+                            SingleFloatField(),
+                            size=512, blank=True, null=True
+                        )
+
     # The 5 facial landmark points (left eye, right eye, nose, left mouth
     # corner, right mouth corner) InsightFace's detector produces, flattened
     # to [x1, y1, x2, y2, x3, y3, x4, y4, x5, y5] in the SOURCE IMAGE's pixel
@@ -393,6 +412,56 @@ class Face(models.Model):
                     )
                 ),
                 name='face_video_fields_require_video_source',
+            ),
+            # Structural backstop for a real bug found 2026-10-26 (see
+            # CLAUDE.md): PyramidalDetector used to never translate a
+            # tiled sub-image detection's kps back to full-image
+            # coordinates (only bbox was), silently storing a kps
+            # thousands of pixels from its own face's box for ~360k
+            # faces in production. Fixed at the source, but the DB
+            # itself should refuse to store this class of corruption
+            # again regardless of which code path writes it. A 25%
+            # margin (not zero) is deliberate -- checked empirically
+            # against 2,682 real, presumed-good production faces: a
+            # strict zero-margin check already rejects 5.07% of them
+            # (real landmark points can legitimately sit just past a
+            # tight SCRFD box edge under an extreme pose/expression),
+            # while 25% leaves only 0.30% -- nowhere near the
+            # thousands-of-pixels scale the real bug produced, so this
+            # stays a true backstop against gross corruption rather than
+            # a routine blocker on normal detections. NULL kps (not yet
+            # backfilled) always passes trivially.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(kps__isnull=True) |
+                    models.Q(RawSQL(
+                        """
+                        kps[1] BETWEEN box_left - (box_right - box_left) * 0.25
+                                   AND box_right + (box_right - box_left) * 0.25
+                        AND kps[2] BETWEEN box_top - (box_bottom - box_top) * 0.25
+                                       AND box_bottom + (box_bottom - box_top) * 0.25
+                        AND kps[3] BETWEEN box_left - (box_right - box_left) * 0.25
+                                       AND box_right + (box_right - box_left) * 0.25
+                        AND kps[4] BETWEEN box_top - (box_bottom - box_top) * 0.25
+                                       AND box_bottom + (box_bottom - box_top) * 0.25
+                        AND kps[5] BETWEEN box_left - (box_right - box_left) * 0.25
+                                       AND box_right + (box_right - box_left) * 0.25
+                        AND kps[6] BETWEEN box_top - (box_bottom - box_top) * 0.25
+                                       AND box_bottom + (box_bottom - box_top) * 0.25
+                        AND kps[7] BETWEEN box_left - (box_right - box_left) * 0.25
+                                       AND box_right + (box_right - box_left) * 0.25
+                        AND kps[8] BETWEEN box_top - (box_bottom - box_top) * 0.25
+                                       AND box_bottom + (box_bottom - box_top) * 0.25
+                        AND kps[9] BETWEEN box_left - (box_right - box_left) * 0.25
+                                       AND box_right + (box_right - box_left) * 0.25
+                        AND kps[10] BETWEEN box_top - (box_bottom - box_top) * 0.25
+                                        AND box_bottom + (box_bottom - box_top) * 0.25
+                        """,
+                        (),
+                        output_field=models.BooleanField(),
+                    ))
+                ),
+                name='face_kps_within_box_margin',
             ),
         ]
 
