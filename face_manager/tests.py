@@ -5678,6 +5678,41 @@ class BackfillVerifiedKpsTests(TestCase):
         face.refresh_from_db()
         self.assertIsNone(face.kps)
 
+    def test_per_image_timeout_covers_the_matching_and_lvface_loop_not_just_detect(self):
+        # Real hang, 2026-10-27: a 710-face crowd photo made the
+        # matching/verification/LVFace-embedding loop AFTER detection the
+        # real dominant cost (up to faces*len(lvface_sizes) separate
+        # embedding calls) -- but the original alarm was canceled right
+        # after app.get() returned, BEFORE that loop, so it never bounded
+        # the actual slow part at all. A shard hung indefinitely on it.
+        # Simulates the same shape with a tiny timeout and a slow
+        # lvface.embed_from_image_array (not a slow detect) -- the
+        # timeout must still fire and the command must not hang.
+        import time as time_module
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+
+        def slow_embed(*args, **kwargs):
+            time_module.sleep(2)
+            return np.full(512, 0.4, dtype=np.float32)
+
+        with patch('face_manager.management.commands.backfill_verified_kps.PER_IMAGE_TIMEOUT_SECONDS', 1), \
+             patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', side_effect=slow_embed):
+            mock_build.return_value.get.return_value = fake_dets
+            start = time_module.time()
+            call_command('backfill_verified_kps')  # must not hang
+            elapsed = time_module.time() - start
+        self.assertLess(elapsed, 10, "timeout did not bound the LVFace-embedding loop")
+        face.refresh_from_db()
+        # kps/det_score were already committed (each face.save() happens
+        # before the lvface loop) -- only the still-unfinished LVFace
+        # writes are lost to the timeout, matching the documented
+        # "partial progress on an image is retried later" behavior.
+        self.assertIsNotNone(face.kps)
+
     def test_no_detections_leaves_face_untouched_and_counted(self):
         face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
         with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
@@ -5923,6 +5958,89 @@ class BackfillVerifiedKpsTests(TestCase):
 
         kps_set_count = sum(1 for f in faces if Face.objects.get(id=f.id).kps is not None)
         self.assertEqual(kps_set_count, 1)
+
+    def test_max_faces_per_image_skips_crowd_photos_without_decoding(self):
+        # Real hang, 2026-10-27: a 710-face crowd photo. Checked against
+        # the EXISTING face count (cheap, already fetched), before even
+        # decoding -- the detector must never be called for such an image.
+        target_face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        for i in range(25):
+            make_face(self.image, declared_name=self.person,
+                      box_left=60 + i, box_top=60, box_right=70 + i, box_bottom=70)
+
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            call_command('backfill_verified_kps', '--max-faces-per-image=20')
+            mock_build.return_value.get.assert_not_called()
+
+        target_face.refresh_from_db()
+        self.assertIsNone(target_face.kps)
+
+    def test_max_faces_per_image_still_processes_a_normal_photo(self):
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps', '--max-faces-per-image=20')
+        face.refresh_from_db()
+        self.assertIsNotNone(face.kps)
+
+    def test_below_collection_floor_skips_lvface_but_still_saves_kps(self):
+        # Same real gate production's own pipeline already uses
+        # (face_extract_encode.py) to decide whether a face is worth a
+        # real embedding -- a face below its own collection's floor
+        # should still get kps/det_score (cheap, already fixed), but not
+        # pay for LVFace (the real dominant cost on a crowd photo full
+        # of tiny background faces that would never get a real embedding
+        # in production either).
+        from filepopulator.models import PhotoCollection
+        collection = PhotoCollection.objects.create(
+            name='Floor Test', root_directory='/photos/naming', min_face_relative_size=0.5,
+        )
+        self.image.directory.collection = collection
+        self.image.directory.save()
+
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        face.relative_size = 0.1  # below the 0.5 floor
+        face.save()
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)) as mock_lv:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+            mock_lv.assert_not_called()
+
+        face.refresh_from_db()
+        self.assertIsNotNone(face.kps)
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    def test_above_collection_floor_still_gets_lvface(self):
+        from filepopulator.models import PhotoCollection
+        collection = PhotoCollection.objects.create(
+            name='Floor Test 2', root_directory='/photos/naming', min_face_relative_size=0.5,
+        )
+        self.image.directory.collection = collection
+        self.image.directory.save()
+
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        face.relative_size = 0.9  # above the 0.5 floor
+        face.save()
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_b, [0.4] * 512)
 
     def test_lvface_sizes_flag_restricts_which_sizes_are_backfilled(self):
         face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)

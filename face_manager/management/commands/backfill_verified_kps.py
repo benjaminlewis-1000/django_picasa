@@ -62,7 +62,7 @@ import lvface
 from face_extract_encode import FaceExtractor, _kps_matches_box
 from face_manager.models import Face, Person
 from django.db.models.expressions import RawSQL
-from filepopulator.models import ImageFile
+from filepopulator.models import ImageFile, below_collection_floor
 from pyramidal_detector import PyramidalDetector
 
 
@@ -170,6 +170,12 @@ class Command(BaseCommand):
                                   "faces (saved at least one LVFace size) -- a hard per-shard "
                                   "budget, for a bounded investigation sample rather than an "
                                   "exhaustive run.")
+        parser.add_argument('--max-faces-per-image', type=int, default=None,
+                             help="Skip any image with more than this many EXISTING faces "
+                                  "outright, before even decoding -- avoids paying the real "
+                                  "dominant cost (the matching/LVFace loop, which scales with "
+                                  "face count) on crowd photos that contribute little per-"
+                                  "targeted-person value anyway.")
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
@@ -182,6 +188,7 @@ class Command(BaseCommand):
             person_ids = [int(s.strip()) for s in options['person_ids'].split(',') if s.strip()]
         per_person_target = options['per_person_target']
         max_new_faces = options['max_new_faces']
+        max_faces_per_image = options['max_faces_per_image']
 
         sentinel = list(settings.NON_DETECTED_FACE_ENCODING)
         unlimited_person_ids = set(
@@ -254,6 +261,21 @@ class Command(BaseCommand):
                 stats['already_done'] += len(image_faces)
                 continue
 
+            # Skip crowd photos outright, before even decoding -- real
+            # hang found 2026-10-27: a 710-face group photo makes the
+            # matching/verification/LVFace loop the dominant cost (up to
+            # faces*len(lvface_sizes) separate embedding calls), and such
+            # images contribute little per-targeted-person value anyway
+            # (mostly strangers/background people) relative to their
+            # cost. Checked against the EXISTING face count (already
+            # fetched, no extra query) rather than a fresh detection
+            # count -- cheaper, and a strong proxy for "crowded" since
+            # this project's own earlier backfills already found roughly
+            # how many faces a given image has.
+            if max_faces_per_image is not None and len(image_faces) > max_faces_per_image:
+                stats['too_many_faces_skip'] += len(image_faces)
+                continue
+
             # Per-person quota: once every (non-sentinel) targeted person
             # on this image already has enough lvface-backfilled faces,
             # skip the whole image WITHOUT decoding/detecting -- the real
@@ -276,6 +298,22 @@ class Command(BaseCommand):
                     stats['quota_satisfied_skip'] += len(image_faces)
                     continue
 
+            # The timeout wraps the WHOLE per-image body, not just
+            # decode+detect -- found via a real hang, not assumed. A
+            # crowded photo (e.g. a 710-face group shot) makes the
+            # trailing matching/verification/LVFace-embedding loop below
+            # the real dominant cost (up to faces*len(lvface_sizes)
+            # separate embedding calls), and that loop used to run
+            # completely unguarded once the original, narrower alarm was
+            # canceled right after app.get() returned -- a shard could
+            # hang on one such image indefinitely. Re-raising _ImageTimeout
+            # mid-loop is safe: every face whose kps/det_score/LVFace was
+            # already saved before the alarm fired stays saved (each
+            # write already committed via its own face.save() call), the
+            # remaining faces on this image are simply left for a later
+            # run to pick up (the already_done resumability check only
+            # treats an image as finished once every one of its faces has
+            # kps, so a partially-processed image is correctly retried).
             try:
                 signal.signal(signal.SIGALRM, _raise_image_timeout)
                 signal.alarm(PER_IMAGE_TIMEOUT_SECONDS)
@@ -285,125 +323,145 @@ class Command(BaseCommand):
                         stats['decode_failed'] += len(image_faces)
                         continue
                     detections = app.get(img_numpy)
+
+                    if not detections:
+                        stats['no_detections'] += len(image_faces)
+                        continue
+
+                    existing_boxes = torch.tensor(
+                        [[f.box_left, f.box_top, f.box_right, f.box_bottom] for f in image_faces],
+                        dtype=torch.float32,
+                    )
+                    detect_boxes = torch.tensor([d.bbox.tolist() for d in detections], dtype=torch.float32)
+                    iou = bops.distance_box_iou(existing_boxes, detect_boxes).numpy()
+                    rows, cols = linear_sum_assignment(-iou)
+
+                    matched_rows = set()
+                    for r, c in zip(rows, cols):
+                        if float(iou[r, c]) < IOU_THRESH:
+                            continue
+                        matched_rows.add(int(r))
+                        face = image_faces[int(r)]
+                        det = detections[int(c)]
+                        this_iou = float(iou[r, c])
+
+                        if not _kps_matches_box(det['kps'], face.box_left, face.box_top, face.box_right, face.box_bottom):
+                            stats['geometry_rejected'] += 1
+                            continue
+
+                        has_trusted_encoding = (
+                            face.face_encoding_512 is not None
+                            and list(face.face_encoding_512) != sentinel
+                        )
+
+                        verified = True
+                        tier = 'unverified'
+                        if has_trusted_encoding:
+                            fresh_emb = _l2norm(det['embedding'])
+                            stored_emb = _l2norm(np.array(face.face_encoding_512, dtype=np.float32))
+                            sim = float(np.dot(fresh_emb, stored_emb))
+                            if sim >= HIGH_CONFIDENCE_SIM:
+                                tier = 'high_confidence'
+                            elif sim >= GRAY_ZONE_SIM and this_iou >= GRAY_ZONE_MIN_IOU and (
+                                face.relative_size is not None and face.relative_size <= GRAY_ZONE_MAX_RELATIVE_SIZE
+                            ):
+                                tier = 'gray_zone'
+                            else:
+                                verified = False
+                                stats['similarity_rejected'] += 1
+
+                        if not verified:
+                            continue
+
+                        if dry_run:
+                            stats[f'saved_{tier}'] += 1
+                            continue
+
+                        # _kps_matches_box() (the pre-check above) is
+                        # deliberately looser (centroid within one
+                        # box-width/-height of the box's own center) than
+                        # the DB's own face_kps_within_box_margin constraint
+                        # (every one of the 5 points individually within a
+                        # 25% margin) -- a real match can clear the
+                        # pre-check's centroid test while one individual
+                        # landmark (e.g. an eye corner under an extreme pose)
+                        # still fails the DB's tighter, per-point requirement.
+                        # Found via a real production crash (an uncaught
+                        # IntegrityError killed an entire shard outright) --
+                        # the DB constraint is the actual source of truth
+                        # here, so this must never be fatal.
+                        try:
+                            # transaction.atomic() here creates a real
+                            # savepoint, not just a Python-level try/except --
+                            # without it, a caught IntegrityError still leaves
+                            # Postgres considering the connection's current
+                            # transaction aborted (every later statement on it
+                            # fails with "current transaction is aborted"
+                            # until an actual ROLLBACK happens), which Python
+                            # catching the exception alone does nothing to
+                            # fix. Harmless no-op overhead-wise when there's
+                            # no outer transaction already open (production's
+                            # normal autocommit mode).
+                            with transaction.atomic():
+                                face.kps = FaceExtractor._flatten_kps(det['kps'])
+                                face.det_score = float(det.det_score)
+                                face.save(update_fields=['kps', 'det_score'])
+                        except IntegrityError as e:
+                            stats['db_constraint_rejected'] += 1
+                            self.stdout.write(f"  face {face.id}: DB rejected the recovered kps ({e}) -- skipping")
+                            continue
+
+                        stats[f'saved_{tier}'] += 1
+
+                        # Same real gate production's own pipeline already
+                        # uses (face_extract_encode.py's add_new_face()/
+                        # reencode_missing_faces()) to decide whether a
+                        # face is even worth a real embedding at all --
+                        # relative_size is box-derived and unaffected by
+                        # the kps bug, so the face's EXISTING stored value
+                        # is still correct and reusable directly; det_score
+                        # is the one we just froze above. A face below its
+                        # own collection's floor would never get a real
+                        # embedding in production either, so there's no
+                        # reason to pay for LVFace here -- directly targets
+                        # the many tiny background faces a crowd photo is
+                        # mostly made of, without the blunter
+                        # --max-faces-per-image's whole-image skip.
+                        if below_collection_floor(img_obj.directory.collection, face.det_score, face.relative_size):
+                            stats['below_collection_floor_skip'] += 1
+                            continue
+
+                        any_lvface_saved = False
+                        for size in lvface_sizes:
+                            try:
+                                emb = lvface.embed_from_image_array(
+                                    img_numpy, face.kps, input_is_bgr=False, size=size,
+                                )
+                            except Exception as e:
+                                self.stdout.write(f"  LVFace-{size} failed for face {face.id}: {e}")
+                                continue
+                            if emb is None:
+                                continue
+                            field = f'face_encoding_lvface_{size.lower()}'
+                            setattr(face, field, emb.tolist())
+                            face.save(update_fields=[field])
+                            any_lvface_saved = True
+                        if any_lvface_saved:
+                            new_faces_this_run += 1
+
+                    for r in range(len(image_faces)):
+                        if r not in matched_rows:
+                            stats['no_match'] += 1
                 finally:
                     signal.alarm(0)
             except _ImageTimeout:
-                self.stdout.write(f"  TIMEOUT on {img_obj.filename} -- skipping")
+                self.stdout.write(f"  TIMEOUT on {img_obj.filename} ({len(image_faces)} faces) -- skipping remainder")
                 stats['timed_out'] += len(image_faces)
                 continue
             except Exception as e:
                 self.stdout.write(f"  decode/detect error on {img_obj.filename}: {e}")
                 stats['decode_failed'] += len(image_faces)
                 continue
-
-            if not detections:
-                stats['no_detections'] += len(image_faces)
-                continue
-
-            existing_boxes = torch.tensor(
-                [[f.box_left, f.box_top, f.box_right, f.box_bottom] for f in image_faces],
-                dtype=torch.float32,
-            )
-            detect_boxes = torch.tensor([d.bbox.tolist() for d in detections], dtype=torch.float32)
-            iou = bops.distance_box_iou(existing_boxes, detect_boxes).numpy()
-            rows, cols = linear_sum_assignment(-iou)
-
-            matched_rows = set()
-            for r, c in zip(rows, cols):
-                if float(iou[r, c]) < IOU_THRESH:
-                    continue
-                matched_rows.add(int(r))
-                face = image_faces[int(r)]
-                det = detections[int(c)]
-                this_iou = float(iou[r, c])
-
-                if not _kps_matches_box(det['kps'], face.box_left, face.box_top, face.box_right, face.box_bottom):
-                    stats['geometry_rejected'] += 1
-                    continue
-
-                has_trusted_encoding = (
-                    face.face_encoding_512 is not None
-                    and list(face.face_encoding_512) != sentinel
-                )
-
-                verified = True
-                tier = 'unverified'
-                if has_trusted_encoding:
-                    fresh_emb = _l2norm(det['embedding'])
-                    stored_emb = _l2norm(np.array(face.face_encoding_512, dtype=np.float32))
-                    sim = float(np.dot(fresh_emb, stored_emb))
-                    if sim >= HIGH_CONFIDENCE_SIM:
-                        tier = 'high_confidence'
-                    elif sim >= GRAY_ZONE_SIM and this_iou >= GRAY_ZONE_MIN_IOU and (
-                        face.relative_size is not None and face.relative_size <= GRAY_ZONE_MAX_RELATIVE_SIZE
-                    ):
-                        tier = 'gray_zone'
-                    else:
-                        verified = False
-                        stats['similarity_rejected'] += 1
-
-                if not verified:
-                    continue
-
-                if dry_run:
-                    stats[f'saved_{tier}'] += 1
-                    continue
-
-                # _kps_matches_box() (the pre-check above) is deliberately
-                # looser (centroid within one box-width/-height of the
-                # box's own center) than the DB's own
-                # face_kps_within_box_margin constraint (every one of the
-                # 5 points individually within a 25% margin) -- a real
-                # match can clear the pre-check's centroid test while one
-                # individual landmark (e.g. an eye corner under an
-                # extreme profile pose) still fails the DB's tighter,
-                # per-point requirement. Found via a real production
-                # crash (an uncaught IntegrityError killed an entire
-                # shard outright) -- the DB constraint is the actual
-                # source of truth here, so this must never be fatal.
-                try:
-                    # transaction.atomic() here creates a real savepoint,
-                    # not just a Python-level try/except -- without it, a
-                    # caught IntegrityError still leaves Postgres
-                    # considering the connection's current transaction
-                    # aborted (every later statement on it fails with
-                    # "current transaction is aborted" until an actual
-                    # ROLLBACK happens), which Python catching the
-                    # exception alone does nothing to fix. Harmless
-                    # no-op overhead-wise when there's no outer
-                    # transaction already open (production's normal
-                    # autocommit mode).
-                    with transaction.atomic():
-                        face.kps = FaceExtractor._flatten_kps(det['kps'])
-                        face.det_score = float(det.det_score)
-                        face.save(update_fields=['kps', 'det_score'])
-                except IntegrityError as e:
-                    stats['db_constraint_rejected'] += 1
-                    self.stdout.write(f"  face {face.id}: DB rejected the recovered kps ({e}) -- skipping")
-                    continue
-
-                stats[f'saved_{tier}'] += 1
-                any_lvface_saved = False
-                for size in lvface_sizes:
-                    try:
-                        emb = lvface.embed_from_image_array(
-                            img_numpy, face.kps, input_is_bgr=False, size=size,
-                        )
-                    except Exception as e:
-                        self.stdout.write(f"  LVFace-{size} failed for face {face.id}: {e}")
-                        continue
-                    if emb is None:
-                        continue
-                    field = f'face_encoding_lvface_{size.lower()}'
-                    setattr(face, field, emb.tolist())
-                    face.save(update_fields=[field])
-                    any_lvface_saved = True
-                if any_lvface_saved:
-                    new_faces_this_run += 1
-
-            for r in range(len(image_faces)):
-                if r not in matched_rows:
-                    stats['no_match'] += 1
 
             if (idx + 1) % 25 == 0:
                 elapsed = time.time() - t0
