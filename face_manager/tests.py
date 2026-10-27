@@ -3345,6 +3345,7 @@ class ReencodeMissingFacesTests(TestCase):
         face.save()
         return face
 
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
     def test_video_faces_are_included_in_the_combined_sweep(self):
         # Real behavior change, 2026-10-26: video used to require a
         # completely separate sub-pass call that only ever ran AFTER
@@ -3363,6 +3364,7 @@ class ReencodeMissingFacesTests(TestCase):
         video_face.refresh_from_db()
         self.assertEqual(video_face.face_encoding_lvface_b, [0.5] * 512)
 
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
     def test_sharded_call_only_processes_video_faces_in_its_own_shard(self):
         # The combined queryset's Mod(F('id'), total_shards) partition
         # applies uniformly to both face types -- every video face must
@@ -3442,6 +3444,7 @@ class ReencodeMissingFacesTests(TestCase):
         face.refresh_from_db()
         self.assertIsNotNone(face.face_encoding_512)
 
+    @override_settings(LVFACE_ENCODING_ENABLED=True)
     def test_periodic_reinit_bounds_memory_growth(self):
         # Regression test for a real production incident (2026-10-25):
         # the merged image loop can now run for a long time against a
