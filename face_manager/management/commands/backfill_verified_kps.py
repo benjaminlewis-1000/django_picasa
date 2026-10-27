@@ -265,14 +265,25 @@ class Command(BaseCommand):
                 continue
 
             # Makes the command safely resumable/relaunchable: without
-            # this, restarting (e.g. to change --lvface-sizes) would
-            # re-run detection on every already-finished image, wasting
-            # all prior progress instead of building on it. An image
-            # where every face already has kps is treated as fully done
-            # and skipped -- cheap (no DB-array fetch needed beyond what
-            # Face.objects.filter() already loaded), no detection cost
-            # paid for images already resolved by an earlier run.
-            if all(f.kps is not None for f in image_faces):
+            # this, restarting would re-run detection on every already-
+            # finished image, wasting all prior progress instead of
+            # building on it. An image is "done" only once every face on
+            # it has kps AND every CURRENTLY-requested LVFace size --
+            # checking kps alone is a real bug if --lvface-sizes changes
+            # between runs (found 2026-10-27: faces backfilled during an
+            # earlier kps-only phase, --lvface-sizes '', would otherwise
+            # be silently skipped forever once LVFace is re-enabled,
+            # since they already have kps but never got the LVFace
+            # fields this run actually wants). An empty lvface_sizes
+            # list makes the inner all() vacuously True, preserving the
+            # original kps-only behavior unchanged for that mode.
+            if all(
+                f.kps is not None and all(
+                    getattr(f, f'face_encoding_lvface_{size.lower()}') is not None
+                    for size in lvface_sizes
+                )
+                for f in image_faces
+            ):
                 stats['already_done'] += len(image_faces)
                 continue
 
