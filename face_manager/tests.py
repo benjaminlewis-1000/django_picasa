@@ -5989,6 +5989,44 @@ class BackfillVerifiedKpsTests(TestCase):
         face.refresh_from_db()
         self.assertIsNotNone(face.kps)
 
+    def test_max_image_pixels_skips_giant_panoramas_without_decoding(self):
+        # Real hang, 2026-10-27: several library images are extreme-
+        # aspect-ratio stitched panoramas (e.g. 22096x1088) that hang
+        # app.get() ITSELF -- confirmed via a stuck process with 149 OS
+        # threads and no open image file (past decode already), with
+        # zero "TIMEOUT on" lines despite the alarm firing, since
+        # app.get() is a single uninterruptible C call. Caught here via
+        # width*height alone -- a panorama can have very few cataloged
+        # faces, so --max-faces-per-image alone would never catch it.
+        target_face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        # .update(), not .save() -- ImageFile.save() re-decodes the real
+        # underlying fixture file and overwrites width/height with its
+        # actual dimensions, undoing a plain attribute assignment.
+        ImageFile.objects.filter(id=self.image.id).update(width=22096, height=1088)
+
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            # 22096*1088 = 24,040,448 -- threshold must be BELOW that.
+            call_command('backfill_verified_kps', '--max-image-pixels=20000000')
+            mock_build.return_value.get.assert_not_called()
+
+        target_face.refresh_from_db()
+        self.assertIsNone(target_face.kps)
+
+    def test_max_image_pixels_still_processes_a_normal_photo(self):
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        ImageFile.objects.filter(id=self.image.id).update(width=4000, height=3000)
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps', '--max-image-pixels=25000000')
+        face.refresh_from_db()
+        self.assertIsNotNone(face.kps)
+
     def test_below_collection_floor_skips_lvface_but_still_saves_kps(self):
         # Same real gate production's own pipeline already uses
         # (face_extract_encode.py) to decide whether a face is worth a

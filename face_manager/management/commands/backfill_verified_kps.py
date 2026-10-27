@@ -176,6 +176,13 @@ class Command(BaseCommand):
                                   "dominant cost (the matching/LVFace loop, which scales with "
                                   "face count) on crowd photos that contribute little per-"
                                   "targeted-person value anyway.")
+        parser.add_argument('--max-image-pixels', type=int, default=None,
+                             help="Skip any image whose width*height exceeds this, before even "
+                                  "decoding -- catches giant/panoramic images that can hang "
+                                  "app.get() ITSELF (not the trailing matching/LVFace loop), "
+                                  "which no timeout can bound since that's a single "
+                                  "uninterruptible C call. Independent of --max-faces-per-image, "
+                                  "since such images can have very few cataloged faces.")
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
@@ -189,6 +196,7 @@ class Command(BaseCommand):
         per_person_target = options['per_person_target']
         max_new_faces = options['max_new_faces']
         max_faces_per_image = options['max_faces_per_image']
+        max_image_pixels = options['max_image_pixels']
 
         sentinel = list(settings.NON_DETECTED_FACE_ENCODING)
         unlimited_person_ids = set(
@@ -274,6 +282,33 @@ class Command(BaseCommand):
             # how many faces a given image has.
             if max_faces_per_image is not None and len(image_faces) > max_faces_per_image:
                 stats['too_many_faces_skip'] += len(image_faces)
+                continue
+
+            # Skip giant panoramas outright, before even decoding -- a
+            # SEPARATE real hang found 2026-10-27, distinct from the
+            # crowd-photo one above: several images in this library are
+            # extreme-aspect-ratio stitched panoramas (e.g. 22096x1088,
+            # ~24MP) that hang app.get() itself (not the trailing
+            # matching/LVFace loop) -- almost certainly the tiling
+            # detector exploding on the extreme aspect ratio. Confirmed
+            # via a stuck process showing 149 OS threads, no open image
+            # file (already past decode), state R (still running) --
+            # this is NOT caught by --max-faces-per-image, since these
+            # panoramas have very few EXISTING cataloged faces (2-4),
+            # not many. Checked against width*height (already stored, no
+            # extra query) against a real empirical cutoff: 1,377 of
+            # 79,077 images in this run's targeted scope exceed 25MP vs.
+            # 9,326 exceeding 20MP -- 25MP cleanly separates the rare
+            # panorama outliers from the much larger population of
+            # ordinary 20-24MP photos (a common legitimate size for
+            # modern phone/DSLR shots) that would be wasteful to exclude
+            # too. Crucially, unlike the crowd-photo cap, this can't be
+            # bounded by a timeout at all -- app.get() is a single C call
+            # that SIGALRM cannot interrupt once inside it, confirmed by
+            # three real, identical hangs in a row with zero "TIMEOUT on"
+            # log lines despite PER_IMAGE_TIMEOUT_SECONDS firing.
+            if max_image_pixels is not None and (img_obj.width or 0) * (img_obj.height or 0) > max_image_pixels:
+                stats['too_many_pixels_skip'] += len(image_faces)
                 continue
 
             # Per-person quota: once every (non-sentinel) targeted person
