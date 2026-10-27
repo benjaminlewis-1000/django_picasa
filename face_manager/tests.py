@@ -18,6 +18,7 @@ Run just the fast ones with:
 import io
 import os
 import unittest
+from contextlib import contextmanager
 import zlib
 from io import BytesIO
 
@@ -28,8 +29,9 @@ import psycopg2
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
-from django.db import connection
-from django.test import TestCase, override_settings, tag
+from django.db import connection, transaction
+from django.db.utils import IntegrityError
+from django.test import TestCase, TransactionTestCase, override_settings, tag
 
 from django.core.management import call_command
 from django.core.management.base import CommandError
@@ -122,6 +124,49 @@ def make_face(image_file, declared_name=None, **overrides):
     face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False)
     face.save()
     return face
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class FaceKpsWithinBoxConstraintTests(TestCase):
+    """DB-level structural backstop (migration 0019, see CLAUDE.md) for
+    the real kps/box translation bug found 2026-10-26 -- a 25%-margin
+    CHECK constraint that a wildly-mismatched kps (the actual failure
+    mode, off by thousands of pixels) can never pass, while real,
+    legitimately-slightly-off-box landmarks (extreme pose/expression)
+    still can."""
+
+    def setUp(self):
+        self.image = make_image()
+
+    def test_kps_wildly_outside_box_is_rejected(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                make_face(self.image, box_left=100, box_top=100, box_right=150, box_bottom=150,
+                           kps=[900.0] * 10)
+
+    def test_kps_centered_in_box_is_accepted(self):
+        face = make_face(
+            self.image, box_left=100, box_top=100, box_right=150, box_bottom=150,
+            kps=[110, 110, 140, 110, 125, 125, 115, 140, 135, 140],
+        )
+        self.assertIsNotNone(face.id)
+
+    def test_kps_slightly_outside_box_within_margin_is_accepted(self):
+        # A landmark a few pixels past the box edge (plausible under an
+        # extreme pose) must not be rejected -- the whole reason this
+        # constraint uses a 25% margin, not a strict zero one (see its
+        # own comment for the real, measured false-positive rate at
+        # zero margin).
+        face = make_face(
+            self.image, box_left=100, box_top=100, box_right=150, box_bottom=150,
+            kps=[95, 110, 140, 110, 125, 125, 115, 140, 135, 140],
+        )
+        self.assertIsNotNone(face.id)
+
+    def test_null_kps_is_always_accepted(self):
+        face = make_face(self.image, box_left=100, box_top=100, box_right=150, box_bottom=150)
+        self.assertIsNone(face.kps)
+        self.assertIsNotNone(face.id)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
@@ -355,6 +400,76 @@ class FaceModelTests(TestCase):
 
 @tag("slow")
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class PyramidalDetectorTileTranslationTests(TestCase):
+    """Fast, mocked unit tests for find_raw_faces()'s tile-offset
+    translation -- no real model loading. Regression coverage for a real
+    bug found 2026-10-26 (see CLAUDE.md): bbox was translated from a
+    tiled sub-image's own local coordinates back to the full image's,
+    but kps never was, silently storing a kps thousands of pixels from
+    its own face's box for any detection whose winning (NMS-selected)
+    result came from a tiled (cut_dims > 1) pass -- confirmed in
+    production affecting ~360k faces (46% of everything with both kps
+    and box), with mismatched kps clustering unmistakably in the
+    image's top-left quadrant (the signature of a small, untranslated
+    local coordinate read as if it were already absolute)."""
+
+    def _fake_face(self, bbox, kps, det_score=0.9):
+        import insightface.app.common
+        return insightface.app.common.Face(
+            bbox=np.array(bbox, dtype=np.float32),
+            kps=np.array(kps, dtype=np.float32),
+            det_score=det_score,
+        )
+
+    def test_tiled_detection_kps_is_translated_to_full_image_coordinates(self):
+        detector = PyramidalDetector.__new__(PyramidalDetector)
+        detector.pct_overlap = 0.0
+        detector.cut_list = [1, 3]
+        mock_app = MagicMock()
+        # A 900x900 image, cut into a 3x3 grid (300x300 tiles, no overlap
+        # since pct_overlap=0), plus the required whole-image (cut_dims=1)
+        # pass. Every call returns the same chip-local detection (bbox/kps
+        # both near the chip's own origin) -- a fresh Face instance per
+        # call, since find_raw_faces() mutates it in place and a shared
+        # object would leak offsets across calls. Only the tile at
+        # (x=2, y=1) is asserted on below.
+        local_bbox = [10, 20, 60, 70]
+        local_kps = [[20, 30], [50, 30], [35, 45], [25, 60], [45, 60]]
+        mock_app.get.side_effect = lambda *a, **k: [self._fake_face(local_bbox, local_kps)]
+        detector.app = mock_app
+
+        np_image = np.zeros((900, 900, 3), dtype=np.uint8)
+        overlapping_detections, box_edges = detector.find_raw_faces(np_image)
+
+        # Tile (x=2, y=1): left_edge=600, top_edge=300. Filter on both
+        # axes -- (x=2, y=0) also has bbox[0]==610 (same left_edge).
+        target = [d for d in overlapping_detections if d['bbox'][0] == 610 and d['bbox'][1] == 320][0]
+        self.assertEqual(list(target['bbox']), [610, 320, 660, 370])
+        expected_kps = np.array(local_kps, dtype=np.float32) + np.array([600, 300])
+        np.testing.assert_array_almost_equal(target['kps'], expected_kps)
+        # The translated kps centroid must fall within the translated box.
+        cx, cy = target['kps'][:, 0].mean(), target['kps'][:, 1].mean()
+        bl, bt, br, bb = target['bbox']
+        self.assertTrue(bl <= cx <= br and bt <= cy <= bb)
+
+    def test_whole_image_pass_kps_is_unaffected(self):
+        # cut_dims == 1 (the whole-image pass) needs no translation at
+        # all -- confirms this fix didn't touch that branch.
+        detector = PyramidalDetector.__new__(PyramidalDetector)
+        detector.pct_overlap = 0.0
+        detector.cut_list = [1]
+        mock_app = MagicMock()
+        bbox = [100, 100, 150, 150]
+        kps = [[110, 110], [140, 110], [125, 125], [115, 140], [135, 140]]
+        mock_app.get.return_value = [self._fake_face(bbox, kps)]
+        detector.app = mock_app
+
+        np_image = np.zeros((300, 300, 3), dtype=np.uint8)
+        overlapping_detections, box_edges = detector.find_raw_faces(np_image)
+
+        np.testing.assert_array_almost_equal(overlapping_detections[0]['kps'], np.array(kps, dtype=np.float32))
+
+
 class PyramidalDetectorRealInferenceTests(TestCase):
     """Runs real insightface inference against known fixture photos.
     Uses test_face_cache so repeat runs (unchanged image + unchanged
@@ -619,9 +734,14 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
         # here evidently normalizes it before this point in production;
         # for this synthetic unit test, int is simplest and correct
         # enough (only relative proportions matter for the gate itself).
+        # kps centered in the bbox (not a hardcoded (0,0) placeholder) --
+        # must satisfy the DB's face_kps_within_box_margin constraint,
+        # same as any real detection's kps always would.
+        bl, bt, br, bb = bbox
+        cx, cy = (bl + br) / 2, (bt + bb) / 2
         return insightface.app.common.Face(
             bbox=np.array(bbox, dtype=np.int64),
-            kps=np.zeros((5, 2), dtype=np.float32),
+            kps=np.array([[cx, cy]] * 5, dtype=np.float32),
             det_score=det_score,
             embedding=np.ones(512, dtype=np.float32),  # ones, not zeros -- distinguishable from "never set"
             age=30, gender=0,
@@ -2963,7 +3083,7 @@ class ReencodeMissingFacesTests(TestCase):
         face.save()
 
         self.mock_face_analysis.get.return_value = [
-            {'bbox': [0, 0, 40, 40], 'kps': np.zeros((5, 2)), 'embedding': np.full(512, 0.4)},
+            {'bbox': [0, 0, 40, 40], 'kps': np.full((5, 2), 20.0), 'embedding': np.full(512, 0.4)},
         ]
 
         self.extractor.reencode_missing_faces()
@@ -2971,44 +3091,6 @@ class ReencodeMissingFacesTests(TestCase):
         face.refresh_from_db()
         self.assertEqual(face.face_encoding_512, [0.4] * 512)
         self.assertTrue(face.reencoded)
-
-    def test_mismatched_kps_is_discarded_in_favor_of_crop_redetect(self):
-        # Real bug, found 2026-10-26 via a real investigation (see
-        # CLAUDE.md): a stored kps can end up unrelated to its own face's
-        # box (confirmed in production: ~360k faces, 46% of everything
-        # with both fields -- traced to backfill_det_score's own IOU
-        # matching, separately fixed). Blindly exact-replaying such a kps
-        # encodes the wrong crop with high confidence instead of a real
-        # face. This face's kps (centroid ~900,900) is nowhere near its
-        # own box (10,10,40,40) -- the exact-replay path (rec_model.get)
-        # must NOT be used; the crop-redetect fallback (self.app.app.get)
-        # must run instead and recover a fresh, box-consistent kps.
-        person = make_person("Mismatched Kps Face")
-        face = make_face(
-            self.image, declared_name=person,
-            box_left=10, box_top=10, box_right=40, box_bottom=40,
-        )
-        face.face_encoding_512 = list(settings.NON_DETECTED_FACE_ENCODING)
-        face.kps = [900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0]
-        face.save()
-
-        buggy_recognition = MagicMock(get=MagicMock(return_value=np.full(512, 0.5, dtype=np.float32)))
-        self.mock_face_analysis.models = {'recognition': buggy_recognition}
-        self.mock_face_analysis.get.return_value = [
-            {'bbox': [0, 0, 30, 30], 'kps': np.full((5, 2), 15.0), 'embedding': np.full(512, 0.7)},
-        ]
-
-        self.extractor.reencode_missing_faces()
-
-        face.refresh_from_db()
-        buggy_recognition.get.assert_not_called()
-        self.assertEqual(face.face_encoding_512, [0.7] * 512)
-        # Recovered kps is freshly translated from the crop-redetect
-        # fallback, no longer the stale/mismatched value.
-        self.assertNotEqual(face.kps, [900.0] * 10)
-        kps_arr = np.array(face.kps).reshape(5, 2)
-        cx, cy = kps_arr[:, 0].mean(), kps_arr[:, 1].mean()
-        self.assertTrue(10 <= cx <= 40 and 10 <= cy <= 40)
 
     def test_non_detected_sentinel_on_ignore_face_is_still_excluded(self):
         ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
@@ -3087,7 +3169,7 @@ class ReencodeMissingFacesTests(TestCase):
         # one near the crop's actual center should be picked instead.
         self.mock_face_analysis.get.return_value = [
             {'bbox': [0, 0, 4, 4], 'kps': np.zeros((5, 2)), 'embedding': far_embedding},
-            {'bbox': [30, 30, 34, 34], 'kps': np.ones((5, 2)), 'embedding': near_center_embedding},
+            {'bbox': [30, 30, 34, 34], 'kps': np.full((5, 2), 32.0), 'embedding': near_center_embedding},
         ]
         self.mock_face_analysis.models = {'recognition': MagicMock()}
 
@@ -3114,7 +3196,10 @@ class ReencodeMissingFacesTests(TestCase):
         margin_y = int(box_h * self.extractor.reencode_crop_margin_mult)
         crop_left, crop_top = 100 - margin_x, 100 - margin_y
 
-        crop_local_kps = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]])
+        # Centered within the bbox (near local (20,20)), not an arbitrary
+        # corner value -- must still land within box_kps_within_box_margin's
+        # 25% margin once translated to absolute coordinates.
+        crop_local_kps = np.array([[18.0, 20.0], [22.0, 20.0], [20.0, 22.0], [18.0, 24.0], [22.0, 24.0]])
         self.mock_face_analysis.get.return_value = [
             {'bbox': [0, 0, 40, 40], 'kps': crop_local_kps, 'embedding': np.full(512, 0.3)},
         ]
@@ -3218,7 +3303,7 @@ class ReencodeMissingFacesTests(TestCase):
         )
         self.assertIsNone(face.kps)
 
-        crop_local_kps = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]])
+        crop_local_kps = np.array([[18.0, 20.0], [22.0, 20.0], [20.0, 22.0], [18.0, 24.0], [22.0, 24.0]])
         self.mock_face_analysis.get.return_value = [
             {'bbox': [0, 0, 40, 40], 'kps': crop_local_kps, 'embedding': np.full(512, 0.3)},
         ]
@@ -3504,7 +3589,7 @@ class ReencodeMissingFacesTests(TestCase):
                 box_left=10, box_top=10, box_right=30, box_bottom=30,
             )
             face.face_encoding_512 = [0.5] * 512
-            face.kps = [1.0] * 10
+            face.kps = [20.0] * 10
             face.face_encoding_lvface_b = None
             face.save()
             faces.append(face)
@@ -3534,7 +3619,7 @@ class ReencodeMissingFacesTests(TestCase):
         for i in range(6):
             person = make_person(f"Shard Face {i}")
             face = self._face_missing_encoding(declared_name=person, box_left=10, box_top=10, box_right=30, box_bottom=30)
-            face.kps = [1.0] * 10
+            face.kps = [20.0] * 10
             face.save()
             faces.append(face)
 
@@ -3563,7 +3648,7 @@ class ReencodeMissingFacesTests(TestCase):
         # when_advisory_lock_already_held) or the plain unsharded lock.
         person = make_person("Shard Lock Independence")
         face = self._face_missing_encoding(declared_name=person, box_left=10, box_top=10, box_right=30, box_bottom=30)
-        face.kps = [1.0] * 10
+        face.kps = [20.0] * 10
         face.save()
         self.mock_face_analysis.models = {
             'recognition': MagicMock(get=MagicMock(return_value=np.full(512, 0.6))),
@@ -3602,6 +3687,103 @@ class ReencodeMissingFacesTests(TestCase):
 
         face.refresh_from_db()
         self.assertEqual(face.face_encoding_512, [0.6] * 512)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class ReencodeMissingFacesMismatchedKpsTransactionTests(TransactionTestCase):
+    """test_mismatched_kps_is_discarded_in_favor_of_crop_redetect needs
+    TransactionTestCase, not the regular TestCase ReencodeMissingFacesTests
+    uses -- it must fabricate a face whose kps is already a real mismatch
+    against its own box (simulating real pre-existing corrupted production
+    data), which means dropping/re-adding face_kps_within_box_margin around
+    the save -- Postgres refuses that ALTER while there are pending trigger
+    events from an earlier write (here, make_face()'s own initial INSERT)
+    in the SAME transaction, which is exactly the one wrapping transaction
+    a plain TestCase runs each test inside."""
+
+    def setUp(self):
+        # TransactionTestCase truncates every table after each test,
+        # including ones only ever populated by data migrations (the
+        # default PhotoCollection make_image()'s own Directory resolution
+        # needs) -- recreate the one row actually needed directly, same
+        # established pattern as api.tests's IgnoreReviewFlaggedCountTests
+        # (see its own comment for why serialized_rollback=True isn't
+        # used instead: it also tries to restore django_content_type rows
+        # that already exist under --parallel, a real UniqueViolation).
+        from filepopulator.models import PhotoCollection
+        PhotoCollection.objects.get_or_create(
+            root_directory=settings.PHOTO_ROOT, defaults={'name': 'Default', 'is_default': True},
+        )
+        self.image = make_image()
+        self.extractor = FaceExtractor.__new__(FaceExtractor)
+        self.extractor.reencode_crop_margin_mult = 0.6
+        self.extractor.LVFACE_REENCODE_MAX_RUNTIME_SECONDS = 3000
+        self.mock_face_analysis = MagicMock()
+        self.mock_pyramidal = MagicMock()
+        self.mock_pyramidal.app = self.mock_face_analysis
+        self.extractor.app = self.mock_pyramidal
+        lvface_patcher = patch('lvface.embed_from_image_array', return_value=None)
+        lvface_patcher.start()
+        self.addCleanup(lvface_patcher.stop)
+
+    def test_mismatched_kps_is_discarded_in_favor_of_crop_redetect(self):
+        # Real bug, found 2026-10-26 via a real investigation (see
+        # CLAUDE.md): a stored kps can end up unrelated to its own face's
+        # box (confirmed in production: ~360k faces, 46% of everything
+        # with both fields -- traced to backfill_det_score's own IOU
+        # matching, separately fixed). Blindly exact-replaying such a kps
+        # encodes the wrong crop with high confidence instead of a real
+        # face. This face's kps (centroid ~900,900) is nowhere near its
+        # own box (10,10,40,40) -- the exact-replay path (rec_model.get)
+        # must NOT be used; the crop-redetect fallback (self.app.app.get)
+        # must run instead and recover a fresh, box-consistent kps.
+        person = make_person("Mismatched Kps Face")
+        face = make_face(
+            self.image, declared_name=person,
+            box_left=10, box_top=10, box_right=40, box_bottom=40,
+        )
+        face.face_encoding_512 = list(settings.NON_DETECTED_FACE_ENCODING)
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE face_manager_face DROP CONSTRAINT face_kps_within_box_margin")
+        try:
+            face.kps = [900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0]
+            face.save()
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    ALTER TABLE face_manager_face ADD CONSTRAINT face_kps_within_box_margin CHECK (
+                        kps IS NULL OR (
+                            kps[1] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
+                            AND kps[2] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
+                            AND kps[3] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
+                            AND kps[4] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
+                            AND kps[5] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
+                            AND kps[6] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
+                            AND kps[7] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
+                            AND kps[8] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
+                            AND kps[9] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
+                            AND kps[10] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
+                        )
+                    ) NOT VALID
+                """)
+
+        buggy_recognition = MagicMock(get=MagicMock(return_value=np.full(512, 0.5, dtype=np.float32)))
+        self.mock_face_analysis.models = {'recognition': buggy_recognition}
+        self.mock_face_analysis.get.return_value = [
+            {'bbox': [0, 0, 30, 30], 'kps': np.full((5, 2), 15.0), 'embedding': np.full(512, 0.7)},
+        ]
+
+        self.extractor.reencode_missing_faces()
+
+        face.refresh_from_db()
+        buggy_recognition.get.assert_not_called()
+        self.assertEqual(face.face_encoding_512, [0.7] * 512)
+        # Recovered kps is freshly translated from the crop-redetect
+        # fallback, no longer the stale/mismatched value.
+        self.assertNotEqual(face.kps, [900.0] * 10)
+        kps_arr = np.array(face.kps).reshape(5, 2)
+        cx, cy = kps_arr[:, 0].mean(), kps_arr[:, 1].mean()
+        self.assertTrue(10 <= cx <= 40 and 10 <= cy <= 40)
 
 
 class ReencodeMissingFacesShardCommandTests(TestCase):
@@ -3738,19 +3920,20 @@ class BackfillLvfaceParallelHelperTests(TestCase):
 
 
 class LVFaceModuleTests(TestCase):
-    """face_manager.lvface -- the LVFace-B (ViT) embedding helper. Mocks
-    the ONNXRuntime session entirely (via lvface._get_session, patched
-    module-globally) so these stay fast and never need the real 455MB
-    model file on disk -- see lvface.py's own docstring for why session
-    construction is lazy in the first place."""
+    """face_manager.lvface -- the LVFace (ViT) embedding helper, now
+    supporting all three published sizes (S/B/L). Mocks the ONNXRuntime
+    session entirely (via lvface._get_session, patched module-globally)
+    so these stay fast and never need any of the real model files on
+    disk -- see lvface.py's own docstring for why session construction
+    is lazy in the first place."""
 
     def setUp(self):
         import lvface
-        lvface._session = None  # don't leak a mock session across tests
+        lvface.reset_session()  # don't leak a mock session across tests
 
     def tearDown(self):
         import lvface
-        lvface._session = None
+        lvface.reset_session()
 
     def _mock_session(self, raw_output):
         mock_session = MagicMock()
@@ -3802,6 +3985,57 @@ class LVFaceModuleTests(TestCase):
             s2 = lvface._get_session()
         self.assertIs(s1, s2)
         mock_ort.assert_called_once()
+
+    def test_each_size_gets_its_own_independently_cached_session(self):
+        import lvface
+        with patch('onnxruntime.InferenceSession') as mock_ort:
+            mock_ort.side_effect = lambda *a, **k: MagicMock()
+            s_small = lvface._get_session('S')
+            s_base = lvface._get_session('B')
+            s_large = lvface._get_session('L')
+            s_base_again = lvface._get_session('B')
+        self.assertIsNot(s_small, s_base)
+        self.assertIsNot(s_base, s_large)
+        self.assertIs(s_base, s_base_again)
+        self.assertEqual(mock_ort.call_count, 3)
+        called_paths = [c.args[0] for c in mock_ort.call_args_list]
+        self.assertEqual(sorted(called_paths), sorted(lvface.LVFACE_MODEL_PATHS.values()))
+
+    def test_unknown_size_raises(self):
+        import lvface
+        with self.assertRaises(ValueError):
+            lvface._get_session('X')
+
+    def test_reset_session_with_no_args_clears_all_sizes(self):
+        import lvface
+        with patch('onnxruntime.InferenceSession') as mock_ort:
+            mock_ort.side_effect = lambda *a, **k: MagicMock()
+            lvface._get_session('S')
+            lvface._get_session('L')
+            lvface.reset_session()
+            lvface._get_session('S')
+            lvface._get_session('L')
+        self.assertEqual(mock_ort.call_count, 4)
+
+    def test_reset_session_with_a_size_clears_only_that_one(self):
+        import lvface
+        with patch('onnxruntime.InferenceSession') as mock_ort:
+            mock_ort.side_effect = lambda *a, **k: MagicMock()
+            lvface._get_session('S')
+            lvface._get_session('L')
+            lvface.reset_session('S')
+            lvface._get_session('S')
+            lvface._get_session('L')  # still cached, no new call
+        self.assertEqual(mock_ort.call_count, 3)
+
+    def test_embed_from_image_array_uses_requested_size(self):
+        import lvface
+        raw = np.full(512, 1.0, dtype=np.float32)
+        img = np.zeros((200, 200, 3), dtype=np.uint8)
+        kps = np.array([[50, 60], [100, 60], [75, 90], [55, 120], [95, 120]], dtype=np.float32)
+        with patch('lvface._get_session', return_value=self._mock_session(raw)) as mock_get:
+            lvface.embed_from_image_array(img, kps, size='L')
+        mock_get.assert_called_once_with('L')
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
@@ -5041,41 +5275,6 @@ class BackfillDetScoreTests(TestCase):
         untouched_face.refresh_from_db()
         self.assertAlmostEqual(untouched_face.det_score, 0.88, places=4)
 
-    def test_recheck_mismatched_corrects_a_kps_that_doesnt_match_its_box(self):
-        # --recheck-mismatched: cleanup for the real bug (2026-10-26) --
-        # a face whose ALREADY-STORED kps doesn't correspond to its own
-        # box (regardless of det_score being populated or not) should be
-        # found by the scan, redetected, and corrected if a clean match
-        # is found this time.
-        face = self._make_ignore_face([10, 10, 50, 50])
-        face.det_score = 0.5
-        face.kps = [900.0] * 10  # nowhere near the box -- a mismatch
-        face.save()
-        fake_kps = [[30.0, 30.0]] * 5
-        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.93, kps=fake_kps)]
-        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
-                   return_value=np.zeros((1000, 1000, 3))), \
-             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
-            mock_build.return_value.get.return_value = fake_dets
-            call_command('backfill_det_score', '--recheck-mismatched')
-        face.refresh_from_db()
-        self.assertAlmostEqual(face.det_score, 0.93, places=4)
-        self.assertEqual(face.kps, [v for pair in fake_kps for v in pair])
-
-    def test_recheck_mismatched_clears_fields_when_no_clean_match_found(self):
-        face = self._make_ignore_face([10, 10, 50, 50])
-        face.det_score = 0.5
-        face.kps = [900.0] * 10
-        face.save()
-        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
-                   return_value=np.zeros((1000, 1000, 3))), \
-             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
-            mock_build.return_value.get.return_value = []
-            call_command('backfill_det_score', '--recheck-mismatched')
-        face.refresh_from_db()
-        self.assertIsNone(face.det_score)
-        self.assertIsNone(face.kps)
-
     def test_recheck_mismatched_leaves_already_consistent_faces_alone(self):
         face = self._make_ignore_face([10, 10, 50, 50])
         face.det_score = 0.87
@@ -5088,20 +5287,6 @@ class BackfillDetScoreTests(TestCase):
         face.refresh_from_db()
         self.assertAlmostEqual(face.det_score, 0.87, places=4)
         self.assertEqual(face.kps, [30.0] * 10)
-
-    def test_recheck_mismatched_dry_run_does_not_clear_or_save(self):
-        face = self._make_ignore_face([10, 10, 50, 50])
-        face.det_score = 0.5
-        face.kps = [900.0] * 10
-        face.save()
-        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
-                   return_value=np.zeros((1000, 1000, 3))), \
-             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
-            mock_build.return_value.get.return_value = []
-            call_command('backfill_det_score', '--recheck-mismatched', '--dry-run')
-        face.refresh_from_db()
-        self.assertAlmostEqual(face.det_score, 0.5, places=4)
-        self.assertEqual(face.kps, [900.0] * 10)
 
     def test_single_pass_flag_restricts_detector_to_one_pass(self):
         # cut_list=[1,3] (the default, matching the live pipeline exactly)
@@ -5192,6 +5377,386 @@ class BackfillDetScoreTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class BackfillDetScoreRecheckMismatchedTransactionTests(TransactionTestCase):
+    """--recheck-mismatched tests that need to fabricate a face with a
+    deliberately-mismatched kps as their STARTING state (simulating real
+    pre-existing production corruption from before face_kps_within_box_
+    margin/the pyramidal_detector.py fix existed). Needs TransactionTestCase,
+    not the regular TestCase used by the rest of BackfillDetScoreTests --
+    Postgres refuses an ALTER TABLE (dropping/re-adding the constraint
+    around the fabricated INSERT) while there are "pending trigger
+    events" from an earlier write in the SAME transaction, which is
+    exactly the single wrapping transaction a plain TestCase runs each
+    test inside. TransactionTestCase commits for real between statements
+    instead, so the drop/insert/re-add sequence works."""
+
+    def setUp(self):
+        # TransactionTestCase flushes every table after each test,
+        # including migration-seeded sentinel Person rows and the
+        # default PhotoCollection -- recreate just what's actually
+        # needed directly, same pattern (and the same reasoning for not
+        # using serialized_rollback=True instead -- see its own comment)
+        # as ReencodeMissingFacesMismatchedKpsTransactionTests.
+        from filepopulator.models import PhotoCollection
+        PhotoCollection.objects.get_or_create(
+            root_directory=settings.PHOTO_ROOT, defaults={'name': 'Default', 'is_default': True},
+        )
+        for name in (settings.SOFT_IGNORE_NAME, settings.BLANK_FACE_NAME):
+            if not Person.objects.filter(person_name=name).exists():
+                make_person(name)
+        self.ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        self.image = make_image()
+
+    def _make_ignore_face(self, box):
+        face = make_face(
+            self.image, declared_name=Person.objects.get(person_name=settings.BLANK_FACE_NAME),
+            box_left=box[0], box_top=box[1], box_right=box[2], box_bottom=box[3],
+        )
+        face.set_possible_person(self.ignore_person, 1, 1.0)
+        face.refresh_from_db()
+        return face
+
+    class _FakeDetection:
+        def __init__(self, bbox, det_score, kps=None):
+            self.bbox = np.array(bbox, dtype=np.float32)
+            self.det_score = det_score
+            self._kps = kps if kps is not None else [[1.0, 2.0]] * 5
+
+        def __getitem__(self, key):
+            if key == 'kps':
+                return self._kps
+            raise KeyError(key)
+
+    @contextmanager
+    def _constraint_suspended(self):
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE face_manager_face DROP CONSTRAINT face_kps_within_box_margin")
+        try:
+            yield
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    ALTER TABLE face_manager_face ADD CONSTRAINT face_kps_within_box_margin CHECK (
+                        kps IS NULL OR (
+                            kps[1] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
+                            AND kps[2] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
+                            AND kps[3] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
+                            AND kps[4] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
+                            AND kps[5] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
+                            AND kps[6] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
+                            AND kps[7] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
+                            AND kps[8] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
+                            AND kps[9] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
+                            AND kps[10] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
+                        )
+                    ) NOT VALID
+                """)
+
+    def test_recheck_mismatched_corrects_a_kps_that_doesnt_match_its_box(self):
+        face = self._make_ignore_face([10, 10, 50, 50])
+        with self._constraint_suspended():
+            face.det_score = 0.5
+            face.kps = [900.0] * 10  # nowhere near the box -- a mismatch
+            face.save()
+        fake_kps = [[30.0, 30.0]] * 5
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.93, kps=fake_kps)]
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_det_score', '--recheck-mismatched')
+        face.refresh_from_db()
+        self.assertAlmostEqual(face.det_score, 0.93, places=4)
+        self.assertEqual(face.kps, [v for pair in fake_kps for v in pair])
+
+    def test_recheck_mismatched_clears_fields_when_no_clean_match_found(self):
+        face = self._make_ignore_face([10, 10, 50, 50])
+        with self._constraint_suspended():
+            face.det_score = 0.5
+            face.kps = [900.0] * 10
+            face.save()
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = []
+            call_command('backfill_det_score', '--recheck-mismatched')
+        face.refresh_from_db()
+        self.assertIsNone(face.det_score)
+        self.assertIsNone(face.kps)
+
+    def test_recheck_mismatched_dry_run_does_not_clear_or_save(self):
+        face = self._make_ignore_face([10, 10, 50, 50])
+        with self._constraint_suspended():
+            face.det_score = 0.5
+            face.kps = [900.0] * 10
+            face.save()
+        with patch('face_manager.management.commands.backfill_det_score.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_det_score._build_detection_only_detector') as mock_build:
+            mock_build.return_value.get.return_value = []
+            call_command('backfill_det_score', '--recheck-mismatched', '--dry-run')
+        face.refresh_from_db()
+        self.assertAlmostEqual(face.det_score, 0.5, places=4)
+        self.assertEqual(face.kps, [900.0] * 10)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class BackfillVerifiedKpsTests(TestCase):
+    """backfill_verified_kps management command -- the rigorous recovery
+    backfill for the kps/box translation bug (see pyramidal_detector.py,
+    CLAUDE.md). Mocks _build_full_detector entirely (real model loading
+    is expensive); only the command's own matching/verification/saving
+    logic is under test here."""
+
+    class _FakeDetection:
+        def __init__(self, bbox, det_score, kps, embedding):
+            self.bbox = np.array(bbox, dtype=np.float32)
+            self.det_score = det_score
+            self._kps = kps
+            self._embedding = np.asarray(embedding, dtype=np.float32)
+
+        def __getitem__(self, key):
+            if key == 'kps':
+                return self._kps
+            if key == 'embedding':
+                return self._embedding
+            raise KeyError(key)
+
+    def setUp(self):
+        self.image = make_image()
+        self.person = make_person("Verified Backfill Person")
+
+    def _make_face_with_encoding(self, box, encoding, relative_size=0.5):
+        face = make_face(
+            self.image, declared_name=self.person,
+            box_left=box[0], box_top=box[1], box_right=box[2], box_bottom=box[3],
+        )
+        face.face_encoding_512 = encoding
+        face.relative_size = relative_size
+        face.save()
+        return face
+
+    def test_high_confidence_match_saves_kps_det_score_and_lvface(self):
+        stored = [0.6] * 512
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored)
+        fresh_kps = [[30.0, 30.0]] * 5
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, fresh_kps, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertEqual(face.kps, [v for pair in fresh_kps for v in pair])
+        self.assertAlmostEqual(face.det_score, 0.9, places=4)
+        self.assertEqual(face.face_encoding_lvface_s, [0.4] * 512)
+        self.assertEqual(face.face_encoding_lvface_b, [0.4] * 512)
+        self.assertEqual(face.face_encoding_lvface_l, [0.4] * 512)
+
+    def test_gray_zone_match_accepted_when_tight_iou_and_small_face(self):
+        # Same embedding direction but scaled down to land in the gray
+        # zone (cosine similarity ~0.8ish via a mixed vector), tight IOU
+        # (identical box), and a small relative_size -- mirrors the real
+        # calibration case (a small/blurry face, genuine match, 0.78
+        # similarity).
+        stored = [1.0] + [0.0] * 511
+        fresh = [0.8] + [0.6] + [0.0] * 510  # cos ~0.8 vs stored
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
+        fresh_kps = [[30.0, 30.0]] * 5
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.85, fresh_kps, fresh)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertEqual(face.kps, [v for pair in fresh_kps for v in pair])
+
+    def test_gray_zone_match_rejected_when_face_not_small(self):
+        stored = [1.0] + [0.0] * 511
+        fresh = [0.8] + [0.6] + [0.0] * 510
+        # Same gray-zone similarity as the accepted case above, but this
+        # face is NOT small (relative_size above the gray-zone cap).
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.5)
+        fresh_kps = [[30.0, 30.0]] * 5
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.85, fresh_kps, fresh)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+
+    def test_low_similarity_match_rejected_entirely(self):
+        stored = [1.0] + [0.0] * 511
+        fresh = [0.0] + [1.0] + [0.0] * 510  # orthogonal -- cos=0
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
+        fresh_kps = [[30.0, 30.0]] * 5
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.85, fresh_kps, fresh)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+        self.assertIsNone(face.det_score)
+
+    def test_unverified_face_without_stored_encoding_is_saved_anyway(self):
+        # Per explicit design direction: an incidental face sharing an
+        # already-triggered image (e.g. unlabeled/.ignore, no stored
+        # encoding to verify against) still gets its kps/det_score saved
+        # -- just without the identity-verification gate, since there's
+        # nothing to verify against.
+        ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        trigger_face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        incidental_face = make_face(
+            self.image, declared_name=ignore_person,
+            box_left=200, box_top=200, box_right=240, box_bottom=240,
+        )
+        self.assertIsNone(incidental_face.face_encoding_512)
+
+        trigger_kps = [[30.0, 30.0]] * 5
+        incidental_kps = [[220.0, 220.0]] * 5
+        fake_dets = [
+            self._FakeDetection([10, 10, 50, 50], 0.9, trigger_kps, [0.6] * 512),
+            self._FakeDetection([200, 200, 240, 240], 0.8, incidental_kps, [0.1] * 512),
+        ]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+
+        incidental_face.refresh_from_db()
+        self.assertEqual(incidental_face.kps, [v for pair in incidental_kps for v in pair])
+        self.assertAlmostEqual(incidental_face.det_score, 0.8, places=4)
+        # Still unverified -- declared_name untouched, no identity claim made.
+        self.assertEqual(incidental_face.declared_name_id, ignore_person.id)
+
+    def test_geometric_rejection_even_with_high_iou(self):
+        # A detection whose bbox clears IOU but whose own kps is nowhere
+        # near the face's box must never be saved -- same guard as
+        # backfill_det_score.py's own fix, reused here directly.
+        stored = [0.6] * 512
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored)
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[900.0, 900.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+
+    def test_no_detections_leaves_face_untouched_and_counted(self):
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.return_value = []
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+
+    def test_dry_run_saves_nothing(self):
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps', '--dry-run')
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+        self.assertIsNone(face.det_score)
+
+    def test_sentinel_encoding_is_treated_as_untrusted(self):
+        # NON_DETECTED_FACE_ENCODING is not NULL but is explicitly NOT a
+        # real stored embedding -- must be treated the same as "no
+        # trusted encoding" (saved without verification), not run
+        # through the similarity gate (which would spuriously fail
+        # against a sentinel that has nothing to do with any real face).
+        # A genuinely-encoded companion face is needed on the same image
+        # to trigger processing at all -- an image with ONLY a sentinel-
+        # encoded face has no real encoding to verify against and is
+        # correctly never selected by this command's own trigger query
+        # (same as test_unverified_face_without_stored_encoding_is_saved_
+        # anyway's "incidental face" shape).
+        trigger_face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        face = self._make_face_with_encoding(
+            [200, 200, 240, 240], list(settings.NON_DETECTED_FACE_ENCODING),
+        )
+        trigger_kps = [[30.0, 30.0]] * 5
+        fresh_kps = [[220.0, 220.0]] * 5
+        fake_dets = [
+            self._FakeDetection([10, 10, 50, 50], 0.9, trigger_kps, [0.6] * 512),
+            self._FakeDetection([200, 200, 240, 240], 0.9, fresh_kps, [0.1] * 512),
+        ]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertEqual(face.kps, [v for pair in fresh_kps for v in pair])
+
+    def test_sharding_covers_every_trigger_image_exactly_once(self):
+        # Distinct real fixture files, not 4x make_image() with its
+        # default argument -- that reuses the SAME path every call (idempotent
+        # on path), silently collapsing all 4 "images" onto a single shared
+        # ImageFile row instead of 4 separate ones. Found via a real test
+        # failure, not assumed.
+        images = [
+            make_image(f) for f in ("naming/good/1.JPG", "naming/good/2.jpg", "naming/good/3.JPEG", "naming/good/4.jpeg")
+        ]
+        faces = []
+        for i, img in enumerate(images):
+            f = make_face(
+                img, declared_name=self.person,
+                box_left=10, box_top=10, box_right=50, box_bottom=50,
+            )
+            f.face_encoding_512 = [0.6] * 512
+            f.save()
+            faces.append(f)
+
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        total_shards = 2
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            for shard_index in range(total_shards):
+                call_command('backfill_verified_kps', f'--shard-index={shard_index}', f'--total-shards={total_shards}')
+
+        for f in faces:
+            f.refresh_from_db()
+            self.assertIsNotNone(f.kps)
+
+    def test_lvface_sizes_flag_restricts_which_sizes_are_backfilled(self):
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)) as mock_lv:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps', '--lvface-sizes=B')
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_b, [0.4] * 512)
+        self.assertIsNone(face.face_encoding_lvface_s)
+        self.assertIsNone(face.face_encoding_lvface_l)
+        mock_lv.assert_called_once()
+        self.assertEqual(mock_lv.call_args.kwargs.get('size'), 'B')
+
+
 class BackfillVideoDetScoreTests(TestCase):
     """backfill_video_det_score management command: re-extracts the
     exact frame a video face's thumbnail/box came from, redetects in a

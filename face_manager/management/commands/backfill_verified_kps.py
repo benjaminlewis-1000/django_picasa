@@ -1,0 +1,289 @@
+"""Rigorous, verified kps/det_score/LVFace backfill -- the real fix for
+the kps/box translation bug (see pyramidal_detector.py's find_raw_faces(),
+and CLAUDE.md for the full investigation). Unlike backfill_det_score.py
+(which only has the matched detection's OWN box geometry to lean on),
+this command cross-checks every match against something semantically
+meaningful: the matched detection's freshly-computed insightface
+embedding, compared to the face's own ALREADY-TRUSTED stored
+face_encoding_512.
+
+Deliberately oriented around whole IMAGES, not individual faces (per
+explicit design direction) -- real efficiency and accuracy comes from
+detecting once per image, matching ALL of that image's faces against the
+detections in one optimal bipartite pass, then handling every face on
+it together, rather than one wasted redetect per trigger face. An
+incidental face that happens to share an already-triggered image (e.g.
+an unlabeled/.ignore face with no stored encoding to verify against)
+still gets its kps/det_score/LVFace embeddings saved -- just without
+the identity-verification gate, since there's nothing to verify
+against; evaluate those later rather than discard the opportunity.
+
+Verification tiers, per face WITH a real stored face_encoding_512:
+  - similarity >= HIGH_CONFIDENCE_SIM: accept outright.
+  - GRAY_ZONE_SIM <= similarity < HIGH_CONFIDENCE_SIM: accept only if
+    the match is a tight box match (IOU >= GRAY_ZONE_MIN_IOU) AND the
+    face is small (relative_size <= GRAY_ZONE_MAX_RELATIVE_SIZE) --
+    calibrated against 39 real faces with known-good stored embeddings
+    2026-10-26: genuine same-photo matches scored 0.78-1.00 (mean
+    0.975), with the one real outlier (0.78) visually confirmed as the
+    same face, just small/blurry (naturally noisier embeddings). A
+    wrong match would be expected to land far below this range
+    (different-person similarity is typically well under 0.5-0.6 per
+    this project's own established classification work).
+  - Below GRAY_ZONE_SIM: rejected, logged, not written.
+
+Faces WITHOUT a usable stored encoding (NULL or the
+NON_DETECTED_FACE_ENCODING sentinel) skip the similarity gate entirely
+-- the IOU match (and the DB's own face_kps_within_box_margin
+constraint) is the only check; kps/det_score/LVFace embeddings are
+saved either way, since there's no ground truth to verify against and
+discarding the detection would lose real, if unverified, information.
+
+--shard-index/--total-shards (same _shard_annotation() hash-based
+partition this project already uses elsewhere) let several instances of
+this command run concurrently against disjoint image sets.
+"""
+import signal
+import time
+from collections import defaultdict
+
+import numpy as np
+import torch
+import torchvision.ops.boxes as bops
+from django.conf import settings
+from django.core.management.base import BaseCommand
+from django.db.models import Q
+from insightface.app import FaceAnalysis
+from scipy.optimize import linear_sum_assignment
+
+import common
+import lvface
+from face_extract_encode import FaceExtractor, _kps_matches_box
+from face_manager.models import Face
+from django.db.models.expressions import RawSQL
+from filepopulator.models import ImageFile
+from pyramidal_detector import PyramidalDetector
+
+
+def _image_shard_annotation(total_shards):
+    """Same HASHTEXT-based hash-shard scheme as face_extract_encode.py's
+    _shard_annotation(), but qualified to filepopulator_imagefile.id --
+    that function's own RawSQL hardcodes face_manager_face.id, which is
+    wrong here: this command's queryset is a queryset of ImageFile (the
+    unit of sharding is the whole image, not any one of its faces), and
+    using the Face-qualified version on a query that JOINS through Face
+    sharded inconsistently -- an image with multiple matching Face rows
+    could land in different shard buckets depending on which joined row
+    got hashed, causing the same image to be (partially) processed by
+    more than one shard. Found via a real test failure, not assumed."""
+    return RawSQL('MOD(ABS(HASHTEXT(filepopulator_imagefile.id::text)), %s)', (total_shards,))
+
+
+IOU_THRESH = 0.3
+HIGH_CONFIDENCE_SIM = 0.9
+GRAY_ZONE_SIM = 0.7
+GRAY_ZONE_MIN_IOU = 0.8
+GRAY_ZONE_MAX_RELATIVE_SIZE = 0.08
+
+PER_IMAGE_TIMEOUT_SECONDS = 60
+
+
+class _ImageTimeout(Exception):
+    pass
+
+
+def _raise_image_timeout(signum, frame):
+    raise _ImageTimeout(f"Image processing exceeded {PER_IMAGE_TIMEOUT_SECONDS}s")
+
+
+def _l2norm(a):
+    a = np.asarray(a, dtype=np.float32)
+    n = np.linalg.norm(a)
+    return a / n if n > 0 else a
+
+
+def _build_full_detector():
+    """A real, production-identical detector -- unlike backfill_det_
+    score's detection-only one, this needs the recognition module too
+    (to verify a match against the face's own stored embedding)."""
+    face_analysis = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+    face_analysis.prepare(ctx_id=-1)
+    return PyramidalDetector(detector=face_analysis, iou_thresh=IOU_THRESH)
+
+
+class Command(BaseCommand):
+    help = (
+        "Rigorous recovery backfill for the kps/box translation bug (see "
+        "pyramidal_detector.py, CLAUDE.md) -- redetects each image with the "
+        "now-fixed, production-identical PyramidalDetector, bipartite-matches "
+        "every face on it against the fresh detections (scipy.optimize."
+        "linear_sum_assignment, same pattern find_and_encode_faces() already "
+        "uses), and only trusts a match once its fresh embedding is verified "
+        "against the face's own stored face_encoding_512 (when one exists). "
+        "Phase 1 (this command's default scope): faces with a real, already-"
+        "trustworthy stored encoding -- the only population we have ground "
+        "truth to verify against. A later pass can widen scope to the "
+        "unlabeled/.ignore population once this is proven out."
+    )
+
+    def add_arguments(self, parser):
+        parser.add_argument('--dry-run', action='store_true')
+        parser.add_argument('--limit', type=int, default=None,
+                             help='Restrict to the first N source images (for testing).')
+        parser.add_argument('--shard-index', type=int, default=None)
+        parser.add_argument('--total-shards', type=int, default=None)
+        parser.add_argument('--lvface-sizes', type=str, default='S,B,L',
+                             help="Comma-separated LVFace sizes to backfill for each verified face.")
+
+    def handle(self, *args, **options):
+        dry_run = options['dry_run']
+        limit = options['limit']
+        shard_index = options['shard_index']
+        total_shards = options['total_shards']
+        lvface_sizes = [s.strip().upper() for s in options['lvface_sizes'].split(',') if s.strip()]
+
+        sentinel = list(settings.NON_DETECTED_FACE_ENCODING)
+
+        # Deliberately queried at the Face level first, not
+        # ImageFile.objects.filter(face__...).exclude(face__...) -- that
+        # shape is the classic Django "spanning multi-valued
+        # relationships" trap: filter() and exclude() across a reverse
+        # FK don't combine on the SAME related row, so an image with one
+        # real-encoded face and one sentinel-encoded face would have the
+        # whole image excluded (the exclude() matches the OTHER face),
+        # even though the real-encoded one should still trigger it.
+        # Found via a real test failure, not assumed.
+        trigger_image_ids = Face.objects.filter(
+            face_encoding_512__isnull=False, source_image_file__isnull=False,
+        ).exclude(face_encoding_512=sentinel).values_list('source_image_file_id', flat=True).distinct()
+        trigger_images = ImageFile.objects.filter(id__in=trigger_image_ids)
+
+        if shard_index is not None and total_shards is not None:
+            trigger_images = trigger_images.annotate(
+                _shard=_image_shard_annotation(total_shards)
+            ).filter(_shard=shard_index)
+
+        image_ids = list(trigger_images.order_by('?').values_list('id', flat=True))
+        if limit is not None:
+            image_ids = image_ids[:limit]
+
+        self.stdout.write(f"{len(image_ids)} source images to process {'(dry run)' if dry_run else ''}")
+
+        app = _build_full_detector()
+
+        stats = defaultdict(int)
+        t0 = time.time()
+
+        for idx, img_id in enumerate(image_ids):
+            img_obj = ImageFile.objects.select_related('directory__collection').get(id=img_id)
+            image_faces = list(Face.objects.filter(source_image_file=img_obj))
+            if not image_faces:
+                continue
+
+            try:
+                signal.signal(signal.SIGALRM, _raise_image_timeout)
+                signal.alarm(PER_IMAGE_TIMEOUT_SECONDS)
+                try:
+                    img_numpy = common.open_img_oriented(img_obj.filename, as_numpy=True)
+                    if img_numpy is None:
+                        stats['decode_failed'] += len(image_faces)
+                        continue
+                    detections = app.get(img_numpy)
+                finally:
+                    signal.alarm(0)
+            except _ImageTimeout:
+                self.stdout.write(f"  TIMEOUT on {img_obj.filename} -- skipping")
+                stats['timed_out'] += len(image_faces)
+                continue
+            except Exception as e:
+                self.stdout.write(f"  decode/detect error on {img_obj.filename}: {e}")
+                stats['decode_failed'] += len(image_faces)
+                continue
+
+            if not detections:
+                stats['no_detections'] += len(image_faces)
+                continue
+
+            existing_boxes = torch.tensor(
+                [[f.box_left, f.box_top, f.box_right, f.box_bottom] for f in image_faces],
+                dtype=torch.float32,
+            )
+            detect_boxes = torch.tensor([d.bbox.tolist() for d in detections], dtype=torch.float32)
+            iou = bops.distance_box_iou(existing_boxes, detect_boxes).numpy()
+            rows, cols = linear_sum_assignment(-iou)
+
+            matched_rows = set()
+            for r, c in zip(rows, cols):
+                if float(iou[r, c]) < IOU_THRESH:
+                    continue
+                matched_rows.add(int(r))
+                face = image_faces[int(r)]
+                det = detections[int(c)]
+                this_iou = float(iou[r, c])
+
+                if not _kps_matches_box(det['kps'], face.box_left, face.box_top, face.box_right, face.box_bottom):
+                    stats['geometry_rejected'] += 1
+                    continue
+
+                has_trusted_encoding = (
+                    face.face_encoding_512 is not None
+                    and list(face.face_encoding_512) != sentinel
+                )
+
+                verified = True
+                tier = 'unverified'
+                if has_trusted_encoding:
+                    fresh_emb = _l2norm(det['embedding'])
+                    stored_emb = _l2norm(np.array(face.face_encoding_512, dtype=np.float32))
+                    sim = float(np.dot(fresh_emb, stored_emb))
+                    if sim >= HIGH_CONFIDENCE_SIM:
+                        tier = 'high_confidence'
+                    elif sim >= GRAY_ZONE_SIM and this_iou >= GRAY_ZONE_MIN_IOU and (
+                        face.relative_size is not None and face.relative_size <= GRAY_ZONE_MAX_RELATIVE_SIZE
+                    ):
+                        tier = 'gray_zone'
+                    else:
+                        verified = False
+                        stats['similarity_rejected'] += 1
+
+                if not verified:
+                    continue
+
+                stats[f'saved_{tier}'] += 1
+                if not dry_run:
+                    face.kps = FaceExtractor._flatten_kps(det['kps'])
+                    face.det_score = float(det.det_score)
+                    face.save(update_fields=['kps', 'det_score'])
+                    for size in lvface_sizes:
+                        try:
+                            emb = lvface.embed_from_image_array(
+                                img_numpy, face.kps, input_is_bgr=False, size=size,
+                            )
+                        except Exception as e:
+                            self.stdout.write(f"  LVFace-{size} failed for face {face.id}: {e}")
+                            continue
+                        if emb is None:
+                            continue
+                        field = f'face_encoding_lvface_{size.lower()}'
+                        setattr(face, field, emb.tolist())
+                        face.save(update_fields=[field])
+
+            for r in range(len(image_faces)):
+                if r not in matched_rows:
+                    stats['no_match'] += 1
+
+            if (idx + 1) % 25 == 0:
+                elapsed = time.time() - t0
+                rate = (idx + 1) / elapsed
+                remaining = len(image_ids) - (idx + 1)
+                eta_min = remaining / rate / 60 if rate else float('inf')
+                self.stdout.write(
+                    f"  ...{idx+1}/{len(image_ids)} images ({rate:.2f} img/s, ETA {eta_min:.0f}min) -- "
+                    + ", ".join(f"{k}={v}" for k, v in sorted(stats.items()))
+                )
+
+        elapsed = time.time() - t0
+        self.stdout.write(
+            f"DONE: {len(image_ids)} images, {elapsed:.0f}s. "
+            + ", ".join(f"{k}={v}" for k, v in sorted(stats.items()))
+        )

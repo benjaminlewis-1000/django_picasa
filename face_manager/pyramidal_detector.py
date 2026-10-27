@@ -181,7 +181,7 @@ class PyramidalDetector():
 
                         # Detect on sub-image. Indicate whether the detection went off
                         # the edge of the chip, and adjust the bounding box to its
-                        # proper location in the larger image. 
+                        # proper location in the larger image.
                         faces_at_level = self.app.get(chip_part)
                         for idx in range(len(faces_at_level)):
                             faces_at_level[idx]['detect_pyr_level'] = cut_dims
@@ -195,6 +195,22 @@ class PyramidalDetector():
                             faces_at_level[idx]['bbox'][2] = int(bbox_r + left_edge) # Right
                             faces_at_level[idx]['bbox'][1] = int(bbox_t + top_edge) # Top
                             faces_at_level[idx]['bbox'][3] = int(bbox_b + top_edge) # Bottom
+                            # Real bug, found 2026-10-26 (see CLAUDE.md): kps was
+                            # never translated back to full-image coordinates for
+                            # any tiled (cut_dims > 1) detection -- only bbox was.
+                            # A detection's kps stayed in the chip's own LOCAL
+                            # coordinate space, silently wrong for any caller that
+                            # used it (confirmed in production: ~360k already-
+                            # stored faces, kps clustering unmistakably in the
+                            # image's top-left quadrant regardless of which tile
+                            # the real detection came from -- the signature of a
+                            # small, untranslated local coordinate being read as
+                            # if it were already absolute).
+                            if faces_at_level[idx]['kps'] is not None:
+                                faces_at_level[idx]['kps'] = (
+                                    np.asarray(faces_at_level[idx]['kps'], dtype=float)
+                                    + np.array([left_edge, top_edge])
+                                )
 
                         overlapping_detections.extend(faces_at_level)
                         iter_num += 1
