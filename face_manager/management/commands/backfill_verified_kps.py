@@ -52,6 +52,7 @@ import torch
 import torchvision.ops.boxes as bops
 from django.conf import settings
 from django.core.management.base import BaseCommand
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from insightface.app import FaceAnalysis
 from scipy.optimize import linear_sum_assignment
@@ -249,24 +250,57 @@ class Command(BaseCommand):
                 if not verified:
                     continue
 
+                if dry_run:
+                    stats[f'saved_{tier}'] += 1
+                    continue
+
+                # _kps_matches_box() (the pre-check above) is deliberately
+                # looser (centroid within one box-width/-height of the
+                # box's own center) than the DB's own
+                # face_kps_within_box_margin constraint (every one of the
+                # 5 points individually within a 25% margin) -- a real
+                # match can clear the pre-check's centroid test while one
+                # individual landmark (e.g. an eye corner under an
+                # extreme profile pose) still fails the DB's tighter,
+                # per-point requirement. Found via a real production
+                # crash (an uncaught IntegrityError killed an entire
+                # shard outright) -- the DB constraint is the actual
+                # source of truth here, so this must never be fatal.
+                try:
+                    # transaction.atomic() here creates a real savepoint,
+                    # not just a Python-level try/except -- without it, a
+                    # caught IntegrityError still leaves Postgres
+                    # considering the connection's current transaction
+                    # aborted (every later statement on it fails with
+                    # "current transaction is aborted" until an actual
+                    # ROLLBACK happens), which Python catching the
+                    # exception alone does nothing to fix. Harmless
+                    # no-op overhead-wise when there's no outer
+                    # transaction already open (production's normal
+                    # autocommit mode).
+                    with transaction.atomic():
+                        face.kps = FaceExtractor._flatten_kps(det['kps'])
+                        face.det_score = float(det.det_score)
+                        face.save(update_fields=['kps', 'det_score'])
+                except IntegrityError as e:
+                    stats['db_constraint_rejected'] += 1
+                    self.stdout.write(f"  face {face.id}: DB rejected the recovered kps ({e}) -- skipping")
+                    continue
+
                 stats[f'saved_{tier}'] += 1
-                if not dry_run:
-                    face.kps = FaceExtractor._flatten_kps(det['kps'])
-                    face.det_score = float(det.det_score)
-                    face.save(update_fields=['kps', 'det_score'])
-                    for size in lvface_sizes:
-                        try:
-                            emb = lvface.embed_from_image_array(
-                                img_numpy, face.kps, input_is_bgr=False, size=size,
-                            )
-                        except Exception as e:
-                            self.stdout.write(f"  LVFace-{size} failed for face {face.id}: {e}")
-                            continue
-                        if emb is None:
-                            continue
-                        field = f'face_encoding_lvface_{size.lower()}'
-                        setattr(face, field, emb.tolist())
-                        face.save(update_fields=[field])
+                for size in lvface_sizes:
+                    try:
+                        emb = lvface.embed_from_image_array(
+                            img_numpy, face.kps, input_is_bgr=False, size=size,
+                        )
+                    except Exception as e:
+                        self.stdout.write(f"  LVFace-{size} failed for face {face.id}: {e}")
+                        continue
+                    if emb is None:
+                        continue
+                    field = f'face_encoding_lvface_{size.lower()}'
+                    setattr(face, field, emb.tolist())
+                    face.save(update_fields=[field])
 
             for r in range(len(image_faces)):
                 if r not in matched_rows:

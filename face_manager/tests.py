@@ -5654,6 +5654,30 @@ class BackfillVerifiedKpsTests(TestCase):
         face.refresh_from_db()
         self.assertIsNone(face.kps)
 
+    def test_db_constraint_rejection_does_not_crash_the_whole_command(self):
+        # Real production crash, 2026-10-26: _kps_matches_box()'s own
+        # pre-check is deliberately looser (centroid within one box-
+        # width/-height of the box's own center) than the DB's
+        # face_kps_within_box_margin constraint (every one of the 5
+        # points individually within a 25% margin) -- a kps with 4
+        # clustered points and one wild outlier can clear the pre-check
+        # (its centroid still lands near the box center) while the
+        # outlier point alone fails the DB's tighter, per-point
+        # requirement. An uncaught IntegrityError here killed an entire
+        # shard outright in real production; must be caught and counted
+        # instead, not fatal.
+        stored = [0.6] * 512
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored)
+        sneaky_kps = [[30.0, 30.0], [30.0, 30.0], [30.0, 30.0], [30.0, 30.0], [150.0, 30.0]]
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, sneaky_kps, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')  # must not raise
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+
     def test_no_detections_leaves_face_untouched_and_counted(self):
         face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
         with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
