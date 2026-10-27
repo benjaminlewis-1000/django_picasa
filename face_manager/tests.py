@@ -5764,6 +5764,67 @@ class BackfillVerifiedKpsTests(TestCase):
             f.refresh_from_db()
             self.assertIsNotNone(f.kps)
 
+    def test_person_ids_filter_restricts_to_images_with_a_targeted_person(self):
+        other_person = make_person("Not The Target")
+        images = [make_image(f) for f in ("naming/good/1.JPG", "naming/good/2.jpg")]
+        target_face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        # move target_face onto the first image explicitly
+        target_face.source_image_file = images[0]
+        target_face.save()
+        other_face = make_face(
+            images[1], declared_name=other_person,
+            box_left=10, box_top=10, box_right=50, box_bottom=50,
+        )
+        other_face.face_encoding_512 = [0.6] * 512
+        other_face.save()
+
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps', f'--person-ids={self.person.id}')
+
+        target_face.refresh_from_db()
+        other_face.refresh_from_db()
+        self.assertIsNotNone(target_face.kps)
+        self.assertIsNone(other_face.kps)
+
+    def test_person_ids_filter_still_backfills_bystander_faces_on_the_same_image(self):
+        # --person-ids only decides WHICH IMAGES get selected -- once an
+        # image is selected, detection runs over the WHOLE image
+        # regardless, so every face on it (not just the targeted
+        # person's) should still get kps/det_score saved. Losing this
+        # would waste real compute: detection is already paid for on
+        # this image, so declining to save a bystander's result for
+        # free would be pure waste.
+        bystander_person = make_person("Bystander")
+        target_face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        bystander_face = make_face(
+            self.image, declared_name=bystander_person,
+            box_left=60, box_top=60, box_right=100, box_bottom=100,
+        )
+        fake_dets = [
+            self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512),
+            self._FakeDetection([60, 60, 100, 100], 0.85, [[80.0, 80.0]] * 5, [0.1] * 512),
+        ]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps', f'--person-ids={self.person.id}', '--lvface-sizes=B')
+
+        target_face.refresh_from_db()
+        bystander_face.refresh_from_db()
+        self.assertIsNotNone(target_face.kps)
+        self.assertIsNotNone(bystander_face.kps)
+        self.assertEqual(bystander_face.kps, [v for pair in [[80.0, 80.0]] * 5 for v in pair])
+        # bystander has no stored face_encoding_512 to verify against -> unverified tier,
+        # but still saved (kps/det_score AND lvface, per the unverified-faces-are-saved-too design)
+        self.assertEqual(bystander_face.face_encoding_lvface_b, [0.4] * 512)
+
     def test_lvface_sizes_flag_restricts_which_sizes_are_backfilled(self):
         face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
         fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]

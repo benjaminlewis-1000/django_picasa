@@ -146,6 +146,13 @@ class Command(BaseCommand):
         parser.add_argument('--total-shards', type=int, default=None)
         parser.add_argument('--lvface-sizes', type=str, default='S,B,L',
                              help="Comma-separated LVFace sizes to backfill for each verified face.")
+        parser.add_argument('--person-ids', type=str, default=None,
+                             help="Comma-separated Person ids. When given, restricts to source "
+                                  "images that have at least one face declared to one of these "
+                                  "people (in ADDITION to the usual trigger-population "
+                                  "requirement) -- lets a run be redirected at specific "
+                                  "under-represented people/negative-pool sentinels instead of "
+                                  "working through the full trigger population in random order.")
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
@@ -153,6 +160,9 @@ class Command(BaseCommand):
         shard_index = options['shard_index']
         total_shards = options['total_shards']
         lvface_sizes = [s.strip().upper() for s in options['lvface_sizes'].split(',') if s.strip()]
+        person_ids = None
+        if options['person_ids']:
+            person_ids = [int(s.strip()) for s in options['person_ids'].split(',') if s.strip()]
 
         sentinel = list(settings.NON_DETECTED_FACE_ENCODING)
 
@@ -165,9 +175,22 @@ class Command(BaseCommand):
         # whole image excluded (the exclude() matches the OTHER face),
         # even though the real-encoded one should still trigger it.
         # Found via a real test failure, not assumed.
-        trigger_image_ids = Face.objects.filter(
-            face_encoding_512__isnull=False, source_image_file__isnull=False,
-        ).exclude(face_encoding_512=sentinel).values_list('source_image_file_id', flat=True).distinct()
+        base_trigger_filter = dict(face_encoding_512__isnull=False, source_image_file__isnull=False)
+        if person_ids is not None:
+            # Same "query at the Face level, not via a cross-relation
+            # exclude()" discipline as above -- this is an additional
+            # AND-restriction (a trigger image that ALSO has a face
+            # declared to one of these people), not a replacement for
+            # the base trigger requirement.
+            target_image_ids = Face.objects.filter(
+                declared_name_id__in=person_ids, source_image_file__isnull=False,
+            ).values_list('source_image_file_id', flat=True).distinct()
+            base_trigger_filter['source_image_file_id__in'] = target_image_ids
+
+        trigger_image_ids = Face.objects.filter(**base_trigger_filter).exclude(
+            face_encoding_512=sentinel
+        ).values_list('source_image_file_id', flat=True).distinct()
+
         trigger_images = ImageFile.objects.filter(id__in=trigger_image_ids)
 
         if shard_index is not None and total_shards is not None:
