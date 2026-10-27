@@ -6129,6 +6129,45 @@ class BackfillVerifiedKpsTests(TestCase):
         mock_lv.assert_called_once()
         self.assertEqual(mock_lv.call_args.kwargs.get('size'), 'B')
 
+    def test_resuming_with_lvface_enabled_does_not_skip_a_kps_only_face(self):
+        # Real bug, 2026-10-27: a face backfilled during an earlier
+        # kps-only phase (--lvface-sizes '') already has kps, so the old
+        # "already_done" check (kps alone) would mark its image fully
+        # done and skip it forever -- even though it was never actually
+        # given the LVFace fields THIS run wants. Must still be
+        # (re-)visited and backfilled once LVFace is re-enabled.
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        face.kps = [30.0] * 10
+        face.det_score = 0.9
+        face.save()
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps', '--lvface-sizes=B')
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_b, [0.4] * 512)
+
+    def test_resuming_with_lvface_disabled_still_skips_a_fully_kps_done_face(self):
+        # Companion case: with --lvface-sizes '' (empty), the check must
+        # still reduce to the original kps-only behavior -- a face that
+        # already has kps and nothing else requested stays skipped.
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        face.kps = [30.0] * 10
+        face.det_score = 0.9
+        face.save()
+
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            call_command('backfill_verified_kps', "--lvface-sizes=")
+            mock_build.return_value.get.assert_not_called()
+
 
 class BackfillLvfaceTargetedTests(TestCase):
     """backfill_lvface_targeted -- the kps-replay-only LVFace backfill
