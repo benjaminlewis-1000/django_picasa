@@ -940,7 +940,6 @@ class ImageFileTests(TestCase):
     def test_bulk_add(self):
 
         add_from_root_dir(self.tmp_valid_dir)
-        sleep(5)
         add_from_root_dir(self.tmp_valid_dir)
 
         valid_files = []
