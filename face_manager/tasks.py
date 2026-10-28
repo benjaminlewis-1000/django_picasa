@@ -420,7 +420,7 @@ def clear_ignored_encodings():
         _log_task_crash('clear_ignored_encodings', e)
 
 @shared_task(ignore_result=True, name='face_manager.assign_faces')
-def thistask(redo_all=False):
+def assign_faces_task(redo_all=False):
 
     i = celery_app.control.inspect()
     active_tasks = i.active()
@@ -445,17 +445,17 @@ def thistask(redo_all=False):
     # heartbeat too is harmless (just an unused row) rather than
     # something that needs its own guard here.
     heartbeat_name = (
-        'face_manager.thistask.weekly_full' if redo_all else 'face_manager.thistask.hourly'
+        'face_manager.assign_faces.weekly_full' if redo_all else 'face_manager.assign_faces.hourly'
     )
     record_heartbeat_start(heartbeat_name)
     try:
         classer = faceAssigner()
         classer.execute(redo_all)
         settings.LOGGER.info(
-            f"thistask(redo_all={redo_all}) completed."
+            f"assign_faces_task(redo_all={redo_all}) completed."
         )
     except Exception as e:
-        _log_task_crash('thistask', e)
+        _log_task_crash('assign_faces_task', e)
     finally:
         record_heartbeat_done(heartbeat_name)
 

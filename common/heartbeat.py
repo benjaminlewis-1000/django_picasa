@@ -11,10 +11,10 @@ def record_heartbeat_start(task_name):
 
     task_name: a short, stable identifier distinguishing this specific
     recurring schedule entry, not just the underlying task function --
-    e.g. 'face_manager.thistask.weekly_full' vs
-    'face_manager.thistask.hourly', since both invoke the same
-    thistask() function with different args and need to be watched for
-    staleness/hangs independently.
+    e.g. 'face_manager.assign_faces.weekly_full' vs
+    'face_manager.assign_faces.hourly', since both invoke the same
+    assign_faces_task() function with different args and need to be
+    watched for staleness/hangs independently.
     """
     from common.models import TaskHeartbeat
     TaskHeartbeat.objects.update_or_create(

@@ -418,9 +418,9 @@ class CheckTaskHeartbeatsTaskTests(TestCase):
     hung). Exercises the registry's own real entry directly rather than
     a fake one, since the watchdog task hardcodes HEARTBEAT_REGISTRY
     (not dependency-injected) -- this is the one real registered task
-    name, 'face_manager.thistask.weekly_full'."""
+    name, 'face_manager.assign_faces.weekly_full'."""
 
-    TASK_NAME = 'face_manager.thistask.weekly_full'
+    TASK_NAME = 'face_manager.assign_faces.weekly_full'
 
     def test_never_recorded_is_flagged(self):
         from common.models import ApplicationError

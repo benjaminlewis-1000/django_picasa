@@ -28,7 +28,7 @@ HEARTBEAT_REGISTRY = {
     # 100k+ faces), far more than the hourly incremental batch -- sized
     # generously above that, not measured against a real completed run
     # yet.
-    'face_manager.thistask.weekly_full': {
+    'face_manager.assign_faces.weekly_full': {
         'max_age_since_start': timedelta(days=8),
         'max_runtime': timedelta(hours=24),
     },
