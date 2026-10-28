@@ -63,12 +63,19 @@ _FILENAME_DATETIME_PATTERNS = [
     re.compile(r'(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})'),       # 2016-02-06_16-18-35
 ]
 # 13-digit millisecond Unix epoch (common in messaging-app media exports).
-# Bounded to a "1[5-8]" leading pattern -- roughly 2017 through 2035 --
-# purely to avoid matching an arbitrary 13-digit number that happens to
-# sit in a filename (e.g. a database id) as if it were a timestamp; the
-# real plausibility check is the MIN/MAX bound applied to every candidate
-# below regardless of which pattern found it.
-_FILENAME_EPOCH_MS_PATTERN = re.compile(r'(?<!\d)(1[5-8]\d{11})(?!\d)')
+# Bounded to a "1[0-8]" leading pattern -- Sept 2001 through ~2027 -- purely
+# to avoid matching an arbitrary 13-digit number that happens to sit in a
+# filename (e.g. a database id) as if it were a timestamp; the real
+# plausibility check is the MIN/MAX bound applied to every candidate below
+# regardless of which pattern found it. Was originally "1[5-8]" (2017-2035)
+# -- found 2026-10-28 to silently miss a real, confirmed batch of photos
+# with genuine millisecond-epoch filenames from 2014-2017 (leading digit
+# "14"), which fell through to None instead of recovering a real date --
+# widened to start from "1[0-8]" (2001 onward) to close that gap. 2001 is
+# the real floor for a 13-digit ms-epoch value at all (10^12 ms); nothing
+# in this library's own naming convention (phone/messaging-app exports)
+# plausibly predates that anyway.
+_FILENAME_EPOCH_MS_PATTERN = re.compile(r'(?<!\d)(1[0-8]\d{11})(?!\d)')
 
 # Date-only (no time component) M-D-YY convention -- real, common in this
 # library's older "Pre_camcorder" digitized home-movie collection (e.g.
@@ -1092,7 +1099,26 @@ class ImageFile(models.Model):
                     
                     if date.tzinfo == None:
                         date = pytz.utc.localize(date)
-                    if date < self.dateTaken: 
+                    if date.year < 1990:
+                        # A real EXIF DateTime* field, but implausible as
+                        # an actual digital capture date -- confirmed
+                        # 2026-10-28 against 2,376 real images (mostly one
+                        # phone's photos) all sharing the exact same
+                        # "1900-01-01 01:01:01" value, a well-known
+                        # device-clock-reset default (the camera/phone's
+                        # clock was never set, or its battery died, so it
+                        # wrote its own factory-default date into every
+                        # photo rather than a real one). Digital EXIF
+                        # didn't exist before the mid-1990s, so any date
+                        # earlier than that is never a real capture date
+                        # regardless of which specific sentinel a device
+                        # happened to default to -- treated the same as
+                        # the other garbage-string cases above (skip this
+                        # EXIF key, fall through to the next one, and
+                        # ultimately to guess_date_from_filename() if none
+                        # of them have a real date).
+                        continue
+                    if date < self.dateTaken:
                         self.dateTaken = date
                         self.dateTakenValid = True
                         self.dateTakenUTC = date.timestamp()
@@ -1110,6 +1136,13 @@ class ImageFile(models.Model):
             filename_guess = guess_date_from_filename(self.filename)
             if filename_guess is not None:
                 self.dateTaken = filename_guess
+                # Real, separate bug found 2026-10-28: only self.dateTaken
+                # (a DateTimeField) was ever set here -- self.dateTakenUTC
+                # (the plain float field Face.dateTakenUTC and other
+                # downstream numeric-date logic actually reads) was left
+                # untouched, silently discarding a successfully-recovered
+                # filename-based date everywhere except this one field.
+                self.dateTakenUTC = filename_guess.timestamp()
 
         # settings.LOGGER.error('Hi, debug here:')
 
