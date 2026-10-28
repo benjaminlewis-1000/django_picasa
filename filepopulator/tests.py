@@ -3982,6 +3982,89 @@ class BackfillDatesFromFilenameTests(TestCase):
         self.assertEqual(obj.dateTaken, original_date)
 
 
+class BackfillImplausibleExifDatesTests(TestCase):
+    """backfill_implausible_exif_dates -- corrects rows already written
+    with a wrongly-trusted implausible (pre-1990) EXIF date, the real
+    bug fixed 2026-10-28 (see _get_date_taken()'s own history). Mirrors
+    BackfillDatesFromFilenameTests' pattern: ingest a real fixture, then
+    force it into the "already has the bad value" state via .update()."""
+
+    def _ingest_real_image_at(self, dest_filename, fixture_name='1.JPG'):
+        val_dir = settings.FILEPOPULATOR_VAL_DIRECTORY
+        src = os.path.join(val_dir, 'naming', 'good', fixture_name)
+        os.makedirs(os.path.dirname(dest_filename), exist_ok=True)
+        shutil.copy(src, dest_filename)
+        create_image_file(dest_filename)
+        return ImageFile.objects.get(filename=dest_filename)
+
+    def test_recovers_real_date_from_filename_when_available(self):
+        dest = '/tmp/implausible_date_backfill_test/IMG_20200101_120000.jpg'
+        obj = self._ingest_real_image_at(dest)
+        ImageFile.objects.filter(pk=obj.pk).update(
+            dateTakenValid=True, dateTakenUTC=-2208985139.0,
+        )
+
+        call_command('backfill_implausible_exif_dates')
+
+        obj.refresh_from_db()
+        self.assertFalse(obj.dateTakenValid)
+        self.assertEqual(obj.dateTaken.isoformat(), '2020-01-01T12:00:00+00:00')
+        self.assertEqual(obj.dateTakenUTC, obj.dateTaken.timestamp())
+
+    def test_resets_to_unknown_placeholder_when_no_filename_date_available(self):
+        dest = '/tmp/implausible_date_backfill_test/received_3804555136348326.jpeg'
+        obj = self._ingest_real_image_at(dest, fixture_name='2.jpg')
+        ImageFile.objects.filter(pk=obj.pk).update(
+            dateTakenValid=True, dateTakenUTC=-2208985139.0,
+        )
+
+        before = timezone.now()
+        call_command('backfill_implausible_exif_dates')
+        after = timezone.now()
+
+        obj.refresh_from_db()
+        self.assertFalse(obj.dateTakenValid)
+        self.assertTrue(before <= obj.dateTaken <= after)
+        self.assertEqual(obj.dateTakenUTC, obj.dateTaken.timestamp())
+
+    def test_row_with_a_plausible_date_is_never_touched(self):
+        dest = '/tmp/implausible_date_backfill_test/IMG_20200101_120000_plausible.jpg'
+        obj = self._ingest_real_image_at(dest)
+        ImageFile.objects.filter(pk=obj.pk).update(dateTakenValid=True, dateTakenUTC=1600000000.0)
+        original_date = ImageFile.objects.get(pk=obj.pk).dateTaken
+
+        call_command('backfill_implausible_exif_dates')
+
+        obj.refresh_from_db()
+        self.assertEqual(obj.dateTaken, original_date)
+
+    def test_row_already_marked_invalid_is_never_touched(self):
+        # Out of scope for this command -- backfill_dates_from_filename
+        # already covers the dateTakenValid=False population.
+        dest = '/tmp/implausible_date_backfill_test/IMG_20200101_120000_alreadyfalse.jpg'
+        obj = self._ingest_real_image_at(dest)
+        ImageFile.objects.filter(pk=obj.pk).update(dateTakenValid=False, dateTakenUTC=-2208985139.0)
+        original_date = ImageFile.objects.get(pk=obj.pk).dateTaken
+
+        call_command('backfill_implausible_exif_dates')
+
+        obj.refresh_from_db()
+        self.assertEqual(obj.dateTaken, original_date)
+
+    def test_dry_run_writes_nothing(self):
+        dest = '/tmp/implausible_date_backfill_test/IMG_20200101_120000_dryrun.jpg'
+        obj = self._ingest_real_image_at(dest)
+        ImageFile.objects.filter(pk=obj.pk).update(
+            dateTakenValid=True, dateTakenUTC=-2208985139.0,
+        )
+
+        call_command('backfill_implausible_exif_dates', '--dry-run')
+
+        obj.refresh_from_db()
+        self.assertTrue(obj.dateTakenValid)
+        self.assertEqual(obj.dateTakenUTC, -2208985139.0)
+
+
 @override_settings(MEDIA_ROOT="/tmp/filepopulator_test_media")
 class VideoIngestionTests(TestCase):
     """VIDEO_DIR mirrors real fixture data locally: 8 real video samples
