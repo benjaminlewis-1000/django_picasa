@@ -6397,6 +6397,61 @@ class BackfillVideoDetScoreTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class SyncFaceDatesFromSourceImageTests(TestCase):
+    """sync_face_dates_from_source_image -- Face.dateTakenUTC is only
+    ever copied from its source ImageFile.dateTakenUTC ONCE, at face-
+    creation time, never kept in sync afterward. Needed alongside
+    filepopulator's backfill_implausible_exif_dates.py (2026-10-28):
+    correcting an image's own date does nothing for faces already
+    extracted from it."""
+
+    def setUp(self):
+        self.image = make_image()
+        self.person = make_person("Sync Dates Person")
+
+    def test_stale_implausible_face_date_is_synced_to_the_image(self):
+        ImageFile.objects.filter(pk=self.image.pk).update(dateTakenUTC=1600000000.0)
+        face = make_face(self.image, declared_name=self.person)
+        Face.objects.filter(pk=face.pk).update(dateTakenUTC=-2208985139.0)
+
+        call_command('sync_face_dates_from_source_image')
+
+        face.refresh_from_db()
+        self.assertEqual(face.dateTakenUTC, 1600000000.0)
+
+    def test_face_already_plausible_is_never_touched(self):
+        ImageFile.objects.filter(pk=self.image.pk).update(dateTakenUTC=1600000000.0)
+        face = make_face(self.image, declared_name=self.person)
+        Face.objects.filter(pk=face.pk).update(dateTakenUTC=1650000000.0)
+
+        call_command('sync_face_dates_from_source_image')
+
+        face.refresh_from_db()
+        self.assertEqual(face.dateTakenUTC, 1650000000.0)
+
+    def test_dry_run_writes_nothing(self):
+        ImageFile.objects.filter(pk=self.image.pk).update(dateTakenUTC=1600000000.0)
+        face = make_face(self.image, declared_name=self.person)
+        Face.objects.filter(pk=face.pk).update(dateTakenUTC=-2208985139.0)
+
+        call_command('sync_face_dates_from_source_image', '--dry-run')
+
+        face.refresh_from_db()
+        self.assertEqual(face.dateTakenUTC, -2208985139.0)
+
+    def test_rerun_finds_nothing(self):
+        ImageFile.objects.filter(pk=self.image.pk).update(dateTakenUTC=1600000000.0)
+        face = make_face(self.image, declared_name=self.person)
+        Face.objects.filter(pk=face.pk).update(dateTakenUTC=-2208985139.0)
+
+        call_command('sync_face_dates_from_source_image')
+        call_command('sync_face_dates_from_source_image')  # must be a safe no-op
+
+        face.refresh_from_db()
+        self.assertEqual(face.dateTakenUTC, 1600000000.0)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class BackfillMissingFaceThumbnailsTests(TestCase):
     """backfill_missing_face_thumbnails management command: real
     incident, 2026-10-06 -- a restored-from-backup database referenced
