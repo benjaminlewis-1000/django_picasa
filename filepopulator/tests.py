@@ -40,6 +40,36 @@ from .scripts import create_image_file, add_from_root_dir, delete_removed_photos
 from .video_scripts import create_video_file, add_videos_from_root_dir, delete_removed_videos, _parse_exif_date, compute_video_content_hash
 from face_manager.models import Face, get_default_blank_person
 from common.open_img_oriented import apply_exif_orientation
+from . import video_scripts as _video_scripts_module
+from .test_video_cache import cached_run_ffprobe, cached_run_exiftool
+
+# Module-level patch (not per-test/per-class): VideoIngestionTests alone
+# has dozens of test methods that each call add_videos_from_root_dir()/
+# create_video_file(), which internally calls _run_ffprobe()/
+# _run_exiftool() against the same small set of real/synthetic fixture
+# files, over and over. test_video_cache.py disk-caches those real
+# subprocess results (keyed on file content + video_scripts.py's own
+# source, so it auto-invalidates if either changes) -- patched here,
+# once, for every test in this module, rather than touching each
+# individual test method. setUpModule/tearDownModule are standard
+# unittest hooks Django's test runner (including under --parallel,
+# once per worker process) already calls automatically.
+_video_cache_patches = []
+
+
+def setUpModule():
+    _video_cache_patches.extend([
+        mock.patch.object(_video_scripts_module, '_run_ffprobe', side_effect=cached_run_ffprobe),
+        mock.patch.object(_video_scripts_module, '_run_exiftool', side_effect=cached_run_exiftool),
+    ])
+    for p in _video_cache_patches:
+        p.start()
+
+
+def tearDownModule():
+    for p in _video_cache_patches:
+        p.stop()
+    _video_cache_patches.clear()
 
 
 def _tiny_jpeg_bytes(size=(30, 30)):
@@ -3811,6 +3841,16 @@ class GuessDateFromFilenameTests(unittest.TestCase):
     def test_date_in_the_future_is_rejected(self):
         self.assertIsNone(guess_date_from_filename('/photos/x/IMG_29990101_120000.jpg'))
 
+    def test_epoch_ms_style_2014_to_2017_range_is_recognized(self):
+        # Real bug, found 2026-10-28: the pattern was originally bounded
+        # to a "1[5-8]" leading digit (~2017-2035), silently missing the
+        # entire 2001-2017 range of real 13-digit ms-epoch timestamps --
+        # confirmed against 1,815 real "Mom Phone" photos with a leading
+        # "14" (2014-2017) that used to return None here despite having a
+        # perfectly real, recoverable date embedded in the filename.
+        got = guess_date_from_filename('/photos/x/1482109271865.jpg')
+        self.assertEqual(got.isoformat(), '2016-12-19T01:01:11.865000+00:00')
+
 
 class GetDateTakenFilenameFallbackTests(unittest.TestCase):
     """Integration-style coverage for ImageFile._get_date_taken()'s use of
@@ -3847,6 +3887,34 @@ class GetDateTakenFilenameFallbackTests(unittest.TestCase):
         after = timezone.now()
         self.assertFalse(obj.dateTakenValid)
         self.assertTrue(before <= obj.dateTaken <= after)
+
+    def test_device_clock_reset_exif_date_is_rejected_falls_back_to_filename(self):
+        # Real bug, found 2026-10-28: a genuine EXIF DateTimeOriginal
+        # field containing "1900:01:01 01:01:01" -- a well-known device-
+        # clock-reset default (confirmed against 2,376 real images, 1,815
+        # from one phone) -- used to be accepted as a real, valid date
+        # just because it parsed successfully, even though it's obviously
+        # not a real digital capture date. Must be rejected the same as
+        # the other garbage-string EXIF cases, falling through to the
+        # filename guess instead.
+        obj = ImageFile(filename='/photos/x/IMG_20200101_120000.jpg')
+        obj.exifDict = {'DateTimeOriginal': '1900:01:01 01:01:01'}
+        obj._get_date_taken()
+        self.assertFalse(obj.dateTakenValid)
+        self.assertEqual(obj.dateTaken.isoformat(), '2020-01-01T12:00:00+00:00')
+
+    def test_filename_guess_also_sets_dateTakenUTC_not_just_dateTaken(self):
+        # Real bug, found 2026-10-28: the filename-fallback branch only
+        # ever set self.dateTaken (a DateTimeField) -- self.dateTakenUTC
+        # (the plain float field Face.dateTakenUTC and other downstream
+        # numeric-date logic actually reads) was silently left at its
+        # stale/default value even when a real date was recovered.
+        obj = ImageFile(filename='/photos/x/IMG_20200101_120000.jpg')
+        obj.exifDict = None
+        obj._get_date_taken()
+        self.assertFalse(obj.dateTakenValid)
+        self.assertEqual(obj.dateTaken.isoformat(), '2020-01-01T12:00:00+00:00')
+        self.assertEqual(obj.dateTakenUTC, obj.dateTaken.timestamp())
 
 
 @override_settings(MEDIA_ROOT="/tmp/filepopulator_test_media")
