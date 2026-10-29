@@ -6873,6 +6873,91 @@ class VideoFaceSetBoxAndThumbnailOrphanTests(TestCase):
         self.assertTrue(os.path.isfile(self.face.face_thumbnail.path))
 
 
+class RedetectConfidenceFallbackTests(unittest.TestCase):
+    """_redetect_in_crop()/_redetect_full_frame_nearest() -- the fix for
+    a real, confirmed bug (2026-10-29, see CLAUDE.md): _redetect_in_crop()
+    used to always return its best candidate, even a low-confidence
+    spurious one on background content, whenever the padded crop (built
+    around a possibly already-wrong upstream box) didn't actually contain
+    the tracked face. Confirmed via a real investigation that the
+    function itself works correctly given a genuinely correct box --
+    the bug was having no way to say "I don't actually know" when given
+    a bad one. Pure math, no Django/DB/video I/O -- object.__new__()
+    skips VideoFaceExtractor.__init__()'s real ONNX model loading, same
+    pattern VideoFaceSetBoxAndThumbnailOrphanTests already established."""
+
+    def setUp(self):
+        from video_face_pipeline import VideoFaceExtractor
+        self.extractor = object.__new__(VideoFaceExtractor)
+        self.frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    @staticmethod
+    def _dets(rows):
+        """rows: list of (l, t, r, b, score). Returns (bboxes, kpss)
+        shaped like insightface's own detector output."""
+        bboxes = np.array([[l, t, r, b, s] for (l, t, r, b, s) in rows], dtype=np.float32)
+        kpss = np.zeros((len(rows), 5, 2), dtype=np.float32)
+        return bboxes, kpss
+
+    def test_confident_crop_candidate_is_still_accepted(self):
+        # Regression: the pre-existing, working case must be unaffected.
+        self.extractor.det10g_model = MagicMock()
+        self.extractor.det10g_model.detect.return_value = self._dets([(5, 5, 40, 40, 0.87)])
+        result = self.extractor._redetect_in_crop(self.frame, (10, 10, 50, 50))
+        self.assertIsNotNone(result)
+        box_out, kps_out, score_out = result
+        self.assertAlmostEqual(score_out, 0.87, places=4)
+
+    def test_low_confidence_crop_candidate_is_rejected(self):
+        # The real bug: a weak, spurious detection in a crop that
+        # doesn't actually contain the face used to be accepted anyway.
+        self.extractor.det10g_model = MagicMock()
+        self.extractor.det10g_model.detect.return_value = self._dets([(5, 5, 40, 40, 0.22)])
+        result = self.extractor._redetect_in_crop(self.frame, (10, 10, 50, 50))
+        self.assertIsNone(result)
+
+    def test_zero_candidates_still_returns_none(self):
+        self.extractor.det10g_model = MagicMock()
+        self.extractor.det10g_model.detect.return_value = (
+            np.zeros((0, 5), dtype=np.float32), np.zeros((0, 5, 2), dtype=np.float32),
+        )
+        result = self.extractor._redetect_in_crop(self.frame, (10, 10, 50, 50))
+        self.assertIsNone(result)
+
+    def test_full_frame_fallback_picks_nearest_confident_candidate_not_just_highest_score(self):
+        # Two people in frame: a far, MORE confident face, and a nearer,
+        # less-but-still-confident one matching where this track's
+        # person actually was. Must pick the nearer one -- picking
+        # highest-confidence overall would silently swap in a different
+        # person's face.
+        self.extractor.det_model = MagicMock()
+        self.extractor.det_model.detect.return_value = self._dets([
+            (400, 400, 440, 440, 0.95),  # far away, very confident -- wrong person
+            (12, 12, 48, 48, 0.6),        # near the original box -- the right person
+        ])
+        result = self.extractor._redetect_full_frame_nearest(self.frame, (10, 10, 50, 50))
+        self.assertIsNotNone(result)
+        box_out, kps_out, score_out = result
+        self.assertAlmostEqual(box_out[0], 12, places=4)
+        self.assertAlmostEqual(score_out, 0.6, places=4)
+
+    def test_full_frame_fallback_ignores_low_confidence_candidates(self):
+        self.extractor.det_model = MagicMock()
+        self.extractor.det_model.detect.return_value = self._dets([
+            (12, 12, 48, 48, 0.3),  # near, but too weak to trust
+        ])
+        result = self.extractor._redetect_full_frame_nearest(self.frame, (10, 10, 50, 50))
+        self.assertIsNone(result)
+
+    def test_full_frame_fallback_returns_none_when_nothing_detected(self):
+        self.extractor.det_model = MagicMock()
+        self.extractor.det_model.detect.return_value = (
+            np.zeros((0, 5), dtype=np.float32), np.zeros((0, 5, 2), dtype=np.float32),
+        )
+        result = self.extractor._redetect_full_frame_nearest(self.frame, (10, 10, 50, 50))
+        self.assertIsNone(result)
+
+
 @tag("slow")
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class VideoFaceExtractorRealInferenceTests(TestCase):
