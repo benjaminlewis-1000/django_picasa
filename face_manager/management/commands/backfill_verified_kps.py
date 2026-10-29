@@ -224,10 +224,17 @@ class Command(BaseCommand):
             # Same "query at the Face level, not via a cross-relation
             # exclude()" discipline as above -- this is an additional
             # AND-restriction (a trigger image that ALSO has a face
-            # declared to one of these people), not a replacement for
-            # the base trigger requirement.
+            # declared OR PROPOSED to one of these people), not a
+            # replacement for the base trigger requirement. Proposed
+            # (poss_ident1) is included alongside declared_name so a
+            # gallery-targeted run also covers the images a person's
+            # own proposed-but-unconfirmed candidates sit on -- those
+            # are exactly the faces a gallery-focused classification
+            # pass cares about reclassifying with the new LVFace-B
+            # encodings, not just the already-confirmed population.
             target_image_ids = Face.objects.filter(
-                declared_name_id__in=person_ids, source_image_file__isnull=False,
+                Q(declared_name_id__in=person_ids) | Q(poss_ident1_id__in=person_ids),
+                source_image_file__isnull=False,
             ).values_list('source_image_file_id', flat=True).distinct()
             base_trigger_filter['source_image_file_id__in'] = target_image_ids
 
