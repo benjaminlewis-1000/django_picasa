@@ -5777,6 +5777,38 @@ class BackfillVerifiedKpsTests(TestCase):
         self.assertIsNotNone(target_face.kps)
         self.assertIsNone(other_face.kps)
 
+    def test_person_ids_filter_also_includes_images_with_a_proposed_match(self):
+        # A gallery-focused run should also pick up images where the
+        # targeted person is only PROPOSED (poss_ident1), not yet
+        # confirmed -- that's exactly the population a reclassification
+        # investigation cares about re-encoding with LVFace-B.
+        other_person = make_person("Not The Target")
+        images = [make_image(f) for f in ("naming/good/1.JPG", "naming/good/2.jpg")]
+        proposed_face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        proposed_face.declared_name = None
+        proposed_face.poss_ident1 = self.person
+        proposed_face.source_image_file = images[0]
+        proposed_face.save()
+        other_face = make_face(
+            images[1], declared_name=other_person,
+            box_left=10, box_top=10, box_right=50, box_bottom=50,
+        )
+        other_face.face_encoding_512 = [0.6] * 512
+        other_face.save()
+
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, [[30.0, 30.0]] * 5, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps', f'--person-ids={self.person.id}')
+
+        proposed_face.refresh_from_db()
+        other_face.refresh_from_db()
+        self.assertIsNotNone(proposed_face.kps)
+        self.assertIsNone(other_face.kps)
+
     def test_person_ids_filter_still_backfills_bystander_faces_on_the_same_image(self):
         # --person-ids only decides WHICH IMAGES get selected -- once an
         # image is selected, detection runs over the WHOLE image
