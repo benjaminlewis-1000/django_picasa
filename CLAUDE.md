@@ -1522,6 +1522,23 @@ session and loads heavy ONNX models per test class already.
 
 `face_manager/test_face_cache.py` caches real `PyramidalDetector` output keyed on `sha256(image bytes) + sha256(pyramidal_detector.py source)`, so repeat runs against an unchanged image with an unchanged detector skip the CPU cost entirely (~4s → ~0.01s per image). Change either the image or the detector's code and the cache key changes automatically.
 
+**`face_manager/tests.py` was split into a `face_manager/tests/` package (2026-10-29)** -- the
+single file had grown to 7328 lines/63 classes and repeated large edits to it that session
+triggered real, reproducible working-tree corruption (hundreds of lines silently lost mid-write,
+3 times in a row, root cause never identified -- see that day's write-up). Split by feature area
+into `test_core_models.py`/`test_face_extraction.py`/`test_classification.py`/`test_lvface.py`/
+`test_video_frame_geometry.py`/`test_video_pipeline.py`/`test_video_tasks.py`/
+`test_backfill_commands.py`, each 200-1600 lines, with shared fixtures (`make_face`/`make_person`/
+`make_image`/`_tiny_jpeg_bytes`/`_embedding`/etc.) in `tests/__init__.py`. Mechanical split only,
+verified lossless (AST-based extraction, exact expected test count match). **A dotted-path
+reference to a face_manager test now needs the submodule name**: `face_manager.tests.
+test_video_pipeline.RedetectConfidenceFallbackTests`, not the old flat `face_manager.tests.
+RedetectConfidenceFallbackTests` -- `manage.py test face_manager` (module-wide, no dotted path)
+is unaffected and still discovers everything in the package automatically.
+`filepopulator/tests.py` (6008 lines) and `api/tests.py` (3942 lines) are the next-largest files
+in the repo and good candidates for the same treatment if they hit the same issue -- not yet
+split as of this writing.
+
 **Bootstrapping a fresh DB from scratch — fixed 2026-08-25** (see "Fixed bugs" for the full writeup): `api/views.py` used to run a module-level query (`Person.objects.filter(person_name='.ignore')[0]`) assuming the `.ignore`/`.realignore`/`_NO_FACE_ASSIGNED_`/etc. `Person` rows already existed, with nothing in the codebase creating them. Now fixed two ways together: the lookups are `SimpleLazyObject`-wrapped (defers the query past import time), and `face_manager/migrations/0003_seed_sentinel_people.py` creates the rows automatically as part of `manage.py migrate`. `ensure_sentinel_people()` in `api/tests.py` still exists as a defensive no-op for tests but is no longer the only thing creating these rows.
 
 **Dev/test infra lives outside this repo entirely**: a separate git worktree at `/home/benjamin/git_repos/django_picasa_dev` on branch `backend_upgrade` (isolated from whatever `picasa_api`/`db_picasa` are running live) with its own `db_picasa_dev`/`task_redis_dev`/`picasa_api_dev_test` Docker containers (plain `docker run` on a dedicated `picasa_test_net` network, not `dockerize_dev`'s compose file — that Dockerfile is stale/broken, missing its own `requirements.txt` and still installing dlib/`face-recognition` instead of insightface). `picasa_api_dev_test` runs from the same `picasa_img:latest` image as production (so dependencies match exactly) with `sleep infinity` as its command — exec into it (`docker exec picasa_api_dev_test bash -c "cd /code && python manage.py test ..."`) rather than expecting it to serve anything. If these containers have been torn down, they're cheap to recreate: fresh `postgres:16-alpine`/`redis:7-alpine` containers, migrate, then seed the sentinel `Person` rows (see `ensure_sentinel_people()` in `api/tests.py` for exactly which ones and why). Real (non-synthetic) fixture data — 500 sampled real photos, the 5 known-corrupted JPEGs pulled from production logs with `NOTES.md`, `.heic` samples, filepopulator's real `test_imgs_filepopulate` — lives under `/mnt/fast_storage/appdata/django_picasa/test_suite/` on the host (used for local/manual runs, especially the `slow`-tagged real-inference tests); separate, small, git-committed *synthetic* equivalents live in `ci_fixtures/` in the repo itself, used only by CI (see below).
