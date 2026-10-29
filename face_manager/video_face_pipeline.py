@@ -766,6 +766,125 @@ def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rot
         container.close()
 
 
+def locate_confident_face_near_timestamp(path, target_seconds, field_order, rotation,
+                                          old_box, det_model, min_score,
+                                          window_seconds=1.5, color_transfer=None,
+                                          sar_scale_width=None):
+    """Remediation helper for a video face whose stored box/kps don't
+    actually bound a real face at its own target_seconds (see
+    audit_video_face_geometry.py / CLAUDE.md's 2026-10-29 write-up) --
+    scans a window of real frames around the target, running a fresh
+    FULL-FRAME detection (det_model, not a crop-restricted search) on
+    each, and returns the first confident candidate whose center lands
+    nearest old_box -- not simply the most confident face anywhere in
+    the window, since another person may also be in frame.
+
+    Unlike extract_frame_near_timestamp() (which finds the frame
+    matching an ALREADY-TRUSTED reference crop), this has no reference
+    to trust -- the whole point is the original box/thumbnail are
+    suspect. Candidates are checked in order of increasing distance
+    from target_seconds (closest first) so a real match at or near the
+    original moment is preferred over a more distant one, with an early
+    exit once a confident match is found (bounds real per-face cost
+    rather than always decoding the full window).
+
+    Returns (frame_bgr, box, kps, det_score, frame_seconds) for the
+    best candidate found, or None if nothing confident turned up
+    anywhere in the window. HDR-tagged sources aren't specially
+    dispatched here (unlike extract_frame_near_timestamp) -- scoped to
+    the common case; an HDR video's frames come out washed-out/wrong-
+    colored via the plain PyAV path, which could itself suppress
+    detection, but this is a deliberate, documented scope limit rather
+    than building a second ffmpeg-subprocess-based window scanner."""
+    container = av.open(path)
+    try:
+        stream = container.streams.video[0]
+        stream.thread_type = 'AUTO'
+        start_seconds = float(
+            (stream.start_time if stream.start_time is not None else 0) * stream.time_base
+        )
+
+        needs_deinterlace = field_order not in ('progressive', 'unknown')
+        needs_sar_fix = sar_scale_width is not None
+        graph = None
+        if needs_deinterlace or needs_sar_fix:
+            graph = av.filter.Graph()
+            buf = graph.add_buffer(template=stream)
+            last = buf
+            if needs_deinterlace:
+                yadif = graph.add('yadif', 'mode=0')
+                last.link_to(yadif)
+                last = yadif
+            if needs_sar_fix:
+                scale = graph.add('scale', f'{sar_scale_width}:ih')
+                last.link_to(scale)
+                setsar = graph.add('setsar', '1')
+                scale.link_to(setsar)
+                last = setsar
+            sink = graph.add('buffersink')
+            last.link_to(sink)
+            graph.configure()
+
+        l, t, r, b = old_box
+        old_cx, old_cy = (l + r) / 2, (t + b) / 2
+
+        candidates = []  # (frame_time, arr)
+        seek_target = max(0.0, target_seconds - window_seconds)
+        container.seek(int(seek_target * av.time_base), backward=True, any_frame=False, stream=None)
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                out_frames = [frame]
+                if graph is not None:
+                    graph.push(frame)
+                    out_frames = []
+                    while True:
+                        try:
+                            out_frames.append(graph.pull())
+                        except Exception:
+                            break
+                for out_frame in out_frames:
+                    pts = out_frame.pts if out_frame.pts is not None else 0
+                    tb = out_frame.time_base if out_frame.time_base is not None else stream.time_base
+                    frame_time = _frame_seconds(pts, tb, start_seconds)
+                    if frame_time > target_seconds + window_seconds:
+                        break
+                    if frame_time < target_seconds - window_seconds:
+                        continue
+                    arr = out_frame.to_ndarray(format='bgr24')
+                    if rotation:
+                        arr = np.rot90(arr, k=round(rotation / 90) % 4)
+                    candidates.append((frame_time, arr))
+            else:
+                continue
+            break
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: abs(c[0] - target_seconds))
+
+        for frame_time, arr in candidates:
+            bboxes, kpss = det_model.detect(arr, max_num=0, metric='default')
+            if bboxes.shape[0] == 0:
+                continue
+            confident = bboxes[:, 4] >= min_score
+            if not confident.any():
+                continue
+            idxs = np.where(confident)[0]
+            centers = np.stack([
+                (bboxes[idxs, 0] + bboxes[idxs, 2]) / 2,
+                (bboxes[idxs, 1] + bboxes[idxs, 3]) / 2,
+            ], axis=1)
+            dists = np.linalg.norm(centers - np.array([old_cx, old_cy]), axis=1)
+            nearest = idxs[int(np.argmin(dists))]
+            return (
+                arr, bboxes[nearest, :4].tolist(), kpss[nearest].tolist(),
+                float(bboxes[nearest, 4]), frame_time,
+            )
+        return None
+    finally:
+        container.close()
+
+
 def sample_stride(fps):
     return max(1, round(fps * (20 / 30.0) / STRIDE_DIVISOR))
 

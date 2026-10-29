@@ -375,6 +375,109 @@ class VideoFaceSetBoxAndThumbnailOrphanTests(TestCase):
         self.assertTrue(os.path.isfile(self.face.face_thumbnail.path))
 
 
+class LocateConfidentFaceNearTimestampTests(unittest.TestCase):
+    """locate_confident_face_near_timestamp() -- the remediation search
+    used by remediate_video_face_geometry.py to find a real fix for a
+    video face whose box/kps don't bound a real face (2026-10-29, see
+    CLAUDE.md). Mocks av.open() and the detector entirely -- this is
+    pure search-logic under test (closest-first ordering, confidence
+    floor, nearest-to-old-box tie-breaking), not real decode/detection."""
+
+    @staticmethod
+    def _mock_frame(seconds, time_base=1):
+        f = MagicMock()
+        f.pts = seconds
+        f.time_base = time_base
+        f.to_ndarray.return_value = np.zeros((100, 100, 3), dtype=np.uint8)
+        return f
+
+    def _mock_container(self, frame_seconds_list):
+        container = MagicMock()
+        stream = MagicMock(start_time=0, time_base=1)
+        container.streams.video = [stream]
+        packet = MagicMock()
+        packet.decode.return_value = [self._mock_frame(s) for s in frame_seconds_list]
+        container.demux.return_value = [packet]
+        return container
+
+    def test_finds_confident_match_closest_to_target_first(self):
+        from video_face_pipeline import locate_confident_face_near_timestamp
+        # Two candidate frames both have a confident detection near the
+        # old box -- the CLOSER one (target+0.1) must win, not whichever
+        # the detector happens to be called on first/last.
+        container = self._mock_container([10.0 - 0.5, 10.0 + 0.1, 10.0 + 0.9])
+        det_model = MagicMock()
+
+        def detect(frame, max_num=0, metric='default'):
+            # Only the two frames nearest target (10.0+0.1 and 10.0-0.5)
+            # have a confident detection; the farthest does not.
+            return (
+                np.array([[40, 40, 60, 60, 0.9]], dtype=np.float32),
+                np.zeros((1, 5, 2), dtype=np.float32),
+            )
+        det_model.detect.side_effect = detect
+
+        with patch('video_face_pipeline.av.open', return_value=container):
+            result = locate_confident_face_near_timestamp(
+                '/fake.mp4', 10.0, 'progressive', 0, (40, 40, 60, 60), det_model, 0.5,
+                window_seconds=1.0,
+            )
+        self.assertIsNotNone(result)
+        frame, box, kps, score, frame_time = result
+        self.assertAlmostEqual(frame_time, 10.1, places=4)
+
+    def test_returns_none_when_nothing_confident_anywhere(self):
+        from video_face_pipeline import locate_confident_face_near_timestamp
+        container = self._mock_container([10.0, 10.0 + 0.3])
+        det_model = MagicMock()
+        det_model.detect.return_value = (
+            np.array([[40, 40, 60, 60, 0.2]], dtype=np.float32),  # below floor
+            np.zeros((1, 5, 2), dtype=np.float32),
+        )
+        with patch('video_face_pipeline.av.open', return_value=container):
+            result = locate_confident_face_near_timestamp(
+                '/fake.mp4', 10.0, 'progressive', 0, (40, 40, 60, 60), det_model, 0.5,
+                window_seconds=1.0,
+            )
+        self.assertIsNone(result)
+
+    def test_picks_nearest_to_old_box_not_highest_score(self):
+        from video_face_pipeline import locate_confident_face_near_timestamp
+        container = self._mock_container([10.0])
+        det_model = MagicMock()
+        # Two confident candidates in the SAME frame: a far, more
+        # confident one, and a nearer, less-but-still-confident one.
+        # Must pick the nearer one.
+        det_model.detect.return_value = (
+            np.array([
+                [400, 400, 440, 440, 0.95],
+                [42, 42, 58, 58, 0.6],
+            ], dtype=np.float32),
+            np.zeros((2, 5, 2), dtype=np.float32),
+        )
+        with patch('video_face_pipeline.av.open', return_value=container):
+            result = locate_confident_face_near_timestamp(
+                '/fake.mp4', 10.0, 'progressive', 0, (40, 40, 60, 60), det_model, 0.5,
+                window_seconds=1.0,
+            )
+        self.assertIsNotNone(result)
+        frame, box, kps, score, frame_time = result
+        self.assertAlmostEqual(box[0], 42, places=4)
+        self.assertAlmostEqual(score, 0.6, places=4)
+
+    def test_no_candidates_in_window_returns_none(self):
+        from video_face_pipeline import locate_confident_face_near_timestamp
+        container = self._mock_container([])
+        det_model = MagicMock()
+        with patch('video_face_pipeline.av.open', return_value=container):
+            result = locate_confident_face_near_timestamp(
+                '/fake.mp4', 10.0, 'progressive', 0, (40, 40, 60, 60), det_model, 0.5,
+                window_seconds=1.0,
+            )
+        self.assertIsNone(result)
+        det_model.detect.assert_not_called()
+
+
 class RedetectConfidenceFallbackTests(unittest.TestCase):
     """_redetect_in_crop()/_redetect_full_frame_nearest() -- the fix for
     a real, confirmed bug (2026-10-29, see CLAUDE.md): _redetect_in_crop()
@@ -566,6 +669,121 @@ class AuditVideoFaceGeometryTests(TestCase):
         output = self._run_with_detections(self._dets([(70, 70, 130, 130, 0.9)]))
         self.assertIn("Checked 0 video face", output)
         self.assertNotIn(str(face.id), output)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class RemediateVideoFaceGeometryTests(TestCase):
+    """remediate_video_face_geometry -- combined triage+fix for video
+    faces whose box/kps don't bound a real face (2026-10-29, see
+    CLAUDE.md). Mocks VideoFaceExtractor (det10g_model.detect for
+    triage, _set_face_box_and_thumbnail/_encode_insightface for the
+    fix) and locate_confident_face_near_timestamp entirely -- this
+    command's own triage/dispatch/save logic is what's under test."""
+
+    CMD_MODULE = 'face_manager.management.commands.remediate_video_face_geometry'
+
+    def _make_video_face(self, **overrides):
+        from filepopulator.models import Directory, VideoFile
+        directory, _ = Directory.objects.get_or_create(dir_path='/videos/remediate_test')
+        video_path = '/tmp/remediate_test_video.mp4'
+        with open(video_path, 'wb') as f:
+            f.write(b'not a real video, existence is all this scan checks')
+        self.addCleanup(lambda: os.path.exists(video_path) and os.remove(video_path))
+        video = VideoFile.objects.create(filename=video_path, directory=directory, width=640, height=480)
+        from face_manager.models import get_default_blank_person
+        face = Face(
+            declared_name=overrides.pop('declared_name', None) or get_default_blank_person(),
+            source_video_file=video,
+            box_left=10, box_top=10, box_right=50, box_bottom=50,
+            video_thumbnail_frame_seconds=overrides.pop('video_thumbnail_frame_seconds', 12.3),
+            kps=[1.0] * 10,
+            **overrides,
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(200, 200))), save=False)
+        face.save()
+        return face
+
+    @staticmethod
+    def _dets(rows):
+        bboxes = np.array([[l, t, r, b, s] for (l, t, r, b, s) in rows], dtype=np.float32) \
+            if rows else np.zeros((0, 5), dtype=np.float32)
+        return bboxes, None
+
+    def test_face_passing_triage_is_skipped_untouched(self):
+        face = self._make_video_face()
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate:
+            MockExtractor.return_value.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        mock_locate.assert_not_called()
+        self.assertIn("1 already fine", out.getvalue())
+        face.refresh_from_db()
+        self.assertEqual(face.box_left, 10)
+
+    def test_face_failing_triage_gets_fixed(self):
+        face = self._make_video_face()
+        fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate:
+            mock_ext = MockExtractor.return_value
+            mock_ext.det10g_model.detect.return_value = self._dets([])  # triage fails
+            mock_locate.return_value = (
+                fake_frame, [20, 20, 80, 80], [[0, 0]] * 5, 0.85, 12.5,
+            )
+            mock_ext._encode_insightface.return_value = np.full(512, 0.3, dtype=np.float32)
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        mock_locate.assert_called_once()
+        mock_ext._set_face_box_and_thumbnail.assert_called_once_with(
+            face, fake_frame, [20, 20, 80, 80], [[0, 0]] * 5, timestamp_seconds=12.5, det_score=0.85,
+        )
+        self.assertIn("1 fixed", out.getvalue())
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.3] * 512)
+
+    def test_unresolved_when_no_confident_match_anywhere(self):
+        face = self._make_video_face()
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp', return_value=None):
+            MockExtractor.return_value.det10g_model.detect.return_value = self._dets([])
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        self.assertIn("1 unresolved", out.getvalue())
+        self.assertIn(str(face.id), out.getvalue())
+        face.refresh_from_db()
+        self.assertEqual(face.box_left, 10)  # untouched
+
+    def test_dry_run_does_not_save(self):
+        face = self._make_video_face()
+        fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate:
+            mock_ext = MockExtractor.return_value
+            mock_ext.det10g_model.detect.return_value = self._dets([])
+            mock_locate.return_value = (fake_frame, [20, 20, 80, 80], [[0, 0]] * 5, 0.85, 12.5)
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', '--dry-run', stdout=out)
+        mock_ext._set_face_box_and_thumbnail.assert_not_called()
+        self.assertIn("1 fixed", out.getvalue())
+        face.refresh_from_db()
+        self.assertEqual(face.box_left, 10)  # untouched despite being counted as "fixed"
+
+    def test_no_stored_timestamp_is_unresolved_without_a_search(self):
+        face = self._make_video_face(video_thumbnail_frame_seconds=None)
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate:
+            MockExtractor.return_value.det10g_model.detect.return_value = self._dets([])
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        mock_locate.assert_not_called()
+        self.assertIn("1 unresolved", out.getvalue())
 
 
 @tag("slow")
