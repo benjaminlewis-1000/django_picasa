@@ -49,6 +49,28 @@
 # window is left completely untouched and reported separately (flagged
 # for later, per the user's explicit call) -- never deleted or guessed
 # at.
+#
+# An "already ok" (triage-passed) face ALSO gets a real video decode
+# now (2026-10-29, per the user's explicit call) -- not the full
+# confident-detection window search the "fixed" path uses (that face's
+# box/kps are already trusted, no redetection needed), but the much
+# cheaper extract_frame_near_timestamp() the on-demand viewer already
+# uses: pixel-matches a small window of real frames against the face's
+# own stored thumbnail (its real ground truth) to recover the exact
+# frame, at a fraction of the fix path's cost. Once recovered, the real
+# frame is run through _redetect_in_crop() around the stored box as a
+# SECOND, independent validation beyond thumbnail-only triage (the
+# thumbnail is itself just a crop of some frame, generated once at
+# extraction time -- re-checking against a freshly-decoded real frame
+# can catch a case thumbnail-only triage wouldn't) -- any disagreement
+# is flagged (ok_frame_check_failed) for follow-up, not auto-"fixed"
+# here, same "flag rather than guess" discipline as unresolved. A face
+# that passes both checks gets LVFace-B computed from the real frame +
+# the (possibly freshly-redetected, more precise) kps, since there's
+# currently no dedicated video-side LVFace backfill at all -- skipped
+# (not overwritten) if the field is already set, since the box/kps
+# here haven't changed and an existing value isn't stale the way a
+# FIXED face's always is.
 
 import signal
 import time
@@ -60,7 +82,10 @@ from django.db.models import Q
 
 import lvface
 from face_manager.models import Face
-from video_face_pipeline import VideoFaceExtractor, ffprobe_info, locate_confident_face_near_timestamp
+from video_face_pipeline import (
+    VideoFaceExtractor, extract_frame_near_timestamp, ffprobe_info,
+    locate_confident_face_near_timestamp,
+)
 
 MIN_SCORE = 0.5
 CENTER_FRACTION = 0.7
@@ -139,12 +164,22 @@ class Command(BaseCommand):
 
         total = 0
         skipped_ok = 0
+        ok_lvface_embedded = 0
+        ok_frame_check_failed = []
         fixed = 0
         lvface_embedded = 0
         unresolved = []
         decode_failed = []
         timed_out = []
         t0 = time.time()
+        ffprobe_cache = {}
+
+        def get_ffprobe(filename):
+            # Many faces share one VideoFile -- avoid re-shelling out to
+            # ffprobe for every single one of them.
+            if filename not in ffprobe_cache:
+                ffprobe_cache[filename] = ffprobe_info(filename)
+            return ffprobe_cache[filename]
 
         for face in qs.iterator(chunk_size=500):
             total += 1
@@ -179,24 +214,71 @@ class Command(BaseCommand):
                             if cx_lo <= bcx <= cx_hi and cy_lo <= bcy <= cy_hi:
                                 ok = True
                                 break
+                    video = face.source_video_file
+                    old_box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
+
                     if ok:
                         skipped_ok += 1
+                        if face.video_thumbnail_frame_seconds is None:
+                            continue
+                        try:
+                            (width, height, avg_fps, probed_field_order, rotation,
+                             color_transfer, sar_scale_width) = get_ffprobe(video.filename)
+                        except Exception:
+                            continue  # no second check/LVFace possible without ffprobe -- not a hard failure
+                        field_order = video.field_order if video.field_order is not None else probed_field_order
+                        try:
+                            real_frame = extract_frame_near_timestamp(
+                                video.filename, face.video_thumbnail_frame_seconds, avg_fps,
+                                field_order, rotation, old_box, thumb,
+                                color_transfer=color_transfer, sar_scale_width=sar_scale_width,
+                            )
+                        except Exception:
+                            continue
+                        if real_frame is None:
+                            continue
+
+                        redet = extractor._redetect_in_crop(real_frame, old_box)
+                        if redet is None:
+                            ok_frame_check_failed.append(face.id)
+                            continue
+                        confirmed_box, confirmed_kps, confirmed_score = redet
+
+                        if lvface_sizes:
+                            any_lvface = False
+                            for size in lvface_sizes:
+                                field = f'face_encoding_lvface_{size.lower()}'
+                                if getattr(face, field) is not None:
+                                    continue
+                                try:
+                                    emb = lvface.embed_from_image_array(
+                                        real_frame, confirmed_kps, input_is_bgr=True, size=size,
+                                    )
+                                except Exception as e:
+                                    self.stdout.write(f"  LVFace-{size} failed for face {face.id}: {e}")
+                                    continue
+                                if emb is None:
+                                    continue
+                                if not dry_run:
+                                    setattr(face, field, emb.tolist())
+                                any_lvface = True
+                            if any_lvface:
+                                ok_lvface_embedded += 1
+                                if not dry_run:
+                                    face.save()
                         continue
 
                     # Triage failed -- attempt a real fix.
-                    video = face.source_video_file
                     if face.video_thumbnail_frame_seconds is None:
                         unresolved.append((face.id, 'no stored timestamp to search around'))
                         continue
                     try:
-                        width, height, avg_fps, probed_field_order, rotation, color_transfer, sar_scale_width = (
-                            ffprobe_info(video.filename)
-                        )
+                        (width, height, avg_fps, probed_field_order, rotation,
+                         color_transfer, sar_scale_width) = get_ffprobe(video.filename)
                     except Exception as e:
                         decode_failed.append((face.id, f'ffprobe failed: {e}'))
                         continue
                     field_order = video.field_order if video.field_order is not None else probed_field_order
-                    old_box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
 
                     try:
                         result = locate_confident_face_near_timestamp(
@@ -253,7 +335,8 @@ class Command(BaseCommand):
             if total % 100 == 0:
                 elapsed = time.time() - t0
                 self.stdout.write(
-                    f"  ...{total} checked ({total/elapsed:.2f}/s), {skipped_ok} already ok, "
+                    f"  ...{total} checked ({total/elapsed:.2f}/s), {skipped_ok} already ok "
+                    f"({ok_lvface_embedded} w/ LVFace, {len(ok_frame_check_failed)} frame-check-failed), "
                     f"{fixed} fixed ({lvface_embedded} w/ LVFace), {len(unresolved)} unresolved, "
                     f"{len(decode_failed)} decode-failed, {len(timed_out)} timed out"
                 )
@@ -261,12 +344,20 @@ class Command(BaseCommand):
         elapsed = time.time() - t0
         self.stdout.write(
             f"\nChecked {total} video face(s) in {elapsed:.0f}s{' (dry run)' if dry_run else ''}.\n"
-            f"  {skipped_ok} already fine, no action needed.\n"
+            f"  {skipped_ok} already fine ({ok_lvface_embedded} also got LVFace embeddings; "
+            f"{len(ok_frame_check_failed)} disagreed on a second, real-frame check -- flagged below).\n"
             f"  {fixed} fixed via a confident nearby detection ({lvface_embedded} also got LVFace embeddings).\n"
             f"  {len(unresolved)} unresolved -- no confident detection anywhere nearby, left untouched.\n"
             f"  {len(decode_failed)} decode/ffprobe failures.\n"
             f"  {len(timed_out)} timed out (>{PER_FACE_TIMEOUT_SECONDS}s) -- left untouched, safe to retry later."
         )
+        if ok_frame_check_failed:
+            self.stdout.write(
+                f"\nFaces that passed thumbnail triage but failed the real-frame second check "
+                f"(first 50), flagged for later -- never auto-touched:"
+            )
+            for fid in ok_frame_check_failed[:50]:
+                self.stdout.write(f"  {fid}")
         if unresolved:
             self.stdout.write("\nUnresolved face ids (first 50), flagged for later:")
             for fid, reason in unresolved[:50]:

@@ -721,6 +721,121 @@ class RemediateVideoFaceGeometryTests(TestCase):
         face.refresh_from_db()
         self.assertEqual(face.box_left, 10)
 
+    def test_ok_face_gets_second_check_and_lvface_from_real_frame(self):
+        """A triage-passed face now also gets a real (cheap) frame decode
+        -- a second, independent validation via _redetect_in_crop against
+        the real frame, and LVFace-B from the real frame + confirmed kps,
+        per the user's explicit request (2026-10-29)."""
+        face = self._make_video_face()
+        real_frame = np.ones((480, 640, 3), dtype=np.uint8) * 7
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=real_frame) as mock_extract, \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate, \
+             patch(f'{self.CMD_MODULE}.lvface') as mock_lvface:
+            mock_ext = MockExtractor.return_value
+            mock_ext.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])  # triage passes
+            mock_ext._redetect_in_crop.return_value = ([12, 12, 48, 48], [[1, 1]] * 5, 0.88)
+            mock_lvface.embed_from_image_array.return_value = np.full(512, 0.6, dtype=np.float32)
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        mock_locate.assert_not_called()
+        mock_extract.assert_called_once()
+        mock_ext._redetect_in_crop.assert_called_once_with(real_frame, (10, 10, 50, 50))
+        mock_lvface.embed_from_image_array.assert_called_once_with(
+            real_frame, [[1, 1]] * 5, input_is_bgr=True, size='B',
+        )
+        self.assertIn("1 already fine (1 also got LVFace embeddings", out.getvalue())
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_b, [0.6] * 512)
+        self.assertEqual(face.box_left, 10)  # box/kps genuinely unchanged, only LVFace was added
+
+    def test_ok_face_flagged_when_real_frame_check_disagrees(self):
+        """Triage passed on the stored thumbnail, but a real frame decode
+        finds nothing confident near the stored box -- flagged, not
+        auto-fixed, same discipline as 'unresolved'."""
+        face = self._make_video_face()
+        real_frame = np.ones((480, 640, 3), dtype=np.uint8) * 7
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=real_frame), \
+             patch(f'{self.CMD_MODULE}.lvface') as mock_lvface:
+            mock_ext = MockExtractor.return_value
+            mock_ext.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
+            mock_ext._redetect_in_crop.return_value = None
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        mock_lvface.embed_from_image_array.assert_not_called()
+        self.assertIn("1 disagreed on a second, real-frame check", out.getvalue())
+        self.assertIn(str(face.id), out.getvalue())
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    def test_ok_face_lvface_skipped_if_already_set(self):
+        """Unlike a FIXED face (kps changed, always overwritten), an OK
+        face's box/kps haven't changed -- an existing LVFace value isn't
+        stale, so it's left alone rather than recomputed."""
+        face = self._make_video_face(face_encoding_lvface_b=[0.9] * 512)
+        real_frame = np.ones((480, 640, 3), dtype=np.uint8) * 7
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=real_frame), \
+             patch(f'{self.CMD_MODULE}.lvface') as mock_lvface:
+            mock_ext = MockExtractor.return_value
+            mock_ext.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
+            mock_ext._redetect_in_crop.return_value = ([12, 12, 48, 48], [[1, 1]] * 5, 0.88)
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        mock_lvface.embed_from_image_array.assert_not_called()
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_b, [0.9] * 512)
+
+    def test_ok_face_dry_run_does_not_save_lvface(self):
+        face = self._make_video_face()
+        real_frame = np.ones((480, 640, 3), dtype=np.uint8) * 7
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=real_frame), \
+             patch(f'{self.CMD_MODULE}.lvface') as mock_lvface:
+            mock_ext = MockExtractor.return_value
+            mock_ext.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
+            mock_ext._redetect_in_crop.return_value = ([12, 12, 48, 48], [[1, 1]] * 5, 0.88)
+            mock_lvface.embed_from_image_array.return_value = np.full(512, 0.6, dtype=np.float32)
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', '--dry-run', stdout=out)
+        self.assertIn("1 also got LVFace embeddings", out.getvalue())
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    def test_ffprobe_cached_across_faces_sharing_one_video(self):
+        """Many faces on the same VideoFile shouldn't each shell out to
+        ffprobe separately."""
+        face1 = self._make_video_face()
+        video = face1.source_video_file
+        face2 = Face(
+            declared_name=face1.declared_name, source_video_file=video,
+            box_left=10, box_top=10, box_right=50, box_bottom=50,
+            video_thumbnail_frame_seconds=20.0, kps=[1.0] * 10,
+        )
+        face2.face_thumbnail.save("thumb2.jpg", ContentFile(_tiny_jpeg_bytes(size=(200, 200))), save=False)
+        face2.save()
+        real_frame = np.ones((480, 640, 3), dtype=np.uint8) * 7
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, None, None)) as mock_ffprobe, \
+             patch(f'{self.CMD_MODULE}.extract_frame_near_timestamp', return_value=real_frame), \
+             patch(f'{self.CMD_MODULE}.lvface') as mock_lvface:
+            mock_ext = MockExtractor.return_value
+            mock_ext.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
+            mock_ext._redetect_in_crop.return_value = ([12, 12, 48, 48], [[1, 1]] * 5, 0.88)
+            mock_lvface.embed_from_image_array.return_value = np.full(512, 0.6, dtype=np.float32)
+            call_command('remediate_video_face_geometry', stdout=io.StringIO())
+        mock_ffprobe.assert_called_once_with(video.filename)
+
     def test_face_failing_triage_gets_fixed(self):
         face = self._make_video_face()
         fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
