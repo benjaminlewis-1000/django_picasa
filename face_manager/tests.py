@@ -6958,6 +6958,114 @@ class RedetectConfidenceFallbackTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class AuditVideoFaceGeometryTests(TestCase):
+    """audit_video_face_geometry -- read-only scan for video faces whose
+    box/kps don't actually bound a real, centered face in their own
+    saved thumbnail (the real bug found 2026-10-29, see CLAUDE.md).
+    Mocks the FaceAnalysis detector entirely; real model loading is
+    expensive and this command's own logic (confidence + centeredness
+    check) is what's under test, not detection accuracy itself."""
+
+    CMD_MODULE = 'face_manager.management.commands.audit_video_face_geometry'
+
+    def _make_video_face(self, **overrides):
+        from filepopulator.models import Directory, VideoFile
+        directory, _ = Directory.objects.get_or_create(dir_path='/videos/geometry_audit_test')
+        video_path = '/tmp/geometry_audit_test_video.mp4'
+        with open(video_path, 'wb') as f:
+            f.write(b'not a real video, existence is all this scan checks')
+        self.addCleanup(lambda: os.path.exists(video_path) and os.remove(video_path))
+        video = VideoFile.objects.create(filename=video_path, directory=directory, width=640, height=480)
+        from face_manager.models import get_default_blank_person
+        face = Face(
+            declared_name=overrides.pop('declared_name', None) or get_default_blank_person(),
+            poss_ident1=overrides.pop('poss_ident1', None),
+            source_video_file=video,
+            box_left=1, box_top=1, box_right=10, box_bottom=10,
+            video_thumbnail_frame_seconds=12.3,
+            kps=[1.0] * 10,
+            **overrides,
+        )
+        face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(200, 200))), save=False)
+        face.save()
+        return face
+
+    @staticmethod
+    def _dets(rows):
+        """rows: list of (l, t, r, b, score)."""
+        bboxes = np.array([[l, t, r, b, s] for (l, t, r, b, s) in rows], dtype=np.float32) \
+            if rows else np.zeros((0, 5), dtype=np.float32)
+        return bboxes, None
+
+    def _run_with_detections(self, bboxes_and_kpss, *extra_args):
+        with patch(f'{self.CMD_MODULE}.FaceAnalysis') as MockFA:
+            mock_det_model = MagicMock()
+            mock_det_model.detect.return_value = bboxes_and_kpss
+            MockFA.return_value.models = {'detection': mock_det_model}
+            out = io.StringIO()
+            call_command('audit_video_face_geometry', *extra_args, stdout=out)
+        return out.getvalue()
+
+    def test_confident_centered_detection_is_not_flagged(self):
+        face = self._make_video_face()
+        output = self._run_with_detections(self._dets([(70, 70, 130, 130, 0.9)]))
+        self.assertIn("0 flagged", output)
+        self.assertNotIn(str(face.id), output)
+
+    def test_no_detection_at_all_is_flagged(self):
+        face = self._make_video_face()
+        output = self._run_with_detections(self._dets([]))
+        self.assertIn("1 flagged", output)
+        self.assertIn(f"{face.id}: no detection in thumbnail at all", output)
+
+    def test_low_confidence_detection_is_flagged(self):
+        face = self._make_video_face()
+        output = self._run_with_detections(self._dets([(70, 70, 130, 130, 0.3)]))
+        self.assertIn("1 flagged", output)
+        self.assertIn(f"{face.id}:", output)
+        self.assertIn("no confident detection", output)
+
+    def test_confident_but_off_center_detection_is_flagged(self):
+        face = self._make_video_face()
+        output = self._run_with_detections(self._dets([(5, 5, 20, 20, 0.9)]))
+        self.assertIn("1 flagged", output)
+        self.assertIn(f"{face.id}: confident detection found, but off-center", output)
+
+    def test_limit_restricts_scope(self):
+        self._make_video_face()
+        self._make_video_face()
+        with patch(f'{self.CMD_MODULE}.FaceAnalysis') as MockFA:
+            mock_det_model = MagicMock()
+            mock_det_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
+            MockFA.return_value.models = {'detection': mock_det_model}
+            out = io.StringIO()
+            call_command('audit_video_face_geometry', '--limit', '1', stdout=out)
+        self.assertIn("Checked 1 video face", out.getvalue())
+
+    def test_person_ids_restricts_to_declared_or_proposed(self):
+        target_person = make_person("Geometry Audit Target")
+        other_person = make_person("Geometry Audit Other")
+        target_face = self._make_video_face(declared_name=target_person)
+        self._make_video_face(declared_name=other_person)
+        with patch(f'{self.CMD_MODULE}.FaceAnalysis') as MockFA:
+            mock_det_model = MagicMock()
+            mock_det_model.detect.return_value = self._dets([])
+            MockFA.return_value.models = {'detection': mock_det_model}
+            out = io.StringIO()
+            call_command('audit_video_face_geometry', f'--person-ids={target_person.id}', stdout=out)
+        output = out.getvalue()
+        self.assertIn("Checked 1 video face", output)
+        self.assertIn(str(target_face.id), output)
+
+    def test_missing_thumbnail_is_flagged_not_crashed(self):
+        face = self._make_video_face()
+        Face.objects.filter(pk=face.pk).update(face_thumbnail='')
+        output = self._run_with_detections(self._dets([(70, 70, 130, 130, 0.9)]))
+        self.assertIn("Checked 0 video face", output)
+        self.assertNotIn(str(face.id), output)
+
+
 @tag("slow")
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class VideoFaceExtractorRealInferenceTests(TestCase):
