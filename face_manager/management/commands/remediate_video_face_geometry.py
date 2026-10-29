@@ -26,10 +26,24 @@
 # whatever multi-frame trimmed-centroid value was there before) --
 # simpler and more trustworthy than trying to reconstruct the original
 # multi-frame average, which isn't stored anywhere besides the final
-# centroid. A face still carrying face_encoding_lvface_b/s/l before this
-# fix will naturally fall out of that population (since kps changed) and
-# get picked up again by the existing, separate LVFace backfill --
-# not re-encoded here, out of scope for a geometry fix.
+# centroid.
+#
+# LVFace-B (--lvface-sizes default) is ALSO (re)computed for a fixed
+# face, same as face_encoding_512 -- the frame is already decoded and
+# new_kps already known at that point, so this is just 1 more small ONNX
+# call, not a second expensive decode. B-only by default to match the
+# image-side gallery backfill (backfill_verified_kps --lvface-sizes=B)
+# this is complementing -- S/L are available via --lvface-sizes but
+# aren't the size actually used for real comparisons. This is
+# opportunistic, not a general video LVFace backfill: an "already ok"
+# (triage-passed) face gets no new decode here at all, so its existing
+# LVFace value (if any) is left alone untouched, stale or not -- there
+# is currently no dedicated video-side LVFace backfill command (the
+# existing backfill_verified_kps/backfill_lvface_targeted/
+# backfill_lvface_parallel commands are all image-only,
+# source_image_file__isnull=False). Any stale LVFace value on a FIXED
+# face is always overwritten here (never skipped), since its kps just
+# changed and the old value is now definitely wrong.
 #
 # A face where NO confident detection turns up anywhere in the search
 # window is left completely untouched and reported separately (flagged
@@ -44,6 +58,7 @@ import numpy as np
 from django.core.management.base import BaseCommand
 from django.db.models import Q
 
+import lvface
 from face_manager.models import Face
 from video_face_pipeline import VideoFaceExtractor, ffprobe_info, locate_confident_face_near_timestamp
 
@@ -85,6 +100,14 @@ class Command(BaseCommand):
         parser.add_argument('--person-ids', type=str, default=None,
                              help='Comma-separated Person ids -- restrict to faces declared '
                                   'or proposed to these people.')
+        parser.add_argument('--lvface-sizes', type=str, default='B',
+                             help='Comma-separated LVFace sizes to (re)compute for a fixed '
+                                  'face, using the frame/kps already decoded for the fix. '
+                                  'Default is B only, matching the image-side gallery '
+                                  'backfill (backfill_verified_kps) this is complementing -- '
+                                  "no reason to pay for S/L on the video side when they "
+                                  "aren't the size actually in use for comparisons. Empty "
+                                  'string disables LVFace embedding entirely.')
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
@@ -92,6 +115,7 @@ class Command(BaseCommand):
         person_ids = None
         if options['person_ids']:
             person_ids = [int(s.strip()) for s in options['person_ids'].split(',') if s.strip()]
+        lvface_sizes = [s.strip().upper() for s in options['lvface_sizes'].split(',') if s.strip()]
 
         qs = Face.objects.filter(source_video_file__isnull=False).exclude(face_thumbnail='') \
             .select_related('source_video_file')
@@ -116,6 +140,7 @@ class Command(BaseCommand):
         total = 0
         skipped_ok = 0
         fixed = 0
+        lvface_embedded = 0
         unresolved = []
         decode_failed = []
         timed_out = []
@@ -195,6 +220,28 @@ class Command(BaseCommand):
                         )
                         new_embedding = extractor._encode_insightface(frame, new_kps)
                         face.face_encoding_512 = new_embedding.tolist()
+                        # frame/new_kps are already decoded for the fix above --
+                        # computing LVFace here too is ~free (1 more small ONNX
+                        # call per size) vs. a second expensive decode later via
+                        # a dedicated backfill (which doesn't exist for video
+                        # faces anyway). Always overwrite: kps just changed, so
+                        # any existing LVFace value is now stale.
+                        any_lvface = False
+                        for size in lvface_sizes:
+                            field = f'face_encoding_lvface_{size.lower()}'
+                            try:
+                                emb = lvface.embed_from_image_array(
+                                    frame, new_kps, input_is_bgr=True, size=size,
+                                )
+                            except Exception as e:
+                                self.stdout.write(f"  LVFace-{size} failed for face {face.id}: {e}")
+                                continue
+                            if emb is None:
+                                continue
+                            setattr(face, field, emb.tolist())
+                            any_lvface = True
+                        if any_lvface:
+                            lvface_embedded += 1
                         face.save()
                 finally:
                     signal.alarm(0)
@@ -207,15 +254,15 @@ class Command(BaseCommand):
                 elapsed = time.time() - t0
                 self.stdout.write(
                     f"  ...{total} checked ({total/elapsed:.2f}/s), {skipped_ok} already ok, "
-                    f"{fixed} fixed, {len(unresolved)} unresolved, {len(decode_failed)} decode-failed, "
-                    f"{len(timed_out)} timed out"
+                    f"{fixed} fixed ({lvface_embedded} w/ LVFace), {len(unresolved)} unresolved, "
+                    f"{len(decode_failed)} decode-failed, {len(timed_out)} timed out"
                 )
 
         elapsed = time.time() - t0
         self.stdout.write(
             f"\nChecked {total} video face(s) in {elapsed:.0f}s{' (dry run)' if dry_run else ''}.\n"
             f"  {skipped_ok} already fine, no action needed.\n"
-            f"  {fixed} fixed via a confident nearby detection.\n"
+            f"  {fixed} fixed via a confident nearby detection ({lvface_embedded} also got LVFace embeddings).\n"
             f"  {len(unresolved)} unresolved -- no confident detection anywhere nearby, left untouched.\n"
             f"  {len(decode_failed)} decode/ffprobe failures.\n"
             f"  {len(timed_out)} timed out (>{PER_FACE_TIMEOUT_SECONDS}s) -- left untouched, safe to retry later."
