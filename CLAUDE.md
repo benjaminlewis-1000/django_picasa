@@ -4682,3 +4682,82 @@ content (the merge conflict `git merge` reported was purely a merge-base bookkee
 this project's dual-branch-parity workflow, not a real divergence), and that master's separate,
 unrelated uncommitted local changes (`api/views.py`, `scratch_reclassify_magnets.py`) were left
 untouched throughout.
+
+## IN PROGRESS (2026-10-29): video-face geometry bug found, fixed going forward, remediation underway
+
+Real investigation, triggered by validating the kps-wipe restore (see the "video-face kps wiped"
+incident elsewhere in this session's history -- Monday 10/26 one-off, restored from the 2026-10-25
+backup for 52,286 of 52,549 wiped faces). While verifying re-encode consistency, found a small but
+real population of video faces whose box/kps don't actually bound a real face at all (confirmed
+visually: a correctly-matching stored thumbnail showing mostly blank wall, not a face).
+
+**Root cause, confirmed via direct testing**: `_redetect_in_crop()` (video_face_pipeline.py) always
+returned its single best candidate from a padded crop around the track's existing box, even a
+low-confidence spurious one on background content, whenever that crop (built around a possibly-
+already-wrong upstream box) didn't actually contain the tracked face -- no confidence floor existed
+to tell "found the real face" apart from "found nothing real here." Feeding the function a
+genuinely correct box for a known-bad face reproduced a clean, confident result, proving the
+function itself works -- the bug was having no way to say "I don't actually know."
+
+**Fixed going forward** (commit `499d33b`): `REDETECT_MIN_SCORE=0.5` floor on `_redetect_in_crop()`,
+plus a new `_redetect_full_frame_nearest()` fallback that re-searches the WHOLE frame (not the
+possibly-wrong crop) and picks whichever confident candidate is nearest the original box -- not
+simply the most confident face in frame, since another person may be present.
+
+**Scope quantified via `audit_video_face_geometry`** (commit `286f3b5`, read-only, runs detection
+directly on each face's saved thumbnail -- no video decode needed): ~16.6% of video faces flagged
+(5000 checked, 816 flagged) -- higher than an early small-sample estimate (~3%) suggested, so the
+real scope is meaningfully broader than first thought.
+
+**Remediation**: `remediate_video_face_geometry` (commits `6c3dff4`, `61f1a6b`) combines triage+fix
+in one pass -- for a flagged face, `locate_confident_face_near_timestamp()` (new function,
+video_face_pipeline.py) searches a window of real frames around the face's own stored timestamp
+(closest first, using the lightweight det_model for the broad search -- det10g proved too slow for
+the many-frame scan an unresolved case requires) for a confident, correctly-positioned detection.
+If found: box/kps/det_score/thumbnail/timestamp updated AND face_encoding_512 recomputed from that
+one now-confirmed-good frame directly (per the user's explicit call -- simpler than reconstructing
+the original multi-frame trimmed-centroid average, which isn't stored anywhere). If nothing
+confident turns up anywhere in the window: left completely untouched and reported, never guessed
+at or deleted (per the user's explicit call -- "flag for later"). Has a PER_FACE_TIMEOUT_SECONDS=60
+SIGALRM safety net (this project's own established pattern, given its repeated real history of
+video/image decode hangs under contention) -- added after an early dry-run attempt sat for 13+
+minutes with zero progress and no way to tell slow-from-contention apart from genuinely stuck.
+
+**Status at this note**: validated directly against the two originally-found bad faces (1096339,
+1114323) -- both resolve cleanly to confident, correctly-centered crops. A 200-face dry-run is
+in progress to confirm real-world throughput before committing to the full ~8,750-face-estimated
+population (16.6% x ~52.7k). The user also had me reduce the concurrently-running gallery-targeted
+`backfill_verified_kps` from 3 shards to 2 (`--total-shards=2`, re-sharded cleanly, no coverage gap)
+to free CPU for this work. **Next step when resuming**: check the dry-run's real throughput/
+fixed-unresolved-timeout breakdown, then launch the real (non-dry-run) run against the full
+population if throughput is workable.
+
+## Real incident (2026-10-29): this session's own working directory had silently diverged from the
+real backend_upgrade branch tip, losing visibility into substantial already-merged work
+
+While attempting to merge a routine test-file-split branch into master, a conflict on `api/tests.py`
+revealed that `django_picasa_dev`'s working directory (used as "the" backend_upgrade checkout for
+the back half of this very long session) had been checked out to a stale commit (`499d33b`) for an
+unknown reason, while the REAL `backend_upgrade` branch tip (same shared git repo -- `django_picasa`
+and `django_picasa_dev` are git worktrees, not separate clones) had moved far ahead via substantial
+earlier work from this same session (throttle fixes, an LVFace backfill supervisor with memory/
+sharding tuning, etc. -- confirmed via matching Claude-Session ids on the master-side commits, not
+another concurrent agent). Everything built in the resumed portion of this session (today's
+redetect fix, audit/remediation commands, 3 test-file splits) was therefore sitting on a divergent
+branch missing that earlier work, not extending it.
+
+**Resolved cleanly, nothing lost**: merged master's current state into `backend_upgrade`
+(`d60f9d1`), resolved the one real conflict (`api/tests.py`, both sides had added content -- took
+master's full content and redid the test-file split against the correct, complete source), verified
+with a full combined test run (892 tests, only the already-known-flaky test failing), then merged
+back into master cleanly.
+
+**Lesson for future sessions working in this environment**: when resuming a long-running session
+(especially across a context-compaction boundary), don't assume a working directory's current HEAD
+is the real, current tip of its branch just because it was correct earlier in the same session --
+verify (`git log -1 <branch>` vs the working directory's own HEAD) before building on it,
+especially before a merge into master. A merge conflict is the actual safety net here (it's what
+caught this) -- the real risk is a conflict that LOOKS clean (auto-resolves with no visible warning)
+when one side is simply missing content the other has, which is exactly what almost happened with
+`face_manager/tests.py`'s own merge here (it went through silently; only a closer audit confirmed
+the content was already identical between both sides, not that it got silently lost).
