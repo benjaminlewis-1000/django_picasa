@@ -727,13 +727,15 @@ class RemediateVideoFaceGeometryTests(TestCase):
         with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
              patch(f'{self.CMD_MODULE}.ffprobe_info',
                    return_value=(640, 480, 30.0, 'progressive', 0, None, None)), \
-             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate:
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate, \
+             patch(f'{self.CMD_MODULE}.lvface') as mock_lvface:
             mock_ext = MockExtractor.return_value
             mock_ext.det10g_model.detect.return_value = self._dets([])  # triage fails
             mock_locate.return_value = (
                 fake_frame, [20, 20, 80, 80], [[0, 0]] * 5, 0.85, 12.5,
             )
             mock_ext._encode_insightface.return_value = np.full(512, 0.3, dtype=np.float32)
+            mock_lvface.embed_from_image_array.return_value = np.full(512, 0.4, dtype=np.float32)
             out = io.StringIO()
             call_command('remediate_video_face_geometry', stdout=out)
         mock_locate.assert_called_once()
@@ -743,6 +745,62 @@ class RemediateVideoFaceGeometryTests(TestCase):
         self.assertIn("1 fixed", out.getvalue())
         face.refresh_from_db()
         self.assertEqual(face.face_encoding_512, [0.3] * 512)
+
+    def test_fixed_face_also_gets_lvface_embeddings_from_the_same_frame(self):
+        """The frame/kps are already decoded for the geometry fix -- LVFace-
+        B is (re)computed from that same frame by default, not left for a
+        separate (nonexistent, for video) backfill. --lvface-sizes can
+        widen this to S/L too, exercised here explicitly."""
+        face = self._make_video_face()
+        fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate, \
+             patch(f'{self.CMD_MODULE}.lvface') as mock_lvface:
+            mock_ext = MockExtractor.return_value
+            mock_ext.det10g_model.detect.return_value = self._dets([])
+            mock_locate.return_value = (fake_frame, [20, 20, 80, 80], [[0, 0]] * 5, 0.85, 12.5)
+            mock_ext._encode_insightface.return_value = np.full(512, 0.3, dtype=np.float32)
+            mock_lvface.embed_from_image_array.side_effect = (
+                lambda frame, kps, input_is_bgr, size: np.full(512, {'S': 0.1, 'B': 0.2, 'L': 0.3}[size],
+                                                                 dtype=np.float32)
+            )
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', '--lvface-sizes=S,B,L', stdout=out)
+        self.assertEqual(mock_lvface.embed_from_image_array.call_count, 3)
+        for call in mock_lvface.embed_from_image_array.call_args_list:
+            args, kwargs = call
+            self.assertIs(args[0], fake_frame)
+            self.assertEqual(args[1], [[0, 0]] * 5)
+            self.assertTrue(kwargs['input_is_bgr'])
+        self.assertIn("1 also got LVFace embeddings", out.getvalue())
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_s, [0.1] * 512)
+        self.assertEqual(face.face_encoding_lvface_b, [0.2] * 512)
+        self.assertEqual(face.face_encoding_lvface_l, [0.3] * 512)
+
+    def test_lvface_sizes_can_be_restricted_via_flag(self):
+        face = self._make_video_face()
+        fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate, \
+             patch(f'{self.CMD_MODULE}.lvface') as mock_lvface:
+            mock_ext = MockExtractor.return_value
+            mock_ext.det10g_model.detect.return_value = self._dets([])
+            mock_locate.return_value = (fake_frame, [20, 20, 80, 80], [[0, 0]] * 5, 0.85, 12.5)
+            mock_ext._encode_insightface.return_value = np.full(512, 0.3, dtype=np.float32)
+            mock_lvface.embed_from_image_array.return_value = np.full(512, 0.2, dtype=np.float32)
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', '--lvface-sizes=B', stdout=out)
+        mock_lvface.embed_from_image_array.assert_called_once()
+        self.assertEqual(mock_lvface.embed_from_image_array.call_args.kwargs['size'], 'B')
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_b, [0.2] * 512)
+        self.assertIsNone(face.face_encoding_lvface_s)
+        self.assertIsNone(face.face_encoding_lvface_l)
 
     def test_unresolved_when_no_confident_match_anywhere(self):
         face = self._make_video_face()
