@@ -89,6 +89,22 @@ MIN_TRACK_LEN_SAMPLES = 3
 # produce a usable embedding anyway.
 ABSURD_SINGLETON_TRACK_COUNT = 150
 REDETECT_PAD_PCT = 0.6
+# Minimum confidence a crop-restricted redetect's own best candidate must
+# clear before being trusted -- matches the ~0.5 floor insightface's own
+# detector already applies internally elsewhere in this codebase (e.g.
+# backfill_det_score's finding that zero faces in the whole database have
+# det_score < 0.5). Without this, _redetect_in_crop() had no way to
+# distinguish "found the real face, just not very confidently" from
+# "found nothing real in this crop, picking the least-bad noise" -- it
+# always returned SOME candidate, even a spurious one on background
+# content, whenever the padded crop (built from a possibly already-wrong
+# upstream box) didn't actually contain the tracked person. Confirmed via
+# a real investigation (2026-10-29, see CLAUDE.md): feeding
+# _redetect_in_crop() the CORRECT box for a known-bad face reproduced a
+# clean, confident result, proving the function itself isn't broken --
+# the bug is that it had no way to say "I don't actually know" when given
+# a bad starting point.
+REDETECT_MIN_SCORE = 0.5
 FACENET_INPUT_SIZE = 160
 # Cap on how many bytes of full decoded frames _detect_and_track will
 # opportunistically retain per video (see its own docstring/comment) --
@@ -826,7 +842,7 @@ class VideoFaceExtractor(object):
             emb = self.facenet_model(tensor)
         return emb.squeeze(0).numpy()
 
-    def _redetect_in_crop(self, frame, box, pad_pct=REDETECT_PAD_PCT):
+    def _redetect_in_crop(self, frame, box, pad_pct=REDETECT_PAD_PCT, min_score=REDETECT_MIN_SCORE):
         l, t, r, b = box
         w, h = r - l, b - t
         l2 = max(0, int(l - w * pad_pct))
@@ -840,10 +856,50 @@ class VideoFaceExtractor(object):
         if bboxes.shape[0] == 0:
             return None
         best = int(np.argmax(bboxes[:, 4]))
+        score_out = float(bboxes[best, 4])
+        if score_out < min_score:
+            # The padded crop (built around `box`, which may itself
+            # already be wrong -- see REDETECT_MIN_SCORE's own comment)
+            # didn't actually contain a real face confidently enough to
+            # trust. Returning None here (instead of this low-confidence
+            # candidate) lets the caller fall back to a full-frame
+            # re-search rather than silently accepting background noise
+            # as if it were a real detection.
+            return None
         box_out = [bboxes[best, 0] + l2, bboxes[best, 1] + t2,
                    bboxes[best, 2] + l2, bboxes[best, 3] + t2]
         kps_out = (kpss[best] + np.array([l2, t2])).tolist()
-        score_out = float(bboxes[best, 4])
+        return box_out, kps_out, score_out
+
+    def _redetect_full_frame_nearest(self, frame, box, min_score=REDETECT_MIN_SCORE):
+        """Fallback for when _redetect_in_crop() comes back empty-handed
+        -- rather than trusting `box` as-is (the crop-redetect's own
+        failure is itself evidence `box` might already be wrong, not
+        just imprecise -- see REDETECT_MIN_SCORE), re-runs the lightweight
+        detector across the WHOLE frame (fresh, full-image search, not
+        restricted to any possibly-already-wrong region) and picks
+        whichever CONFIDENT candidate is spatially closest to `box` --
+        not simply the single highest-confidence face in the frame,
+        since another person may also be in frame and more prominent.
+        Returns None if nothing in the frame clears min_score at all."""
+        bboxes, kpss = self.det_model.detect(frame, max_num=0, metric='default')
+        if bboxes.shape[0] == 0:
+            return None
+        confident = bboxes[:, 4] >= min_score
+        if not confident.any():
+            return None
+        l, t, r, b = box
+        cx, cy = (l + r) / 2, (t + b) / 2
+        candidate_idxs = np.where(confident)[0]
+        centers = np.stack([
+            (bboxes[candidate_idxs, 0] + bboxes[candidate_idxs, 2]) / 2,
+            (bboxes[candidate_idxs, 1] + bboxes[candidate_idxs, 3]) / 2,
+        ], axis=1)
+        dists = np.linalg.norm(centers - np.array([cx, cy]), axis=1)
+        nearest = candidate_idxs[int(np.argmin(dists))]
+        box_out = bboxes[nearest, :4].tolist()
+        kps_out = kpss[nearest].tolist()
+        score_out = float(bboxes[nearest, 4])
         return box_out, kps_out, score_out
 
     @staticmethod
@@ -990,10 +1046,22 @@ class VideoFaceExtractor(object):
                 frame = frame_pixels[frame_idx]
                 orig_box = t['boxes'][i]
                 redet = self._redetect_in_crop(frame, orig_box)
+                if redet is None:
+                    # The crop-restricted redetect wasn't confident --
+                    # per REDETECT_MIN_SCORE's own comment, that's real
+                    # evidence `orig_box` itself may already be wrong
+                    # (not just imprecise), so don't trust it blindly.
+                    # Re-search the WHOLE frame fresh instead, picking
+                    # whichever confident candidate is nearest to
+                    # orig_box, before falling further back to orig_box
+                    # itself as a last resort.
+                    redet = self._redetect_full_frame_nearest(frame, orig_box)
                 # Falls back to the original (lighter det_500m) sampling
-                # pass's own score when the det_10g crop redetect fails --
-                # same fallback shape as the existing box_use/kps_use
-                # fallback, just carrying the score along with it.
+                # pass's own score only if BOTH the crop redetect and the
+                # full-frame re-search above failed to find anything
+                # confident -- same fallback shape as the existing
+                # box_use/kps_use fallback, just carrying the score
+                # along with it.
                 if redet is not None:
                     box_use, kps_use, score_use = redet
                 else:
