@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import shutil
 import tempfile
 import unittest
@@ -551,3 +552,18 @@ class GeocodeReviewTests(ApiTestCase):
         data = json.loads(resp.content)
         names = [r['name'] for r in data['results']]
         self.assertIn('Florence', names)
+
+
+def _sha256_hex(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _make_zip(entries):
+    """entries: list of (name_in_zip, bytes). Returns raw zip bytes."""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, 'w') as zf:
+        for name, data in entries:
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+

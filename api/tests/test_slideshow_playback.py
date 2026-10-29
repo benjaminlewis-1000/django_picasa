@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import shutil
 import tempfile
 import unittest
@@ -116,6 +117,29 @@ class SlideshowPaginationTests(ApiTestCase):
         self.assertEqual(ids1 & ids2, set())
         self.assertEqual(ids1 | ids2, {img.id for img in images})
 
+    def test_fresh_seeds_differ_even_with_the_global_random_module_pinned(self):
+        # Regression test: picasa/settings.py deliberately reseeds the
+        # GLOBAL random module to today.year*10000+month*100+day at
+        # import time (for unrelated reproducibility elsewhere) - every
+        # gunicorn worker does this independently at its own startup
+        # (no --preload), so without worker-process-local entropy here,
+        # two workers that happen to reach this code after the same
+        # number of prior random.* calls would mint byte-identical
+        # "random" seeds. Confirmed live in production: genuinely
+        # separate requests, seconds apart, different cf-ray ids,
+        # returned the exact same seed. Simulates the settings.py reseed
+        # directly (rather than needing multiple real processes) and
+        # confirms two back-to-back calls still diverge - the fix was
+        # switching the seed string's source from random.choice to
+        # secrets.choice (OS CSPRNG, unaffected by random.seed()).
+        self._make_images(5)
+        seeds = []
+        for _ in range(2):
+            random.seed(20261024)  # same fixed value settings.py uses for "today"
+            resp = self.anon_client.get(f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}')
+            seeds.append(resp.json()['seed'])
+        self.assertNotEqual(seeds[0], seeds[1])
+
     def test_not_ready_video_is_excluded_from_items_and_total_count(self):
         directory = Directory.objects.create(dir_path='/videos/pagination_test')
         VideoFile.objects.create(
@@ -139,6 +163,16 @@ class SlideshowPaginationTests(ApiTestCase):
         self.assertEqual(set(data['full_data'].keys()), {str(i['id']) for i in data['items']})
         for entry in data['full_data'].values():
             self.assertIn('sig', entry)
+
+    def test_response_is_marked_uncacheable(self):
+        # Regression test: this response had no caching headers of any
+        # kind, which let a plain browser reload (not a hard refresh)
+        # get served a stale cached response instead of hitting the
+        # network - landing on the exact same "random" order every
+        # reload rather than a fresh shuffle each time.
+        self._make_images(5)
+        resp = self.anon_client.get(f'/api/image_list/?key={settings.SLIDESHOW_API_KEY}')
+        self.assertEqual(resp.headers.get('Cache-Control'), 'no-store')
 
 
 class SlideshowMediaSigTests(ApiTestCase):

@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import shutil
 import tempfile
 import unittest
@@ -281,5 +282,23 @@ class ParameterCredentialExposureTests(ApiTestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp.data['img_server_user'], settings.MEDIA_URL_USER)
         self.assertEqual(resp.data['img_server_pw'], settings.MEDIA_URL_PW)
+
+
+class CsrfCookieViewTests(ApiTestCase):
+    """GET /api/csrf/ - exists solely to make Django issue a csrftoken
+    cookie, since nothing else in this project ever does (see the
+    view's own docstring). Without it, SlideshowConfigViewSet's
+    POST/PUT 403s with a missing-CSRF-cookie error that's invisible
+    until someone actually tries to save."""
+
+    def test_anonymous_request_still_gets_a_csrf_cookie(self):
+        resp = self.anon_client.get('/api/csrf/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn('csrftoken', resp.cookies)
+
+    def test_authenticated_request_also_gets_a_csrf_cookie(self):
+        resp = self.client.get('/api/csrf/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn('csrftoken', resp.cookies)
 
 

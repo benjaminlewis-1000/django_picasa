@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import shutil
 import tempfile
 import unittest
@@ -469,5 +470,70 @@ class ApplicationErrorApiTests(ApiTestCase):
         error.refresh_from_db()
         self.assertTrue(error.dismissed)
         self.assertIsNotNone(error.dismissed_at)
+
+
+class PersonListLightweightTests(ApiTestCase):
+    """GET /api/person_list/?lightweight=true - a cheap alternate response
+    shape on the SAME endpoint facewires already uses (rather than a
+    second person-listing endpoint), for net_slideshow's settings page
+    People autocomplete: just name + face count, sorted by face count
+    descending, skipping the heavy live-count/sentinel-breakdown work
+    the default (unparameterized) response does for the admin sidebar."""
+
+    def test_anonymous_cannot_use_lightweight_mode_either(self):
+        resp = self.anon_client.get('/api/person_list/?lightweight=true')
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_anything_other_than_literal_true_falls_back_to_the_default_response(self):
+        # Matches the rest of this file's own boolean query param
+        # convention (params.get('x', '').lower() == 'true' - see
+        # 'flagged'/'date'/'fast'/'highlight_box' above) rather than a
+        # bare truthy check, so e.g. a stray ?lightweight=0 doesn't
+        # silently switch callers expecting the full response shape.
+        resp = self.client.get('/api/person_list/?lightweight=0')
+        results = json.loads(resp.content)['results']
+        self.assertTrue(results)
+        self.assertIn('num_possibilities', results[0])
+
+    def test_people_are_sorted_by_face_count_descending(self):
+        image = self.make_image()
+        popular, _ = Person.objects.get_or_create(person_name='Popular Person')
+        rare, _ = Person.objects.get_or_create(person_name='Rare Person')
+        self.make_face(image, declared_name=popular, box_left=1, box_top=1, box_right=10, box_bottom=10)
+        self.make_face(image, declared_name=popular, box_left=11, box_top=1, box_right=20, box_bottom=10)
+        self.make_face(image, declared_name=rare, box_left=21, box_top=1, box_right=30, box_bottom=10)
+
+        resp = self.client.get('/api/person_list/?lightweight=true')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        results = json.loads(resp.content)['results']
+        names = [r['person_name'] for r in results]
+        self.assertLess(names.index('Popular Person'), names.index('Rare Person'))
+        by_name = {r['person_name']: r['num_faces'] for r in results}
+        self.assertEqual(by_name['Popular Person'], 2)
+        self.assertEqual(by_name['Rare Person'], 1)
+
+    def test_sentinel_names_are_excluded(self):
+        resp = self.client.get('/api/person_list/?lightweight=true')
+        names = [r['person_name'] for r in json.loads(resp.content)['results']]
+        for sentinel in settings.IGNORED_NAMES:
+            self.assertNotIn(sentinel, names)
+
+    def test_lightweight_entries_have_no_extra_fields(self):
+        self.make_image()
+        resp = self.client.get('/api/person_list/?lightweight=true')
+        for entry in json.loads(resp.content)['results']:
+            self.assertEqual(set(entry.keys()), {'person_name', 'num_faces'})
+
+    def test_default_response_is_unaffected_by_the_new_param(self):
+        # Regression guard: adding the lightweight branch must not
+        # change what facewires' existing unparameterized calls get
+        # back - num_possibilities/url/id/etc. are still there.
+        resp = self.client.get('/api/person_list/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        results = json.loads(resp.content)['results']
+        self.assertTrue(results)
+        entry = results[0]
+        for field in ('id', 'url', 'num_faces', 'num_possibilities', 'num_unverified_faces'):
+            self.assertIn(field, entry)
 
 
