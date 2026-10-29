@@ -36,6 +36,7 @@
 # for later, per the user's explicit call) -- never deleted or guessed
 # at.
 
+import signal
 import time
 
 import cv2
@@ -49,6 +50,21 @@ from video_face_pipeline import VideoFaceExtractor, ffprobe_info, locate_confide
 MIN_SCORE = 0.5
 CENTER_FRACTION = 0.7
 SEARCH_WINDOW_SECONDS = 1.5
+# Generous relative to the ~3s of video this normally decodes+searches,
+# even under heavy CPU contention -- this project has repeated, real
+# history of video/image decode calls hanging outright (not just being
+# slow) under contention, hence the same SIGALRM safety net used
+# elsewhere (backfill_det_score.py's PER_IMAGE_TIMEOUT_SECONDS,
+# face_manager/tasks.py's PER_VIDEO_TIMEOUT_SECONDS).
+PER_FACE_TIMEOUT_SECONDS = 60
+
+
+class _FaceTimeout(Exception):
+    pass
+
+
+def _raise_face_timeout(signum, frame):
+    raise _FaceTimeout(f"Face processing exceeded {PER_FACE_TIMEOUT_SECONDS}s")
 
 
 class Command(BaseCommand):
@@ -87,91 +103,112 @@ class Command(BaseCommand):
 
         extractor = VideoFaceExtractor()
         det10g = extractor.det10g_model
+        # Triage (one thumbnail, cheap either way) uses the heavier,
+        # more accurate det10g -- but the window SEARCH can scan many
+        # frames per face, especially ones that end up unresolved (no
+        # early exit on failure), so it uses the lightweight det_model
+        # instead, same "cheap model for broad search" split this
+        # project already uses elsewhere (periodic sampling vs. the
+        # few-frame det_10g refinement pass). A window match only needs
+        # to clear MIN_SCORE, which det_model already supports reliably.
+        det_lightweight = extractor.det_model
 
         total = 0
         skipped_ok = 0
         fixed = 0
         unresolved = []
         decode_failed = []
+        timed_out = []
         t0 = time.time()
 
         for face in qs.iterator(chunk_size=500):
             total += 1
             try:
-                face.face_thumbnail.open('rb')
-                thumb_bytes = face.face_thumbnail.read()
-            finally:
+                signal.signal(signal.SIGALRM, _raise_face_timeout)
+                signal.alarm(PER_FACE_TIMEOUT_SECONDS)
                 try:
-                    face.face_thumbnail.close()
-                except Exception:
-                    pass
+                    try:
+                        face.face_thumbnail.open('rb')
+                        thumb_bytes = face.face_thumbnail.read()
+                    finally:
+                        try:
+                            face.face_thumbnail.close()
+                        except Exception:
+                            pass
 
-            thumb = cv2.imdecode(np.frombuffer(thumb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if thumb is None:
-                decode_failed.append(face.id)
-                continue
+                    thumb = cv2.imdecode(np.frombuffer(thumb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if thumb is None:
+                        decode_failed.append(face.id)
+                        continue
 
-            h, w = thumb.shape[:2]
-            bboxes, _ = det10g.detect(thumb, max_num=0, metric='default')
-            confident = bboxes[:, 4] >= MIN_SCORE if bboxes.shape[0] else np.array([], dtype=bool)
-            ok = False
-            if confident.any():
-                cx_lo, cx_hi = w * (1 - CENTER_FRACTION) / 2, w * (1 + CENTER_FRACTION) / 2
-                cy_lo, cy_hi = h * (1 - CENTER_FRACTION) / 2, h * (1 + CENTER_FRACTION) / 2
-                for i in np.where(confident)[0]:
-                    bcx = (bboxes[i, 0] + bboxes[i, 2]) / 2
-                    bcy = (bboxes[i, 1] + bboxes[i, 3]) / 2
-                    if cx_lo <= bcx <= cx_hi and cy_lo <= bcy <= cy_hi:
-                        ok = True
-                        break
-            if ok:
-                skipped_ok += 1
-                continue
+                    h, w = thumb.shape[:2]
+                    bboxes, _ = det10g.detect(thumb, max_num=0, metric='default')
+                    confident = bboxes[:, 4] >= MIN_SCORE if bboxes.shape[0] else np.array([], dtype=bool)
+                    ok = False
+                    if confident.any():
+                        cx_lo, cx_hi = w * (1 - CENTER_FRACTION) / 2, w * (1 + CENTER_FRACTION) / 2
+                        cy_lo, cy_hi = h * (1 - CENTER_FRACTION) / 2, h * (1 + CENTER_FRACTION) / 2
+                        for i in np.where(confident)[0]:
+                            bcx = (bboxes[i, 0] + bboxes[i, 2]) / 2
+                            bcy = (bboxes[i, 1] + bboxes[i, 3]) / 2
+                            if cx_lo <= bcx <= cx_hi and cy_lo <= bcy <= cy_hi:
+                                ok = True
+                                break
+                    if ok:
+                        skipped_ok += 1
+                        continue
 
-            # Triage failed -- attempt a real fix.
-            video = face.source_video_file
-            if face.video_thumbnail_frame_seconds is None:
-                unresolved.append((face.id, 'no stored timestamp to search around'))
-                continue
-            try:
-                width, height, avg_fps, probed_field_order, rotation, color_transfer, sar_scale_width = (
-                    ffprobe_info(video.filename)
-                )
-            except Exception as e:
-                decode_failed.append((face.id, f'ffprobe failed: {e}'))
-                continue
-            field_order = video.field_order if video.field_order is not None else probed_field_order
-            old_box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
+                    # Triage failed -- attempt a real fix.
+                    video = face.source_video_file
+                    if face.video_thumbnail_frame_seconds is None:
+                        unresolved.append((face.id, 'no stored timestamp to search around'))
+                        continue
+                    try:
+                        width, height, avg_fps, probed_field_order, rotation, color_transfer, sar_scale_width = (
+                            ffprobe_info(video.filename)
+                        )
+                    except Exception as e:
+                        decode_failed.append((face.id, f'ffprobe failed: {e}'))
+                        continue
+                    field_order = video.field_order if video.field_order is not None else probed_field_order
+                    old_box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
 
-            try:
-                result = locate_confident_face_near_timestamp(
-                    video.filename, face.video_thumbnail_frame_seconds, field_order, rotation,
-                    old_box, det10g, MIN_SCORE, window_seconds=SEARCH_WINDOW_SECONDS,
-                    color_transfer=color_transfer, sar_scale_width=sar_scale_width,
-                )
-            except Exception as e:
-                decode_failed.append((face.id, f'window search failed: {e}'))
-                continue
+                    try:
+                        result = locate_confident_face_near_timestamp(
+                            video.filename, face.video_thumbnail_frame_seconds, field_order, rotation,
+                            old_box, det_lightweight, MIN_SCORE, window_seconds=SEARCH_WINDOW_SECONDS,
+                            color_transfer=color_transfer, sar_scale_width=sar_scale_width,
+                        )
+                    except Exception as e:
+                        decode_failed.append((face.id, f'window search failed: {e}'))
+                        continue
 
-            if result is None:
-                unresolved.append((face.id, 'no confident detection anywhere in the search window'))
-                continue
+                    if result is None:
+                        unresolved.append((face.id, 'no confident detection anywhere in the search window'))
+                        continue
 
-            frame, new_box, new_kps, new_det_score, new_ts = result
-            fixed += 1
-            if not dry_run:
-                extractor._set_face_box_and_thumbnail(
-                    face, frame, new_box, new_kps, timestamp_seconds=new_ts, det_score=new_det_score,
-                )
-                new_embedding = extractor._encode_insightface(frame, new_kps)
-                face.face_encoding_512 = new_embedding.tolist()
-                face.save()
+                    frame, new_box, new_kps, new_det_score, new_ts = result
+                    fixed += 1
+                    if not dry_run:
+                        extractor._set_face_box_and_thumbnail(
+                            face, frame, new_box, new_kps, timestamp_seconds=new_ts, det_score=new_det_score,
+                        )
+                        new_embedding = extractor._encode_insightface(frame, new_kps)
+                        face.face_encoding_512 = new_embedding.tolist()
+                        face.save()
+                finally:
+                    signal.alarm(0)
+            except _FaceTimeout:
+                timed_out.append(face.id)
+                self.stdout.write(f"  TIMEOUT on face {face.id} -- skipping")
+                continue
 
             if total % 100 == 0:
                 elapsed = time.time() - t0
                 self.stdout.write(
                     f"  ...{total} checked ({total/elapsed:.2f}/s), {skipped_ok} already ok, "
-                    f"{fixed} fixed, {len(unresolved)} unresolved, {len(decode_failed)} decode-failed"
+                    f"{fixed} fixed, {len(unresolved)} unresolved, {len(decode_failed)} decode-failed, "
+                    f"{len(timed_out)} timed out"
                 )
 
         elapsed = time.time() - t0
@@ -180,7 +217,8 @@ class Command(BaseCommand):
             f"  {skipped_ok} already fine, no action needed.\n"
             f"  {fixed} fixed via a confident nearby detection.\n"
             f"  {len(unresolved)} unresolved -- no confident detection anywhere nearby, left untouched.\n"
-            f"  {len(decode_failed)} decode/ffprobe failures."
+            f"  {len(decode_failed)} decode/ffprobe failures.\n"
+            f"  {len(timed_out)} timed out (>{PER_FACE_TIMEOUT_SECONDS}s) -- left untouched, safe to retry later."
         )
         if unresolved:
             self.stdout.write("\nUnresolved face ids (first 50), flagged for later:")
