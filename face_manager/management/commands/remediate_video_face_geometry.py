@@ -171,6 +171,7 @@ class Command(BaseCommand):
         unresolved = []
         decode_failed = []
         timed_out = []
+        crashed = []
         t0 = time.time()
         ffprobe_cache = {}
 
@@ -331,6 +332,18 @@ class Command(BaseCommand):
                 timed_out.append(face.id)
                 self.stdout.write(f"  TIMEOUT on face {face.id} -- skipping")
                 continue
+            except Exception as e:
+                # Real, confirmed gap (2026-10-30): a missing thumbnail
+                # file on disk for one face (FileNotFoundError) crashed
+                # this ENTIRE multi-day run, since only _FaceTimeout was
+                # caught at this level -- same "one bad item shouldn't
+                # kill the whole batch" discipline this project already
+                # enforces everywhere else (face_extraction, assign_
+                # faces.py's per-face error handling, etc.), just missing
+                # here until a real crash exposed it.
+                crashed.append((face.id, f'{type(e).__name__}: {e}'))
+                self.stdout.write(f"  CRASH on face {face.id}: {type(e).__name__}: {e} -- skipping")
+                continue
 
             if total % 100 == 0:
                 elapsed = time.time() - t0
@@ -338,7 +351,8 @@ class Command(BaseCommand):
                     f"  ...{total} checked ({total/elapsed:.2f}/s), {skipped_ok} already ok "
                     f"({ok_lvface_embedded} w/ LVFace, {len(ok_frame_check_failed)} frame-check-failed), "
                     f"{fixed} fixed ({lvface_embedded} w/ LVFace), {len(unresolved)} unresolved, "
-                    f"{len(decode_failed)} decode-failed, {len(timed_out)} timed out"
+                    f"{len(decode_failed)} decode-failed, {len(timed_out)} timed out, "
+                    f"{len(crashed)} crashed"
                 )
 
         elapsed = time.time() - t0
@@ -349,8 +363,13 @@ class Command(BaseCommand):
             f"  {fixed} fixed via a confident nearby detection ({lvface_embedded} also got LVFace embeddings).\n"
             f"  {len(unresolved)} unresolved -- no confident detection anywhere nearby, left untouched.\n"
             f"  {len(decode_failed)} decode/ffprobe failures.\n"
-            f"  {len(timed_out)} timed out (>{PER_FACE_TIMEOUT_SECONDS}s) -- left untouched, safe to retry later."
+            f"  {len(timed_out)} timed out (>{PER_FACE_TIMEOUT_SECONDS}s) -- left untouched, safe to retry later.\n"
+            f"  {len(crashed)} crashed on an unexpected error -- left untouched, logged below, safe to retry later."
         )
+        if crashed:
+            self.stdout.write("\nCrashed face ids (first 50), flagged for later:")
+            for fid, reason in crashed[:50]:
+                self.stdout.write(f"  {fid}: {reason}")
         if ok_frame_check_failed:
             self.stdout.write(
                 f"\nFaces that passed thumbnail triage but failed the real-frame second check "
