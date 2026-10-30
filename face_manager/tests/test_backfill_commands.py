@@ -1493,3 +1493,76 @@ class FaceSaveThumbnailCheckTests(TestCase):
             face.save()
 
 
+class BackfillHalfvecMirrorsTests(TestCase):
+    """backfill_halfvec_mirrors -- pure copy of the already-stored
+    float32 embedding into its halfvec mirror, for rows written before
+    the dual-write migration (2026-10-30, see CLAUDE.md)."""
+
+    def setUp(self):
+        self.image = make_image()
+
+    def test_backfills_all_four_fields_on_one_face(self):
+        # Exactly representable in float16 (a power of two), so the
+        # halfvec mirror comes back bit-for-bit identical rather than
+        # needing a precision-aware comparison -- this test is about
+        # which fields get copied, not about quantization (already
+        # covered by this project's own earlier pgvector precision
+        # benchmark).
+        embedding = [0.5] * 512
+        face = make_face(
+            self.image,
+            face_encoding_512=embedding, face_encoding_lvface_b=embedding,
+            face_encoding_lvface_s=embedding, face_encoding_lvface_l=embedding,
+        )
+        call_command('backfill_halfvec_mirrors', stdout=io.StringIO())
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512_hv, embedding)
+        self.assertEqual(face.face_encoding_lvface_b_hv, embedding)
+        self.assertEqual(face.face_encoding_lvface_s_hv, embedding)
+        self.assertEqual(face.face_encoding_lvface_l_hv, embedding)
+
+    def test_skips_a_field_with_no_float32_value(self):
+        """A face with ONLY face_encoding_512 set shouldn't get any
+        LVFace _hv field touched -- there's nothing to copy."""
+        face = make_face(self.image, face_encoding_512=[0.25] * 512)
+        call_command('backfill_halfvec_mirrors', stdout=io.StringIO())
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512_hv, [0.25] * 512)
+        self.assertIsNone(face.face_encoding_lvface_b_hv)
+
+    def test_already_backfilled_face_is_left_alone(self):
+        """A face dual-written going forward (both columns already
+        populated) must not be re-touched -- the candidate query
+        requires the _hv mirror to be NULL."""
+        embedding = [0.125] * 512
+        face = make_face(self.image, face_encoding_512=embedding, face_encoding_512_hv=embedding)
+        out = io.StringIO()
+        call_command('backfill_halfvec_mirrors', stdout=out)
+        self.assertIn("Backfilled 0 candidate face(s)", out.getvalue())
+
+    def test_dry_run_does_not_save(self):
+        embedding = [0.75] * 512
+        face = make_face(self.image, face_encoding_512=embedding)
+        out = io.StringIO()
+        call_command('backfill_halfvec_mirrors', '--dry-run', stdout=out)
+        self.assertIn("Would backfill 1 candidate face(s)", out.getvalue())
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_512_hv)
+
+    def test_limit_restricts_candidate_count(self):
+        embedding = [0.0625] * 512
+        for _ in range(3):
+            make_face(self.image, face_encoding_512=embedding)
+        out = io.StringIO()
+        call_command('backfill_halfvec_mirrors', '--limit=1', stdout=out)
+        self.assertIn("Backfilled 1 candidate face(s)", out.getvalue())
+
+    def test_rerun_finds_nothing_left(self):
+        embedding = [0.03125] * 512
+        make_face(self.image, face_encoding_512=embedding, face_encoding_lvface_b=embedding)
+        call_command('backfill_halfvec_mirrors', stdout=io.StringIO())
+        out = io.StringIO()
+        call_command('backfill_halfvec_mirrors', stdout=out)
+        self.assertIn("Backfilled 0 candidate face(s)", out.getvalue())
+
+
