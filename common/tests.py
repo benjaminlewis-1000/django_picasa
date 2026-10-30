@@ -432,6 +432,11 @@ class CheckTaskHeartbeatsTaskTests(TestCase):
         self.assertEqual(error.source, 'common.tasks.check_task_heartbeats')
         self.assertIn(self.TASK_NAME, error.message)
         self.assertIn('never recorded', error.message)
+        # 2026-10-30: a structured link back to the specific task, not
+        # just free text -- see ApplicationError.related_heartbeat_
+        # task_name's own docstring, lets dismiss() offer a "clear it"
+        # action without parsing the message.
+        self.assertEqual(error.related_heartbeat_task_name, self.TASK_NAME)
 
     def test_recently_started_and_completed_is_healthy(self):
         from common.models import ApplicationError, TaskHeartbeat

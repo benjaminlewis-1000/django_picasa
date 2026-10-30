@@ -22,6 +22,16 @@ class ApplicationError(models.Model):
     dismissed = models.BooleanField(default=False)
     dismissed_at = models.DateTimeField(null=True, blank=True)
 
+    # Set only for errors raised by common.tasks.check_task_heartbeats
+    # (2026-10-30) -- a structured link back to the specific
+    # TaskHeartbeat.task_name this alert is about, so the frontend can
+    # offer a "this wasn't actually stuck, clear it" action on dismiss
+    # without parsing the free-text message. NULL for every other kind
+    # of ApplicationError (most of them -- this is deliberately a niche
+    # field, not something every error needs). See
+    # ApplicationErrorViewSet.dismiss()'s own `clear_heartbeat` param.
+    related_heartbeat_task_name = models.CharField(max_length=256, null=True, blank=True)
+
     class Meta:
         ordering = ['-created_at']
 
