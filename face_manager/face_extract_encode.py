@@ -617,7 +617,7 @@ class FaceExtractor(object):
                 face_obj.delete()
                 continue
 
-            face_obj.face_encoding_512 = settings.NON_DETECTED_FACE_ENCODING
+            face_obj.set_embedding('face_encoding_512', settings.NON_DETECTED_FACE_ENCODING)
             face_obj.box_left = np.max((0, int(orig_left)))
             face_obj.box_top = np.max((0, int(orig_top)))
             face_obj.box_right = np.min((int(orig_right), img_w))
@@ -681,7 +681,7 @@ class FaceExtractor(object):
         assert new_left < new_right
         assert new_top < new_bottom
 
-        existing_face.face_encoding_512 = new_embedding.tolist()
+        existing_face.set_embedding('face_encoding_512', new_embedding.tolist())
         existing_face.kps = self._flatten_kps(new_data['kps'])
         existing_face.det_score = new_data['det_score']
         existing_face.box_left = new_left
@@ -706,7 +706,7 @@ class FaceExtractor(object):
             try:
                 lv_embedding = lvface.embed_from_image_array(img_numpy, existing_face.kps, input_is_bgr=False)
                 if lv_embedding is not None:
-                    existing_face.face_encoding_lvface_b = lv_embedding.tolist()
+                    existing_face.set_embedding('face_encoding_lvface_b', lv_embedding.tolist())
             except Exception as e:
                 settings.LOGGER.error(f"LVFace encoding failed for Face (updating existing): {e}")
 
@@ -780,7 +780,7 @@ class FaceExtractor(object):
         # existing library still gets encoded exactly as before this
         # existed.
         if not below_collection_floor(img_obj.directory.collection, new_face.det_score, new_face.relative_size):
-            new_face.face_encoding_512 = insight_detected_face['embedding'].tolist()
+            new_face.set_embedding('face_encoding_512', insight_detected_face['embedding'].tolist())
 
             # LVFace-B embedding, same floor gating as insightface's own
             # above -- a below-floor detection never participates in
@@ -793,7 +793,7 @@ class FaceExtractor(object):
                 if settings.LVFACE_ENCODING_ENABLED:
                     lv_embedding = lvface.embed_from_image_array(img_numpy, new_face.kps, input_is_bgr=False)
                     if lv_embedding is not None:
-                        new_face.face_encoding_lvface_b = lv_embedding.tolist()
+                        new_face.set_embedding('face_encoding_lvface_b', lv_embedding.tolist())
             except Exception as e:
                 settings.LOGGER.error(f"LVFace encoding failed for new Face: {e}")
 
@@ -1192,8 +1192,8 @@ class FaceExtractor(object):
         if embedding is None:
             return
 
-        face.face_encoding_lvface_b = embedding.tolist()
-        face.save(update_fields=['face_encoding_lvface_b'])
+        face.set_embedding('face_encoding_lvface_b', embedding.tolist())
+        face.save(update_fields=['face_encoding_lvface_b', 'face_encoding_lvface_b_hv'])
 
     def _reencode_missing_faces_locked(self, collection=None, lvface_max_runtime_seconds='default',
                                         shard_index=None, total_shards=None):
@@ -1391,7 +1391,7 @@ class FaceExtractor(object):
                     kps_arr = np.array(face.kps, dtype=np.float32).reshape(5, 2)
                     insight_face = insightface.app.common.Face(kps=kps_arr)
                     embedding = rec_model.get(img, insight_face)
-                    face.face_encoding_512 = embedding.tolist()
+                    face.set_embedding('face_encoding_512', embedding.tolist())
                     face.reencoded = True
                     insight_touched = True
                 else:
@@ -1408,12 +1408,12 @@ class FaceExtractor(object):
                         crop = img[ct:cb, cl:cr]
 
                         if crop.shape[0] < 20 or crop.shape[1] < 20:
-                            face.face_encoding_512 = settings.REENCODE_DEFAULT_ENCODING
+                            face.set_embedding('face_encoding_512', settings.REENCODE_DEFAULT_ENCODING)
                             insight_touched = True
                         else:
                             dets = self.app.app.get(crop)
                             if len(dets) == 0:
-                                face.face_encoding_512 = settings.REENCODE_DEFAULT_ENCODING
+                                face.set_embedding('face_encoding_512', settings.REENCODE_DEFAULT_ENCODING)
                                 insight_touched = True
                             else:
                                 # Several faces may be found in the crop
@@ -1431,7 +1431,7 @@ class FaceExtractor(object):
                                     if best_dist is None or dist < best_dist:
                                         best_dist, best = dist, d
 
-                                face.face_encoding_512 = best['embedding'].tolist()
+                                face.set_embedding('face_encoding_512', best['embedding'].tolist())
                                 # Translate the freshly-detected kps from
                                 # crop-local back to the source image's
                                 # absolute coordinates (matching how
@@ -1461,13 +1461,13 @@ class FaceExtractor(object):
                     settings.LOGGER.error(f"Cannot compute LVFace encoding for Face {face.id}: {e}")
                     lv_embedding = None
                 if lv_embedding is not None:
-                    face.face_encoding_lvface_b = lv_embedding.tolist()
+                    face.set_embedding('face_encoding_lvface_b', lv_embedding.tolist())
                     lvface_touched = True
 
             if insight_touched:
                 face.save()
             elif lvface_touched:
-                face.save(update_fields=['face_encoding_lvface_b'])
+                face.save(update_fields=['face_encoding_lvface_b', 'face_encoding_lvface_b_hv'])
 
             # Covers this face's own native allocations (image decode,
             # ONNX inference buffers) before moving to the next --

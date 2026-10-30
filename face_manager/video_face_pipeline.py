@@ -1446,7 +1446,7 @@ class VideoFaceExtractor(object):
             face.dateTakenUTC = video_obj.dateTakenUTC
             face.reencoded = True
             face.written_to_photo_metadata = False
-            face.face_encoding_512 = cand['centroid'].tolist()
+            face.set_embedding('face_encoding_512', cand['centroid'].tolist())
             face.video_first_timestamp_seconds = self._clamp_to_duration(
                 video_obj, cand['first_sample'] / fps, 'video_first_timestamp_seconds'
             )

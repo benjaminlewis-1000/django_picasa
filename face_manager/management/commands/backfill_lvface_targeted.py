@@ -144,8 +144,8 @@ class Command(BaseCommand):
                         continue
                     if emb is None:
                         continue
-                    setattr(face, field, emb.tolist())
-                    face.save(update_fields=[field])
+                    face.set_embedding(field, emb.tolist())
+                    face.save(update_fields=[field, Face.EMBEDDING_FIELD_HV_MIRRORS[field]])
                     any_saved = True
                 stats['embedded' if any_saved else 'no_sizes_needed'] += 1
 

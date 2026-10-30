@@ -310,6 +310,55 @@ class FaceModelTests(TestCase):
         self.assertNotEqual(face.face_encoding_512[0], double_only_value)
 
 
+class FaceSetEmbeddingDualWriteTests(TestCase):
+    """Face.set_embedding() -- the single write path for the dual-write
+    phase of the pgvector/halfvec migration (2026-10-30, see CLAUDE.md).
+    Every real call site should go through this instead of a bare
+    attribute assignment, so the float32 field and its halfvec mirror
+    can never silently drift apart."""
+
+    def setUp(self):
+        self.image = make_image()
+
+    def test_sets_both_the_float32_field_and_its_halfvec_mirror(self):
+        face = make_face(self.image)
+        embedding = list(np.arange(512, dtype=np.float32) / 100.0)
+        face.set_embedding('face_encoding_512', embedding)
+        self.assertEqual(face.face_encoding_512, embedding)
+        self.assertEqual(face.face_encoding_512_hv, embedding)
+
+    def test_accepts_a_raw_numpy_array_not_just_a_list(self):
+        face = make_face(self.image)
+        embedding = np.arange(512, dtype=np.float32) / 100.0
+        face.set_embedding('face_encoding_lvface_b', embedding)
+        self.assertEqual(face.face_encoding_lvface_b, embedding.tolist())
+        self.assertEqual(face.face_encoding_lvface_b_hv, embedding.tolist())
+
+    def test_none_clears_both(self):
+        face = make_face(self.image, face_encoding_512=[0.1] * 512, face_encoding_512_hv=[0.1] * 512)
+        face.set_embedding('face_encoding_512', None)
+        self.assertIsNone(face.face_encoding_512)
+        self.assertIsNone(face.face_encoding_512_hv)
+
+    def test_sentinel_value_is_set_on_both_unchanged(self):
+        """The NON_DETECTED_FACE_ENCODING sentinel is a valid `value`
+        here too -- halfvec doesn't need special-casing for it, it's
+        just another vector as far as this helper is concerned."""
+        face = make_face(self.image)
+        face.set_embedding('face_encoding_512', settings.NON_DETECTED_FACE_ENCODING)
+        self.assertEqual(face.face_encoding_512, settings.NON_DETECTED_FACE_ENCODING)
+        self.assertEqual(face.face_encoding_512_hv, settings.NON_DETECTED_FACE_ENCODING)
+
+    def test_real_save_round_trips_through_both_columns(self):
+        face = make_face(self.image)
+        embedding = list(np.arange(512, dtype=np.float32) / 100.0)
+        face.set_embedding('face_encoding_lvface_s', embedding)
+        face.save()
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_s, embedding)
+        self.assertIsNotNone(face.face_encoding_lvface_s_hv)
+
+
 @tag("slow")
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class PyramidalDetectorTileTranslationTests(TestCase):
