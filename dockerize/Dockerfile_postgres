@@ -5,6 +5,28 @@ RUN apk add --no-cache supervisor tzdata docker-cli
 RUN mkdir /etc/supervisor.d
 COPY postgres_cron.ini /etc/supervisor.d/postgres_cron.ini
 
+# pgvector (2026-10-29, scoping for a possible float16 embedding-storage
+# migration -- see CLAUDE.md). Built from source rather than switching to
+# the official pgvector/pgvector image, which is Debian-based and would
+# mean redoing all the alpine-specific infra above (supervisord, cron,
+# docker-cli) on a different base. Verified in a standalone throwaway
+# spike first: builds cleanly against this exact postgres:17.5-alpine's
+# headers once the OPTIONAL LLVM JIT-bytecode step is skipped (with_llvm=
+# no) -- that step failed on a clang major-version mismatch between
+# alpine's packaged clang and what PGXS's JIT inlining expects; it's not
+# needed for the extension to function, only for an unrelated JIT
+# optimization. CREATE EXTENSION itself is NOT run here -- baking in the
+# capability is harmless and reversible (no functional change until a
+# migration actually runs `CREATE EXTENSION vector`), separate from the
+# decision of whether/when to actually use it.
+RUN apk add --no-cache --virtual .pgvector-build-deps build-base postgresql-dev git \
+    && git clone --branch v0.8.0 --depth 1 https://github.com/pgvector/pgvector.git /tmp/pgvector \
+    && cd /tmp/pgvector \
+    && make OPTFLAGS="" with_llvm=no \
+    && make install with_llvm=no \
+    && cd / && rm -rf /tmp/pgvector \
+    && apk del .pgvector-build-deps
+
 # TZ env var (set in docker-compose.yaml) needs tzdata installed to
 # actually take effect -- without it, TZ is silently ignored and
 # everything (including cron) stays on UTC.
