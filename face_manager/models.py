@@ -9,6 +9,7 @@ from django.core.validators import *
 from datetime import datetime
 from django.utils import timezone
 from django.contrib.postgres.fields import ArrayField
+from pgvector.django import HalfVectorField
 import cv2
 import numpy as np
 import os
@@ -274,6 +275,51 @@ class Face(models.Model):
                             SingleFloatField(),
                             size=512, blank=True, null=True
                         )
+
+    # ADDITIVE, dual-write-phase halfvec (float16) mirrors of the 4
+    # embedding fields above (2026-10-30 -- see CLAUDE.md's pgvector
+    # investigation). Validated empirically before building this,
+    # not assumed: real cosine-similarity drift from float16 rounding
+    # is ~1e-5 on average, max ~7e-5 even in the classification-relevant
+    # 0.3-0.7 similarity band -- three orders of magnitude below this
+    # project's tightest real threshold margin (CANDIDATE_MARGIN_FLOOR=
+    # 0.03) -- and a real pg_dump/pg_restore spike confirmed backups
+    # restore cleanly PROVIDED the target Postgres also has the vector
+    # extension built in (now true for both master's Dockerfile_postgres
+    # and a rebuilt db_picasa_dev; NOT yet true for the live, still-
+    # running db_picasa/picasa_api containers -- deliberately deferred,
+    # see the deploy note elsewhere in this file, since multi-day
+    # backfill/remediation jobs were actively running in picasa_api at
+    # the time these fields were added).
+    #
+    # These are NOT yet read by anything -- this is purely the additive
+    # schema step. Every WRITE call site (face_extract_encode.py,
+    # video_face_pipeline.py, the LVFace/verified-kps backfill commands,
+    # remediate_video_face_geometry.py, etc.) needs to be updated to
+    # dual-write these alongside the existing float32 ArrayField, THEN a
+    # one-time backfill converts every existing row, THEN (only once
+    # verified against real restored/backfilled data) read call sites
+    # cut over one subsystem at a time, THEN -- only after a real bake-in
+    # period and a fresh backup -- the old float32 columns get dropped to
+    # actually reclaim the storage. Nothing here is a cutover by itself.
+    #
+    # A real, confirmed ORM-compatibility gap, found via a direct spike
+    # (not assumed): exact-equality lookups (`filter(field=value)`,
+    # `~Q(field=value)`) work correctly against HalfVectorField -- every
+    # one of the 8 real NON_DETECTED_FACE_ENCODING sentinel-equality call
+    # sites (assign_faces.py x4, verification_clustering.py,
+    # face_extract_encode.py, redetect_sar_affected_videos.py) will work
+    # unmodified once cut over. Per-element index lookups (Django's
+    # ArrayField `__0` transform, SQL `emb[1]`) do NOT work --
+    # HalfVectorField raises a clean FieldError, not a silent wrong
+    # result -- so cleanup_chronically_unmatched_faces.py's
+    # `face_encoding_512__0=...` check needs a small rewrite (full-vector
+    # equality instead of a first-element check) before that file can be
+    # cut over; not yet done.
+    face_encoding_512_hv = HalfVectorField(dimensions=512, blank=True, null=True)
+    face_encoding_lvface_b_hv = HalfVectorField(dimensions=512, blank=True, null=True)
+    face_encoding_lvface_s_hv = HalfVectorField(dimensions=512, blank=True, null=True)
+    face_encoding_lvface_l_hv = HalfVectorField(dimensions=512, blank=True, null=True)
 
     # The 5 facial landmark points (left eye, right eye, nose, left mouth
     # corner, right mouth corner) InsightFace's detector produces, flattened
