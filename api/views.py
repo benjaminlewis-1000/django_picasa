@@ -2276,6 +2276,20 @@ class ApplicationErrorViewSet(viewsets.ReadOnlyModelViewSet):
         error.dismissed = True
         error.dismissed_at = timezone.now()
         error.save()
+        # Explicit, opt-in-only (2026-10-30, per the user's own call) --
+        # NEVER implied by a plain dismiss. Dismissing just means "I
+        # acknowledged this alert," not "the task actually finished";
+        # conflating the two would mean a habit of dismissing without
+        # checking silently teaches the watchdog to stop watching, which
+        # defeats the point of it. This requires the caller to
+        # separately assert they've verified it (e.g. a settings-page
+        # toggle, not the default dismiss action) AND only has any
+        # effect when this specific error really is a heartbeat alert
+        # (related_heartbeat_task_name set by check_task_heartbeats) --
+        # silently a no-op on any other kind of ApplicationError.
+        if request.data.get('clear_heartbeat') and error.related_heartbeat_task_name:
+            from common.heartbeat import record_heartbeat_done
+            record_heartbeat_done(error.related_heartbeat_task_name)
         return Response(api_ser.ApplicationErrorSerializer(error).data)
 
 

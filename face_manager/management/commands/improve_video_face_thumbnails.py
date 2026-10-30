@@ -251,7 +251,7 @@ class Command(BaseCommand):
 
                 with transaction.atomic():
                     frame = frame_pixels[best_rep['frame_idx']]
-                    face.face_encoding_512 = cand['centroid'].tolist()
+                    face.set_embedding('face_encoding_512', cand['centroid'].tolist())
                     extractor._set_face_box_and_thumbnail(
                         face, frame, best_rep['box'], best_rep['kps'],
                         best_rep['frame_idx'] / fps, det_score=best_rep['det_score'],

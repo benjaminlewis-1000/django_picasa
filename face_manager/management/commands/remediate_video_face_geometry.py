@@ -261,7 +261,7 @@ class Command(BaseCommand):
                                 if emb is None:
                                     continue
                                 if not dry_run:
-                                    setattr(face, field, emb.tolist())
+                                    face.set_embedding(field, emb.tolist())
                                 any_lvface = True
                             if any_lvface:
                                 ok_lvface_embedded += 1
@@ -302,7 +302,7 @@ class Command(BaseCommand):
                             face, frame, new_box, new_kps, timestamp_seconds=new_ts, det_score=new_det_score,
                         )
                         new_embedding = extractor._encode_insightface(frame, new_kps)
-                        face.face_encoding_512 = new_embedding.tolist()
+                        face.set_embedding('face_encoding_512', new_embedding.tolist())
                         # frame/new_kps are already decoded for the fix above --
                         # computing LVFace here too is ~free (1 more small ONNX
                         # call per size) vs. a second expensive decode later via
@@ -321,7 +321,7 @@ class Command(BaseCommand):
                                 continue
                             if emb is None:
                                 continue
-                            setattr(face, field, emb.tolist())
+                            face.set_embedding(field, emb.tolist())
                             any_lvface = True
                         if any_lvface:
                             lvface_embedded += 1

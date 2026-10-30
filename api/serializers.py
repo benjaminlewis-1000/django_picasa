@@ -543,7 +543,8 @@ class ScheduleRuleSerializer(serializers.ModelSerializer):
 class ApplicationErrorSerializer(serializers.ModelSerializer):
     class Meta:
         model = ApplicationError
-        fields = ['id', 'source', 'message', 'created_at', 'dismissed', 'dismissed_at']
+        fields = ['id', 'source', 'message', 'created_at', 'dismissed', 'dismissed_at',
+                  'related_heartbeat_task_name']
         read_only_fields = fields
 
 

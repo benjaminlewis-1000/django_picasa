@@ -67,4 +67,4 @@ def check_task_heartbeats():
                 continue
 
             settings.LOGGER.error(f"check_task_heartbeats: {message}")
-            log_error('common.tasks.check_task_heartbeats', message)
+            log_error('common.tasks.check_task_heartbeats', message, related_heartbeat_task_name=task_name)

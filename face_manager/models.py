@@ -725,6 +725,34 @@ class Face(models.Model):
         reject_list.append(person_id)
         self.rejected_fields = list(set(reject_list))
 
+    EMBEDDING_FIELD_HV_MIRRORS = {
+        'face_encoding_512': 'face_encoding_512_hv',
+        'face_encoding_lvface_b': 'face_encoding_lvface_b_hv',
+        'face_encoding_lvface_s': 'face_encoding_lvface_s_hv',
+        'face_encoding_lvface_l': 'face_encoding_lvface_l_hv',
+    }
+
+    def set_embedding(self, field_name, value):
+        """Sets BOTH `field_name` (one of the 4 existing float32
+        ArrayField embedding columns) and its halfvec mirror together --
+        the single write path for the dual-write phase of the pgvector/
+        halfvec migration (2026-10-30, see CLAUDE.md's pgvector
+        investigation). Every real write call site across the codebase
+        should go through this instead of a bare attribute assignment,
+        so the two columns can never silently drift apart by a call
+        site forgetting the mirror. `value` may be a real embedding
+        (list/tolist()-able array) or None (clears both) -- the sentinel
+        NON_DETECTED_FACE_ENCODING/REENCODE_DEFAULT_ENCODING values are
+        valid `value`s too, same as the float32 field already treats
+        them (a non-face marker, not something requiring special
+        handling here -- halfvec doesn't care, it's just another
+        vector). Does NOT save() -- same convention as the rest of this
+        model's setter-only helpers (e.g. add_to_rejected_fields)."""
+        hv_field = self.EMBEDDING_FIELD_HV_MIRRORS[field_name]
+        value = value.tolist() if hasattr(value, 'tolist') else value
+        setattr(self, field_name, value)
+        setattr(self, hv_field, value)
+
 
 def clear_confirmed_ignore_face_encodings():
     """Null face_encoding_512 for every face CONFIRMED (declared_name) to
@@ -745,7 +773,11 @@ def clear_confirmed_ignore_face_encodings():
     qs = Face.objects.filter(
         declared_name__person_name__in=[settings.SOFT_IGNORE_NAME, '.realignore'],
     ).exclude(face_encoding_512__isnull=True)
-    return qs.update(face_encoding_512=None)
+    # Clears the halfvec mirror alongside the float32 field (dual-write
+    # phase, see CLAUDE.md's pgvector investigation) -- a cleared field
+    # should stay cleared on BOTH, not leave a stale halfvec value
+    # behind once face_encoding_512 itself is gone.
+    return qs.update(face_encoding_512=None, face_encoding_512_hv=None)
 
 
 def clear_encodings_below_collection_floor(collection=None, dry_run=False):
@@ -788,7 +820,7 @@ def clear_encodings_below_collection_floor(collection=None, dry_run=False):
     from filepopulator.models import below_collection_floor
 
     BATCH_SIZE = 5000
-    update_fields = ['face_encoding_512']
+    update_fields = ['face_encoding_512', 'face_encoding_512_hv']
     for poss_idx in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1):
         update_fields.append(f'poss_ident{poss_idx}')
         update_fields.append(f'weight_{poss_idx}')
@@ -815,6 +847,7 @@ def clear_encodings_below_collection_floor(collection=None, dry_run=False):
         cleared += 1
         if not dry_run:
             face.face_encoding_512 = None
+            face.face_encoding_512_hv = None
             for poss_idx in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1):
                 setattr(face, f'poss_ident{poss_idx}', None)
                 setattr(face, f'weight_{poss_idx}', 0.0)

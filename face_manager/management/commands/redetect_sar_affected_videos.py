@@ -165,7 +165,7 @@ class Command(BaseCommand):
                     cand = candidates[j]
                     provisional = cand['provisional']
                     provisional_frame = frame_pixels[provisional['frame_idx']]
-                    face.face_encoding_512 = cand['centroid'].tolist()
+                    face.set_embedding('face_encoding_512', cand['centroid'].tolist())
                     face.video_first_timestamp_seconds = extractor._clamp_to_duration(
                         video, cand['first_sample'] / fps, 'video_first_timestamp_seconds'
                     )
@@ -190,7 +190,7 @@ class Command(BaseCommand):
                     face.dateTakenUTC = video.dateTakenUTC
                     face.reencoded = True
                     face.written_to_photo_metadata = False
-                    face.face_encoding_512 = cand['centroid'].tolist()
+                    face.set_embedding('face_encoding_512', cand['centroid'].tolist())
                     face.video_first_timestamp_seconds = extractor._clamp_to_duration(
                         video, cand['first_sample'] / fps, 'video_first_timestamp_seconds'
                     )

@@ -471,6 +471,56 @@ class ApplicationErrorApiTests(ApiTestCase):
         self.assertTrue(error.dismissed)
         self.assertIsNotNone(error.dismissed_at)
 
+    def test_dismiss_without_clear_heartbeat_leaves_heartbeat_untouched(self):
+        """Plain dismiss must NEVER implicitly clear a heartbeat -- that
+        would silently teach the watchdog a task finished when all that
+        really happened is a human acknowledged the alert."""
+        from common.error_log import log_error
+        from common.heartbeat import record_heartbeat_start
+        from common.models import ApplicationError, TaskHeartbeat
+        record_heartbeat_start('some.task')
+        log_error('common.tasks.check_task_heartbeats', 'stuck', related_heartbeat_task_name='some.task')
+        error = ApplicationError.objects.get()
+
+        resp = self.client.post(f"/api/application_errors/{error.pk}/dismiss/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        hb = TaskHeartbeat.objects.get(task_name='some.task')
+        self.assertIsNone(hb.last_completed_at)
+
+    def test_dismiss_with_clear_heartbeat_marks_the_task_done(self):
+        from common.error_log import log_error
+        from common.heartbeat import record_heartbeat_start
+        from common.models import ApplicationError, TaskHeartbeat
+        record_heartbeat_start('some.task')
+        log_error('common.tasks.check_task_heartbeats', 'stuck', related_heartbeat_task_name='some.task')
+        error = ApplicationError.objects.get()
+
+        resp = self.client.post(f"/api/application_errors/{error.pk}/dismiss/", {'clear_heartbeat': True})
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        error.refresh_from_db()
+        self.assertTrue(error.dismissed)
+        hb = TaskHeartbeat.objects.get(task_name='some.task')
+        self.assertIsNotNone(hb.last_completed_at)
+        self.assertGreaterEqual(hb.last_completed_at, hb.last_started_at)
+
+    def test_clear_heartbeat_is_a_no_op_on_an_unrelated_error(self):
+        """An ApplicationError with no related_heartbeat_task_name (the
+        vast majority of them) must silently ignore the flag, not
+        error out -- the flag only ever does something for a real
+        heartbeat alert."""
+        from common.error_log import log_error
+        from common.models import ApplicationError
+        log_error('face_manager.assign_faces.execute', 'some unrelated error')
+        error = ApplicationError.objects.get()
+        self.assertIsNone(error.related_heartbeat_task_name)
+
+        resp = self.client.post(f"/api/application_errors/{error.pk}/dismiss/", {'clear_heartbeat': True})
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        error.refresh_from_db()
+        self.assertTrue(error.dismissed)
+
 
 class PersonListLightweightTests(ApiTestCase):
     """GET /api/person_list/?lightweight=true - a cheap alternate response

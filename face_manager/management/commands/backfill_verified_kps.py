@@ -526,8 +526,8 @@ class Command(BaseCommand):
                             if emb is None:
                                 continue
                             field = f'face_encoding_lvface_{size.lower()}'
-                            setattr(face, field, emb.tolist())
-                            face.save(update_fields=[field])
+                            face.set_embedding(field, emb.tolist())
+                            face.save(update_fields=[field, Face.EMBEDDING_FIELD_HV_MIRRORS[field]])
                             any_lvface_saved = True
                         if any_lvface_saved:
                             new_faces_this_run += 1
