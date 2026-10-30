@@ -17,6 +17,12 @@ only buried in a session's own narrative further down.** Full detail/context for
 the dated write-up elsewhere in this file (search for a distinctive word from the bullet).
 
 **Open questions / follow-ups:**
+- **pgvector/halfvec migration (2026-10-30) -- phases 1-3 done+deployed, phase 4 (backfill) running,
+  nothing reads the new columns yet.** See the dated write-up (search "pgvector/halfvec
+  embedding-storage migration") for the full picture. Next real step once the backfill finishes:
+  verify against real backfilled data, then cut over `assign_faces.py`'s reads first. LVFace-S/L
+  are stuck flat at 3.8% coverage (nothing populates them currently) -- not blocking, investigation-
+  only.
 - No automated "did last night's backup actually run" freshness check exists — the current
   restore-testing only validates a backup file once it's promoted into weekly retention, which
   says nothing about a night the backup silently never ran at all (this has already happened
@@ -1519,6 +1525,25 @@ workers are daemonic). If a `--parallel` run ever reports an opaque `TypeError: 
 as of this writing) to see the actual error. **Do not add `--parallel` to the slow-tagged real-
 inference suite** without separately re-validating it -- it wasn't tested under `--parallel` this
 session and loads heavy ONNX models per test class already.
+
+**Known-flaky tests, re-confirmed via real isolation re-runs 2026-10-30** (each passes cleanly
+alone -- not a real bug, just test-isolation noise; earlier "2 pre-existing failures" references
+elsewhere in this file predate these specific ones and may no longer be accurate given how much
+has changed):
+- `filepopulator.tests.test_video.VideoIngestionTests.test_multiple_roots_are_all_walked` --
+  intermittent, cause not fully chased down.
+- `api.tests.test_review_queue.IgnoreReviewFlaggedUnverifiedCountTests.
+  test_person_list_num_unverified_excludes_flagged_for_ignore` -- intermittent under `--parallel`.
+- `api.tests.test_media_serving.KeyedImageViewTests.test_unauthenticated_without_access_key_rejected`
+  -- fails under a full SERIAL run specifically (`429 != 404`), from throttle-state (DRF rate
+  limiter) accumulating across many tests sharing one long-lived process with no reset between
+  them; passes every time in isolation or under `--parallel` (where each worker's process is
+  shorter-lived). A real gap if ever investigated further: no test currently resets DRF's throttle
+  cache between cases.
+- A leftover `/tmp/img_validation` directory from a PREVIOUS run (not cleaned up if a run was
+  killed/interrupted, e.g. by a background-task timeout) causes a real, unrelated-looking failure
+  (`shutil.Error: File exists`) in `filepopulator.tests.test_ingestion_core` -- not a flake, just
+  needs `rm -rf /tmp/img_validation` before re-running if a prior run didn't finish cleanly.
 
 `face_manager/test_face_cache.py` caches real `PyramidalDetector` output keyed on `sha256(image bytes) + sha256(pyramidal_detector.py source)`, so repeat runs against an unchanged image with an unchanged detector skip the CPU cost entirely (~4s → ~0.01s per image). Change either the image or the detector's code and the cache key changes automatically.
 
@@ -4761,3 +4786,161 @@ caught this) -- the real risk is a conflict that LOOKS clean (auto-resolves with
 when one side is simply missing content the other has, which is exactly what almost happened with
 `face_manager/tests.py`'s own merge here (it went through silently; only a closer audit confirmed
 the content was already identical between both sides, not that it got silently lost).
+
+## IN PROGRESS (2026-10-30): pgvector/halfvec embedding-storage migration -- phases 1-3 done and
+deployed, phase 4 (backfill existing rows) running now, nothing reads the new columns yet
+
+**Why**: float32->float16 storage for the 4 embedding fields (`face_encoding_512`/
+`face_encoding_lvface_{b,s,l}`), to roughly halve their storage footprint. Empirically validated
+BEFORE any implementation (not assumed): real cosine-similarity drift from float16 rounding is
+~1e-5 mean, ~7e-5 max even in the classification-relevant 0.3-0.7 similarity band -- three orders
+of magnitude below this project's tightest real threshold margin (`CANDIDATE_MARGIN_FLOOR=0.03`).
+Full phased plan (additive -> dual-write -> backfill -> verify -> cutover reads one subsystem at a
+time -> only THEN, after a bake-in period and a fresh backup, drop the old float32 columns) was
+agreed with the user up front specifically so "we don't want to lose data" is true at every single
+step, not just the end state.
+
+**Real infra work needed before any schema change, found via a real spike (not assumed)**:
+- `pgvector` v0.8.0 built from source into both `dockerize/Dockerfile_postgres` (prod) and a
+  disposable `postgres:17.5-alpine`-based image for `db_picasa_dev` (rebuilt onto it 2026-10-29,
+  matching prod's real PG version for the first time -- it had drifted to plain `postgres:16-alpine`
+  previously, with no committed Dockerfile backing it at all). `with_llvm=no` skips an unrelated
+  optional JIT-bytecode build step that fails on an alpine clang version mismatch -- not needed for
+  the extension to function.
+- Exact-equality ORM lookups (`filter(field=value)`, `~Q(...)`) work correctly against pgvector's
+  `HalfVectorField` -- confirmed directly, so all 8 real `NON_DETECTED_FACE_ENCODING` sentinel-
+  equality call sites work unmodified. Per-element index lookups (Django's ArrayField `__0`
+  transform) do NOT work (`FieldError: Unsupported lookup '0'`, a clean error, not silent
+  corruption) -- `cleanup_chronically_unmatched_faces.py`'s `face_encoding_512__0=...` check still
+  needs a small rewrite (full-vector equality instead of first-element) before it can ever be cut
+  over to the halfvec column; not yet done, not urgent since nothing reads halfvec yet.
+- **Backup/restore compatibility, a real and non-obvious gap**: `pg_dump`/`pg_restore` requires the
+  TARGET Postgres to have the `vector` extension's shared library present, not just the source --
+  confirmed by actually reproducing the failure (restoring into a vanilla `postgres:17.5-alpine`
+  cascades through 7 errors, though `pg_restore`'s own exit code IS already nonzero, so this
+  project's existing row-count-based backup-verification test (not the exit code, which it
+  deliberately ignores for an unrelated reason) would have caught it). Fixed two ways: (1)
+  `postgres_bak.sh` now writes a `REQUIRED_EXTENSIONS.txt` manifest into every backup (queried live
+  from the DB, not guessed) so a human/script knows what's needed before attempting a restore, and
+  (2) `CREATE EXTENSION vector` moved entirely OUT of Django's migration tracking into
+  `dockerize/postgres_init_vector.sql`, run automatically as superuser via the official postgres
+  image's own `/docker-entrypoint-initdb.d/*.sql` convention on a FRESH data directory init
+  (covers a brand-new container AND a disaster-recovery restore, which also starts from a fresh
+  data directory, with zero manual steps). **This had to target `template1`, not the app's own
+  database** -- found via a second real failure, not assumed: Django's test runner creates a
+  brand-new `test_picasa` database on every run, which does NOT go through
+  `/docker-entrypoint-initdb.d/` at all (only fires once, on the whole cluster's first-ever init);
+  Postgres clones every new database from `template1` by default, so installing the extension
+  there once makes it automatically present in every future database in the cluster, test or
+  otherwise.
+  - **Why it's NOT a Django migration operation at all** (not even a `VectorExtension()` op):
+    a REAL first deploy of this hit `permission denied to create extension` under this project's
+    own deliberately-non-superuser app DB role (`benjamin`) -- rolled back the WHOLE migration
+    (Postgres DDL is transactional) even though every other operation needed no special privilege.
+    Not fixable by granting that one migration elevated privilege -- Django always runs a
+    migration as whatever role it's configured to connect as, no per-operation override. Had to
+    manually run migration 0020's exact SQL (via `sqlmigrate`, not hand-written, so there's no gap
+    between "what migrate would have done" and "what was actually done") connected as the real
+    `postgres` superuser, then `--fake`-apply the migration in Django's own bookkeeping.
+- `git`'s `safe.directory` needed adding to `Dockerfile_picasa` for an UNRELATED reason that
+  surfaced mid-session (the backup-script git-checkout-snapshot feature, see below) -- confirmed
+  directly ("detected dubious ownership") since the container runs as root over a host-owned bind
+  mount.
+
+**Schema (additive, migration `face_manager.0020`)**: 4 new nullable `HalfVectorField(dimensions=
+512)` columns -- `face_encoding_512_hv`/`face_encoding_lvface_{b,s,l}_hv`. Deployed to prod,
+`db_picasa_dev`, and backend_upgrade.
+
+**Dual-write (commit `f1f2de8`/merged)**: every real write site now goes through one new shared
+`Face.set_embedding(field_name, value)` helper (sets both the float32 field and its `_hv` mirror
+together, accepts `None`/the sentinel values/a raw numpy array) instead of a bare attribute
+assignment -- so the two columns can never silently drift apart by some call site forgetting the
+mirror. Updated: `face_extract_encode.py` (the main live image pipeline -- most call sites),
+`video_face_pipeline.py` (main live video pipeline), `models.py`'s two encoding-clearing functions
+(clearing to None clears both), and 4 management commands (`backfill_verified_kps`,
+`backfill_lvface_targeted`, `redetect_sar_affected_videos`, `improve_video_face_thumbnails`,
+`remediate_video_face_geometry`). Each site using a restricted `update_fields` save also needed the
+matching `_hv` field name added to that list, or the write would silently never persist.
+Deliberately NOT touched: `face_manager/scripts.py` (dead code, references the already-removed
+legacy 128-d `face_encoding` field) and `management/commands/deprecated/inception_features.py`
+(deprecated).
+
+**Confirmed actually live in production, not just merged**: `picasa_api`'s gunicorn+celery were
+restarted 2026-10-30 (see below) specifically so the already-running long-lived Celery workers
+would pick up the dual-write code -- confirmed via a direct count (237 faces dual-written within
+minutes of the restart). The 3 long-running foreground jobs active at the time (2x
+`backfill_verified_kps` gallery shards, `remediate_video_face_geometry`) were ALSO killed and
+relaunched with identical arguments specifically to pick up dual-write -- they're separate
+`docker exec -d` processes holding old in-memory code, unaffected by editing files on disk or by
+the gunicorn/celery restart. Per the user's own explicit call: skipping this relaunch would have
+meant a SECOND later backfill pass just for whatever these jobs wrote in the gap.
+
+**Backfill (phase 4, commit `dc6768b`/merged, `backfill_halfvec_mirrors` management command) --
+IN PROGRESS as of this writing.** Pure copy of the already-stored float32 value into the matching
+`_hv` column for every row written before dual-write existed -- no decode, no model inference.
+Processes all 4 fields per face in one combined query/update pass (a face can need more than one
+backfilled at once), not 4 separate full-table scans. Real scope measured against production right
+before launch: 423,601 faces needed `face_encoding_512_hv`, 191,108 needed
+`face_encoding_lvface_b_hv`, 30,155 each for `_s_hv`/`_l_hv`. Dry-run timing (20k candidates, 62s)
+projected ~22 minutes for the full run; running concurrently with the other 3 heavy jobs is slowing
+that down for real (200,000/423,601 processed after ~17 CPU-minutes, slower than the dry-run's
+clean-contention rate) -- expected, not a bug, same CPU-contention story as everything else running
+concurrently this session. **Check `/tmp/backfill_halfvec_mirrors.log` inside `picasa_api` for
+`EXIT:` to see if it's finished; it logs a checkpoint every 50,000 candidates.**
+
+**Explicitly NOT done yet (phases 5-8)**: verification against the real backfilled data (round-trip
++ row-count parity), read-side cutover one subsystem at a time (`assign_faces.py` first, the most
+sensitive), a bake-in period, and -- only after a fresh backup -- dropping the old float32 columns
+to actually reclaim storage. Nothing currently reads any `_hv` column; this is all still additive
+storage, zero behavior change so far.
+
+**Known gap, not yet addressed**: LVFace-S/L (`face_encoding_lvface_s/l`) are stuck at a flat
+3.8% of all 800,897 faces -- nothing currently running populates them (only a one-off 2026-10-26
+investigation backfill ever touched them; the live pipeline and the gallery-targeted command both
+only ever write LVFace-B). Not blocking anything (S/L are investigation-only, not wired into any
+live classification gate), but worth remembering if S/L ever becomes load-bearing.
+
+## DONE (2026-10-30): heartbeat-alert "clear it" feature, plus two real incidents found/fixed
+while deploying it
+
+**Feature**: `ApplicationErrorViewSet.dismiss()` (`/api/application_errors/{id}/dismiss/`) now
+accepts an opt-in `clear_heartbeat` body param (any truthy value). New `ApplicationError.
+related_heartbeat_task_name` field (set ONLY by `common.tasks.check_task_heartbeats`, via a new
+optional `log_error(..., related_heartbeat_task_name=...)` kwarg) gives dismiss() a structured link
+back to the specific `TaskHeartbeat` to clear, instead of parsing the free-text message -- NULL
+(and the flag silently a no-op) for every other kind of `ApplicationError`. Plain dismiss NEVER
+implicitly clears a heartbeat -- conflating "acknowledged" with "actually finished" would teach the
+watchdog to stop watching if a human habitually dismisses without checking first (e.g. via `celery
+inspect active`). Meant to be wired into a settings-page toggle, not a default action. Full
+contract (list shape, dismiss body/response) was written up directly for the user to build the
+frontend against. **Verified working end-to-end for real**: temporarily simulated a stuck heartbeat
+to generate a fresh alert row (confirming `related_heartbeat_task_name` populates correctly),
+restored the real heartbeat state immediately after, then the user dismissed that test row with the
+toggle through the actual app -- confirmed both halves fired (`dismissed=True` and the
+`TaskHeartbeat.last_completed_at` updated in the same instant).
+
+**Real incident this surfaced, found when the user asked "did it go through"**: `ApplicationError`
+id 17 -- the ORIGINAL stale `assign_faces.weekly_full` alert from 2026-10-26 that motivated this
+whole feature -- predates the fix (created hours before the backend change was even committed) and
+will NEVER get `related_heartbeat_task_name` populated retroactively. Not a bug; just old. The real
+underlying dangling heartbeat (a run that started 2026-10-26 and was killed mid-flight by some
+earlier restart, never recording completion -- confirmed via `celery inspect active` showing zero
+active tasks at the time) was resolved directly via `record_heartbeat_done()` once nothing was
+confirmed running.
+
+**Second real incident, found via an independent review while deploying this**: the gunicorn
+graceful-reload (`kill -HUP <master_pid>`) used to deploy the fix left ONE stale worker (PID 105,
+running code from the container's original boot the day before) alive alongside the 4 fresh
+workers -- a graceful reload didn't fully retire it, and it didn't even respond to a plain
+`SIGTERM` (needed `SIGKILL`). **Lesson for future deploys in this environment**: a gunicorn HUP
+reload is not guaranteed complete -- always verify with `ps aux` that every surviving worker's
+start time is actually after the reload, don't just trust that the signal was sent. A full
+`docker compose up -d --force-recreate picasa` is the more certain (but more disruptive -- kills
+the 3 long-running foreground jobs too) alternative; the lighter HUP+verify approach was chosen
+here specifically to avoid that disruption, and the leftover case just needed one extra manual
+`kill -KILL` once spotted.
+
+**Also while here**: celery beat + worker were separately restarted (clean `SIGTERM` warm
+shutdown, waited for the one in-flight task to finish, then relaunched with the exact same
+commands from `startup.sh`) -- same reasoning, needed to pick up the dual-write code above without
+a full container recreate.
