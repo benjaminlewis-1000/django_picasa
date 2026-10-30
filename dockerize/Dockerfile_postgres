@@ -15,10 +15,7 @@ COPY postgres_cron.ini /etc/supervisor.d/postgres_cron.ini
 # no) -- that step failed on a clang major-version mismatch between
 # alpine's packaged clang and what PGXS's JIT inlining expects; it's not
 # needed for the extension to function, only for an unrelated JIT
-# optimization. CREATE EXTENSION itself is NOT run here -- baking in the
-# capability is harmless and reversible (no functional change until a
-# migration actually runs `CREATE EXTENSION vector`), separate from the
-# decision of whether/when to actually use it.
+# optimization.
 RUN apk add --no-cache --virtual .pgvector-build-deps build-base postgresql-dev git \
     && git clone --branch v0.8.0 --depth 1 https://github.com/pgvector/pgvector.git /tmp/pgvector \
     && cd /tmp/pgvector \
@@ -26,6 +23,23 @@ RUN apk add --no-cache --virtual .pgvector-build-deps build-base postgresql-dev 
     && make install with_llvm=no \
     && cd / && rm -rf /tmp/pgvector \
     && apk del .pgvector-build-deps
+
+# Real, confirmed gotcha from the first real deploy of this (2026-10-29/
+# 30, see CLAUDE.md and face_manager/migrations/0020's own header):
+# `CREATE EXTENSION` needs superuser, but this project's app DB role
+# (`benjamin`) deliberately ISN'T superuser in production -- so a Django
+# migration running under that restricted role can NEVER create this
+# extension itself, fresh database or not; it's not a one-time fluke.
+# postgres_init_vector.sql runs automatically, as superuser, via the
+# official postgres image's own /docker-entrypoint-initdb.d/*.sql
+# convention, the FIRST time a fresh (empty) data directory is
+# initialized -- covering a brand-new container AND a disaster-recovery
+# restore into a fresh data directory (initdb, including this script,
+# runs before pg_restore ever touches it) with zero manual steps. An
+# ALREADY-initialized database doesn't get this re-run automatically and
+# needs CREATE EXTENSION done once, by hand, as superuser (already done
+# for db_picasa/db_picasa_dev as of this deploy).
+COPY postgres_init_vector.sql /docker-entrypoint-initdb.d/
 
 # TZ env var (set in docker-compose.yaml) needs tzdata installed to
 # actually take effect -- without it, TZ is silently ignored and
