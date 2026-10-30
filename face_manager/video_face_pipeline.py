@@ -541,6 +541,38 @@ def _mean_abs_pixel_diff(a, b):
     return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16))))
 
 
+def decode_face_thumbnail(face):
+    """Decodes a Face's stored face_thumbnail file into a raw BGR numpy
+    array, or None if the file is missing, unreadable, or doesn't decode
+    as a valid image -- all three are the same practical outcome (no
+    usable reference thumbnail), not worth distinguishing at this layer.
+    Always releases the file handle, even on failure.
+
+    Consolidated 2026-10-30: this exact open/read/close/cv2.imdecode
+    sequence had been independently copy-pasted across 7 management
+    commands (audit_video_face_geometry, backfill_video_det_score,
+    backfill_video_thumbnail_timestamps, scan_video_thumbnail_mismatches,
+    scan_video_thumbnail_quality, reset_bad_video_thumbnails,
+    remediate_video_face_geometry) -- 2 of them (backfill_video_
+    thumbnail_timestamps, reset_bad_video_thumbnails) didn't even guard
+    the open/read call, so a single face with a missing thumbnail file
+    would have crashed the entire command, the same bug class already
+    found and fixed in remediate_video_face_geometry.py's own extraction
+    path. See CLAUDE.md's video-face-pipeline consolidation write-up."""
+    try:
+        face.face_thumbnail.open('rb')
+        try:
+            raw = face.face_thumbnail.read()
+        finally:
+            try:
+                face.face_thumbnail.close()
+            except Exception:
+                pass
+    except Exception:
+        return None
+    return cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
 def _frame_seconds(pts, time_base, start_seconds):
     """A PyAV frame's real-world timestamp in seconds -- always via that
     SPECIFIC frame's own time_base, never a time_base borrowed from

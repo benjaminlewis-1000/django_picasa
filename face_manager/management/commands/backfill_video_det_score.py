@@ -1,9 +1,9 @@
-import numpy as np
-import cv2
 from django.core.management.base import BaseCommand
 
 from face_manager.models import Face
-from video_face_pipeline import VideoFaceExtractor, extract_frame_near_timestamp, ffprobe_info
+from video_face_pipeline import (
+    VideoFaceExtractor, decode_face_thumbnail, extract_frame_near_timestamp, ffprobe_info,
+)
 
 IOU_MATCH_THRESHOLD = 0.3
 
@@ -108,19 +108,7 @@ class Command(BaseCommand):
             field_order = video.field_order or probed_field_order
             box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
 
-            try:
-                face.face_thumbnail.open('rb')
-                thumb_bytes = face.face_thumbnail.read()
-            except Exception:
-                no_frame += 1
-                continue
-            finally:
-                try:
-                    face.face_thumbnail.close()
-                except Exception:
-                    pass
-
-            reference_bgr = cv2.imdecode(np.frombuffer(thumb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+            reference_bgr = decode_face_thumbnail(face)
             if reference_bgr is None:
                 no_frame += 1
                 continue

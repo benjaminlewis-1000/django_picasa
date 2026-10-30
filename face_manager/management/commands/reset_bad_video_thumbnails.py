@@ -6,23 +6,8 @@ from django.core.management.base import BaseCommand
 
 from face_manager.models import Face
 from filepopulator.models import VideoFile
-from video_face_pipeline import VideoFaceExtractor, ffprobe_info
-
-
-def _decode_stored_thumbnail(face):
-    face.face_thumbnail.open('rb')
-    try:
-        raw = face.face_thumbnail.read()
-    finally:
-        face.face_thumbnail.close()
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-
-
-def _mean_abs_diff(a, b):
-    if a is None or b is None or a.shape != b.shape:
-        return None
-    return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16))))
+from video_face_pipeline import VideoFaceExtractor, decode_face_thumbnail, ffprobe_info
+from video_face_pipeline import _mean_abs_pixel_diff as _mean_abs_diff
 
 
 def _extract_frame(path, timestamp, field_order, accurate=False):
@@ -101,7 +86,7 @@ class Command(BaseCommand):
                     field_order = 'unknown'
 
             box = (f.box_left, f.box_top, f.box_right, f.box_bottom)
-            stored = _decode_stored_thumbnail(f)
+            stored = decode_face_thumbnail(f)
 
             frame = _extract_frame(video.filename, f.video_thumbnail_frame_seconds, field_order)
             diff = None

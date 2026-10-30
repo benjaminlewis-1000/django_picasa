@@ -721,6 +721,41 @@ class RemediateVideoFaceGeometryTests(TestCase):
         face.refresh_from_db()
         self.assertEqual(face.box_left, 10)
 
+    def test_face_already_lvface_embedded_is_skipped_by_default(self):
+        """Real fix (2026-10-30): this command has been killed and
+        relaunched many times across real deploys. Without this skip, a
+        restart re-walks the ENTIRE population from scratch every time
+        -- harmless for an 'already ok' face that's a cheap no-op either
+        way, but genuinely bad for a 'fixed' face, which gets its box/
+        kps/thumbnail/embedding unconditionally re-overwritten on every
+        single restart even though it was already correctly fixed.
+        Filtering on the existing face_encoding_lvface_b column (set by
+        either outcome) avoids ever reaching either path a second time
+        -- no new field/migration needed."""
+        already_done = self._make_video_face(face_encoding_lvface_b=[0.5] * 512)
+        not_yet_done = self._make_video_face()
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate:
+            MockExtractor.return_value.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        # Only the not-yet-done face was even looked at -- a bare count
+        # check, not a substring-on-id check (a small sequential id like
+        # "2" is too easy to coincidentally match elsewhere in the
+        # output, e.g. "(first 20)").
+        self.assertIn("Checked 1 video face", out.getvalue())
+        already_done.refresh_from_db()
+        self.assertEqual(already_done.box_left, 10)  # genuinely untouched
+
+    def test_recheck_all_includes_already_embedded_faces(self):
+        already_done = self._make_video_face(face_encoding_lvface_b=[0.5] * 512)
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate:
+            MockExtractor.return_value.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', '--recheck-all', stdout=out)
+        self.assertIn("Checked 1 video face", out.getvalue())
+
     def test_ok_face_gets_second_check_and_lvface_from_real_frame(self):
         """A triage-passed face now also gets a real (cheap) frame decode
         -- a second, independent validation via _redetect_in_crop against
@@ -1000,7 +1035,14 @@ class RemediateVideoFaceGeometryTests(TestCase):
         face.refresh_from_db()
         self.assertEqual(face.box_left, 10)  # untouched despite being counted as "fixed"
 
-    def test_no_stored_timestamp_is_unresolved_without_a_search(self):
+    def test_no_stored_timestamp_is_logged_as_an_error_not_tracked(self):
+        """Empirically doesn't happen in production (0/52,806 video faces
+        checked 2026-10-30 lacked a timestamp), so this is a defensive
+        guard, not a real population to track/retry -- logged via
+        log_error() and skipped, per the user's explicit call to trim
+        this branch down rather than keep treating it as a first-class
+        'unresolved' outcome."""
+        from common.models import ApplicationError
         face = self._make_video_face(video_thumbnail_frame_seconds=None)
         with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
              patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate:
@@ -1008,16 +1050,28 @@ class RemediateVideoFaceGeometryTests(TestCase):
             out = io.StringIO()
             call_command('remediate_video_face_geometry', stdout=out)
         mock_locate.assert_not_called()
-        self.assertIn("1 unresolved", out.getvalue())
+        self.assertNotIn("1 unresolved", out.getvalue())
+        self.assertTrue(
+            ApplicationError.objects.filter(
+                source='remediate_video_face_geometry', message__contains=str(face.id),
+            ).exists()
+        )
 
-    def test_unexpected_error_on_one_face_does_not_abort_the_whole_run(self):
+    def test_missing_thumbnail_file_does_not_abort_the_whole_run(self):
         """Real bug found 2026-10-30: a missing thumbnail file on disk
         (FileNotFoundError, genuinely reproduced here by deleting it)
         crashed the ENTIRE multi-day production run, since only
-        _FaceTimeout was caught at the per-face level. Any unexpected
-        exception must be caught, logged, and skipped -- same 'one bad
-        item can't kill the batch' discipline this project enforces
-        everywhere else."""
+        _FaceTimeout was caught at the per-face level. Fixed originally
+        by catching any unexpected exception at the per-face level.
+
+        After the 2026-10-30 decode_face_thumbnail() consolidation, a
+        missing file is no longer an exception at all -- the shared
+        helper swallows it into a plain None return, same as a garbage/
+        undecodable file, so this now lands in decode_failed rather than
+        crashed (a deliberate behavior change, see the comment at this
+        command's own decode call site) -- but the real property this
+        test guards (one bad face can't take down the whole run) still
+        holds and is still what's being checked here."""
         bad_face = self._make_video_face()
         os.remove(bad_face.face_thumbnail.path)
         good_face = self._make_video_face()
@@ -1025,9 +1079,28 @@ class RemediateVideoFaceGeometryTests(TestCase):
             MockExtractor.return_value.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
             out = io.StringIO()
             call_command('remediate_video_face_geometry', stdout=out)
+        self.assertIn("1 already fine", out.getvalue())
+        self.assertIn("1 decode/ffprobe failures", out.getvalue())
+        self.assertNotIn("1 crashed", out.getvalue())
+
+    def test_unexpected_error_on_one_face_does_not_abort_the_whole_run(self):
+        """A genuinely unexpected failure (not a missing/undecodable
+        thumbnail -- that's decode_failed now, see the test above) still
+        must not abort the whole run -- same 'one bad item can't kill
+        the batch' discipline, exercised here via a real exception from
+        the detector itself rather than the thumbnail-decode step."""
+        bad_face = self._make_video_face()
+        good_face = self._make_video_face()
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor:
+            mock_ext = MockExtractor.return_value
+            mock_ext.det10g_model.detect.side_effect = [
+                RuntimeError("boom"), self._dets([(70, 70, 130, 130, 0.9)]),
+            ]
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
         self.assertIn("1 crashed", out.getvalue())
         self.assertIn(str(bad_face.id), out.getvalue())
-        self.assertIn("FileNotFoundError", out.getvalue())
+        self.assertIn("RuntimeError", out.getvalue())
         self.assertIn("1 already fine", out.getvalue())
 
 

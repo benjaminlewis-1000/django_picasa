@@ -31,12 +31,12 @@
 
 import time
 
-import cv2
 import numpy as np
 from django.core.management.base import BaseCommand
 from insightface.app import FaceAnalysis
 
 from face_manager.models import Face
+from video_face_pipeline import decode_face_thumbnail
 
 MIN_SCORE = 0.5
 # Fraction of the thumbnail's own width/height the detected face's
@@ -88,21 +88,9 @@ class Command(BaseCommand):
 
         for face in qs.iterator(chunk_size=500):
             total += 1
-            try:
-                face.face_thumbnail.open('rb')
-                thumb_bytes = face.face_thumbnail.read()
-            except Exception:
-                flagged.append((face.id, 'thumbnail file missing/unreadable'))
-                continue
-            finally:
-                try:
-                    face.face_thumbnail.close()
-                except Exception:
-                    pass
-
-            img = cv2.imdecode(np.frombuffer(thumb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+            img = decode_face_thumbnail(face)
             if img is None:
-                flagged.append((face.id, 'thumbnail failed to decode'))
+                flagged.append((face.id, 'thumbnail missing, unreadable, or undecodable'))
                 continue
 
             h, w = img.shape[:2]

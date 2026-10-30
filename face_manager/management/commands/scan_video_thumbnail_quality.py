@@ -32,6 +32,7 @@ import numpy as np
 from django.core.management.base import BaseCommand
 
 from face_manager.models import Face
+from video_face_pipeline import decode_face_thumbnail
 
 
 class Command(BaseCommand):
@@ -63,10 +64,7 @@ class Command(BaseCommand):
             out.write('face_id,video_id,declared_name,brightness,sharpness\n')
             for i, face in enumerate(qs.iterator(), start=1):
                 try:
-                    face.face_thumbnail.open('rb')
-                    data = face.face_thumbnail.read()
-                    face.face_thumbnail.close()
-                    img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    img = decode_face_thumbnail(face)
                     if img is None:
                         raise ValueError('decode returned None')
                     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
