@@ -166,6 +166,8 @@ class Command(BaseCommand):
         skipped_ok = 0
         ok_lvface_embedded = 0
         ok_frame_check_failed = []
+        ok_ffprobe_failed = []
+        ok_extract_failed = []
         fixed = 0
         lvface_embedded = 0
         unresolved = []
@@ -225,18 +227,26 @@ class Command(BaseCommand):
                         try:
                             (width, height, avg_fps, probed_field_order, rotation,
                              color_transfer, sar_scale_width) = get_ffprobe(video.filename)
-                        except Exception:
-                            continue  # no second check/LVFace possible without ffprobe -- not a hard failure
+                        except Exception as e:
+                            # no second check/LVFace possible without ffprobe -- not a hard
+                            # failure, but tracked (not just silently dropped) so a real,
+                            # systemic cause isn't invisible the way the extract_frame_
+                            # near_timestamp bug above was before this fix.
+                            ok_ffprobe_failed.append((face.id, repr(e)))
+                            continue
                         field_order = video.field_order if video.field_order is not None else probed_field_order
                         try:
                             real_frame = extract_frame_near_timestamp(
                                 video.filename, face.video_thumbnail_frame_seconds, avg_fps,
                                 field_order, rotation, old_box, thumb,
+                                width=width, height=height,
                                 color_transfer=color_transfer, sar_scale_width=sar_scale_width,
                             )
-                        except Exception:
+                        except Exception as e:
+                            ok_extract_failed.append((face.id, repr(e)))
                             continue
                         if real_frame is None:
+                            ok_extract_failed.append((face.id, 'extract returned None'))
                             continue
 
                         redet = extractor._redetect_in_crop(real_frame, old_box)
@@ -349,7 +359,8 @@ class Command(BaseCommand):
                 elapsed = time.time() - t0
                 self.stdout.write(
                     f"  ...{total} checked ({total/elapsed:.2f}/s), {skipped_ok} already ok "
-                    f"({ok_lvface_embedded} w/ LVFace, {len(ok_frame_check_failed)} frame-check-failed), "
+                    f"({ok_lvface_embedded} w/ LVFace, {len(ok_frame_check_failed)} frame-check-failed, "
+                    f"{len(ok_ffprobe_failed)} ffprobe-failed, {len(ok_extract_failed)} extract-failed), "
                     f"{fixed} fixed ({lvface_embedded} w/ LVFace), {len(unresolved)} unresolved, "
                     f"{len(decode_failed)} decode-failed, {len(timed_out)} timed out, "
                     f"{len(crashed)} crashed"
@@ -359,7 +370,9 @@ class Command(BaseCommand):
         self.stdout.write(
             f"\nChecked {total} video face(s) in {elapsed:.0f}s{' (dry run)' if dry_run else ''}.\n"
             f"  {skipped_ok} already fine ({ok_lvface_embedded} also got LVFace embeddings; "
-            f"{len(ok_frame_check_failed)} disagreed on a second, real-frame check -- flagged below).\n"
+            f"{len(ok_frame_check_failed)} disagreed on a second, real-frame check -- flagged below; "
+            f"{len(ok_ffprobe_failed)} couldn't be ffprobe'd; "
+            f"{len(ok_extract_failed)} failed recovering the real frame -- see below).\n"
             f"  {fixed} fixed via a confident nearby detection ({lvface_embedded} also got LVFace embeddings).\n"
             f"  {len(unresolved)} unresolved -- no confident detection anywhere nearby, left untouched.\n"
             f"  {len(decode_failed)} decode/ffprobe failures.\n"
@@ -377,6 +390,17 @@ class Command(BaseCommand):
             )
             for fid in ok_frame_check_failed[:50]:
                 self.stdout.write(f"  {fid}")
+        if ok_ffprobe_failed:
+            self.stdout.write(f"\nAlready-ok faces whose video couldn't be ffprobe'd (first 20):")
+            for fid, reason in ok_ffprobe_failed[:20]:
+                self.stdout.write(f"  {fid}: {reason}")
+        if ok_extract_failed:
+            self.stdout.write(
+                f"\nAlready-ok faces where real-frame recovery failed/crashed (first 20) -- "
+                f"these never got a chance at LVFace:"
+            )
+            for fid, reason in ok_extract_failed[:20]:
+                self.stdout.write(f"  {fid}: {reason}")
         if unresolved:
             self.stdout.write("\nUnresolved face ids (first 50), flagged for later:")
             for fid, reason in unresolved[:50]:
