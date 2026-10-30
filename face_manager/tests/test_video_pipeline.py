@@ -958,6 +958,26 @@ class RemediateVideoFaceGeometryTests(TestCase):
         mock_locate.assert_not_called()
         self.assertIn("1 unresolved", out.getvalue())
 
+    def test_unexpected_error_on_one_face_does_not_abort_the_whole_run(self):
+        """Real bug found 2026-10-30: a missing thumbnail file on disk
+        (FileNotFoundError, genuinely reproduced here by deleting it)
+        crashed the ENTIRE multi-day production run, since only
+        _FaceTimeout was caught at the per-face level. Any unexpected
+        exception must be caught, logged, and skipped -- same 'one bad
+        item can't kill the batch' discipline this project enforces
+        everywhere else."""
+        bad_face = self._make_video_face()
+        os.remove(bad_face.face_thumbnail.path)
+        good_face = self._make_video_face()
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor:
+            MockExtractor.return_value.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        self.assertIn("1 crashed", out.getvalue())
+        self.assertIn(str(bad_face.id), out.getvalue())
+        self.assertIn("FileNotFoundError", out.getvalue())
+        self.assertIn("1 already fine", out.getvalue())
+
 
 @tag("slow")
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
