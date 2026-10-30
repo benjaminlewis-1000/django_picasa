@@ -1,0 +1,33 @@
+-- Runs automatically, as superuser, the FIRST time a fresh (empty) data
+-- directory is initialized -- this is the official postgres image's own
+-- /docker-entrypoint-initdb.d/*.sql convention, not something custom to
+-- this project. Covers both a brand-new container AND restoring a
+-- backup into a fresh data directory (the restore target's initdb runs,
+-- including this script, before pg_restore ever touches it).
+--
+-- Deliberately NOT a Django-managed migration operation (see
+-- face_manager/migrations/0020's own header comment, and CLAUDE.md,
+-- 2026-10-30) -- CREATE EXTENSION requires superuser, but this
+-- project's app DB role is deliberately NOT superuser in production,
+-- so a Django migration running under that restricted role can never
+-- run this statement itself, fresh database or not.
+--
+-- Targets template1, not the app's own database -- found necessary via
+-- a real failure, not assumed: Django's test runner creates a brand-new
+-- `test_picasa` database on every single test run, which does NOT go
+-- through /docker-entrypoint-initdb.d/ at all (that only fires once, on
+-- the whole CLUSTER's first-ever init, never again for a later `CREATE
+-- DATABASE`) -- so `test_picasa` never got the extension and every
+-- migration touching a halfvec column failed with `type "halfvec" does
+-- not exist`. Postgres clones every new database from template1 by
+-- default, so installing it there once makes it automatically present
+-- in EVERY future database in this cluster, including Django's
+-- ephemeral test databases, with no further step needed anywhere.
+--
+-- An ALREADY-initialized cluster (anything from before this file
+-- existed) still needs this run once, by hand, as superuser, against
+-- BOTH template1 (for future test-DB creation) and the real app
+-- database (for the live schema) -- already done for db_picasa/
+-- db_picasa_dev as of 2026-10-30.
+\connect template1
+CREATE EXTENSION IF NOT EXISTS vector;
