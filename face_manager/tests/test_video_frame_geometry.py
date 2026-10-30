@@ -96,6 +96,47 @@ class VideoFaceFrameSecondsTests(unittest.TestCase):
         self.assertAlmostEqual(buggy, correct * 2, places=3)
 
 
+class DecodeFaceThumbnailTests(TestCase):
+    """decode_face_thumbnail() -- the shared open/read/close/cv2.imdecode
+    helper consolidated 2026-10-30 out of 7 independently copy-pasted
+    management-command implementations (2 of which didn't even guard
+    the open/read call -- see CLAUDE.md's video-face-pipeline
+    consolidation write-up). Source-agnostic (just a FileField read),
+    so a plain image-sourced Face exercises it exactly the same as a
+    video-sourced one would."""
+
+    def test_valid_thumbnail_decodes_to_a_real_array(self):
+        from video_face_pipeline import decode_face_thumbnail
+        face = make_face(make_image())
+        img = decode_face_thumbnail(face)
+        self.assertIsNotNone(img)
+        self.assertEqual(img.shape, (30, 30, 3))
+
+    def test_missing_file_on_disk_returns_none_without_raising(self):
+        from video_face_pipeline import decode_face_thumbnail
+        face = make_face(make_image())
+        os.remove(face.face_thumbnail.path)
+        self.assertIsNone(decode_face_thumbnail(face))
+
+    def test_corrupted_content_returns_none_without_raising(self):
+        from video_face_pipeline import decode_face_thumbnail
+        face = make_face(make_image())
+        with open(face.face_thumbnail.path, 'wb') as f:
+            f.write(b'not a real image')
+        self.assertIsNone(decode_face_thumbnail(face))
+
+    def test_file_handle_is_released_across_many_calls(self):
+        # Real motivation for consolidating this in the first place: a
+        # leaked fd across a tight loop (the exact shape every one of
+        # the 7 original call sites ran in) eventually exhausts the
+        # process's fd limit. Calling it many times in a row on the
+        # same face is a cheap proxy for "does this leak."
+        from video_face_pipeline import decode_face_thumbnail
+        face = make_face(make_image())
+        for _ in range(200):
+            self.assertIsNotNone(decode_face_thumbnail(face))
+
+
 class HdrVideoToneMapTests(unittest.TestCase):
     """is_hdr_transfer/build_vf_filter -- pure functions, no DB/decode
     needed. See CLAUDE.md's 2026-09-22 write-up: a real HDR-tagged phone
@@ -581,5 +622,150 @@ class RedetectSarAffectedVideosTests(TestCase):
         # video_a's face untouched (its redetect never completed);
         # video_b's face still got matched/updated normally.
         self.assertEqual(fake_extractor._compute_candidate_groups.call_count, 2)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class BackfillVideoThumbnailTimestampsTests(TestCase):
+    """backfill_video_thumbnail_timestamps -- previously had NO test
+    coverage at all, and (found during the 2026-10-30 video-face-
+    pipeline consolidation) its own local _decode_stored_thumbnail()
+    didn't guard the face_thumbnail open/read call -- a single face
+    with a missing thumbnail file would have crashed the entire
+    command, the exact same bug class already found and fixed in
+    remediate_video_face_geometry.py. Now uses the shared, guarded
+    decode_face_thumbnail() instead."""
+
+    CMD = 'face_manager.management.commands.backfill_video_thumbnail_timestamps'
+
+    def _make_video(self, path, width=40, height=40):
+        from filepopulator.models import Directory, VideoFile
+        directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(path))
+        return VideoFile.objects.create(
+            filename=path, directory=directory, width=width, height=height,
+            duration_seconds=30, isProcessed=True,
+        )
+
+    def _make_face(self, video, first_ts, last_ts):
+        # VideoFaceExtractor._square_thumbnail() always cv2.resizes its
+        # output to settings.FACE_THUMBNAIL_SIZE regardless of the input
+        # frame/box size -- the stored thumbnail must match THAT size,
+        # not the frame's own size, or _mean_abs_diff's shape check
+        # rejects every candidate. _tiny_jpeg_bytes() is solid black
+        # (all-zero), so whichever candidate frame is numerically
+        # closest to 0 is the one that should win the pixel match.
+        from django.conf import settings as django_settings
+        person = make_person("Backfill Timestamp Person")
+        face = Face(
+            declared_name=person, source_video_file=video,
+            box_left=5, box_top=5, box_right=35, box_bottom=35,
+            video_first_timestamp_seconds=first_ts, video_last_timestamp_seconds=last_ts,
+        )
+        face.face_thumbnail.save(
+            f"thumb_{video.pk}_{first_ts}.jpg",
+            ContentFile(_tiny_jpeg_bytes(size=django_settings.FACE_THUMBNAIL_SIZE)), save=False,
+        )
+        face.save()
+        return face
+
+    def _frame(self, fill_value, size=40):
+        return np.full((size, size, 3), fill_value, dtype=np.uint8)
+
+    def test_missing_thumbnail_file_does_not_crash_the_whole_run(self):
+        video = self._make_video('/videos/backfill_ts_test/a.mp4')
+        bad_face = self._make_face(video, first_ts=1.0, last_ts=2.0)
+        os.remove(bad_face.face_thumbnail.path)
+
+        with patch(f'{self.CMD}.ffprobe_info',
+                   return_value=(40, 40, 1.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD}.ffmpeg_frame_iterator',
+                   return_value=iter([self._frame(50), self._frame(100)])):
+            out = io.StringIO()
+            call_command('backfill_video_thumbnail_timestamps', stdout=out)
+
+        # No crash (the real regression) -- and since the thumbnail
+        # itself is unreadable, this face correctly can't be resolved.
+        self.assertIn('unresolved: 1', out.getvalue())
+        bad_face.refresh_from_db()
+        self.assertIsNone(bad_face.video_thumbnail_frame_seconds)
+
+    def test_resolves_timestamp_via_closest_pixel_match(self):
+        video = self._make_video('/videos/backfill_ts_test/b.mp4')
+        face = self._make_face(video, first_ts=0.0, last_ts=2.0)
+
+        with patch(f'{self.CMD}.ffprobe_info',
+                   return_value=(40, 40, 1.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD}.ffmpeg_frame_iterator',
+                   return_value=iter([self._frame(50), self._frame(100), self._frame(10)])):
+            out = io.StringIO()
+            call_command('backfill_video_thumbnail_timestamps', stdout=out)
+
+        self.assertIn('Resolved: 1', out.getvalue())
+        face.refresh_from_db()
+        self.assertAlmostEqual(face.video_thumbnail_frame_seconds, 2.0)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class ResetBadVideoThumbnailsTests(TestCase):
+    """reset_bad_video_thumbnails -- previously had NO test coverage at
+    all, and (found during the 2026-10-30 video-face-pipeline
+    consolidation) its own local _decode_stored_thumbnail() didn't
+    guard the face_thumbnail open/read call -- a single face with a
+    missing thumbnail file would have crashed the entire command. Now
+    uses the shared, guarded decode_face_thumbnail() instead."""
+
+    CMD = 'face_manager.management.commands.reset_bad_video_thumbnails'
+
+    def _make_video(self, path, width=40, height=40):
+        from filepopulator.models import Directory, VideoFile
+        directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(path))
+        return VideoFile.objects.create(
+            filename=path, directory=directory, width=width, height=height,
+            duration_seconds=30, isProcessed=True, field_order='progressive',
+        )
+
+    def _make_face(self, video, timestamp):
+        person = make_person("Reset Bad Thumbnail Person")
+        face = Face(
+            declared_name=person, source_video_file=video,
+            box_left=5, box_top=5, box_right=35, box_bottom=35,
+            video_thumbnail_frame_seconds=timestamp,
+        )
+        face.face_thumbnail.save(
+            f"thumb_{video.pk}_{timestamp}.jpg",
+            ContentFile(_tiny_jpeg_bytes(size=(30, 30))), save=False,
+        )
+        face.save()
+        return face
+
+    def test_missing_thumbnail_file_does_not_crash_the_whole_run(self):
+        video = self._make_video('/videos/reset_bad_test/a.mp4')
+        bad_face = self._make_face(video, timestamp=1.0)
+        os.remove(bad_face.face_thumbnail.path)
+        good_video = self._make_video('/videos/reset_bad_test/b.mp4')
+        good_face = self._make_face(good_video, timestamp=1.0)
+
+        def fake_extract(path, timestamp, field_order, accurate=False):
+            # Matches whichever face's own thumbnail this call is "for" via
+            # the video path, so good_face's fast check passes cleanly.
+            return np.full((30, 30, 3), 7, dtype=np.uint8) if 'b.mp4' in path else None
+
+        with patch(f'{self.CMD}._extract_frame', side_effect=fake_extract), \
+             patch(f'{self.CMD}.VideoFaceExtractor._square_thumbnail',
+                   side_effect=lambda frame, box: frame):
+            out = io.StringIO()
+            call_command('reset_bad_video_thumbnails', stdout=out)
+
+        # No crash (the real regression, checked by simply reaching
+        # this line without an unhandled exception) -- bad_face's video
+        # is flagged (can't confirm a good thumbnail at all, having no
+        # usable stored reference to compare against), its face deleted
+        # and the video reset to unprocessed; good_face's video is left
+        # completely alone.
+        video.refresh_from_db()
+        self.assertFalse(video.isProcessed)
+        self.assertFalse(Face.objects.filter(pk=bad_face.pk).exists())
+        good_video.refresh_from_db()
+        self.assertTrue(good_video.isProcessed)
+        self.assertTrue(Face.objects.filter(pk=good_face.pk).exists())
 
 

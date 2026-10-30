@@ -75,15 +75,15 @@
 import signal
 import time
 
-import cv2
 import numpy as np
 from django.core.management.base import BaseCommand
 from django.db.models import Q
 
 import lvface
+from common.error_log import log_error
 from face_manager.models import Face
 from video_face_pipeline import (
-    VideoFaceExtractor, extract_frame_near_timestamp, ffprobe_info,
+    VideoFaceExtractor, decode_face_thumbnail, extract_frame_near_timestamp, ffprobe_info,
     locate_confident_face_near_timestamp,
 )
 
@@ -133,10 +133,18 @@ class Command(BaseCommand):
                                   "no reason to pay for S/L on the video side when they "
                                   "aren't the size actually in use for comparisons. Empty "
                                   'string disables LVFace embedding entirely.')
+        parser.add_argument('--recheck-all', action='store_true',
+                             help='Also re-walk faces that already have the first --lvface-'
+                                  'sizes embedding set -- normally skipped (see the default '
+                                  'queryset filter below). Only pass this for a genuine full '
+                                  're-audit (e.g. after a real model/threshold change); '
+                                  'routine restarts should NOT use it, since it defeats the '
+                                  'whole point of the skip.')
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
         limit = options['limit']
+        recheck_all = options['recheck_all']
         person_ids = None
         if options['person_ids']:
             person_ids = [int(s.strip()) for s in options['person_ids'].split(',') if s.strip()]
@@ -144,6 +152,17 @@ class Command(BaseCommand):
 
         qs = Face.objects.filter(source_video_file__isnull=False).exclude(face_thumbnail='') \
             .select_related('source_video_file')
+        if lvface_sizes and not recheck_all:
+            # A "fixed" face always gets this field written (always overwritten, since its
+            # kps just changed -- see this command's own docstring); an "already ok" face
+            # gets it too unless the field was already set. Either way, once this is set,
+            # the face has reached a stable, settled outcome -- skip it on any future run
+            # instead of re-walking (and, for a FIXED face, re-overwriting box/kps/
+            # thumbnail/embedding) something already done. This command has been killed
+            # and relaunched many times across real deploys (e.g. the 2026-10-30 HDR-
+            # dispatch bug fix), so this matters for real, not just in theory.
+            primary_lvface_field = f'face_encoding_lvface_{lvface_sizes[0].lower()}'
+            qs = qs.filter(**{f'{primary_lvface_field}__isnull': True})
         if person_ids is not None:
             qs = qs.filter(Q(declared_name_id__in=person_ids) | Q(poss_ident1_id__in=person_ids))
         qs = qs.order_by('id')
@@ -190,16 +209,15 @@ class Command(BaseCommand):
                 signal.signal(signal.SIGALRM, _raise_face_timeout)
                 signal.alarm(PER_FACE_TIMEOUT_SECONDS)
                 try:
-                    try:
-                        face.face_thumbnail.open('rb')
-                        thumb_bytes = face.face_thumbnail.read()
-                    finally:
-                        try:
-                            face.face_thumbnail.close()
-                        except Exception:
-                            pass
-
-                    thumb = cv2.imdecode(np.frombuffer(thumb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    # decode_face_thumbnail() swallows a missing/unreadable file the
+                    # same way as a garbage/undecodable one -- both land in
+                    # decode_failed. Previously a missing file (FileNotFoundError)
+                    # propagated past this point and was caught by the outer except
+                    # as a "crash" instead; collapsed deliberately during the
+                    # 2026-10-30 consolidation (see CLAUDE.md) since both are really
+                    # the same practical outcome: no usable thumbnail, face left
+                    # untouched, safe to retry later.
+                    thumb = decode_face_thumbnail(face)
                     if thumb is None:
                         decode_failed.append(face.id)
                         continue
@@ -223,6 +241,13 @@ class Command(BaseCommand):
                     if ok:
                         skipped_ok += 1
                         if face.video_thumbnail_frame_seconds is None:
+                            # Empirically doesn't happen (0/52,806 video faces checked
+                            # 2026-10-30) -- every video face has a stored timestamp in
+                            # practice. Kept as a defensive guard, not a real population
+                            # to track/retry, so just logged and moved past.
+                            log_error('remediate_video_face_geometry',
+                                      f'Face {face.id}: already-ok video face has no '
+                                      f'video_thumbnail_frame_seconds')
                             continue
                         try:
                             (width, height, avg_fps, probed_field_order, rotation,
@@ -281,7 +306,11 @@ class Command(BaseCommand):
 
                     # Triage failed -- attempt a real fix.
                     if face.video_thumbnail_frame_seconds is None:
-                        unresolved.append((face.id, 'no stored timestamp to search around'))
+                        # Same empirically-doesn't-happen guard as the already-ok branch
+                        # above -- logged and moved past, not tracked as a population.
+                        log_error('remediate_video_face_geometry',
+                                  f'Face {face.id}: triage-failed video face has no '
+                                  f'video_thumbnail_frame_seconds to search around')
                         continue
                     try:
                         (width, height, avg_fps, probed_field_order, rotation,

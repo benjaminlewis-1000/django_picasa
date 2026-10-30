@@ -34,15 +34,14 @@ import signal
 import time
 from collections import defaultdict
 
-import cv2
-import numpy as np
 from django.core.management.base import BaseCommand
 
 from face_manager.models import Face
 from face_manager.tasks import PER_VIDEO_TIMEOUT_SECONDS, _VideoProcessingTimeout, _raise_video_timeout
 from filepopulator.models import VideoFile
 from video_face_pipeline import (
-    VideoFaceExtractor, _mean_abs_pixel_diff, build_vf_filter, ffmpeg_frame_iterator, ffprobe_info,
+    VideoFaceExtractor, _mean_abs_pixel_diff, build_vf_filter, decode_face_thumbnail,
+    ffmpeg_frame_iterator, ffprobe_info,
 )
 
 MISMATCH_THRESHOLD = 15.0
@@ -138,13 +137,9 @@ class Command(BaseCommand):
                 box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
                 fresh_crop = VideoFaceExtractor._square_thumbnail(exact_frame, box)
 
-                try:
-                    face.face_thumbnail.open('rb')
-                    thumb_bytes = face.face_thumbnail.read()
-                    face.face_thumbnail.close()
-                except Exception:
+                stored = decode_face_thumbnail(face)
+                if stored is None:
                     continue
-                stored = cv2.imdecode(np.frombuffer(thumb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
 
                 diff = _mean_abs_pixel_diff(fresh_crop, stored)
                 if diff is not None and diff > MISMATCH_THRESHOLD:
