@@ -742,6 +742,15 @@ class RemediateVideoFaceGeometryTests(TestCase):
             call_command('remediate_video_face_geometry', stdout=out)
         mock_locate.assert_not_called()
         mock_extract.assert_called_once()
+        # Regression (2026-10-30): extract_frame_near_timestamp() dispatches HDR-tagged
+        # sources to its ffmpeg-subprocess variant, which needs width/height explicitly
+        # (it has no container to read dimensions from the way the PyAV path does) --
+        # this command used to omit them entirely, crashing with
+        # TypeError('NoneType * NoneType') for every HDR-sourced "already ok" face, always
+        # silently swallowed by a bare except. Assert the real ffprobe'd dimensions are
+        # actually passed through, not just that the function was called at all.
+        self.assertEqual(mock_extract.call_args.kwargs.get('width'), 640)
+        self.assertEqual(mock_extract.call_args.kwargs.get('height'), 480)
         mock_ext._redetect_in_crop.assert_called_once_with(real_frame, (10, 10, 50, 50))
         mock_lvface.embed_from_image_array.assert_called_once_with(
             real_frame, [[1, 1]] * 5, input_is_bgr=True, size='B',
@@ -750,6 +759,49 @@ class RemediateVideoFaceGeometryTests(TestCase):
         face.refresh_from_db()
         self.assertEqual(face.face_encoding_lvface_b, [0.6] * 512)
         self.assertEqual(face.box_left, 10)  # box/kps genuinely unchanged, only LVFace was added
+
+    def test_ok_face_hdr_source_does_not_crash_extract_frame_near_timestamp(self):
+        """Regression (2026-10-30): an HDR-tagged video (color_transfer
+        'arib-std-b67'/'smpte2084') makes extract_frame_near_timestamp()
+        dispatch to its ffmpeg-subprocess variant, which needs width/
+        height explicitly -- this command used to call it without them,
+        crashing with TypeError('NoneType * NoneType') for every single
+        HDR-sourced 'already ok' face, silently swallowed by a bare
+        except so it looked like simple skip-already-done behavior
+        rather than a real, systemic failure. Uses the REAL
+        extract_frame_near_timestamp()/dispatch logic (only
+        ffmpeg_frame_iterator itself is mocked, to avoid a real
+        subprocess), so this exercises the exact code path that crashed,
+        not a mock standing in for it."""
+        face = self._make_video_face()
+        real_frame = np.ones((480, 640, 3), dtype=np.uint8) * 7
+        # remediate_video_face_geometry.py imports video_face_pipeline as a BARE
+        # top-level module (`from video_face_pipeline import ...`), which this codebase
+        # also loads under `face_manager.video_face_pipeline` -- same file, but two
+        # distinct sys.modules entries with independent globals. Must patch the bare
+        # one, or the patch silently has no effect on the real dispatch path.
+        import video_face_pipeline as vfp_module
+        mock_iterator = MagicMock(return_value=iter([real_frame]))
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, 'arib-std-b67', None)), \
+             patch.object(vfp_module, 'ffmpeg_frame_iterator', mock_iterator), \
+             patch(f'{self.CMD_MODULE}.lvface') as mock_lvface:
+            mock_ext = MockExtractor.return_value
+            mock_ext.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
+            mock_ext._redetect_in_crop.return_value = ([12, 12, 48, 48], [[1, 1]] * 5, 0.88)
+            mock_lvface.embed_from_image_array.return_value = np.full(512, 0.6, dtype=np.float32)
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        # The real point of this test: the HDR dispatch path actually ran (no TypeError
+        # from frame_size = width * height * 3 with width/height missing) and reached
+        # the raw-pipe frame source with the REAL ffprobe'd dimensions, not None/None.
+        mock_iterator.assert_called()
+        call_args = mock_iterator.call_args_list[0]
+        self.assertEqual(call_args.args[1], 640)  # width
+        self.assertEqual(call_args.args[2], 480)  # height
+        self.assertEqual(out.getvalue().count('CRASH'), 0)
+        self.assertNotIn('TypeError', out.getvalue())
 
     def test_ok_face_flagged_when_real_frame_check_disagrees(self):
         """Triage passed on the stored thumbnail, but a real frame decode
