@@ -158,6 +158,27 @@ def _crop_redetect(app, img_numpy, box, pad_pct=CROP_REDETECT_PAD_PCT, min_score
     return kps_out, float(best.det_score), n_candidates
 
 
+def _face_is_done(face, lvface_sizes, sentinel):
+    """A face is done either the normal way (real kps + every requested
+    LVFace size populated) or via _mark_no_face_found()'s permanent
+    "confirmed nothing here" marker (kps stays NULL forever by design,
+    but every requested LVFace size is the sentinel). Without the second
+    branch, a marked face would have no kps and get re-examined by every
+    future run forever -- exactly the wasted-recompute problem marking
+    it was meant to solve."""
+    if not lvface_sizes:
+        return face.kps is not None
+    if face.kps is not None:
+        return all(
+            getattr(face, f'face_encoding_lvface_{size.lower()}') is not None
+            for size in lvface_sizes
+        )
+    return all(
+        list(getattr(face, f'face_encoding_lvface_{size.lower()}') or []) == sentinel
+        for size in lvface_sizes
+    )
+
+
 def _build_full_detector():
     """Unlike backfill_det_score's detection-only detector, this one also
     needs the recognition module (to verify a match against the face's
@@ -305,6 +326,39 @@ class Command(BaseCommand):
             any_lvface_saved = True
         return any_lvface_saved
 
+    def _mark_no_face_found(self, face, lvface_sizes, stats, dry_run):
+        """2026-10-31 (see CLAUDE.md): for a face where BOTH detection
+        attempts came back genuinely empty -- the whole-image pass never
+        matched it at all, and the cheap crop-based fallback found
+        nothing either -- leaving its LVFace fields NULL forever means
+        every future run re-examines it from scratch, paying the same
+        whole-image + crop detection cost indefinitely for a face that's
+        already been confirmed to have no findable geometry. Marking the
+        sentinel (settings.NON_DETECTED_FACE_ENCODING, the same one
+        face_encoding_512 already uses for this exact 'no match' concept)
+        records "checked, nothing here" as a real, permanent fact --
+        consistent with how every reader of this field already treats
+        the sentinel (reclassify_candidates, the gallery-building code in
+        this very file) as "not a usable embedding," not as "unknown."
+
+        Deliberately does NOT touch kps -- there's no equivalent "no kps"
+        sentinel in this codebase, and NULL already correctly means that.
+        Only applied to crop_redetect_empty (not crop_redetect_ambiguous,
+        where a real face likely IS there, just unclear which candidate
+        -- marking that as 'confirmed nothing' would be actively wrong)."""
+        if dry_run:
+            stats['marked_no_face_found'] += 1
+            return
+        sentinel = list(settings.NON_DETECTED_FACE_ENCODING)
+        update_fields = []
+        for size in lvface_sizes:
+            field = f'face_encoding_lvface_{size.lower()}'
+            face.set_embedding(field, sentinel)
+            update_fields += [field, Face.EMBEDDING_FIELD_HV_MIRRORS[field]]
+        if update_fields:
+            face.save(update_fields=update_fields)
+            stats['marked_no_face_found'] += 1
+
     def handle(self, *args, **options):
         dry_run = options['dry_run']
         limit = options['limit']
@@ -399,13 +453,15 @@ class Command(BaseCommand):
             # fields this run actually wants). An empty lvface_sizes
             # list makes the inner all() vacuously True, preserving the
             # original kps-only behavior unchanged for that mode.
-            if all(
-                f.kps is not None and all(
-                    getattr(f, f'face_encoding_lvface_{size.lower()}') is not None
-                    for size in lvface_sizes
-                )
-                for f in image_faces
-            ):
+            #
+            # A face _mark_no_face_found() marked (kps NULL forever, but
+            # LVFace set to the sentinel) also counts as done -- it has
+            # no kps to wait for, by design, since nothing was ever found
+            # to write kps FROM. Without this, every such face would be
+            # re-examined (whole-image + crop redetect, both already
+            # confirmed empty) on every single future run forever,
+            # defeating the entire point of marking it.
+            if all(_face_is_done(f, lvface_sizes, sentinel) for f in image_faces):
                 stats['already_done'] += len(image_faces)
                 continue
 
@@ -607,6 +663,7 @@ class Command(BaseCommand):
                         )
                         if cr is None:
                             stats['crop_redetect_empty'] += 1
+                            self._mark_no_face_found(face, lvface_sizes, stats, dry_run)
                             continue
                         kps_out, det_score_out, n_candidates = cr
                         if n_candidates > 1:
