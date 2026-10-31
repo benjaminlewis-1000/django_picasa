@@ -690,7 +690,14 @@ class BackfillVerifiedKpsTests(TestCase):
         face.refresh_from_db()
         self.assertIsNone(face.kps)
 
-    def test_crop_redetect_finds_nothing_leaves_face_untouched(self):
+    def test_crop_redetect_finds_nothing_marks_sentinel_not_untouched(self):
+        # 2026-10-31 (see CLAUDE.md): both detection attempts came back
+        # genuinely empty -- kps stays NULL forever (nothing was ever
+        # found to write it FROM), but the LVFace fields get the same
+        # sentinel face_encoding_512 already uses for "no match" --
+        # otherwise this face would be re-examined (whole-image + crop
+        # redetect, both already confirmed empty) on every future run
+        # forever.
         stored = [1.0] + [0.0] * 511
         face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
         whole_image_dets = [self._FakeDetection([25, 25, 65, 65], 0.85, [[45.0, 45.0]] * 5, [0.0] * 512)]
@@ -701,6 +708,61 @@ class BackfillVerifiedKpsTests(TestCase):
             call_command('backfill_verified_kps')
         face.refresh_from_db()
         self.assertIsNone(face.kps)
+        self.assertEqual(list(face.face_encoding_lvface_b), [-999.0] * 512)
+
+    def test_crop_redetect_empty_dry_run_does_not_write_sentinel(self):
+        stored = [1.0] + [0.0] * 511
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
+        whole_image_dets = [self._FakeDetection([25, 25, 65, 65], 0.85, [[45.0, 45.0]] * 5, [0.0] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.side_effect = [whole_image_dets, []]
+            call_command('backfill_verified_kps', '--dry-run')
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    def test_sentinel_marked_face_is_not_reexamined_on_a_later_run(self):
+        # The real point of marking it: a second run must NOT call the
+        # detector again for an image whose only face is already marked
+        # "confirmed nothing here" -- it should be skipped via the
+        # already_done resumability check, same as a genuinely-finished
+        # face.
+        stored = [1.0] + [0.0] * 511
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
+        whole_image_dets = [self._FakeDetection([25, 25, 65, 65], 0.85, [[45.0, 45.0]] * 5, [0.0] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.side_effect = [whole_image_dets, []]
+            call_command('backfill_verified_kps')
+
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented') as mock_open, \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build2:
+            call_command('backfill_verified_kps')
+            mock_open.assert_not_called()
+            mock_build2.return_value.get.assert_not_called()
+
+    def test_crop_redetect_ambiguous_does_not_mark_sentinel(self):
+        # A real face likely IS there, just unclear which candidate --
+        # marking "confirmed nothing here" would be actively wrong.
+        stored = [1.0] + [0.0] * 511
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
+        whole_image_dets = [self._FakeDetection([25, 25, 65, 65], 0.85, [[45.0, 45.0]] * 5, [0.0] * 512)]
+        crop_kps = [[30.0, 30.0]] * 5
+        crop_dets = [
+            self._FakeDetection([5, 5, 45, 45], 0.75, crop_kps, [0.0] * 512),
+            self._FakeDetection([8, 8, 48, 48], 0.70, crop_kps, [0.0] * 512),
+        ]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.side_effect = [whole_image_dets, crop_dets]
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+        self.assertIsNone(face.face_encoding_lvface_b)
 
     def test_unverified_face_without_stored_encoding_is_saved_anyway(self):
         # Per explicit design direction: an incidental face sharing an
