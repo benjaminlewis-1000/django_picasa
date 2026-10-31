@@ -86,6 +86,26 @@ GRAY_ZONE_SIM = 0.7
 GRAY_ZONE_MIN_IOU = 0.8
 GRAY_ZONE_MAX_RELATIVE_SIZE = 0.08
 
+# Geometry-trust fallback tiers (2026-10-31, see CLAUDE.md) -- for a face
+# whose STORED embedding doesn't match a fresh redetection well enough to
+# clear GRAY_ZONE_SIM, a confident and UNAMBIGUOUS box match is still real
+# evidence the box/kps themselves are correct, even though the identity
+# question (is this really who it's declared/proposed as) is explicitly
+# NOT this tier's job -- that stays gated separately by whichever real
+# classification pass reads the resulting embedding later (e.g.
+# reclassify_candidates --encoding=lvface_b). Validated empirically against
+# real production data (301 real candidate faces): whole-image IOU>=0.5
+# recovers 254/301 with zero ambiguous cases found; a second, cheap
+# crop-based redetection fallback (same REDETECT_PAD_PCT/REDETECT_MIN_SCORE
+# shape video_face_pipeline.py already uses) on the remainder recovers 15
+# more, flags 3 as genuinely ambiguous (left untouched), and correctly
+# finds nothing at all for the other ~30 (visually confirmed: some are
+# real people who aren't a match, some are pure background/no-face-at-all
+# -- never guessed at either way).
+IOU_OVERRIDE_THRESH = 0.5
+CROP_REDETECT_PAD_PCT = 0.6
+CROP_REDETECT_MIN_SCORE = 0.5
+
 PER_IMAGE_TIMEOUT_SECONDS = 60
 
 
@@ -101,6 +121,41 @@ def _l2norm(a):
     a = np.asarray(a, dtype=np.float32)
     n = np.linalg.norm(a)
     return a / n if n > 0 else a
+
+
+def _crop_redetect(app, img_numpy, box, pad_pct=CROP_REDETECT_PAD_PCT, min_score=CROP_REDETECT_MIN_SCORE):
+    """Cheap fallback for an existing face whose stored box got no
+    confident whole-image match at all -- crops a padded region around
+    the box and redetects just within it, same shape as video_face_
+    pipeline.py's own _redetect_in_crop(). Only searches the immediate
+    neighborhood of the stored box, so (unlike a whole-image search) it
+    structurally cannot accidentally match a detection far away in the
+    image -- a real, confirmed failure mode of the whole-image IOU
+    override (see IOU_OVERRIDE_THRESH's own comment).
+
+    Returns (kps_in_full_image_coords, det_score, n_candidates_clearing_
+    min_score) for the single best candidate, or None if nothing in the
+    crop clears min_score at all. The caller decides what to do with
+    n_candidates > 1 (ambiguous -- more than one real face nearby, don't
+    guess which one is right)."""
+    l, t, r, b = box
+    w, h = r - l, b - t
+    l2 = max(0, int(l - w * pad_pct))
+    t2 = max(0, int(t - h * pad_pct))
+    r2 = min(img_numpy.shape[1], int(r + w * pad_pct))
+    b2 = min(img_numpy.shape[0], int(b + h * pad_pct))
+    crop = img_numpy[t2:b2, l2:r2]
+    if crop.shape[0] < 20 or crop.shape[1] < 20:
+        return None
+    dets = app.get(crop)
+    if not dets:
+        return None
+    n_candidates = sum(1 for d in dets if d.det_score >= min_score)
+    if n_candidates == 0:
+        return None
+    best = max(dets, key=lambda d: d.det_score)
+    kps_out = (np.asarray(best['kps'], dtype=float) + np.array([l2, t2])).reshape(-1).tolist()
+    return kps_out, float(best.det_score), n_candidates
 
 
 def _build_full_detector():
@@ -189,6 +244,66 @@ class Command(BaseCommand):
                                   "aspect ratio is a cleaner, more reliable signal than raw pixel "
                                   "count alone (which can't distinguish a genuine panorama from "
                                   "an ordinary large photo in the same megapixel range).")
+
+    def _save_kps_and_lvface(self, face, kps, det_score, img_numpy, img_obj, lvface_sizes, stats, tier, dry_run):
+        """Shared write path for every verification tier (high_confidence/
+        gray_zone/iou_override/crop_redetect/unverified) -- saves kps/
+        det_score (the DB's own face_kps_within_box_margin constraint is
+        the real source of truth, never fatal if it rejects), then LVFace
+        for each configured size if the face clears its collection's
+        detection floor. face_encoding_512 is deliberately never touched
+        here -- only this command's dedicated verification tiers decide
+        when a fresh embedding is trustworthy enough to overwrite it, and
+        none of them currently do.
+
+        Returns True if at least one LVFace size was saved (the caller's
+        own new_faces_this_run counter), False otherwise (including dry
+        run, where nothing is written at all)."""
+        if dry_run:
+            stats[f'saved_{tier}'] += 1
+            return False
+
+        # _kps_matches_box() (checked by callers before reaching here) is
+        # deliberately looser than the DB's own face_kps_within_box_margin
+        # constraint (every one of the 5 points individually within a 25%
+        # margin) -- a real match can clear the looser centroid check while
+        # one individual landmark still fails the DB's tighter, per-point
+        # requirement. transaction.atomic() here creates a real savepoint,
+        # not just a Python-level try/except -- without it, a caught
+        # IntegrityError still leaves Postgres considering the connection's
+        # current transaction aborted until an actual ROLLBACK happens.
+        try:
+            with transaction.atomic():
+                face.kps = FaceExtractor._flatten_kps(kps)
+                face.det_score = det_score
+                face.save(update_fields=['kps', 'det_score'])
+        except IntegrityError as e:
+            stats['db_constraint_rejected'] += 1
+            self.stdout.write(f"  face {face.id}: DB rejected the recovered kps ({e}) -- skipping")
+            return False
+
+        stats[f'saved_{tier}'] += 1
+
+        if below_collection_floor(img_obj.directory.collection, face.det_score, face.relative_size):
+            stats['below_collection_floor_skip'] += 1
+            return False
+
+        any_lvface_saved = False
+        for size in lvface_sizes:
+            try:
+                emb = lvface.embed_from_image_array(
+                    img_numpy, face.kps, input_is_bgr=False, size=size,
+                )
+            except Exception as e:
+                self.stdout.write(f"  LVFace-{size} failed for face {face.id}: {e}")
+                continue
+            if emb is None:
+                continue
+            field = f'face_encoding_lvface_{size.lower()}'
+            face.set_embedding(field, emb.tolist())
+            face.save(update_fields=[field, Face.EMBEDDING_FIELD_HV_MIRRORS[field]])
+            any_lvface_saved = True
+        return any_lvface_saved
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
@@ -449,6 +564,20 @@ class Command(BaseCommand):
                                 face.relative_size is not None and face.relative_size <= GRAY_ZONE_MAX_RELATIVE_SIZE
                             ):
                                 tier = 'gray_zone'
+                            elif this_iou >= IOU_OVERRIDE_THRESH and (
+                                int((iou[r, :] >= IOU_OVERRIDE_THRESH).sum()) == 1
+                            ):
+                                # The stored embedding doesn't match well enough to
+                                # trust via similarity, but the box match is
+                                # confident AND unambiguous (no other detection in
+                                # this image also clears the bar against this same
+                                # existing box) -- real evidence the GEOMETRY is
+                                # right even though identity isn't being judged
+                                # here at all (see IOU_OVERRIDE_THRESH's own
+                                # comment). face_encoding_512 is deliberately left
+                                # untouched, same as every other tier -- only
+                                # kps/det_score/LVFace get written.
+                                tier = 'iou_override'
                             else:
                                 verified = False
                                 stats['similarity_rejected'] += 1
@@ -456,85 +585,43 @@ class Command(BaseCommand):
                         if not verified:
                             continue
 
-                        if dry_run:
-                            stats[f'saved_{tier}'] += 1
-                            continue
-
-                        # _kps_matches_box() (the pre-check above) is
-                        # deliberately looser (centroid within one
-                        # box-width/-height of the box's own center) than
-                        # the DB's own face_kps_within_box_margin constraint
-                        # (every one of the 5 points individually within a
-                        # 25% margin) -- a real match can clear the
-                        # pre-check's centroid test while one individual
-                        # landmark (e.g. an eye corner under an extreme pose)
-                        # still fails the DB's tighter, per-point requirement.
-                        # Found via a real production crash (an uncaught
-                        # IntegrityError killed an entire shard outright) --
-                        # the DB constraint is the actual source of truth
-                        # here, so this must never be fatal.
-                        try:
-                            # transaction.atomic() here creates a real
-                            # savepoint, not just a Python-level try/except --
-                            # without it, a caught IntegrityError still leaves
-                            # Postgres considering the connection's current
-                            # transaction aborted (every later statement on it
-                            # fails with "current transaction is aborted"
-                            # until an actual ROLLBACK happens), which Python
-                            # catching the exception alone does nothing to
-                            # fix. Harmless no-op overhead-wise when there's
-                            # no outer transaction already open (production's
-                            # normal autocommit mode).
-                            with transaction.atomic():
-                                face.kps = FaceExtractor._flatten_kps(det['kps'])
-                                face.det_score = float(det.det_score)
-                                face.save(update_fields=['kps', 'det_score'])
-                        except IntegrityError as e:
-                            stats['db_constraint_rejected'] += 1
-                            self.stdout.write(f"  face {face.id}: DB rejected the recovered kps ({e}) -- skipping")
-                            continue
-
-                        stats[f'saved_{tier}'] += 1
-
-                        # Same real gate production's own pipeline already
-                        # uses (face_extract_encode.py's add_new_face()/
-                        # reencode_missing_faces()) to decide whether a
-                        # face is even worth a real embedding at all --
-                        # relative_size is box-derived and unaffected by
-                        # the kps bug, so the face's EXISTING stored value
-                        # is still correct and reusable directly; det_score
-                        # is the one we just froze above. A face below its
-                        # own collection's floor would never get a real
-                        # embedding in production either, so there's no
-                        # reason to pay for LVFace here -- directly targets
-                        # the many tiny background faces a crowd photo is
-                        # mostly made of, without the blunter
-                        # --max-faces-per-image's whole-image skip.
-                        if below_collection_floor(img_obj.directory.collection, face.det_score, face.relative_size):
-                            stats['below_collection_floor_skip'] += 1
-                            continue
-
-                        any_lvface_saved = False
-                        for size in lvface_sizes:
-                            try:
-                                emb = lvface.embed_from_image_array(
-                                    img_numpy, face.kps, input_is_bgr=False, size=size,
-                                )
-                            except Exception as e:
-                                self.stdout.write(f"  LVFace-{size} failed for face {face.id}: {e}")
-                                continue
-                            if emb is None:
-                                continue
-                            field = f'face_encoding_lvface_{size.lower()}'
-                            face.set_embedding(field, emb.tolist())
-                            face.save(update_fields=[field, Face.EMBEDDING_FIELD_HV_MIRRORS[field]])
-                            any_lvface_saved = True
-                        if any_lvface_saved:
+                        if self._save_kps_and_lvface(
+                            face, det['kps'], float(det.det_score), img_numpy, img_obj,
+                            lvface_sizes, stats, tier, dry_run,
+                        ):
                             new_faces_this_run += 1
 
-                    for r in range(len(image_faces)):
-                        if r not in matched_rows:
-                            stats['no_match'] += 1
+                    unmatched_rows = [r for r in range(len(image_faces)) if r not in matched_rows]
+                    for r in unmatched_rows:
+                        stats['no_match'] += 1
+                        face = image_faces[r]
+                        has_trusted_encoding = (
+                            face.face_encoding_512 is not None
+                            and list(face.face_encoding_512) != sentinel
+                        )
+                        if not has_trusted_encoding:
+                            continue  # nothing to recover a geometry match FOR
+                        cr = _crop_redetect(
+                            app, img_numpy,
+                            (face.box_left, face.box_top, face.box_right, face.box_bottom),
+                        )
+                        if cr is None:
+                            stats['crop_redetect_empty'] += 1
+                            continue
+                        kps_out, det_score_out, n_candidates = cr
+                        if n_candidates > 1:
+                            stats['crop_redetect_ambiguous'] += 1
+                            continue
+                        if not _kps_matches_box(
+                            kps_out, face.box_left, face.box_top, face.box_right, face.box_bottom,
+                        ):
+                            stats['geometry_rejected'] += 1
+                            continue
+                        if self._save_kps_and_lvface(
+                            face, kps_out, det_score_out, img_numpy, img_obj,
+                            lvface_sizes, stats, 'crop_redetect', dry_run,
+                        ):
+                            new_faces_this_run += 1
                 finally:
                     signal.alarm(0)
             except _ImageTimeout:
