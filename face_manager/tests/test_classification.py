@@ -1181,3 +1181,124 @@ class LoadEncodingsCachingTests(TestCase):
         self.assertEqual(len(fresh_assigner.candidate_dict[self.person.id]), 2)
 
 
+class ReclassifyCandidatesLvfaceTests(TestCase):
+    """reclassify_candidates --encoding=lvface_b -- real production rebuild
+    tool (2026-10-31, see CLAUDE.md) replacing one-off scratch scripts.
+    Validated empirically against real production data: unlike
+    insightface, LVFace-B needs no gallery-size-bucketed threshold (TPR
+    ~97%, FPR <0.4% held consistently from 30-face galleries through
+    16,653-face ones at threshold=0.30), so this path is a direct
+    sim_99th-vs-single-threshold check, no bucket lookup."""
+
+    def _make_gallery_face(self, person, base_idx, seed):
+        face = make_face(make_image(), declared_name=person, validated=True)
+        face.set_embedding('face_encoding_lvface_b', _embedding(base_idx, seed=seed))
+        face.save()
+        return face
+
+    def _make_proposed_face(self, person, base_idx, seed):
+        face = make_face(make_image(), declared_name=get_default_blank_person())
+        face.poss_ident1 = person
+        face.set_embedding('face_encoding_lvface_b', _embedding(base_idx, seed=seed))
+        face.save()
+        return face
+
+    def test_requires_threshold_for_lvface_b(self):
+        person = make_person("LVFace Threshold Person")
+        with self.assertRaises(CommandError):
+            call_command('reclassify_candidates', f'--person-ids={person.id}', '--encoding=lvface_b')
+
+    def test_unknown_person_id_raises(self):
+        with self.assertRaises(CommandError):
+            call_command('reclassify_candidates', '--person-ids=999999', '--encoding=lvface_b', '--threshold=0.3')
+
+    def test_similar_candidate_is_kept(self):
+        person = make_person("LVFace Kept Person")
+        for i in range(5):
+            self._make_gallery_face(person, base_idx=0, seed=i)
+        candidate = self._make_proposed_face(person, base_idx=0, seed=50)  # same base direction
+
+        out = io.StringIO()
+        call_command('reclassify_candidates', f'--person-ids={person.id}',
+                      '--encoding=lvface_b', '--threshold=0.3', stdout=out)
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.poss_ident1_id, person.id)
+        self.assertIn('kept: 1', out.getvalue())
+
+    def test_dissimilar_candidate_is_reverted_to_ignore(self):
+        person = make_person("LVFace Reverted Person")
+        for i in range(5):
+            self._make_gallery_face(person, base_idx=0, seed=i)
+        candidate = self._make_proposed_face(person, base_idx=1, seed=50)  # different base direction
+
+        out = io.StringIO()
+        call_command('reclassify_candidates', f'--person-ids={person.id}',
+                      '--encoding=lvface_b', '--threshold=0.3', stdout=out)
+
+        candidate.refresh_from_db()
+        ignore_person = Person.objects.get(person_name=settings.SOFT_IGNORE_NAME)
+        self.assertEqual(candidate.poss_ident1_id, ignore_person.id)
+        self.assertIn('Reverted: 1', out.getvalue())
+
+    def test_dry_run_does_not_write(self):
+        person = make_person("LVFace DryRun Person")
+        for i in range(5):
+            self._make_gallery_face(person, base_idx=0, seed=i)
+        candidate = self._make_proposed_face(person, base_idx=1, seed=50)
+        old_poss = candidate.poss_ident1_id
+
+        call_command('reclassify_candidates', f'--person-ids={person.id}',
+                      '--encoding=lvface_b', '--threshold=0.3', '--dry-run',
+                      stdout=io.StringIO())
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.poss_ident1_id, old_poss)
+
+    def test_person_with_no_validated_gallery_is_skipped_not_crashed(self):
+        person = make_person("LVFace No Gallery Person")
+        self._make_proposed_face(person, base_idx=0, seed=50)
+
+        out = io.StringIO()
+        call_command('reclassify_candidates', f'--person-ids={person.id}',
+                      '--encoding=lvface_b', '--threshold=0.3', stdout=out)
+        self.assertIn('no validated LVFace-B gallery yet', out.getvalue())
+
+    def test_sentinel_encoding_candidates_excluded(self):
+        person = make_person("LVFace Sentinel Person")
+        for i in range(5):
+            self._make_gallery_face(person, base_idx=0, seed=i)
+        candidate = self._make_proposed_face(person, base_idx=1, seed=50)
+        candidate.set_embedding('face_encoding_lvface_b', settings.NON_DETECTED_FACE_ENCODING)
+        candidate.save()
+
+        out = io.StringIO()
+        call_command('reclassify_candidates', f'--person-ids={person.id}',
+                      '--encoding=lvface_b', '--threshold=0.3', stdout=out)
+        self.assertIn('proposed_with_lvface_b=0', out.getvalue())
+
+
+class ReclassifyCandidatesInsightfaceTests(TestCase):
+    """reclassify_candidates --encoding=insightface (the default) -- reuses
+    the real production classify_unassigned() pipeline unmodified, same as
+    the scratch script this command replaces."""
+
+    CMD_MODULE = 'face_manager.management.commands.reclassify_candidates'
+
+    def test_calls_real_classify_unassigned_for_each_proposed_face(self):
+        person = make_person("Insightface Reclass Person")
+        img = make_image()
+        face = make_face(img, declared_name=get_default_blank_person())
+        face.poss_ident1 = person
+        face.face_encoding_512 = [0.3] * 512
+        face.save()
+
+        with patch(f'{self.CMD_MODULE}.faceAssigner') as MockAssigner:
+            mock_fa = MockAssigner.return_value
+            call_command('reclassify_candidates', f'--person-ids={person.id}', stdout=io.StringIO())
+
+        mock_fa.load_encodings.assert_called_once()
+        mock_fa.classify_unassigned.assert_called_once()
+        self.assertEqual(mock_fa.classify_unassigned.call_args[0][0].id, face.id)
+
+
