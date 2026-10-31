@@ -559,10 +559,19 @@ class BackfillVerifiedKpsTests(TestCase):
         stored = [1.0] + [0.0] * 511
         fresh = [0.8] + [0.6] + [0.0] * 510
         # Same gray-zone similarity as the accepted case above, but this
-        # face is NOT small (relative_size above the gray-zone cap).
+        # face is NOT small (relative_size above the gray-zone cap) --
+        # and the box is shifted enough (real distance_box_iou ~0.494)
+        # to also fall under IOU_OVERRIDE_THRESH=0.5, so there's no
+        # independent geometric fallback to rescue it either. An
+        # identical/near-identical box here would now correctly recover
+        # via iou_override regardless of the size gate failing -- a
+        # confident, unambiguous box match is real evidence on its own
+        # (see test_iou_override_recovers_confident_unambiguous_geometry_match)
+        # -- so this test is deliberately NOT using a tight box, to keep
+        # testing gray_zone's own size gate in isolation.
         face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.5)
         fresh_kps = [[30.0, 30.0]] * 5
-        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.85, fresh_kps, fresh)]
+        fake_dets = [self._FakeDetection([17, 17, 57, 57], 0.85, fresh_kps, fresh)]
         with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
                    return_value=np.zeros((1000, 1000, 3))), \
              patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
@@ -572,11 +581,16 @@ class BackfillVerifiedKpsTests(TestCase):
         self.assertIsNone(face.kps)
 
     def test_low_similarity_match_rejected_entirely(self):
+        # Both signals bad: orthogonal embedding (cos=0) AND the box match
+        # itself isn't confident enough either (real distance_box_iou for
+        # this exact shift measured at ~0.395 -- matched at all, since it
+        # clears IOU_THRESH=0.3, but below IOU_OVERRIDE_THRESH=0.5, so
+        # there's no independent geometric evidence to fall back on).
         stored = [1.0] + [0.0] * 511
         fresh = [0.0] + [1.0] + [0.0] * 510  # orthogonal -- cos=0
         face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
         fresh_kps = [[30.0, 30.0]] * 5
-        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.85, fresh_kps, fresh)]
+        fake_dets = [self._FakeDetection([19, 19, 59, 59], 0.85, fresh_kps, fresh)]
         with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
                    return_value=np.zeros((1000, 1000, 3))), \
              patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
@@ -585,6 +599,108 @@ class BackfillVerifiedKpsTests(TestCase):
         face.refresh_from_db()
         self.assertIsNone(face.kps)
         self.assertIsNone(face.det_score)
+
+    def test_iou_override_recovers_confident_unambiguous_geometry_match(self):
+        # 2026-10-31 (see CLAUDE.md): orthogonal embedding (cos=0, the
+        # SAME bad signal as the fully-rejected test above), but this
+        # time the box match itself is confident (real distance_box_iou
+        # for this shift measured at ~0.549, above IOU_OVERRIDE_THRESH)
+        # AND unambiguous (only one detection in the image) -- real,
+        # independent evidence the GEOMETRY is right even though the
+        # stored embedding doesn't agree. face_encoding_512 must stay
+        # untouched -- this tier only ever writes kps/det_score/LVFace.
+        stored = [1.0] + [0.0] * 511
+        fresh = [0.0] + [1.0] + [0.0] * 510
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
+        fresh_kps = [[30.0, 30.0]] * 5
+        fake_dets = [self._FakeDetection([16, 16, 56, 56], 0.85, fresh_kps, fresh)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertEqual(face.kps, [v for pair in fresh_kps for v in pair])
+        self.assertAlmostEqual(face.det_score, 0.85, places=4)
+        self.assertEqual(face.face_encoding_lvface_b, [0.4] * 512)
+        self.assertEqual(list(face.face_encoding_512), stored)  # untouched
+
+    def test_iou_override_skipped_when_ambiguous(self):
+        # Two detections both clear IOU_OVERRIDE_THRESH against the SAME
+        # existing box -- real evidence this isn't a clean single match,
+        # so neither is trusted (per the user's own explicit safety call:
+        # "if there's only one high overlap, yes... if there's a few,
+        # look at it again later").
+        stored = [1.0] + [0.0] * 511
+        fresh = [0.0] + [1.0] + [0.0] * 510
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
+        fresh_kps = [[30.0, 30.0]] * 5
+        # Real distance_box_iou for these two shifts measured at ~0.743
+        # and ~0.549 -- both comfortably clear IOU_OVERRIDE_THRESH=0.5
+        # against the same existing box.
+        fake_dets = [
+            self._FakeDetection([13, 13, 53, 53], 0.85, fresh_kps, fresh),
+            self._FakeDetection([16, 16, 56, 56], 0.80, fresh_kps, fresh),
+        ]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+
+    def test_crop_redetect_recovers_a_face_the_whole_image_pass_missed(self):
+        # The whole-image detection is too far from the stored box to
+        # even clear IOU_THRESH=0.3 (real distance_box_iou for this
+        # shift measured at ~0.168) -- the face falls through to
+        # unmatched_rows, where the cheap crop-based fallback gets a
+        # SECOND, independent chance to find it.
+        stored = [1.0] + [0.0] * 511
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
+        whole_image_dets = [self._FakeDetection([25, 25, 65, 65], 0.85, [[45.0, 45.0]] * 5, [0.0] * 512)]
+        crop_kps = [[30.0, 30.0]] * 5
+        crop_det = self._FakeDetection([5, 5, 45, 45], 0.75, crop_kps, [0.0] * 512)
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.side_effect = [whole_image_dets, [crop_det]]
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNotNone(face.kps)
+        self.assertAlmostEqual(face.det_score, 0.75, places=4)
+        self.assertEqual(face.face_encoding_lvface_b, [0.4] * 512)
+
+    def test_crop_redetect_ambiguous_leaves_face_untouched(self):
+        stored = [1.0] + [0.0] * 511
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
+        whole_image_dets = [self._FakeDetection([25, 25, 65, 65], 0.85, [[45.0, 45.0]] * 5, [0.0] * 512)]
+        crop_kps = [[30.0, 30.0]] * 5
+        crop_dets = [
+            self._FakeDetection([5, 5, 45, 45], 0.75, crop_kps, [0.0] * 512),
+            self._FakeDetection([8, 8, 48, 48], 0.70, crop_kps, [0.0] * 512),
+        ]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.side_effect = [whole_image_dets, crop_dets]
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+
+    def test_crop_redetect_finds_nothing_leaves_face_untouched(self):
+        stored = [1.0] + [0.0] * 511
+        face = self._make_face_with_encoding([10, 10, 50, 50], stored, relative_size=0.03)
+        whole_image_dets = [self._FakeDetection([25, 25, 65, 65], 0.85, [[45.0, 45.0]] * 5, [0.0] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.side_effect = [whole_image_dets, []]
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
 
     def test_unverified_face_without_stored_encoding_is_saved_anyway(self):
         # Per explicit design direction: an incidental face sharing an
