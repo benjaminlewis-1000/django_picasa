@@ -158,6 +158,24 @@ def _crop_redetect(app, img_numpy, box, pad_pct=CROP_REDETECT_PAD_PCT, min_score
     return kps_out, float(best.det_score), n_candidates
 
 
+def _unresolved_faces_q(lvface_sizes, sentinel):
+    """The exact negation of _face_is_done(), expressed as a Q object so
+    an already-done face is never loaded out of the DB at all -- not
+    fetched and then filtered in Python. 2026-10-31's mixed-image fix
+    still pulled every face on an image (including fully-settled ones,
+    with their full embedding arrays) just to immediately discard most
+    of them; this pushes the same "done" check into the query itself."""
+    if not lvface_sizes:
+        return Q(kps__isnull=True)
+    done_with_kps = Q(kps__isnull=False)
+    done_without_kps = Q(kps__isnull=True)
+    for size in lvface_sizes:
+        field = f'face_encoding_lvface_{size.lower()}'
+        done_with_kps &= Q(**{f'{field}__isnull': False})
+        done_without_kps &= Q(**{field: sentinel})
+    return ~(done_with_kps | done_without_kps)
+
+
 def _face_is_done(face, lvface_sizes, sentinel):
     """A face is done either the normal way (real kps + every requested
     LVFace size populated) or via _mark_no_face_found()'s permanent
@@ -436,9 +454,6 @@ class Command(BaseCommand):
                 break
 
             img_obj = ImageFile.objects.select_related('directory__collection').get(id=img_id)
-            image_faces = list(Face.objects.filter(source_image_file=img_obj))
-            if not image_faces:
-                continue
 
             # Makes the command safely resumable/relaunchable: without
             # this, restarting would re-run detection on every already-
@@ -451,8 +466,8 @@ class Command(BaseCommand):
             # be silently skipped forever once LVFace is re-enabled,
             # since they already have kps but never got the LVFace
             # fields this run actually wants). An empty lvface_sizes
-            # list makes the inner all() vacuously True, preserving the
-            # original kps-only behavior unchanged for that mode.
+            # list makes the query match every kps-null face, preserving
+            # the original kps-only behavior unchanged for that mode.
             #
             # A face _mark_no_face_found() marked (kps NULL forever, but
             # LVFace set to the sentinel) also counts as done -- it has
@@ -461,21 +476,25 @@ class Command(BaseCommand):
             # re-examined (whole-image + crop redetect, both already
             # confirmed empty) on every single future run forever,
             # defeating the entire point of marking it.
-            if all(_face_is_done(f, lvface_sizes, sentinel) for f in image_faces):
-                stats['already_done'] += len(image_faces)
+            #
+            # 2026-10-31: pushed the "done" check into the query itself
+            # (_unresolved_faces_q) instead of loading every face on the
+            # image and filtering in Python -- an already-done face is
+            # never fetched at all now, not even its lightweight columns,
+            # let alone the full embedding arrays the old `image_faces`
+            # list pulled for every face on a mixed image regardless of
+            # whether it still needed anything.
+            unresolved_faces = list(
+                Face.objects.filter(source_image_file=img_obj)
+                .filter(_unresolved_faces_q(lvface_sizes, sentinel))
+            )
+            if not unresolved_faces:
+                total_face_count = Face.objects.filter(source_image_file=img_obj).count()
+                stats['already_done'] += total_face_count
                 continue
 
-            # 2026-10-31: an image with a MIX of done and not-yet-done faces
-            # used to still match/verify EVERY face on it, including the
-            # ones that already have real kps/LVFace (or the sentinel) --
-            # pure wasted decode+redetect+embed cost for faces that need
-            # nothing further. Only the genuinely unresolved subset is
-            # matched against this image's fresh detections from here on;
-            # the whole-image decode+detect still happens once (unavoidable
-            # -- there's no way to detect faces for only PART of an image),
-            # but nothing downstream touches an already-done face again.
-            unresolved_faces = [f for f in image_faces if not _face_is_done(f, lvface_sizes, sentinel)]
-            stats['already_done'] += len(image_faces) - len(unresolved_faces)
+            total_face_count = Face.objects.filter(source_image_file=img_obj).count()
+            stats['already_done'] += total_face_count - len(unresolved_faces)
 
             # Skip crowd photos outright, before even decoding -- real
             # hang found 2026-10-27: a 710-face group photo makes the
@@ -551,10 +570,16 @@ class Command(BaseCommand):
             # against the DB (not a cached in-process count) so this
             # stays correct even with several shards running at once.
             if per_person_target is not None and person_ids is not None:
-                relevant_pids = {
-                    f.declared_name_id for f in image_faces
-                    if f.declared_name_id in person_ids and f.declared_name_id not in unlimited_person_ids
-                }
+                # declared_name_id over EVERY face on the image (not just
+                # unresolved_faces) -- identity presence is unaffected by
+                # per-face resolution state. A plain values_list query,
+                # not a Python set comprehension over a loaded list, now
+                # that image_faces no longer exists.
+                relevant_pids = set(
+                    Face.objects.filter(source_image_file=img_obj, declared_name_id__in=person_ids)
+                    .exclude(declared_name_id__in=unlimited_person_ids)
+                    .values_list('declared_name_id', flat=True)
+                )
                 if relevant_pids and all(
                     Face.objects.filter(
                         declared_name_id=pid, face_encoding_lvface_b__isnull=False,
