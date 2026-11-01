@@ -17,6 +17,14 @@ only buried in a session's own narrative further down.** Full detail/context for
 the dated write-up elsewhere in this file (search for a distinctive word from the bullet).
 
 **Open questions / follow-ups:**
+- **Video/image face-geometry recovery backfills (2026-10-31) -- both restarted after a host CPU
+  upgrade, in progress.** See the dated write-up (search "geometry-trust fallback tiers") for the
+  full picture: `remediate_video_face_geometry` (no args) and `backfill_verified_kps
+  --person-ids=1436 --lvface-sizes=B --max-faces-per-image=710 --max-image-pixels=25000000
+  --max-aspect-ratio=2.5` (Leslie Williams specifically) are both resumable, safe to kill/relaunch
+  any time. Once Leslie's image-side gap closes, the same broadened-cap approach should be applied
+  to the other magnet people (David Redd, Emma, Elder Tim Call, Luca Wilson) and then genuinely
+  everyone, not just the 4 originally gallery-targeted people -- not started yet.
 - **pgvector/halfvec migration (2026-10-30) -- phases 1-3 done+deployed, phase 4 (backfill) running,
   nothing reads the new columns yet.** See the dated write-up (search "pgvector/halfvec
   embedding-storage migration") for the full picture. Next real step once the backfill finishes:
@@ -4944,3 +4952,135 @@ here specifically to avoid that disruption, and the leftover case just needed on
 shutdown, waited for the one in-flight task to finish, then relaunched with the exact same
 commands from `startup.sh`) -- same reasoning, needed to pick up the dual-write code above without
 a full container recreate.
+
+## DONE (2026-10-31): video-face-pipeline code consolidation, a real HDR dispatch bug fix, and new
+geometry-trust fallback tiers for backfill_verified_kps -- plus a real production-config correction
+(host CPU upgrade) made mid-session
+
+**Code audit + consolidation**: the open/read/close/cv2.imdecode sequence for a Face's stored
+thumbnail was independently copy-pasted across 7 management commands (`audit_video_face_geometry`,
+`backfill_video_det_score`, `backfill_video_thumbnail_timestamps`, `scan_video_thumbnail_mismatches`,
+`scan_video_thumbnail_quality`, `reset_bad_video_thumbnails`, `remediate_video_face_geometry`) -- 2
+of them (`backfill_video_thumbnail_timestamps`, `reset_bad_video_thumbnails`) never even guarded
+the open/read call, so a single face with a missing thumbnail file would have crashed the entire
+command (previously had **zero test coverage** -- a real gap closed the same day). Consolidated
+into one shared `decode_face_thumbnail()` in `video_face_pipeline.py`; `_mean_abs_pixel_diff`
+duplicates removed the same way. New tests: `DecodeFaceThumbnailTests` (the shared helper directly)
+plus real regression tests for both previously-unguarded commands.
+
+**Real bug found and fixed in `remediate_video_face_geometry.py`'s "already ok" path**:
+`extract_frame_near_timestamp()` dispatches HDR-tagged sources (`color_transfer='arib-std-b67'`/
+`smpte2084`) to its ffmpeg-subprocess variant, which needs `width`/`height` explicitly -- this
+command called it without them, crashing with `TypeError('NoneType * NoneType')` for every single
+HDR-sourced "already ok" face, silently swallowed by a bare `except`. This is why LVFace coverage
+for "already ok" video faces was stuck at 0 despite the command appearing to run successfully --
+confirmed directly via full traceback, fixed by passing `width=width, height=height` through.
+Also found and fixed along the way: this codebase loads `video_face_pipeline` under **two separate
+module identities** (bare top-level `video_face_pipeline` vs `face_manager.video_face_pipeline` --
+same file, two distinct `sys.modules` entries with independent globals) -- a test patching the
+wrong one silently has no effect on the real dispatch path; must patch the bare one, matching
+`remediate_video_face_geometry.py`'s own `from video_face_pipeline import ...` style.
+
+**`remediate_video_face_geometry.py` now skips faces already settled by a previous run.** This
+command has been killed and relaunched many times across real deploys -- without a skip, every
+restart re-walked the ENTIRE population from scratch, silently re-overwriting a previously-FIXED
+face's box/kps/thumbnail/embedding on every restart. Fixed with a simple existing-column filter
+(`face_encoding_lvface_b__isnull=True` by default, `--recheck-all` to force a full re-walk) --
+**deliberately NOT a new DB field/migration** (an earlier attempt at that was presented and
+reverted before being built, per the user's own "should be simple to just filter against faces
+that already have LVFace" correction -- see this file's own feedback-memory note on presenting a
+plan before implementing a schema change). Also simplified the (empirically 0-occurrence --
+0/52,806 video faces checked lacked a timestamp) missing-timestamp guard to a single `log_error()`
+call instead of tracking it as a first-class outcome, per explicit direction to trim that branch
+down.
+
+**New reusable command, `reclassify_candidates.py`, replacing one-off reclassification scratch
+scripts going forward.** Re-evaluates a person's currently-proposed candidates under either the
+real insightface pipeline (`classify_unassigned()`, unmodified) or a direct LVFace-B cosine-
+similarity check -- `--person-ids`/`--encoding`/`--threshold` are all parameters, not hardcoded, so
+this replaces `scratch_reclassify_magnets.py`'s shape for any future person set or threshold.
+
+**LVFace-B threshold found empirically: 0.30, and -- unlike insightface -- no gallery-size
+bucketing needed at all.** Real validation against 152 galleries (30 to 16,653 faces each, leave-
+one-out positive pairs vs. confirmed-`.ignore` negative pairs): TPR ~97%, FPR <0.4%, held
+consistent across every size bucket tested from smallest to largest. Applied for real to the 4
+people the gallery-targeted `backfill_verified_kps` shards had just finished covering (Gwendolyn
+Lewis, Leslie Williams, Nathaniel Lewis, Sterling Bradshaw) -- **2,534 proposed candidates reverted
+to `.ignore`, 958 kept.** Leslie Williams alone: 2,073 -> 503 proposed (a ~76% drop, though note
+the apparent "99.5% revert" figure from the earlier threshold-sweep investigation was relative to
+only the subset that already had LVFace-B at the time -- not a discrepancy, just two different
+denominators; see the full investigation below for how this was root-caused).
+
+**Two new geometry-trust fallback tiers added to `backfill_verified_kps.py`, empirically validated
+before building.** For a face whose STORED embedding doesn't match a fresh redetection well enough
+to clear the existing `GRAY_ZONE_SIM` gate, a confident and UNAMBIGUOUS box match is still real
+evidence the box/kps themselves are correct -- identity is explicitly NOT judged by either new
+tier, that stays gated separately by whichever classification pass reads the resulting embedding
+later (e.g. `reclassify_candidates --encoding=lvface_b`). Both tiers refuse to guess between
+competing candidates, per the user's own explicit safety call ("if there's only one high overlap,
+yes... if there's a few, look at it again later"):
+- `iou_override` (`IOU_OVERRIDE_THRESH=0.5`): the whole-image detection's box clears this against
+  the stored box, AND no other detection in the image also clears it against that same box.
+- `crop_redetect` (`CROP_REDETECT_PAD_PCT=0.6`, `CROP_REDETECT_MIN_SCORE=0.5`, same shape
+  `video_face_pipeline.py`'s own `_redetect_in_crop()` already uses): for a face with NO
+  whole-image match at all, a cheap crop-based redetection around the stored box gets a second,
+  cheap chance -- and structurally CANNOT match a detection far away in the image the way a
+  whole-image search could (a real, confirmed failure mode of the whole-image-only approach: one
+  investigated face's "best match" under pure whole-image IOU was a completely different, much
+  older person elsewhere in the same photo).
+  Real validation against 301 production candidate faces (Leslie Williams' then-remaining gap,
+  excluding the already-capped crowd/panorama images): whole-image IOU>=0.5 recovered 254/301 with
+  **zero ambiguous cases found**; crop-redetect recovered 15 more of the remainder, flagged 3 as
+  genuinely ambiguous (left untouched), and correctly found nothing for the other ~30 -- visually
+  confirmed via real image crops: mostly pure background/non-face content (walls, plants, gravel,
+  wood grain, fabric, a literal bird), a few genuinely hard partial faces (profile shots, one face
+  buried in sand with sunglasses) that are real people but not a match. The investigation that led
+  here is worth remembering for its own sake: several rounds of "maybe lower the bar more" /
+  "maybe mirror the pyramid detector" / "maybe small faces explain it" were each tested empirically
+  and found NOT to hold (size correlation with low-IOU: r=0.134, essentially none; the command
+  already uses the full `PyramidalDetector`, nothing to "mirror") before landing on the real
+  answer (crop-based redetection, cheap and structurally safer than widening the whole-image
+  search).
+
+**A face where BOTH detection attempts come back genuinely empty now gets the same `-999` sentinel
+`face_encoding_512` already uses for "no match."** Previously such a face's LVFace fields stayed
+NULL forever, meaning every future run re-examined it from scratch at the same real cost (whole-
+image pass + crop fallback) indefinitely. `_mark_no_face_found()` sets the sentinel (never kps --
+there's no equivalent "no kps" sentinel in this codebase, and NULL already means that correctly)
+only for the confirmed-empty case (`crop_redetect_empty`), deliberately NOT for the ambiguous case
+(a real face likely IS there, just unclear which candidate -- marking that "confirmed nothing"
+would be actively wrong). The resumability "already_done" check was extended to recognize a
+sentinel-marked face as done too, via a new `_face_is_done()` helper, closing the loop.
+
+**Real-world result applying all of the above to Leslie Williams specifically**: her image-side
+LVFace-B gap went from ~494 missing (at the start of this investigation) down to a small remainder
+of genuinely-hard/no-face cases, via (1) loosening `--max-faces-per-image`/`--max-image-pixels`
+(NOT `--max-aspect-ratio`, which guards a real, confirmed-unrecoverable `app.get()` hang that no
+timeout can interrupt) now that host CPU allows it, (2) the two new fallback tiers, (3) the
+sentinel marking for the genuinely-empty remainder. A single real run: 1,732 images, 6,498 new
+LVFace embeddings, of which 539 via `iou_override` and 13 via `crop_redetect` -- real recovery the
+old logic would have just left blank forever.
+
+**Real operational incident mid-session, not a code bug**: running Leslie's `backfill_verified_kps`
+re-run concurrently with the already-restarted `remediate_video_face_geometry` caused SEVERE CPU
+starvation for the video job (host load average 56-62, confirmed via a direct before/after CPU-
+time delta measurement that it was making near-zero net progress for over an hour despite being
+alive and not crashed) -- not a bug, just two genuinely heavy jobs sharing one host. **Resolved by
+the user physically adding a CPU to the host mid-session** -- both jobs were gracefully stopped
+(`SIGTERM`, fully resumable, no data loss -- both write per-face with immediate commits, nothing
+held only in memory) before the shutdown, then restarted after the upgrade. `nproc` still reports
+24 immediately post-reboot; worth rechecking once the upgrade is confirmed fully recognized by the
+OS if contention reappears.
+
+**Status at session end**: both `remediate_video_face_geometry` (no args) and Leslie's
+`backfill_verified_kps --person-ids=1436 --lvface-sizes=B --max-faces-per-image=710
+--max-image-pixels=25000000 --max-aspect-ratio=2.5` are running again post-restart, making real
+progress (image missing count 60->57, video missing count 93->88 within the first few minutes).
+Both commands are fully resumable -- safe to kill/relaunch any time, no special cleanup needed.
+**Not yet done**: the same broadened-cap + new-tier approach hasn't been applied to the other
+known "magnet" people (David Redd, Emma, Elder Tim Call, Luca Wilson) or to the general/unrestricted
+population yet -- only Leslie has been specifically targeted so far. The overall unrestricted
+`backfill_verified_kps` population (180,496 trigger images, vs. the ~37k the person-id-restricted
+shards covered) and the full video `remediate_video_face_geometry` population (53,176 faces, most
+still unprocessed) both remain large, multi-day backlogs regardless of today's targeted work on
+Leslie specifically.
