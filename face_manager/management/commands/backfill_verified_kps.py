@@ -465,6 +465,18 @@ class Command(BaseCommand):
                 stats['already_done'] += len(image_faces)
                 continue
 
+            # 2026-10-31: an image with a MIX of done and not-yet-done faces
+            # used to still match/verify EVERY face on it, including the
+            # ones that already have real kps/LVFace (or the sentinel) --
+            # pure wasted decode+redetect+embed cost for faces that need
+            # nothing further. Only the genuinely unresolved subset is
+            # matched against this image's fresh detections from here on;
+            # the whole-image decode+detect still happens once (unavoidable
+            # -- there's no way to detect faces for only PART of an image),
+            # but nothing downstream touches an already-done face again.
+            unresolved_faces = [f for f in image_faces if not _face_is_done(f, lvface_sizes, sentinel)]
+            stats['already_done'] += len(image_faces) - len(unresolved_faces)
+
             # Skip crowd photos outright, before even decoding -- real
             # hang found 2026-10-27: a 710-face group photo makes the
             # matching/verification/LVFace loop the dominant cost (up to
@@ -476,8 +488,8 @@ class Command(BaseCommand):
             # count -- cheaper, and a strong proxy for "crowded" since
             # this project's own earlier backfills already found roughly
             # how many faces a given image has.
-            if max_faces_per_image is not None and len(image_faces) > max_faces_per_image:
-                stats['too_many_faces_skip'] += len(image_faces)
+            if max_faces_per_image is not None and len(unresolved_faces) > max_faces_per_image:
+                stats['too_many_faces_skip'] += len(unresolved_faces)
                 continue
 
             # Skip giant panoramas outright, before even decoding -- a
@@ -504,7 +516,7 @@ class Command(BaseCommand):
             # three real, identical hangs in a row with zero "TIMEOUT on"
             # log lines despite PER_IMAGE_TIMEOUT_SECONDS firing.
             if max_image_pixels is not None and (img_obj.width or 0) * (img_obj.height or 0) > max_image_pixels:
-                stats['too_many_pixels_skip'] += len(image_faces)
+                stats['too_many_pixels_skip'] += len(unresolved_faces)
                 continue
 
             # Same panorama hang as above, but via ASPECT RATIO instead
@@ -527,7 +539,7 @@ class Command(BaseCommand):
             if max_aspect_ratio is not None and img_obj.width and img_obj.height:
                 aspect_ratio = max(img_obj.width, img_obj.height) / min(img_obj.width, img_obj.height)
                 if aspect_ratio > max_aspect_ratio:
-                    stats['too_wide_skip'] += len(image_faces)
+                    stats['too_wide_skip'] += len(unresolved_faces)
                     continue
 
             # Per-person quota: once every (non-sentinel) targeted person
@@ -549,7 +561,7 @@ class Command(BaseCommand):
                     ).count() >= per_person_target
                     for pid in relevant_pids
                 ):
-                    stats['quota_satisfied_skip'] += len(image_faces)
+                    stats['quota_satisfied_skip'] += len(unresolved_faces)
                     continue
 
             # The timeout wraps the WHOLE per-image body, not just
@@ -574,16 +586,16 @@ class Command(BaseCommand):
                 try:
                     img_numpy = common.open_img_oriented(img_obj.filename, as_numpy=True)
                     if img_numpy is None:
-                        stats['decode_failed'] += len(image_faces)
+                        stats['decode_failed'] += len(unresolved_faces)
                         continue
                     detections = app.get(img_numpy)
 
                     if not detections:
-                        stats['no_detections'] += len(image_faces)
+                        stats['no_detections'] += len(unresolved_faces)
                         continue
 
                     existing_boxes = torch.tensor(
-                        [[f.box_left, f.box_top, f.box_right, f.box_bottom] for f in image_faces],
+                        [[f.box_left, f.box_top, f.box_right, f.box_bottom] for f in unresolved_faces],
                         dtype=torch.float32,
                     )
                     detect_boxes = torch.tensor([d.bbox.tolist() for d in detections], dtype=torch.float32)
@@ -595,7 +607,7 @@ class Command(BaseCommand):
                         if float(iou[r, c]) < IOU_THRESH:
                             continue
                         matched_rows.add(int(r))
-                        face = image_faces[int(r)]
+                        face = unresolved_faces[int(r)]
                         det = detections[int(c)]
                         this_iou = float(iou[r, c])
 
@@ -647,10 +659,10 @@ class Command(BaseCommand):
                         ):
                             new_faces_this_run += 1
 
-                    unmatched_rows = [r for r in range(len(image_faces)) if r not in matched_rows]
+                    unmatched_rows = [r for r in range(len(unresolved_faces)) if r not in matched_rows]
                     for r in unmatched_rows:
                         stats['no_match'] += 1
-                        face = image_faces[r]
+                        face = unresolved_faces[r]
                         has_trusted_encoding = (
                             face.face_encoding_512 is not None
                             and list(face.face_encoding_512) != sentinel
@@ -682,12 +694,12 @@ class Command(BaseCommand):
                 finally:
                     signal.alarm(0)
             except _ImageTimeout:
-                self.stdout.write(f"  TIMEOUT on {img_obj.filename} ({len(image_faces)} faces) -- skipping remainder")
-                stats['timed_out'] += len(image_faces)
+                self.stdout.write(f"  TIMEOUT on {img_obj.filename} ({len(unresolved_faces)} faces) -- skipping remainder")
+                stats['timed_out'] += len(unresolved_faces)
                 continue
             except Exception as e:
                 self.stdout.write(f"  decode/detect error on {img_obj.filename}: {e}")
-                stats['decode_failed'] += len(image_faces)
+                stats['decode_failed'] += len(unresolved_faces)
                 continue
 
             if (idx + 1) % 25 == 0:

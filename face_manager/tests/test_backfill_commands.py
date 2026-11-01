@@ -517,6 +517,54 @@ class BackfillVerifiedKpsTests(TestCase):
         face.save()
         return face
 
+    def test_already_resolved_face_on_a_mixed_image_is_never_touched(self):
+        # 2026-10-31 (see CLAUDE.md): an image with a MIX of done and
+        # not-yet-done faces used to re-match/re-verify EVERY face on it,
+        # including ones that already have real kps/LVFace -- pure wasted
+        # cost, and a real risk of an already-good result getting
+        # silently rewritten if a detection happened to also overlap it.
+        # Only the genuinely unresolved face should ever be touched.
+        done_face = make_face(
+            self.image, declared_name=self.person,
+            box_left=200, box_top=200, box_right=240, box_bottom=240,
+        )
+        done_face.kps = [210.0] * 10
+        done_face.det_score = 0.95
+        done_face.face_encoding_512 = [1.0] + [0.0] * 511
+        # The command's default --lvface-sizes is 'S,B,L' -- _face_is_done()
+        # requires ALL requested sizes populated, so all three must be set
+        # here for done_face to actually be considered done under that
+        # default (matching every other test in this file that calls
+        # call_command('backfill_verified_kps') with no explicit override).
+        done_face.set_embedding('face_encoding_lvface_s', [0.9] * 512)
+        done_face.set_embedding('face_encoding_lvface_b', [0.9] * 512)
+        done_face.set_embedding('face_encoding_lvface_l', [0.9] * 512)
+        done_face.save()
+        original_kps = list(done_face.kps)
+        original_lvface = list(done_face.face_encoding_lvface_b)
+
+        pending_face = self._make_face_with_encoding([10, 10, 50, 50], [1.0] + [0.0] * 511)
+        fresh_kps = [[30.0, 30.0]] * 5
+        # A detection that would ALSO clear IOU_THRESH against done_face's
+        # own box if done_face were wrongly included in the match matrix.
+        fake_dets = [
+            self._FakeDetection([10, 10, 50, 50], 0.9, fresh_kps, [1.0] + [0.0] * 511),
+            self._FakeDetection([200, 200, 240, 240], 0.99, [[220.0, 220.0]] * 5, [0.0] * 512),
+        ]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps')
+
+        pending_face.refresh_from_db()
+        done_face.refresh_from_db()
+        self.assertEqual(pending_face.kps, [v for pair in fresh_kps for v in pair])
+        self.assertEqual(list(done_face.kps), original_kps)
+        self.assertEqual(list(done_face.face_encoding_lvface_b), original_lvface)
+        self.assertAlmostEqual(done_face.det_score, 0.95, places=4)
+
     def test_high_confidence_match_saves_kps_det_score_and_lvface(self):
         stored = [0.6] * 512
         face = self._make_face_with_encoding([10, 10, 50, 50], stored)
