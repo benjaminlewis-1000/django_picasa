@@ -1364,6 +1364,22 @@ class KeyedImageView(APIView):
         # (DRF's initial() -> check_throttles() runs before get()
         # itself). Both throttle classes skip entirely for an
         # authenticated session regardless of type.
+        # TEMP DIAGNOSTIC (2026-11-01): PhotoVerify mobile reports most
+        # face_array/face_source requests still getting 429'd even though
+        # the app now sends an Authelia bearer token on these. Log exactly
+        # what arrives, to tell apart "header never reaches the server"
+        # from "header arrives but auth resolves to anonymous anyway".
+        # Remove once that's root-caused.
+        auth_header = self.request.META.get('HTTP_AUTHORIZATION', '')
+        print(
+            f"KIV_DIAG type={self.kwargs.get('type')} "
+            f"authed={self.request.user.is_authenticated} "
+            f"has_auth_header={bool(auth_header)} "
+            f"auth_header_prefix={auth_header[:16]!r} "
+            f"id={self.request.query_params.get('id')} "
+            f"ua={self.request.META.get('HTTP_USER_AGENT', '')[:40]!r}",
+            flush=True,
+        )
         if self.kwargs.get('type') == 'slideshow':
             return [SlideshowMediaThrottle()]
         return [AccessKeyMediaThrottle()]
