@@ -482,6 +482,114 @@ class BackfillDetScoreRecheckMismatchedTransactionTests(TransactionTestCase):
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class UnresolvedFacesQueryTests(TestCase):
+    """_unresolved_faces_q() -- the query-level equivalent of _face_is_done()'s
+    negation, added 2026-10-31 so an already-done face is never loaded out of
+    the DB at all (not fetched then filtered in Python). Confirms the query
+    selects exactly the same faces _face_is_done() would call unresolved,
+    across every branch that function has."""
+
+    def setUp(self):
+        self.image = make_image()
+        self.person = make_person("Unresolved Query Person")
+        self.sentinel = list(settings.NON_DETECTED_FACE_ENCODING)
+
+    def _face(self, **kwargs):
+        return make_face(self.image, declared_name=self.person, **kwargs)
+
+    def test_empty_lvface_sizes_matches_kps_null_only(self):
+        from face_manager.management.commands.backfill_verified_kps import _unresolved_faces_q
+
+        no_kps = self._face()
+        has_kps = self._face()
+        has_kps.kps = [1.0] * 10
+        has_kps.save()
+
+        matched_ids = set(
+            Face.objects.filter(source_image_file=self.image)
+            .filter(_unresolved_faces_q([], self.sentinel))
+            .values_list('id', flat=True)
+        )
+        self.assertEqual(matched_ids, {no_kps.id})
+
+    def test_kps_present_but_missing_an_lvface_size_is_unresolved(self):
+        from face_manager.management.commands.backfill_verified_kps import _unresolved_faces_q
+
+        partial = self._face()
+        partial.kps = [1.0] * 10
+        partial.set_embedding('face_encoding_lvface_s', [0.5] * 512)
+        partial.save()  # lvface_b still NULL
+
+        complete = self._face()
+        complete.kps = [1.0] * 10
+        complete.set_embedding('face_encoding_lvface_s', [0.5] * 512)
+        complete.set_embedding('face_encoding_lvface_b', [0.5] * 512)
+        complete.save()
+
+        matched_ids = set(
+            Face.objects.filter(source_image_file=self.image)
+            .filter(_unresolved_faces_q(['S', 'B'], self.sentinel))
+            .values_list('id', flat=True)
+        )
+        self.assertEqual(matched_ids, {partial.id})
+
+    def test_sentinel_marked_no_kps_counts_as_done(self):
+        from face_manager.management.commands.backfill_verified_kps import _unresolved_faces_q
+
+        marked = self._face()
+        marked.set_embedding('face_encoding_lvface_b', self.sentinel)
+        marked.save()  # kps stays NULL, by design
+
+        unmarked = self._face()  # kps NULL, lvface_b NULL -- genuinely unresolved
+
+        matched_ids = set(
+            Face.objects.filter(source_image_file=self.image)
+            .filter(_unresolved_faces_q(['B'], self.sentinel))
+            .values_list('id', flat=True)
+        )
+        self.assertEqual(matched_ids, {unmarked.id})
+
+    def test_matches_face_is_done_negation_exactly_across_a_mixed_set(self):
+        from face_manager.management.commands.backfill_verified_kps import (
+            _face_is_done, _unresolved_faces_q,
+        )
+
+        lvface_sizes = ['S', 'B']
+        faces = []
+
+        f1 = self._face()  # nothing set at all
+        faces.append(f1)
+
+        f2 = self._face()
+        f2.kps = [1.0] * 10
+        f2.set_embedding('face_encoding_lvface_s', [0.5] * 512)
+        f2.set_embedding('face_encoding_lvface_b', [0.5] * 512)
+        f2.save()  # fully done
+        faces.append(f2)
+
+        f3 = self._face()
+        f3.set_embedding('face_encoding_lvface_s', self.sentinel)
+        f3.set_embedding('face_encoding_lvface_b', self.sentinel)
+        f3.save()  # sentinel-done, kps NULL
+        faces.append(f3)
+
+        f4 = self._face()
+        f4.kps = [1.0] * 10
+        f4.set_embedding('face_encoding_lvface_s', [0.5] * 512)
+        f4.save()  # kps present, lvface_b still missing -- unresolved
+        faces.append(f4)
+
+        expected_unresolved = {
+            f.id for f in faces if not _face_is_done(f, lvface_sizes, self.sentinel)
+        }
+        matched_ids = set(
+            Face.objects.filter(source_image_file=self.image)
+            .filter(_unresolved_faces_q(lvface_sizes, self.sentinel))
+            .values_list('id', flat=True)
+        )
+        self.assertEqual(matched_ids, expected_unresolved)
+
+
 class BackfillVerifiedKpsTests(TestCase):
     """backfill_verified_kps management command -- the rigorous recovery
     backfill for the kps/box translation bug (see pyramidal_detector.py,
