@@ -406,7 +406,7 @@ class Command(BaseCommand):
         # whole image excluded (the exclude() matches the OTHER face),
         # even though the real-encoded one should still trigger it.
         # Found via a real test failure, not assumed.
-        base_trigger_filter = dict(face_encoding_512__isnull=False, source_image_file__isnull=False)
+        base_trigger_filter = dict(source_image_file__isnull=False, kps__isnull=True)
         if person_ids is not None:
             # Same "query at the Face level, not via a cross-relation
             # exclude()" discipline as above -- this is an additional
@@ -452,6 +452,8 @@ class Command(BaseCommand):
             if max_new_faces is not None and new_faces_this_run >= max_new_faces:
                 self.stdout.write(f"  --max-new-faces={max_new_faces} reached -- stopping")
                 break
+
+            self.stdout.write(f"Processing index {idx}")
 
             img_obj = ImageFile.objects.select_related('directory__collection').get(id=img_id)
 

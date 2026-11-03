@@ -17,20 +17,38 @@ only buried in a session's own narrative further down.** Full detail/context for
 the dated write-up elsewhere in this file (search for a distinctive word from the bullet).
 
 **Open questions / follow-ups:**
-- **Video/image face-geometry recovery backfills (2026-10-31) -- both restarted after a host CPU
-  upgrade, in progress.** See the dated write-up (search "geometry-trust fallback tiers") for the
-  full picture: `remediate_video_face_geometry` (no args) and `backfill_verified_kps
-  --person-ids=1436 --lvface-sizes=B --max-faces-per-image=710 --max-image-pixels=25000000
-  --max-aspect-ratio=2.5` (Leslie Williams specifically) are both resumable, safe to kill/relaunch
-  any time. Once Leslie's image-side gap closes, the same broadened-cap approach should be applied
-  to the other magnet people (David Redd, Emma, Elder Tim Call, Luca Wilson) and then genuinely
-  everyone, not just the 4 originally gallery-targeted people -- not started yet.
-- **pgvector/halfvec migration (2026-10-30) -- phases 1-3 done+deployed, phase 4 (backfill) running,
-  nothing reads the new columns yet.** See the dated write-up (search "pgvector/halfvec
-  embedding-storage migration") for the full picture. Next real step once the backfill finishes:
-  verify against real backfilled data, then cut over `assign_faces.py`'s reads first. LVFace-S/L
-  are stuck flat at 3.8% coverage (nothing populates them currently) -- not blocking, investigation-
-  only.
+- **Three backfill/remediation jobs running concurrently (2026-11-03) -- see "session status
+  snapshot" write-up (search "WIP backfill_verified_kps edit") for the full picture, including
+  live progress numbers.** Two `backfill_verified_kps --lvface-sizes=B --shard-index {0,1}
+  --total-shards 2` shards (general population, no `--person-ids`) and one
+  `remediate_video_face_geometry`. **Real risk flagged, not yet fixed**: the two image-backfill
+  shards are currently running WITHOUT the `--max-faces-per-image`/`--max-image-pixels`/
+  `--max-aspect-ratio` safety caps that guard a real, confirmed-unrecoverable hang (2026-10-27) --
+  worth relaunching with those caps restored. All three write to an attached pty, not a log file
+  -- check progress via direct DB queries, not log tailing. **Also outstanding**: a live,
+  uncommitted WIP edit to `backfill_verified_kps.py`'s trigger filter (broadens it from
+  "faces with a real encoding" to "any face missing kps") sits only in an auto-generated backup
+  commit, not yet reviewed/tested/merged -- don't assume it's finished or correct without
+  re-checking. Generalizing the resume-commands into something more durable than re-typing a long
+  `docker exec -d` line is also flagged as wanted but not designed.
+- **pgvector/halfvec migration -- phase 4 (backfill) is DONE (2026-11-03, confirmed: 471,291
+  faces, near-zero residual gap).** See the dated write-up (search "pgvector/halfvec
+  embedding-storage migration") for phases 1-4, and the 2026-11-03 "session status snapshot" entry
+  for the phase-4-complete confirmation. **Phases 5-8 (verify, cut over `assign_faces.py`'s reads,
+  bake-in, drop old columns) still not started** -- nothing reads any `_hv` column yet. LVFace-S/L
+  are still stuck flat (now ~5% coverage, still nothing actively populating them beyond one-off
+  investigation work) -- not blocking, investigation-only.
+- **LVFace-B threshold (0.30, no bucketing) is validated and already used for targeted
+  reclassification, but HOW to integrate it into the live `classify_unassigned()` pipeline is a
+  genuinely open, unmade decision** -- see the 2026-11-03 "session status snapshot" entry for the
+  options considered (replace insightface entirely / require agreement between both / use as a
+  secondary gate) and current coverage numbers.
+- **PhotoVerify 429 investigation -- real findings, not yet resolved.** See the 2026-11-03
+  "session status snapshot" entry (search "PhotoVerify 429"). Backend throttle logic confirmed
+  correct; root cause looks like an intermittent client-side bug (PhotoVerify sometimes doesn't
+  attach its own Authorization header, not a backend problem) -- needs reporting to whoever owns
+  that mobile client. TEMP diagnostic logging is still live in production (`api/views.py`'s
+  `KeyedImageView.get_throttles()`) and verbose -- remove once actually closed out.
 - No automated "did last night's backup actually run" freshness check exists — the current
   restore-testing only validates a backup file once it's promoted into weekly retention, which
   says nothing about a night the backup silently never ran at all (this has already happened
@@ -5084,3 +5102,155 @@ population yet -- only Leslie has been specifically targeted so far. The overall
 shards covered) and the full video `remediate_video_face_geometry` population (53,176 faces, most
 still unprocessed) both remain large, multi-day backlogs regardless of today's targeted work on
 Leslie specifically.
+
+## IN PROGRESS (2026-11-03): session status snapshot -- WIP backfill_verified_kps edit, three
+concurrent backfills, pgvector phase 4 complete, PhotoVerify 429 investigation, open threads
+
+Written mid-session specifically to survive a context clear -- several things below exist only as
+running processes/uncommitted edits right now, not yet captured anywhere durable.
+
+**Host CPU upgrade (2026-10-31) confirmed fully recognized**: `nproc` now reports **28** (up from
+24) -- the earlier "worth rechecking" note is resolved.
+
+**`backfill_verified_kps.py` -- a live, uncommitted WIP edit, intentionally left alone this
+session (explicitly asked not to touch it).** Currently exists only via an "Automated backup
+commit" (`b72fc3d` on `master` -- there's apparently a periodic mechanism that auto-commits
+uncommitted working-tree changes; worth knowing this exists next time something shows up that
+nobody remembers writing). Not yet reviewed for merge, not synced to `backend_upgrade`, not run
+through the test suite.
+
+The edit: `base_trigger_filter` changed from `dict(face_encoding_512__isnull=False,
+source_image_file__isnull=False)` to `dict(source_image_file__isnull=False, kps__isnull=True)` --
+drops the old requirement that a face already have a real stored insightface embedding before its
+image enters the trigger population, switching the trigger to "any face still missing kps."
+Verified (read-only, not modified) that this is sound: `.exclude(face_encoding_512=sentinel)`
+still runs after it, and Django's ORM compiles that exclude with an automatic `IS NOT NULL` guard
+(confirmed via inspecting the real compiled SQL) -- so a NULL-encoded `.ignore` face correctly
+survives the exclude (gets included) while a sentinel-marked face still gets correctly filtered
+out. A debug print (`"Processing index {idx}"`) was also added -- harmless, just verbose.
+
+Real effect: the trigger population goes from a narrow "faces with a real stored encoding" set to
+a much broader "any kps-missing face" set -- **412,414** faces match the new broad filter vs.
+**180,745** under the old narrow one (both counted live against production 2026-11-03). This is
+very likely the actual explanation for the earlier open question ("why do we keep getting ~1732
+instead of ~90") -- the OLD filter's `face_encoding_512__isnull=False` requirement is what was
+producing that narrower, oddly-stable-looking number; worth revisiting that question once this
+edit is finished/tested, since it may already answer itself.
+
+**Three backfill/remediation jobs are running concurrently right now** (load average ~63 on the
+now-28-core host -- real, substantial contention, not nothing):
+- Two `backfill_verified_kps --lvface-sizes=B --shard-index {0,1} --total-shards 2` processes
+  (PIDs 1477107/1479147, started 2026-11-03 ~07:12/07:13). **Running WITHOUT the
+  `--max-faces-per-image`/`--max-image-pixels`/`--max-aspect-ratio` safety caps** that were
+  established 2026-10-27 specifically to prevent real, confirmed-unrecoverable `app.get()` hangs
+  on crowd photos and extreme-aspect-ratio panoramas (see that date's write-up above --
+  `--max-aspect-ratio` in particular guards a hang that `PER_IMAGE_TIMEOUT_SECONDS`/SIGALRM
+  cannot interrupt, since it's a single uninterruptible C call). This is a real, live risk on the
+  now-unrestricted general population (no `--person-ids`, so it's exposed to the whole library,
+  not just a curated gallery subset) -- flagging this plainly rather than silently fixing it,
+  since I wasn't asked to change anything running right now.
+- One `remediate_video_face_geometry` (PID 1788, restarted 2026-11-02 ~22:30, no args).
+- **None of these are running via a detached `docker exec -d ... > logfile` the way I'd been
+  launching them** -- all three write directly to an attached pty (`/dev/pts/0`/`/dev/pts/1`,
+  confirmed via `/proc/<pid>/fd/1`), meaning they were started from an interactive terminal
+  session outside of what I have log-tailing access to. **Progress has to be read via direct DB
+  queries from here on, not log tailing**, until/unless they're relaunched the detached-with-log
+  way again.
+- Live counts as of this writing: **412,414** image faces still need kps (the broad population the
+  WIP filter now targets); **24,351** video faces still need `face_encoding_lvface_b` (the
+  `remediate_video_face_geometry` target population, down sharply from 37,376 reported earlier the
+  same session -- real, fast progress on the video side specifically).
+- The exact commands last used to launch the single-shard, capped version (documented for
+  reference/resumability, NOT what's currently running):
+  ```
+  docker exec -d picasa_api bash -c "cd /code && python -u manage.py backfill_verified_kps --lvface-sizes=B --max-faces-per-image=710 --max-image-pixels=25000000 --max-aspect-ratio=2.5 > /tmp/backfill_general1.log 2>&1; echo EXIT:\$? >> /tmp/backfill_general1.log"
+  docker exec -d picasa_api bash -c "cd /code && python -u manage.py remediate_video_face_geometry > /tmp/remediate_full_run.log 2>&1; echo EXIT:\$? >> /tmp/remediate_full_run.log"
+  ```
+  **Open TODO, per the user's own observation**: these ad hoc one-off invocations should be
+  generalized into something more durable/discoverable -- e.g. a small wrapper script (or even
+  just a documented canonical set of flags + a `tmux`/`screen` session convention) rather than
+  relying on remembering exact flags and re-typing a long `docker exec -d` line each time a job
+  needs resuming after being killed. Not designed or built yet.
+
+**pgvector/halfvec migration -- Phase 4 (backfill) is DONE.** `backfill_halfvec_mirrors` completed
+(confirmed via its own log's `EXIT:0` and final tally): 471,291 candidate faces processed --
+`face_encoding_512_hv`: 422,787 backfilled, `face_encoding_lvface_b_hv`: 191,120,
+`face_encoding_lvface_s_hv`: 30,155, `face_encoding_lvface_l_hv`: 30,135. Verified live: zero
+remaining gap for `face_encoding_512`/`_lvface_s`/`_lvface_l` (every row with a real float32 value
+now has its halfvec mirror); **554 faces still show a `face_encoding_lvface_b` gap** (real value
+present, `_hv` mirror still NULL) -- almost certainly just faces written by the two backfill jobs
+above in the window between the halfvec backfill's query snapshot and its completion, since
+dual-write (`Face.set_embedding()`) has been confirmed live since 2026-10-30. Small enough to
+clean up with a quick re-run of `backfill_halfvec_mirrors` whenever convenient; not urgent.
+
+**Phases 5-8 (verify against real backfilled data, cut over `assign_faces.py`'s reads one
+subsystem at a time, bake-in period, drop the old float32 columns only after a fresh backup) are
+still NOT started.** Nothing currently reads any `_hv` column -- this remains purely additive
+storage with zero behavior change.
+
+**LVFace-B coverage, broken down live (2026-11-03)**: 306,293 / 823,277 faces overall (37.2%) --
+image-sourced 277,096 / 769,653 (36.0%), video-sourced 29,262 / 53,624 (54.6%, boosted by
+`remediate_video_face_geometry`'s own dedicated LVFace-B write path). kps coverage: image-sourced
+357,081 / 769,653 (46.4%), video-sourced 53,394 / 53,624 (**99.6%, essentially complete** -- the
+video-side kps backfill is in its final stretch, it's specifically LVFace-B that's still catching
+up on video, not kps).
+
+**LVFace-B threshold (0.30, no gallery-size bucketing needed) is already empirically validated**
+against 152 real galleries (30-16,653 faces each, see the 2026-10-31 write-up above for the full
+TPR/FPR numbers) and already applied for real to 4 people's proposed candidates (Leslie Williams,
+Gwendolyn Lewis, Nathaniel Lewis, Sterling Bradshaw) via `reclassify_candidates --encoding=
+lvface_b --threshold=0.30`. **What's still a genuinely open decision, not yet made**: how LVFace-B
+actually gets integrated into the LIVE `classify_unassigned()`/`assign_faces.py` pipeline once
+broader coverage lands -- options not yet weighed against each other: (a) replace insightface's
+`face_encoding_512` entirely as the primary classification embedding, (b) run both and require
+agreement (the same agreement-gating idea investigated and set aside for the video pipeline back
+in the Phase 3 design work, for a different reason there), or (c) use LVFace-B as a secondary
+gate/signal alongside insightface's existing margin/det_score gates (the same shape as the
+2026-09-21 `DET_SCORE_FLOOR`/`CANDIDATE_MARGIN_FLOOR` work). The 0.30 threshold itself may also be
+worth re-validating once coverage is broad rather than concentrated in the handful of
+already-targeted galleries, since the 152-gallery validation sample, while real and large, predates
+today's much larger general backfill.
+
+**PhotoVerify 429 investigation -- real progress, still open.** Two TEMP diagnostic commits
+(`b61d56f`/`9702d61`, `api/views.py`'s `KeyedImageView.get_throttles()`) log every face_array/
+face_source request's auth-header state, explicitly marked for removal once root-caused -- still
+live in production, still printing on every request (verbose; don't forget to actually remove it
+once this is closed out). Findings so far, from real production log data (not assumed):
+- The throttle classes' own `get_cache_key()` logic (return `None` for an authenticated request =
+  skip the throttle entirely) is confirmed correct and working -- not the bug.
+- PhotoVerify's real mobile traffic (`okhttp/4.9.2` user-agent) mostly DOES send a valid Authelia
+  bearer token and resolves to `authed=True`: 1,110 of 1,254 sampled `face_array` requests (88.5%)
+  had the header and were correctly never throttled.
+- **But 144 of 1,254 (11.5%) arrived from the SAME client with NO `Authorization` header at all**
+  -- correctly fell back to anonymous, correctly got throttled by `AccessKeyMediaThrottle`'s
+  by-design rate limit. Cross-referenced directly against real 429 responses in the access log
+  (e.g. ids 960723/1092768 at 2026-11-01 10:21:23) -- confirmed these specific 429'd requests
+  really did arrive with `has_auth_header=False`, so the throttle did exactly what it's supposed
+  to given what it received.
+- **This is intermittent, not a clean old-app-version-vs-new-app-version split** -- a
+  header-present request and a header-absent request were logged 29 seconds apart from what looks
+  like the same session (15:20:55 present, 15:21:24 absent). Points at a client-side (PhotoVerify
+  mobile app) bug where the Authorization header is sometimes dropped on a per-request basis --
+  not something fixable from this backend repo, since PhotoVerify's own code isn't visible here.
+  Real next step: report this specific finding (intermittent per-request header loss, not a
+  blanket missing-header problem) back to whoever owns the PhotoVerify client, since it reframes
+  the investigation away from "is the backend throttle broken" (confirmed: no) toward "why does
+  the mobile HTTP client sometimes not attach its own auth header."
+
+**Frontend UI idea -- user recalled "we were considering doing another UI thing" but couldn't
+remember what.** Searched this repo's git log, CLAUDE.md, and memory files for anything matching;
+found no new commits or memory entries since the 2026-10-30 heartbeat-dismiss work that would be a
+better match. **Best guess, not confirmed**: the heartbeat-alert dismiss/clear-heartbeat toggle
+(`ApplicationErrorViewSet.dismiss()`'s `clear_heartbeat` param, `related_heartbeat_task_name`
+field -- see the 2026-10-30 write-up above) was explicitly built "meant to be wired into a
+settings-page toggle" on the frontend, and as far as this repo can tell, that frontend work was
+never confirmed done. If this isn't it, the real idea is still unrecovered -- worth asking the
+user directly next session rather than guessing further.
+
+**"Making the frontend use cookies to get these images"** -- per the user's own description this
+session; not independently verified from this backend repo, since if it's a frontend-side change
+(PhotoVerify or `dev_facewire`) it would be invisible here regardless of whether it's done,
+in-progress, or just proposed. Recorded as told, not confirmed. Plausibly connects to the 429
+investigation above (an alternative to bearer-token auth for image/face-chip requests), but that
+connection is this document's own inference, not something the user stated directly -- don't treat
+it as confirmed either.
