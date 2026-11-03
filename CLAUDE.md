@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Don't touch `master` or this directory (`/home/benjamin/git_repos/django_picasa`) for exploratory/maintenance work.** This checkout is bind-mounted directly into the live `picasa_api` production container (`dockerize/.env`'s `DJANGO_FILES_ROOT` points here) — editing files here can affect what's actually running. Do this kind of work (tests, dependency upgrades, CI, bug investigation) in the `backend_upgrade` branch/worktree at `/home/benjamin/git_repos/django_picasa_dev` instead (see "Where things stand" below for what's already there). Only touch `master` directly for something the user explicitly asks to land on `master` right now.
 
+**A host-wide nightly cron job auto-commits AND auto-pushes any dirty working tree in this repo, with no review.** `/home/benjamin/server_scripts/preserve_server_state/sync_git_repos.sh` runs daily at 3:30am via the host's own crontab (unrelated to anything in `dockerize/`), looping over every repo listed in `/home/benjamin/install_scripts/repos.txt` -- **this `django_picasa` checkout (`master`) is on that list** (`django_picasa_dev`/`backend_upgrade` is NOT). For each dirty repo it does a blind `git add -A && git commit -m "Automated backup commit <timestamp>"`, then pushes to `origin` if the branch is ahead. Found 2026-11-03 while investigating an "Automated backup commit" that had swept up a genuinely in-progress, not-yet-reviewed edit to `backfill_verified_kps.py` and silently pushed it to GitHub under a non-descriptive message -- not a bug in this project's own code, just a real operational fact worth knowing: **any edit left uncommitted in THIS checkout overnight will be auto-committed and auto-pushed with zero review by morning**, bypassing this project's own "test before merge before deploy" discipline entirely if someone isn't aware of it. Practical implications: (1) don't assume an uncommitted change here is safely "just sitting there" past 3:30am; (2) a commit titled "Automated backup commit" is a signal that whatever it contains was never deliberately reviewed/tested before landing, not evidence the change is finished or correct; (3) this is scoped to `master` only, not `backend_upgrade` -- genuinely in-progress work on this repo is safer parked in the `django_picasa_dev` worktree than left dirty in this one.
+
 **Deploying a code change to `master` is not complete until the affected long-running process is actually restarted.** `/code` being bind-mounted means an edited `.py` file is visible on disk immediately, but Python processes only read a module's code once, at interpreter/import time -- a `celery` worker, `celery beat`, or `gunicorn` that was already running keeps executing the *old* code in memory indefinitely, with no error or warning, until it's restarted. This has caused a real, confirmed production incident: the `missing_since` grace-period fix (commit `967067f`, landed 2026-10-05 10:10 EDT) sat committed but not yet running for long enough that the exact race it fixed hit a real photo in that window, permanently deleting a human-reviewed `ImageFile`/`Face` row before the fix was ever live. **Rule going forward: any edit that touches code executed by `celery worker`, `celery beat`, or `gunicorn` must be followed by actually restarting whichever of those processes runs that code** (`docker compose restart picasa` for a full restart, or the narrower kill+relaunch-in-place approach documented elsewhere in this file when avoiding disrupting the other process mid-task) -- not just committing and moving on. A pure data-only or docs-only change doesn't need this, but when in doubt, restart.
 
 ## Open TODOs (quick index)
@@ -49,6 +51,10 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   attach its own Authorization header, not a backend problem) -- needs reporting to whoever owns
   that mobile client. TEMP diagnostic logging is still live in production (`api/views.py`'s
   `KeyedImageView.get_throttles()`) and verbose -- remove once actually closed out.
+- **Orientation-detection signal (2026-11-03) -- validated real and cheap (free landmark-angle
+  geometry on already-stored `Face.kps`, no new ML model), not built.** See the dated write-up
+  (search "a cheap (no new ML model) orientation-detection signal") for the validation numbers and
+  real limits. Would need a new read-only audit management command; not scoped.
 - No automated "did last night's backup actually run" freshness check exists — the current
   restore-testing only validates a backup file once it's promoted into weekly retention, which
   says nothing about a night the backup silently never ran at all (this has already happened
@@ -5254,3 +5260,44 @@ in-progress, or just proposed. Recorded as told, not confirmed. Plausibly connec
 investigation above (an alternative to bearer-token auth for image/face-chip requests), but that
 connection is this document's own inference, not something the user stated directly -- don't treat
 it as confirmed either.
+
+**Investigated, validated, NOT built: a cheap (no new ML model) orientation-detection signal using
+already-stored face landmarks.** Prompted by face 1296015 (`/lewis_parents/Pictures/2013
+pictures/(3) Mar 2013/DSC01659.JPG`) -- visually confirmed genuinely rotated ~90°, but its EXIF
+`Orientation` tag is really `1` (no rotation flagged), confirmed via both `exiftool` and PIL's raw
+EXIF read directly against the file -- not an ingestion bug. Root cause: the source camera is a
+**Sony DSC-W530** (budget 2011-era compact, no orientation sensor) -- all 37 photos in that same
+directory share the identical camera/orientation signature, confirming this is a structural,
+per-camera metadata gap (the file genuinely has no orientation info to recover), not a parsing
+bug.
+
+**The cheap detection signal**: `Face.kps`'s existing 5-point landmarks (point order: left eye,
+right eye, nose, left mouth corner, right mouth corner, already computed by the live detector for
+every face with zero extra inference) give a free orientation estimate via the eye-to-eye vector's
+`atan2(dy, dx)` angle -- 0° ≈ upright, ±90° ≈ rotated one way or the other, 180° ≈ upside-down, and
+being signed, the angle also tells you WHICH way, not just whether.
+
+**Validated against real data, not just theorized**: a random 500-face sample (det_score≥0.85)
+found 99.4% within 30° of horizontal (normal head-tilt noise), 99th percentile at ~26°, zero
+anywhere near 90° or 180° -- a clean gap. The known-bad face 1296015 landed at a clean -93.3° in
+that gap. Two more faces (1301748, 1302819), picked and checked at the user's request, landed at
+-92.7°/-98.4° and were BOTH visually confirmed as genuinely rotated photos (real screenshots
+pulled and inspected, not just trusted on the angle) -- held up even at lower det_score (0.76,
+0.63) than the clean validation sample, a good robustness sign.
+
+**Real limits, not glossed over**: only flags images with at least one detected face (fine for
+this library's actual content, silent on faceless shots); a single face's angle can be noisy near
+a borderline case (someone genuinely tilting their head ~30-40°) -- aggregating/voting across every
+face on the same image would be far more robust than trusting one face alone; and this is
+**detection only** -- it tells you which images are likely rotated and which direction, but
+actually correcting one means re-rotating the stored pixels, regenerating thumbnails, and
+transforming every existing box/kps record on that image (and anything downstream assuming
+current coordinates) -- a separate, larger piece of work from the audit itself, not scoped or
+started.
+
+**Not built**: this is validated as a real, cheap signal (zero new model inference, pure geometry
+on data already in the DB) but no audit script/management command exists yet -- would be a
+one-time read-only scan over `Face` rows with `kps` populated, flagging/aggregating per-image, no
+image decode needed at all. A real ML orientation classifier (4-way CNN) would be more general
+(catches faceless photos too) but isn't obviously worth it given how cheaply the landmark-angle
+signal already covers this library's dominant case.
