@@ -836,8 +836,17 @@ class FaceExtractor(object):
 
         img_h, img_w, _ = img_numpy.shape
 
-        bb_l, bb_t, bb_r, bb_b = insight_detected_face['bbox']
-        # print("BBOX", insight_detected_face['bbox'])
+        # bbox is a numpy float32 array even when every value is whole --
+        # confirmed empirically (PyramidalDetector's own in-place int(...)
+        # assignment doesn't actually change the array's dtype). All of the
+        # chip_*/bb_* math below is numpy-array-sliced (img_numpy[chip_t:
+        # chip_b, chip_l:chip_r]) and this numpy version raises "slice
+        # indices must be integers..." on a float slice bound even when the
+        # value is whole -- cast to plain Python int up front, same as
+        # add_new_face() does for its own (separate) use of these bounds,
+        # so every caller gets integer-safe slicing regardless of whether
+        # it passes a freshly-detected Face or one built by hand.
+        bb_l, bb_t, bb_r, bb_b = (int(v) for v in insight_detected_face['bbox'])
 
         bb_l = np.max((0, bb_l))
         bb_t = np.max((0, bb_t))
