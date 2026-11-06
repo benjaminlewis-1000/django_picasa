@@ -1380,6 +1380,17 @@ class KeyedImageView(APIView):
             f"ua={self.request.META.get('HTTP_USER_AGENT', '')[:40]!r}",
             flush=True,
         )
+        # TEMP DIAGNOSTIC (2026-11-05): widen the net -- every narrower
+        # theory (client code, FlatList, local reverse proxy) has been
+        # ruled out and the header is simply never seen above. Dump every
+        # HTTP_* header verbatim in case it's arriving under an unexpected
+        # name/casing rather than missing outright. Remove with the above.
+        if not auth_header:
+            all_headers = {
+                k: v for k, v in self.request.META.items()
+                if k.startswith('HTTP_') or k in ('CONTENT_TYPE', 'CONTENT_LENGTH')
+            }
+            print(f"KIV_DIAG_HEADERS type={self.kwargs.get('type')} {all_headers!r}", flush=True)
         if self.kwargs.get('type') == 'slideshow':
             return [SlideshowMediaThrottle()]
         return [AccessKeyMediaThrottle()]
