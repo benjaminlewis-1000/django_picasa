@@ -18,12 +18,37 @@ import django
 # right after it.
 CANONICAL_ROTATIONS_DEG = (90.0, -90.0, 180.0)
 
+# How close a degrees value has to be to 0/360 ("no rotation") before it's
+# rejected as a real correction rather than snapped to one of the 3
+# canonical values -- see is_meaningful_rotation()'s own docstring. Half of
+# 90 -- exactly equidistant between "no rotation" and the nearest real
+# correction is already too ambiguous to accept.
+MIN_MEANINGFUL_ROTATION_DEGREES = 45.0
+
+
+def circular_distance(a, b):
+    diff = abs(a - b) % 360
+    return min(diff, 360 - diff)
+
 
 def snap_to_canonical_rotation(degrees):
-    def _circular_distance(a, b):
-        diff = abs(a - b) % 360
-        return min(diff, 360 - diff)
-    return min(CANONICAL_ROTATIONS_DEG, key=lambda c: _circular_distance(degrees, c))
+    return min(CANONICAL_ROTATIONS_DEG, key=lambda c: circular_distance(degrees, c))
+
+
+def is_meaningful_rotation(degrees):
+    """False for a degrees value close enough to 0 (no rotation) that it
+    shouldn't be accepted as a real correction at all -- e.g. a human
+    manually dialing in a rotation via repeated 90-degree UI adjustments
+    who lands back near the original orientation. snap_to_canonical_
+    rotation() always returns SOME value no matter how close to 0 degrees
+    is (0 itself is equidistant between the 90 and -90 buckets, an
+    arbitrary tie-break, not a real answer) -- callers that actually COMMIT
+    a human-chosen rotation (as opposed to the audit's own measurement,
+    which is never anywhere near 0 by construction -- see rotation_geometry.
+    py's UPRIGHT_TOLERANCE_DEG) must check this first and reject/ignore
+    instead of silently snapping a meaningless value to an arbitrary bucket.
+    """
+    return circular_distance(degrees, 0) >= MIN_MEANINGFUL_ROTATION_DEGREES
 
 
 def _pil_transpose_op(snapped_degrees):

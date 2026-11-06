@@ -1402,6 +1402,11 @@ class KeyedImageView(APIView):
           same as slideshow -- lets a human reviewer see the corrected
           orientation before confirming, without pre-rendering/storing
           anything. 404s if the image has no proposed_rotation_degrees.
+          A further rotation the reviewer dials in beyond this (rotate-
+          left/right buttons) is a client-side transform on the already-
+          fetched image, not a separate backend request -- only the
+          FINAL chosen degrees is ever sent back, via the bulk_action
+          endpoint's confirm param.
         '''
 
         params = self.request.query_params

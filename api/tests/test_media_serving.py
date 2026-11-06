@@ -121,7 +121,6 @@ class RotationPreviewKeyedImageTests(ApiTestCase):
         resp = self.anon_client.get(f"/api/keyed_image/rotation_preview/?id={self.image.id}")
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
-
 class KeyedImageViewThrottleTests(ApiTestCase):
     """api/throttles.py -- real bug fixed 2026-10-26: these throttles
     never actually checked request.user.is_authenticated despite the
