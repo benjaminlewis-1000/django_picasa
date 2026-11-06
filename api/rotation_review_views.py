@@ -22,6 +22,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+import common
 from api.mobile_views import _clamped_limit
 from face_manager.tasks import correct_image_rotation_ids_task
 from filepopulator.models import ImageFile
@@ -77,47 +78,84 @@ class RotationReviewListView(APIView):
 
 
 class RotationReviewBulkActionView(APIView):
-    """Bulk-resolve a batch of FLAGGED images.
+    """Bulk-resolve a batch of images -- not restricted to ones the audit
+    actually FLAGGED: a human can confirm a rotation the audit never
+    detected at all (no faces to measure from, a wrong/missed proposal),
+    as long as it hasn't already been baked in (rotation_correction_
+    applied=False) -- see rotation_signal_source.HUMAN.
 
-      - `confirm_ids`: rotation_scan_state -> CONFIRMED (the image shows
-        correctly everywhere immediately, see this module's own
-        docstring), then an on-demand Celery task is dispatched for
-        exactly these ids to migrate their existing Faces' box/kps into
-        the new coordinate space -- not applied here, synchronously,
-        inside an HTTP request.
-      - `dismiss_ids`: rotation_scan_state -> DISMISSED_NOT_ROTATED (the
-        image isn't actually rotated; the audit's proposal was wrong).
+      - `confirm`: [{"id": int, "degrees": float}, ...] -- `degrees` is
+        the human's FINAL chosen correction (always explicit, even if it
+        happens to match what the audit proposed -- there's no implicit
+        "just accept the proposal" shorthand, so the frontend's rotate-
+        left/right UI has one single code path regardless of whether the
+        reviewer touched those buttons). Snapped to the nearest canonical
+        90-degree value, same as any other correction. A `degrees` too
+        close to "no rotation" (see common.is_meaningful_rotation) is
+        rejected -- use `dismiss_ids` for that case instead. Overwrites
+        proposed_rotation_degrees with the given value and sets
+        rotation_scan_state -> CONFIRMED; an on-demand Celery task is
+        then dispatched for exactly the ids that succeeded, to migrate
+        their existing Faces' box/kps into the new coordinate space --
+        not applied here, synchronously, inside this HTTP request.
+      - `dismiss_ids`: rotation_scan_state -> DISMISSED_NOT_ROTATED,
+        proposed_rotation_degrees cleared (the image isn't rotated at
+        all, whether or not the audit ever proposed otherwise).
 
-    Only rows currently FLAGGED are touched -- an id that's already been
-    resolved (by this call or a concurrent one) or was never flagged is
-    silently skipped, not errored, matching BulkConfirmIgnore's convention.
+    Either action is rejected per-id (reported in `rejected`, never a
+    silent no-op) once rotation_correction_applied=True for that image --
+    re-correcting an already-corrected image isn't supported yet.
     """
 
     permission_classes = (IsAuthenticated,)
 
     def patch(self, request, *args, **kwargs):
-        confirm_ids = request.data.get('confirm_ids') or []
+        confirm_entries = request.data.get('confirm') or []
         dismiss_ids = request.data.get('dismiss_ids') or []
         ScanState = ImageFile.RotationScanState
 
-        confirmed = (
-            ImageFile.objects
-            .filter(id__in=confirm_ids, rotation_scan_state=ScanState.FLAGGED)
-            .update(rotation_scan_state=ScanState.CONFIRMED)
-        )
+        confirmed_ids = []
+        rejected = []
+        for entry in confirm_entries:
+            try:
+                image_id = int(entry['id'])
+                degrees = float(entry['degrees'])
+            except (KeyError, TypeError, ValueError):
+                rejected.append({'id': entry.get('id') if isinstance(entry, dict) else None,
+                                  'reason': 'missing or invalid id/degrees'})
+                continue
+
+            if not common.is_meaningful_rotation(degrees):
+                rejected.append({
+                    'id': image_id,
+                    'reason': 'degrees too close to no rotation -- use dismiss_ids instead',
+                })
+                continue
+
+            updated = (
+                ImageFile.objects
+                .filter(id=image_id, rotation_correction_applied=False)
+                .update(
+                    rotation_scan_state=ScanState.CONFIRMED,
+                    proposed_rotation_degrees=degrees,
+                    rotation_signal_source=ImageFile.RotationSignalSource.HUMAN,
+                )
+            )
+            if updated:
+                confirmed_ids.append(image_id)
+            else:
+                rejected.append({
+                    'id': image_id,
+                    'reason': 'no such image, or already corrected',
+                })
+
         dismissed = (
             ImageFile.objects
-            .filter(id__in=dismiss_ids, rotation_scan_state=ScanState.FLAGGED)
-            .update(rotation_scan_state=ScanState.DISMISSED_NOT_ROTATED)
+            .filter(id__in=dismiss_ids, rotation_correction_applied=False)
+            .update(rotation_scan_state=ScanState.DISMISSED_NOT_ROTATED, proposed_rotation_degrees=None)
         )
 
-        # Passing the raw confirm_ids (not a re-queried "which ones
-        # actually flipped" list) is safe and deliberate -- run_rotation_
-        # correction()'s own queryset re-filters to CONFIRMED-and-not-
-        # yet-applied, so an id that didn't actually change state here
-        # (already resolved, never flagged) just harmlessly doesn't match
-        # and costs nothing.
-        if confirm_ids:
-            correct_image_rotation_ids_task.delay(confirm_ids)
+        if confirmed_ids:
+            correct_image_rotation_ids_task.delay(confirmed_ids)
 
-        return Response({'confirmed': confirmed, 'dismissed': dismissed})
+        return Response({'confirmed': len(confirmed_ids), 'dismissed': dismissed, 'rejected': rejected})

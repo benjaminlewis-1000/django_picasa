@@ -80,54 +80,134 @@ class RotationReviewBulkActionViewTests(ApiTestCase):
         self.mock_dispatch = patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_confirm_sets_confirmed_state(self):
+    def test_confirm_sets_confirmed_state_and_stores_given_degrees(self):
         resp = self.client.patch(
-            "/api/rotation_review/bulk_action/", {'confirm_ids': [self.img_a.id]}, format='json',
+            "/api/rotation_review/bulk_action/",
+            {'confirm': [{'id': self.img_a.id, 'degrees': 90.0}]}, format='json',
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.data, {'confirmed': 1, 'dismissed': 0})
+        self.assertEqual(resp.data, {'confirmed': 1, 'dismissed': 0, 'rejected': []})
         self.img_a.refresh_from_db()
         self.assertEqual(self.img_a.rotation_scan_state, ImageFile.RotationScanState.CONFIRMED)
+        self.assertEqual(self.img_a.proposed_rotation_degrees, 90.0)
 
-    def test_dismiss_sets_dismissed_state(self):
+    def test_confirm_overrides_the_audit_proposed_degrees(self):
+        # img_a's audit proposal was 90.0 -- a human overriding to 180.0
+        # (rotate-left/right buttons landing somewhere else) must take
+        # precedence, with rotation_signal_source recording that a human
+        # made the call, not the audit.
+        resp = self.client.patch(
+            "/api/rotation_review/bulk_action/",
+            {'confirm': [{'id': self.img_a.id, 'degrees': 180.0}]}, format='json',
+        )
+        self.assertEqual(resp.data['confirmed'], 1)
+        self.img_a.refresh_from_db()
+        self.assertEqual(self.img_a.proposed_rotation_degrees, 180.0)
+        self.assertEqual(self.img_a.rotation_signal_source, ImageFile.RotationSignalSource.HUMAN)
+
+    def test_confirm_on_a_never_flagged_image_is_allowed(self):
+        # The audit never touches an image with no detected faces at
+        # all -- a human must still be able to confirm a rotation on it
+        # manually.
+        never_flagged = self.make_image(relative_fixture="naming/good/4.jpeg")
+        self.assertEqual(never_flagged.rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
+
+        resp = self.client.patch(
+            "/api/rotation_review/bulk_action/",
+            {'confirm': [{'id': never_flagged.id, 'degrees': -90.0}]}, format='json',
+        )
+        self.assertEqual(resp.data['confirmed'], 1)
+        never_flagged.refresh_from_db()
+        self.assertEqual(never_flagged.rotation_scan_state, ImageFile.RotationScanState.CONFIRMED)
+        self.assertEqual(never_flagged.proposed_rotation_degrees, -90.0)
+
+    def test_confirm_rejects_degrees_too_close_to_no_rotation(self):
+        resp = self.client.patch(
+            "/api/rotation_review/bulk_action/",
+            {'confirm': [{'id': self.img_a.id, 'degrees': 10.0}]}, format='json',
+        )
+        self.assertEqual(resp.data['confirmed'], 0)
+        self.assertEqual(len(resp.data['rejected']), 1)
+        self.assertEqual(resp.data['rejected'][0]['id'], self.img_a.id)
+        self.img_a.refresh_from_db()
+        self.assertEqual(self.img_a.rotation_scan_state, ImageFile.RotationScanState.FLAGGED)
+
+    def test_confirm_rejects_an_already_corrected_image(self):
+        self.img_a.rotation_correction_applied = True
+        self.img_a.save(update_fields=['rotation_correction_applied'])
+        resp = self.client.patch(
+            "/api/rotation_review/bulk_action/",
+            {'confirm': [{'id': self.img_a.id, 'degrees': 90.0}]}, format='json',
+        )
+        self.assertEqual(resp.data['confirmed'], 0)
+        self.assertEqual(len(resp.data['rejected']), 1)
+
+    def test_confirm_rejects_malformed_entries(self):
+        resp = self.client.patch(
+            "/api/rotation_review/bulk_action/",
+            {'confirm': [{'id': self.img_a.id}, {'degrees': 90.0}, 'not_even_a_dict']}, format='json',
+        )
+        self.assertEqual(resp.data['confirmed'], 0)
+        self.assertEqual(len(resp.data['rejected']), 3)
+
+    def test_dismiss_sets_dismissed_state_and_clears_proposed_degrees(self):
         resp = self.client.patch(
             "/api/rotation_review/bulk_action/", {'dismiss_ids': [self.img_b.id]}, format='json',
         )
-        self.assertEqual(resp.data, {'confirmed': 0, 'dismissed': 1})
+        self.assertEqual(resp.data, {'confirmed': 0, 'dismissed': 1, 'rejected': []})
         self.img_b.refresh_from_db()
         self.assertEqual(
             self.img_b.rotation_scan_state, ImageFile.RotationScanState.DISMISSED_NOT_ROTATED,
         )
+        self.assertIsNone(self.img_b.proposed_rotation_degrees)
+
+    def test_dismiss_works_from_confirmed_state_too(self):
+        # A reviewer changing their mind before the async correction job
+        # has run -- confirmed but not yet rotation_correction_applied.
+        self.img_b.rotation_scan_state = ImageFile.RotationScanState.CONFIRMED
+        self.img_b.save(update_fields=['rotation_scan_state'])
+        resp = self.client.patch(
+            "/api/rotation_review/bulk_action/", {'dismiss_ids': [self.img_b.id]}, format='json',
+        )
+        self.assertEqual(resp.data['dismissed'], 1)
+
+    def test_dismiss_rejects_an_already_corrected_image(self):
+        self.img_b.rotation_correction_applied = True
+        self.img_b.save(update_fields=['rotation_correction_applied'])
+        resp = self.client.patch(
+            "/api/rotation_review/bulk_action/", {'dismiss_ids': [self.img_b.id]}, format='json',
+        )
+        self.assertEqual(resp.data['dismissed'], 0)
 
     def test_both_in_one_call(self):
         resp = self.client.patch(
             "/api/rotation_review/bulk_action/",
-            {'confirm_ids': [self.img_a.id], 'dismiss_ids': [self.img_b.id]},
+            {'confirm': [{'id': self.img_a.id, 'degrees': 90.0}], 'dismiss_ids': [self.img_b.id]},
             format='json',
         )
-        self.assertEqual(resp.data, {'confirmed': 1, 'dismissed': 1})
-
-    def test_an_already_resolved_image_is_not_touched_again(self):
-        self.img_a.rotation_scan_state = ImageFile.RotationScanState.CONFIRMED
-        self.img_a.save(update_fields=['rotation_scan_state'])
-        resp = self.client.patch(
-            "/api/rotation_review/bulk_action/", {'confirm_ids': [self.img_a.id]}, format='json',
-        )
-        # Already CONFIRMED, not FLAGGED -- the scoped .filter() doesn't
-        # match it, so the update count is correctly 0, not 1.
-        self.assertEqual(resp.data['confirmed'], 0)
+        self.assertEqual(resp.data['confirmed'], 1)
+        self.assertEqual(resp.data['dismissed'], 1)
 
     def test_anonymous_request_rejected(self):
         resp = self.anon_client.patch(
-            "/api/rotation_review/bulk_action/", {'confirm_ids': [self.img_a.id]}, format='json',
+            "/api/rotation_review/bulk_action/",
+            {'confirm': [{'id': self.img_a.id, 'degrees': 90.0}]}, format='json',
         )
         self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
 
     def test_confirm_dispatches_an_on_demand_correction_task_for_those_ids(self):
         self.client.patch(
-            "/api/rotation_review/bulk_action/", {'confirm_ids': [self.img_a.id]}, format='json',
+            "/api/rotation_review/bulk_action/",
+            {'confirm': [{'id': self.img_a.id, 'degrees': 90.0}]}, format='json',
         )
         self.mock_dispatch.assert_called_once_with([self.img_a.id])
+
+    def test_rejected_entries_are_not_dispatched(self):
+        self.client.patch(
+            "/api/rotation_review/bulk_action/",
+            {'confirm': [{'id': self.img_a.id, 'degrees': 5.0}]}, format='json',
+        )
+        self.mock_dispatch.assert_not_called()
 
     def test_dismiss_only_does_not_dispatch_anything(self):
         self.client.patch(

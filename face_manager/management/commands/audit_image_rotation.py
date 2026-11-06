@@ -5,7 +5,7 @@ detection write-up for the design and validation this is built on.
 """
 from django.core.management.base import BaseCommand
 
-from face_manager.rotation_audit import run_rotation_audit
+from face_manager.rotation_audit import DEFAULT_MAX_IMAGES_PER_RUN, run_rotation_audit
 
 
 class Command(BaseCommand):
@@ -19,10 +19,16 @@ class Command(BaseCommand):
                              help="Actually write rotation_scan_state/proposed_rotation_degrees/"
                                   "rotation_signal_source/rotation_scanned_at_version. Without "
                                   "this, reports counts only -- no DB writes.")
+        parser.add_argument('--max-images', type=int, default=DEFAULT_MAX_IMAGES_PER_RUN,
+                             help=f"Cap per invocation (default {DEFAULT_MAX_IMAGES_PER_RUN}) -- see "
+                                  "run_rotation_audit()'s own comment on why this isn't unbounded. "
+                                  "Pass 0 to remove the cap entirely for a deliberate, supervised "
+                                  "one-off run with its own external memory monitoring.")
 
     def handle(self, *args, **options):
         write = options['yes']
-        result = run_rotation_audit(write=write)
+        max_images = options['max_images'] or None
+        result = run_rotation_audit(write=write, max_images=max_images)
 
         self.stdout.write(f"Candidates examined: {result['examined']}")
         for key, value in result['counts'].items():

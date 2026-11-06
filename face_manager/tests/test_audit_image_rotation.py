@@ -68,6 +68,100 @@ class EvaluateImageTests(TestCase):
         self.assertAlmostEqual(outcome['estimate'], 90.0, delta=2)
 
 
+def _flat_kps_for_eye_angle(angle_deg, eye_separation=50.0):
+    return [coord for point in _kps_for_eye_angle(angle_deg, eye_separation) for coord in point]
+
+
+class RunRotationAuditTests(TestCase):
+    """run_rotation_audit() itself, against the real DB -- previously
+    only the pure evaluate_image() helper and the task's lock/crash
+    wrapper (mocking run_rotation_audit entirely) were tested, which is
+    exactly the gap that let a real production incident (2026-11-06)
+    through: the unbatched version loaded the ENTIRE ~271k-image backlog
+    (every Face row in full, via the default prefetch_related) into
+    memory in one call, measured at 25GB+ RSS and still climbing on a
+    host already low on free memory before it was killed. These tests
+    cover the real fix -- a bounded max_images per call, ordered by id
+    so repeated calls make forward, non-overlapping progress.
+    """
+
+    def setUp(self):
+        from face_manager.tests import make_face, make_image
+
+        self.images = []
+        for i, fixture in enumerate([
+            "naming/good/1.JPG", "naming/good/2.jpg", "naming/good/3.JPEG",
+        ]):
+            img = make_image(relative_fixture=fixture)
+            # Box sized to actually contain _flat_kps_for_eye_angle's
+            # points (centered at (100,100), eye_separation=50) --
+            # make_face()'s own tiny default box would violate the DB's
+            # face_kps_within_box_margin constraint otherwise.
+            make_face(img, box_left=50, box_top=50, box_right=150, box_bottom=150,
+                      kps=_flat_kps_for_eye_angle(90.0))
+            self.images.append(img)
+
+    def test_write_false_examines_but_does_not_persist(self):
+        from face_manager.rotation_audit import run_rotation_audit
+
+        result = run_rotation_audit(write=False)
+        self.assertEqual(result['examined'], 3)
+        self.assertEqual(result['counts']['flagged_new_or_updated'], 3)
+        for img in self.images:
+            img.refresh_from_db()
+            self.assertEqual(img.rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
+            self.assertIsNone(img.proposed_rotation_degrees)
+
+    def test_write_true_persists_the_flag(self):
+        from face_manager.rotation_audit import run_rotation_audit
+
+        result = run_rotation_audit(write=True)
+        self.assertEqual(result['updated'], 3)
+        for img in self.images:
+            img.refresh_from_db()
+            self.assertEqual(img.rotation_scan_state, ImageFile.RotationScanState.FLAGGED)
+            self.assertAlmostEqual(img.proposed_rotation_degrees, 90.0, delta=1)
+            self.assertEqual(img.rotation_scanned_at_version, 1)
+
+    def test_max_images_caps_the_batch(self):
+        from face_manager.rotation_audit import run_rotation_audit
+
+        result = run_rotation_audit(write=True, max_images=1)
+        self.assertEqual(result['examined'], 1)
+        self.assertEqual(result['updated'], 1)
+
+    def test_repeated_capped_calls_make_forward_progress(self):
+        # Ordered by id, so three calls capped at 1 each must cover all
+        # three DISTINCT images, never reprocessing the same one twice --
+        # this is what lets the scheduled hourly task grind through a
+        # large backlog safely over many runs instead of one unbounded
+        # pass.
+        from face_manager.rotation_audit import run_rotation_audit
+
+        seen_ids = set()
+        for _ in range(3):
+            result = run_rotation_audit(write=True, max_images=1)
+            self.assertEqual(result['examined'], 1)
+            seen_ids.update(
+                img.id for img in ImageFile.objects.filter(
+                    rotation_scan_state=ImageFile.RotationScanState.FLAGGED,
+                )
+            )
+        self.assertEqual(seen_ids, {img.id for img in self.images})
+
+        # The whole eligible backlog is now exhausted -- a 4th call finds
+        # nothing left (every image's rotation_scanned_at_version is now
+        # >= ROTATION_SCAN_LOGIC_VERSION, excluding it from the next scan).
+        result = run_rotation_audit(write=True, max_images=1)
+        self.assertEqual(result['examined'], 0)
+
+    def test_max_images_none_removes_the_cap(self):
+        from face_manager.rotation_audit import run_rotation_audit
+
+        result = run_rotation_audit(write=False, max_images=None)
+        self.assertEqual(result['examined'], 3)
+
+
 class AuditImageRotationTaskTests(TestCase):
     """The scheduled Celery task is a thin advisory-lock + crash-logging
     wrapper around run_rotation_audit() -- same shape as this codebase's

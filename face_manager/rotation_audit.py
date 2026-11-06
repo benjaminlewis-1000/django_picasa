@@ -7,8 +7,9 @@ FaceExtractor.reencode_missing_faces()'s own
 task-is-a-thin-wrapper-around-one-shared-function shape elsewhere in
 this codebase.
 """
-from django.db.models import Q
+from django.db.models import Prefetch, Q
 
+from face_manager.models import Face
 from face_manager.rotation_geometry import (
     ROTATION_SCAN_LOGIC_VERSION,
     UPRIGHT_TOLERANCE_DEG,
@@ -19,13 +20,25 @@ from face_manager.rotation_geometry import (
 )
 from filepopulator.models import ImageFile
 
+# A real, confirmed production incident (2026-11-06): the unbatched version
+# of this function loaded every eligible ImageFile PLUS every one of its
+# Face rows IN FULL (face_encoding_512/lvface_b included, ~2KB+ per face,
+# via the default prefetch_related('face_set')) all at once -- against the
+# real ~271k-image backlog this measured 25GB+ RSS and still climbing, on a
+# host already low on free memory, before it was killed. evaluate_image()
+# only ever reads Face.kps, so the prefetch now pulls just id/kps per face,
+# and the whole scan is capped to a bounded chunk per call rather than the
+# entire backlog at once -- the scheduled hourly task naturally grinds
+# through a large backlog over many runs instead of one unbounded pass.
+DEFAULT_MAX_IMAGES_PER_RUN = 2000
+
 
 def _candidate_images_queryset():
     ScanState = ImageFile.RotationScanState
     return ImageFile.objects.filter(
         Q(rotation_scan_state=ScanState.NOT_SCANNED) | Q(rotation_scan_state=ScanState.FLAGGED),
         rotation_scanned_at_version__lt=ROTATION_SCAN_LOGIC_VERSION,
-    )
+    ).order_by('id')
 
 
 def evaluate_image(image, faces_with_kps):
@@ -58,17 +71,29 @@ def evaluate_image(image, faces_with_kps):
     return {'examined': True, 'estimate': estimate, 'source': source, 'significant': significant}
 
 
-def run_rotation_audit(write=False):
-    """Scan every eligible ImageFile (see _candidate_images_queryset) and
-    either report (write=False, the default) or persist (write=True)
-    the resulting rotation_scan_state/proposed_rotation_degrees/
-    rotation_signal_source/rotation_scanned_at_version changes.
+def run_rotation_audit(write=False, max_images=DEFAULT_MAX_IMAGES_PER_RUN):
+    """Scans up to `max_images` eligible ImageFiles (see
+    _candidate_images_queryset, ordered by id for stable chunking across
+    repeated calls) and either reports (write=False, the default) or
+    persists (write=True) the resulting rotation_scan_state/
+    proposed_rotation_degrees/rotation_signal_source/
+    rotation_scanned_at_version changes.
+
+    Deliberately NOT the whole backlog in one call -- see
+    DEFAULT_MAX_IMAGES_PER_RUN's own comment. `max_images=None` removes
+    the cap entirely (only for a deliberate, supervised one-off run with
+    its own external memory monitoring -- never from the scheduled task).
 
     Returns a dict: {'examined': int, 'counts': {...}, 'updated': int}.
     """
     ScanState = ImageFile.RotationScanState
 
-    candidates = list(_candidate_images_queryset().prefetch_related('face_set'))
+    queryset = _candidate_images_queryset().prefetch_related(
+        Prefetch('face_set', queryset=Face.objects.only('id', 'kps', 'source_image_file')),
+    )
+    if max_images is not None:
+        queryset = queryset[:max_images]
+    candidates = list(queryset)
     counts = {
         'no_usable_faces': 0,
         'ambiguous_disagreement': 0,

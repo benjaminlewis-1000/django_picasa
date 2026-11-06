@@ -12,7 +12,10 @@ from django.utils import timezone
 from PIL import Image
 
 from common.advisory_lock import advisory_lock
-from common.open_img_oriented import open_img_oriented, apply_exif_orientation
+from common.open_img_oriented import (
+    open_img_oriented, apply_exif_orientation, apply_additional_rotation,
+    circular_distance, is_meaningful_rotation,
+)
 from common.equalize import clahe_equalize_bgr
 
 
@@ -84,6 +87,52 @@ def _diagonal_marker_image(width=200, height=150, color=(120, 60, 200)):
     for i in range(min(width, height)):
         img[i, i] = (255, 255, 255)
     return Image.fromarray(img)
+
+
+class IsMeaningfulRotationTests(TestCase):
+    """Guards against snap_to_canonical_rotation()'s own tie-break near 0
+    degrees -- it always returns SOME canonical value no matter how close
+    to "no rotation" the input is, which is fine for the audit (its
+    measured angle is never near 0 by construction) but would be a real,
+    silent bug if a human-chosen override near 0 were accepted and
+    snapped to an arbitrary nearby bucket instead of being rejected.
+    """
+
+    def test_exact_canonical_values_are_meaningful(self):
+        for degrees in (90.0, -90.0, 180.0, 270.0):
+            self.assertTrue(is_meaningful_rotation(degrees), degrees)
+
+    def test_near_zero_is_not_meaningful(self):
+        for degrees in (0.0, 10.0, -10.0, 44.0, -44.0, 350.0, -350.0):
+            self.assertFalse(is_meaningful_rotation(degrees), degrees)
+
+    def test_the_45_degree_boundary(self):
+        self.assertTrue(is_meaningful_rotation(45.0))
+        self.assertTrue(is_meaningful_rotation(-45.0))
+        self.assertFalse(is_meaningful_rotation(44.9))
+
+    def test_circular_distance_wraps_correctly(self):
+        self.assertAlmostEqual(circular_distance(350.0, 0.0), 10.0)
+        self.assertAlmostEqual(circular_distance(10.0, 350.0), 20.0)
+        self.assertAlmostEqual(circular_distance(90.0, -90.0), 180.0)
+
+
+class ApplyAdditionalRotationTests(TestCase):
+    def test_none_degrees_returns_the_same_image_unchanged(self):
+        img = Image.new('RGB', (10, 20))
+        result = apply_additional_rotation(img, None)
+        self.assertIs(result, img)
+
+    def test_90_degrees_swaps_dimensions(self):
+        img = Image.new('RGB', (10, 20))
+        result = apply_additional_rotation(img, 90.0)
+        self.assertEqual(result.size, (20, 10))
+
+    def test_an_arbitrary_angle_snaps_to_the_nearest_canonical_value(self):
+        img = Image.new('RGB', (10, 20))
+        # 100 degrees snaps to 90 -- same dimension swap as an exact 90.
+        result = apply_additional_rotation(img, 100.0)
+        self.assertEqual(result.size, (20, 10))
 
 
 class ApplyExifOrientationTests(TestCase):
