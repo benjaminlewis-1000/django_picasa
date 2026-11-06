@@ -6,7 +6,9 @@ import pillow_heif
 # rather than deferred into filepopulator's HEIC-specific code.
 pillow_heif.register_heif_opener()
 
-from .open_img_oriented import open_img_oriented, apply_exif_orientation
+from .open_img_oriented import (
+    open_img_oriented, apply_exif_orientation, apply_additional_rotation, snap_to_canonical_rotation,
+)
 from .equalize import clahe_equalize_bgr
 from .advisory_lock import advisory_lock
 from .error_log import log_error

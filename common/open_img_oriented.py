@@ -8,6 +8,46 @@ from PIL import Image, ExifTags
 import numpy as np
 import django
 
+# A human-confirmed rotation correction (ImageFile.rotation_scan_state/
+# proposed_rotation_degrees -- see face_manager's rotation-review feature)
+# is always one of these three discrete values -- the measured angle is
+# snapped to whichever is closest before ever being applied as a real
+# transform. Lives here (not in face_manager) because this is the single
+# shared image-decode chokepoint every consumer already goes through for
+# EXIF orientation, and the confirmed correction is applied the same way,
+# right after it.
+CANONICAL_ROTATIONS_DEG = (90.0, -90.0, 180.0)
+
+
+def snap_to_canonical_rotation(degrees):
+    def _circular_distance(a, b):
+        diff = abs(a - b) % 360
+        return min(diff, 360 - diff)
+    return min(CANONICAL_ROTATIONS_DEG, key=lambda c: _circular_distance(degrees, c))
+
+
+def _pil_transpose_op(snapped_degrees):
+    return {90.0: Image.ROTATE_90, -90.0: Image.ROTATE_270, 180.0: Image.ROTATE_180}[snapped_degrees]
+
+
+def apply_additional_rotation(image, degrees):
+    """Applies a human-confirmed rotation correction ON TOP OF whatever
+    EXIF orientation has already been applied -- these are two
+    independent corrections composed in the order they were actually
+    measured in, not the same correction applied twice: the confirmed
+    angle was measured from face landmarks detected on the ALREADY-EXIF-
+    corrected image (every detection pass already decodes through this
+    same module), so it is by construction the residual rotation EXIF
+    correction did not fix (e.g. a camera with no orientation sensor).
+
+    `degrees` of None (no confirmed correction -- the overwhelmingly
+    common case) returns `image` unchanged.
+    """
+    if degrees is None:
+        return image
+    return image.transpose(_pil_transpose_op(snap_to_canonical_rotation(degrees)))
+
+
 def apply_exif_orientation(image, orientation):
     """Apply the EXIF Orientation transform to a PIL Image, returning the
     corrected image. Handles all 8 standard values (1-8) via transpose(),
@@ -42,9 +82,16 @@ def apply_exif_orientation(image, orientation):
     return image
 
 
-def open_img_oriented(filename: str, as_numpy: bool):
+def open_img_oriented(filename: str, as_numpy: bool, extra_rotation_degrees=None):
     # Open an image, get its metadata from the EXIF tag,
-    # orient it, and then return as a numpy array
+    # orient it, and then return as a numpy array.
+    #
+    # extra_rotation_degrees: a human-confirmed rotation correction (see
+    # apply_additional_rotation's own docstring) -- applied AFTER EXIF
+    # orientation, if given. The caller passes this explicitly (typically
+    # ImageFile.confirmed_rotation_override_degrees) rather than this
+    # function looking it up itself, since this is a generic, storage-
+    # agnostic decode helper with no inherent DB dependency.
     
     if type(filename) == django.db.models.fields.files.ImageFieldFile:
 #        data = filename.read()    
@@ -91,6 +138,8 @@ def open_img_oriented(filename: str, as_numpy: bool):
 
         if orientation in exif.keys():
             image = apply_exif_orientation(image, exif[orientation])
+
+        image = apply_additional_rotation(image, extra_rotation_degrees)
 
         if as_numpy:
             image = np.array(image)

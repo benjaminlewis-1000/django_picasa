@@ -7,6 +7,8 @@ from .models import (
 )
 from assign_faces import faceAssigner
 from verification_clustering import cluster_all_unverified_faces
+from face_manager.rotation_audit import run_rotation_audit
+from face_manager.rotation_correction import run_rotation_correction
 from celery import shared_task
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -492,3 +494,79 @@ def cluster_unverified_faces_task():
         )
     except Exception as e:
         _log_task_crash('cluster_unverified_faces_task', e)
+
+@shared_task(ignore_result=True, name='face_manager.audit_image_rotation')
+def audit_image_rotation_task():
+    """Scheduled wrapper around face_manager.rotation_audit.
+    run_rotation_audit() -- see that module and CLAUDE.md's
+    2026-11-03/11-05 orientation-detection write-up for the design.
+    Same advisory-lock convention as the other scheduled tasks here;
+    covers manual (management-command) and scheduled invocations alike.
+    """
+    with advisory_lock('face_manager.audit_image_rotation') as acquired:
+        if not acquired:
+            settings.LOGGER.debug("Image rotation audit is locked, exiting.")
+            return
+        try:
+            result = run_rotation_audit(write=True)
+            settings.LOGGER.debug(
+                f"audit_image_rotation_task: examined {result['examined']}, "
+                f"updated {result['updated']} -- {result['counts']}"
+            )
+        except Exception as e:
+            _log_task_crash('audit_image_rotation_task', e)
+
+@shared_task(ignore_result=True, name='face_manager.correct_image_rotation')
+def correct_image_rotation_task():
+    """Scheduled SAFETY-NET sweep around face_manager.rotation_correction.
+    run_rotation_correction() -- catches any CONFIRMED-but-not-yet-
+    corrected image the on-demand correct_image_rotation_ids_task below
+    missed (e.g. a lost broker message, a worker crash mid-task). The
+    common case (a human confirms, sees it corrected within moments) is
+    handled by that on-demand task instead -- this one is deliberately
+    infrequent (see its own CELERY_BEAT_SCHEDULE entry) since it's only
+    ever meant to catch the rare leftover, not deliver the primary UX.
+    run_rotation_correction() itself takes a per-image advisory lock, so
+    this can safely overlap an in-flight on-demand task without either
+    double-processing the same row.
+    """
+    with advisory_lock('face_manager.correct_image_rotation') as acquired:
+        if not acquired:
+            settings.LOGGER.debug("Image rotation correction sweep is locked, exiting.")
+            return
+        try:
+            result = run_rotation_correction()
+            settings.LOGGER.debug(
+                f"correct_image_rotation_task: corrected {result['corrected']}, "
+                f"failed {result['failed']}"
+            )
+        except Exception as e:
+            _log_task_crash('correct_image_rotation_task', e)
+
+
+@shared_task(ignore_result=True, name='face_manager.correct_image_rotation_ids')
+def correct_image_rotation_ids_task(image_ids):
+    """On-demand (NOT scheduled -- dispatched directly via .delay() right
+    after a human confirms a rotation, see api.rotation_review_views'
+    RotationReviewBulkActionView) wrapper around run_rotation_correction(),
+    scoped to exactly the ids just confirmed. Fast turnaround (the human
+    sees the corrected image within moments) is the whole point of this
+    task existing separately from the scheduled sweep above -- no
+    advisory lock at the TASK level here (a small, specific id list is
+    cheap and safe to run concurrently with the sweep or another on-
+    demand dispatch; run_rotation_correction()'s own per-image lock is
+    what actually prevents double-processing any single row).
+
+    If this task's message is ever lost entirely (broker restart, a
+    worker crash before it starts), there's no retry here -- the
+    scheduled sweep above is exactly the recourse for that case, just on
+    its own (longer) cadence.
+    """
+    try:
+        result = run_rotation_correction(image_ids=image_ids)
+        settings.LOGGER.debug(
+            f"correct_image_rotation_ids_task({image_ids}): corrected {result['corrected']}, "
+            f"failed {result['failed']}"
+        )
+    except Exception as e:
+        _log_task_crash('correct_image_rotation_ids_task', e)

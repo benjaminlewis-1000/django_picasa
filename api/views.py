@@ -878,7 +878,10 @@ class FaceViewSet(viewsets.ModelViewSet):
         # Extract the source file, oriented.
         source_file = face.source_image_file.filename
         pixel_hash = face.source_image_file.pixel_hash
-        image = common.open_img_oriented(source_file, as_numpy = False)
+        image = common.open_img_oriented(
+            source_file, as_numpy=False,
+            extra_rotation_degrees=face.source_image_file.confirmed_rotation_override_degrees,
+        )
 
         # Clamp the padded box to the source image's bounds - a face
         # near an edge would otherwise crop out of range.
@@ -1364,33 +1367,6 @@ class KeyedImageView(APIView):
         # (DRF's initial() -> check_throttles() runs before get()
         # itself). Both throttle classes skip entirely for an
         # authenticated session regardless of type.
-        # TEMP DIAGNOSTIC (2026-11-01): PhotoVerify mobile reports most
-        # face_array/face_source requests still getting 429'd even though
-        # the app now sends an Authelia bearer token on these. Log exactly
-        # what arrives, to tell apart "header never reaches the server"
-        # from "header arrives but auth resolves to anonymous anyway".
-        # Remove once that's root-caused.
-        auth_header = self.request.META.get('HTTP_AUTHORIZATION', '')
-        print(
-            f"KIV_DIAG type={self.kwargs.get('type')} "
-            f"authed={self.request.user.is_authenticated} "
-            f"has_auth_header={bool(auth_header)} "
-            f"auth_header_prefix={auth_header[:16]!r} "
-            f"id={self.request.query_params.get('id')} "
-            f"ua={self.request.META.get('HTTP_USER_AGENT', '')[:40]!r}",
-            flush=True,
-        )
-        # TEMP DIAGNOSTIC (2026-11-05): widen the net -- every narrower
-        # theory (client code, FlatList, local reverse proxy) has been
-        # ruled out and the header is simply never seen above. Dump every
-        # HTTP_* header verbatim in case it's arriving under an unexpected
-        # name/casing rather than missing outright. Remove with the above.
-        if not auth_header:
-            all_headers = {
-                k: v for k, v in self.request.META.items()
-                if k.startswith('HTTP_') or k in ('CONTENT_TYPE', 'CONTENT_LENGTH')
-            }
-            print(f"KIV_DIAG_HEADERS type={self.kwargs.get('type')} {all_headers!r}", flush=True)
         if self.kwargs.get('type') == 'slideshow':
             return [SlideshowMediaThrottle()]
         return [AccessKeyMediaThrottle()]
@@ -1419,10 +1395,20 @@ class KeyedImageView(APIView):
           mobile client; every "show me the full photo" path goes through
           slideshow (live-resized from the original) instead. See
           CLAUDE.md.
+        rotation_preview: key type: image. Live-rotates the original file by
+          its own ImageFile.proposed_rotation_degrees (snapped to the same
+          canonical 90-degree correction face_manager.rotation_correction.
+          apply_rotation_correction() would actually apply) and resizes,
+          same as slideshow -- lets a human reviewer see the corrected
+          orientation before confirming, without pre-rendering/storing
+          anything. 404s if the image has no proposed_rotation_degrees.
         '''
 
         params = self.request.query_params
-        valid_types = ['face_highlight', 'face_array', 'face_source', 'slideshow', 'full_small']
+        valid_types = [
+            'face_highlight', 'face_array', 'face_source', 'slideshow', 'full_small',
+            'rotation_preview',
+        ]
         
         def err_404(message=""):
             msg_start = f'Invalid request. Url is of format (/keyed_image/<type>/?id=<int>&access_key=<string>). Valid types include {valid_types}. \n\n'
@@ -1541,7 +1527,17 @@ class KeyedImageView(APIView):
             elif image_type == 'full_small':
                 img_obj = getAndCheckID('image', id_key)
                 image = img_obj.thumbnail_small
-                    
+            elif image_type == 'rotation_preview':
+                img_obj = getAndCheckID('image', id_key)
+                if img_obj.proposed_rotation_degrees is None:
+                    return err_404('This image has no proposed_rotation_degrees.')
+                image = img_obj.filename
+                if 'height' in params.keys():
+                    height = int(params['height'])
+                else:
+                    height = settings.DEFAULT_RESOLUTION_HEIGHT
+                width = 1920 / 1080 * height
+
         except:
             return err_404(f'Bad id for object of type {image_type}')
 
@@ -1561,7 +1557,7 @@ class KeyedImageView(APIView):
                 src = face.source_image_file or face.source_video_file
                 date_taken = src.dateTaken if src is not None else None
                 filename = src.filename if src is not None else None
-            elif image_type in ('slideshow', 'full_small'):
+            elif image_type in ('slideshow', 'full_small', 'rotation_preview'):
                 date_taken = img_obj.dateTaken
                 filename = img_obj.filename
             else:
@@ -1587,9 +1583,31 @@ class KeyedImageView(APIView):
         else:
             # print("Type of image is ", type(image), image_type, dir(image))
             # if type(image) ==
-            image = common.open_img_oriented(image, as_numpy = False)
+            if image_type == 'face_source':
+                source_obj = face.source_image_file
+            elif image_type in ('slideshow', 'full_small', 'rotation_preview'):
+                source_obj = img_obj
+            else:
+                source_obj = None  # face_highlight -- no single source ImageFile
 
-        # Resize image. Allow for upsampling now. 
+            extra_degrees = (
+                source_obj.confirmed_rotation_override_degrees if source_obj is not None else None
+            )
+            image = common.open_img_oriented(image, as_numpy=False, extra_rotation_degrees=extra_degrees)
+
+            if image_type == 'rotation_preview' and image is not None and extra_degrees is None:
+                # Preview of a PROPOSED (not yet confirmed) correction --
+                # confirmed_rotation_override_degrees (applied just above,
+                # if set) only takes effect once CONFIRMED; before that,
+                # show what confirming WOULD produce using
+                # proposed_rotation_degrees directly. Applied BEFORE the
+                # resize math below, since a 90/-90 correction swaps
+                # width/height. The extra_degrees-is-None guard avoids
+                # double-applying the rotation for an already-CONFIRMED
+                # image (open_img_oriented already applied it above).
+                image = common.apply_additional_rotation(image, img_obj.proposed_rotation_degrees)
+
+        # Resize image. Allow for upsampling now.
         w, h = image.size[:2]
 
         try:

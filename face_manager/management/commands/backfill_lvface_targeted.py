@@ -110,7 +110,10 @@ class Command(BaseCommand):
                 signal.signal(signal.SIGALRM, _raise_image_timeout)
                 signal.alarm(PER_IMAGE_TIMEOUT_SECONDS)
                 try:
-                    img_numpy = common.open_img_oriented(img_obj.filename, as_numpy=True)
+                    img_numpy = common.open_img_oriented(
+                    img_obj.filename, as_numpy=True,
+                    extra_rotation_degrees=img_obj.confirmed_rotation_override_degrees,
+                )
                 finally:
                     signal.alarm(0)
             except _ImageTimeout:
