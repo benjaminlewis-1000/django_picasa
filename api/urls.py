@@ -6,6 +6,7 @@ from api import mobile_views
 from api import geocode_views
 from api import upload_views
 from api import photos_watch_views
+from api import rotation_review_views
 from django.urls import path
 from rest_framework.authtoken.views import obtain_auth_token  # <-- Here
 
@@ -60,6 +61,8 @@ urlpatterns = [
     path(r'mobile/verify_candidates/', mobile_views.VerifyCandidatesList.as_view(), name='verify_candidates'),
     path(r'mobile/verify_ignore_candidates/', mobile_views.VerifyIgnoreCandidatesList.as_view(), name='verify_ignore_candidates'),
     path(r'mobile/bulk_verify/', mobile_views.BulkVerify.as_view(), name='bulk_verify'),
+    path(r'rotation_review/', rotation_review_views.RotationReviewListView.as_view(), name='rotation_review'),
+    path(r'rotation_review/bulk_action/', rotation_review_views.RotationReviewBulkActionView.as_view(), name='rotation_review_bulk_action'),
     path(r'geocode_review/', geocode_views.GeocodeReviewListView.as_view(), name='geocode_review'),
     path(r'geocode_review/action/', geocode_views.GeocodeReviewActionView.as_view(), name='geocode_review_action'),
     path(r'geocode_review/search_places/', geocode_views.GeocodeReviewSearchPlacesView.as_view(), name='geocode_review_search_places'),

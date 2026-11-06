@@ -742,6 +742,73 @@ class ImageFile(models.Model):
 
     description = models.CharField(max_length = 1024, null=True, blank = True)
 
+    # Rotation-review fields -- see CLAUDE.md's 2026-11-03/11-05 orientation-
+    # detection write-up. Populated by face_manager's audit_image_rotation
+    # command (landmark-geometry signal today; a future ML classifier is a
+    # second signal source writing the same fields, see ROTATION_SOURCE_
+    # PRIORITY below) and consumed/confirmed via a rotation-review API.
+    class RotationScanState(models.TextChoices):
+        NOT_SCANNED = 'not_scanned', 'Not scanned'
+        FLAGGED = 'flagged', 'Flagged -- awaiting human review'
+        CONFIRMED = 'confirmed', 'Confirmed by a human'
+        DISMISSED_NOT_ROTATED = 'dismissed_not_rotated', 'Dismissed -- not actually rotated'
+
+    class RotationSignalSource(models.TextChoices):
+        LANDMARK_SINGLE_FACE = 'landmark_single_face', 'Face-landmark geometry (single face)'
+        LANDMARK_MULTI_FACE = 'landmark_multi_face', 'Face-landmark geometry (multi-face agreement)'
+        ML_CLASSIFIER = 'ml_classifier', 'ML orientation classifier'
+        HUMAN = 'human', 'Human-entered'
+
+    # db_default (not just default=) per CLAUDE.md's 2026-09-18 incident
+    # write-up -- ImageFile is written by long-running Celery workers, so
+    # a stale forked worker process that loaded the app registry before
+    # this migration landed must still be able to INSERT successfully.
+    rotation_scan_state = models.CharField(
+        max_length=32, choices=RotationScanState.choices,
+        default=RotationScanState.NOT_SCANNED, db_default=RotationScanState.NOT_SCANNED,
+    )
+    # The proposed (or human-confirmed) correction angle in degrees, using
+    # the same signed atan2 convention as face_manager.rotation_geometry --
+    # e.g. 90/-90/180. Not restricted to those three values: a future ML
+    # classifier could in principle propose any angle. NULL whenever
+    # rotation_scan_state is NOT_SCANNED or DISMISSED_NOT_ROTATED.
+    proposed_rotation_degrees = models.FloatField(null=True, blank=True)
+    rotation_signal_source = models.CharField(
+        max_length=32, choices=RotationSignalSource.choices, null=True, blank=True,
+    )
+    # Compared via < against face_manager.rotation_geometry.ROTATION_SCAN_
+    # LOGIC_VERSION -- a stale version (or NOT_SCANNED) is eligible for
+    # re-scan; CONFIRMED/DISMISSED_NOT_ROTATED are human-decided and never
+    # re-scanned regardless of version.
+    rotation_scanned_at_version = models.IntegerField(default=0, db_default=0)
+    # Set True once face_manager.rotation_correction.apply_rotation_
+    # correction() has transformed every attached Face's box/kps into the
+    # CONFIRMED rotation's coordinate space and regenerated their
+    # thumbnails -- distinct from rotation_scan_state=CONFIRMED itself,
+    # which only records the human decision and, as of this field's
+    # existing-row migration, already takes effect at DECODE TIME
+    # everywhere (see confirmed_rotation_override_degrees below) with no
+    # waiting on this flag. This field tracks only the one-time Face-row
+    # geometry migration a newly-confirmed image still needs so the
+    # standard find_and_encode_faces() reconciliation can correctly match
+    # (not duplicate) its existing faces once it starts seeing the
+    # now-rotation-aware decoded pixels. No pixel data is ever rewritten
+    # to disk -- the rotation is always applied live, on every decode.
+    rotation_correction_applied = models.BooleanField(default=False, db_default=False)
+
+    @property
+    def confirmed_rotation_override_degrees(self):
+        """The human-confirmed rotation correction to apply ON TOP OF EXIF
+        orientation whenever this image is decoded anywhere (see
+        common.open_img_oriented's extra_rotation_degrees param) -- None
+        if nothing has been confirmed. A single property so every caller
+        derives this the same way, rather than each one re-deriving "is
+        this CONFIRMED and does it have a real angle" independently.
+        """
+        if self.rotation_scan_state == self.RotationScanState.CONFIRMED and self.proposed_rotation_degrees is not None:
+            return self.proposed_rotation_degrees
+        return None
+
     # thumbnail = models.ImageField(upload_to = settings.FILEPOPULATOR_THUMBNAIL_DIR, default = str(timezone.now) + '_thumbnail.jpg' )
 
     # def _get_full_path(self):
@@ -995,6 +1062,15 @@ class ImageFile(models.Model):
         except:
             # Orientation 1
             pass
+
+        # A human-confirmed rotation correction (see
+        # confirmed_rotation_override_degrees's own docstring) applies ON
+        # TOP of EXIF orientation, same as every other decode path --
+        # self.rotation_scan_state/proposed_rotation_degrees are already
+        # real field values on this instance by the time _init_image()
+        # runs for a reprocessing pass (the only case where they could
+        # ever be CONFIRMED -- a brand-new row is always NOT_SCANNED).
+        self.image = common.apply_additional_rotation(self.image, self.confirmed_rotation_override_degrees)
 
         self.width, self.height = self.image.size
 

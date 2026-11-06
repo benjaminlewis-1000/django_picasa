@@ -72,6 +72,56 @@ class KeyedImageViewTests(ApiTestCase):
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
 
+class RotationPreviewKeyedImageTests(ApiTestCase):
+    """KeyedImageView's 'rotation_preview' type -- see
+    CLAUDE.md's 2026-11-06 orientation-detection write-up."""
+
+    def setUp(self):
+        super().setUp()
+        self.image = self.make_image()
+
+    def test_no_proposed_rotation_returns_404(self):
+        self.assertIsNone(self.image.proposed_rotation_degrees)
+        resp = self.client.get(f"/api/keyed_image/rotation_preview/?id={self.image.id}")
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_proposed_rotation_returns_a_rotated_image(self):
+        from PIL import Image
+
+        self.image.proposed_rotation_degrees = 90.0
+        self.image.save(update_fields=['proposed_rotation_degrees'])
+
+        orig_w, orig_h = self.image.width, self.image.height
+        resp = self.client.get(f"/api/keyed_image/rotation_preview/?id={self.image.id}")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp["Content-Type"], "image/jpeg")
+
+        # A 90-degree correction swaps the aspect ratio -- the returned
+        # image's width/height ratio should be inverted relative to the
+        # un-rotated original (within the resize's own BICUBIC rounding),
+        # confirming the rotation was actually applied, not just that
+        # *some* JPEG came back.
+        returned = Image.open(BytesIO(resp.content))
+        orig_ratio = orig_w / orig_h
+        returned_ratio = returned.width / returned.height
+        self.assertAlmostEqual(returned_ratio, 1 / orig_ratio, delta=0.05)
+
+    def test_unauthenticated_with_correct_access_key_accepted(self):
+        self.image.proposed_rotation_degrees = -90.0
+        self.image.save(update_fields=['proposed_rotation_degrees'])
+        resp = self.anon_client.get(
+            f"/api/keyed_image/rotation_preview/?id={self.image.id}"
+            f"&access_key={settings.RANDOM_ACCESS_KEY}"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_unauthenticated_without_access_key_rejected(self):
+        self.image.proposed_rotation_degrees = 180.0
+        self.image.save(update_fields=['proposed_rotation_degrees'])
+        resp = self.anon_client.get(f"/api/keyed_image/rotation_preview/?id={self.image.id}")
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+
 class KeyedImageViewThrottleTests(ApiTestCase):
     """api/throttles.py -- real bug fixed 2026-10-26: these throttles
     never actually checked request.user.is_authenticated despite the

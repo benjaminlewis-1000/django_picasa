@@ -353,7 +353,10 @@ class FaceExtractor(object):
             source_file = img_obj.filename
             print(source_file)
             try:
-                img_numpy = common.open_img_oriented(source_file, as_numpy = True)
+                img_numpy = common.open_img_oriented(
+                    source_file, as_numpy=True,
+                    extra_rotation_degrees=img_obj.confirmed_rotation_override_degrees,
+                )
                 assert len(img_numpy.shape) == 3
                 # print(img_numpy.shape)
 
@@ -1366,7 +1369,10 @@ class FaceExtractor(object):
                 )
 
             try:
-                img = common.open_img_oriented(img_obj.filename, as_numpy=True)
+                img = common.open_img_oriented(
+                    img_obj.filename, as_numpy=True,
+                    extra_rotation_degrees=img_obj.confirmed_rotation_override_degrees,
+                )
             except Exception as e:
                 settings.LOGGER.error(f"Cannot re-encode Face {face.id}: failed to open image ({e}).")
                 continue

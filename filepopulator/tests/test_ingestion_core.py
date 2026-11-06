@@ -59,11 +59,19 @@ class ImageFileTests(TestCase):
         # assert os.path.isdir(self.val_train), 'val_train directory in ImageFileTests does not exist.'
         # assert os.path.isdir(self.val_test), 'val_test directory in ImageFileTests does not exist.'
 
-        self.tmp_valid_dir = '/tmp/img_validation'
-
-        if os.path.exists(self.tmp_valid_dir):
-            shutil.rmtree(self.tmp_valid_dir)
-
+        # A unique-per-call directory (not a fixed '/tmp/img_validation'
+        # path) -- under --parallel, multiple forked worker processes
+        # share this container's /tmp, and a fixed shared path raced
+        # between this class's own per-test rmtree/copytree and
+        # DirectoryTests' own per-class copytree of the identical literal
+        # path, producing real, intermittent "No such file or directory"/
+        # "Directory not empty" failures in both (confirmed 2026-11-06,
+        # not just "leftover from an interrupted run" as this file's own
+        # CLAUDE.md note previously assumed). tempfile.mkdtemp() makes a
+        # genuinely unique directory per call -- no cleanup-then-create
+        # race is possible.
+        self._tmp_valid_parent = tempfile.mkdtemp(prefix='img_validation_')
+        self.tmp_valid_dir = os.path.join(self._tmp_valid_parent, 'validation')
         shutil.copytree(self.validation_dir, self.tmp_valid_dir)
 
         self.test_dir = os.path.join(self.tmp_valid_dir, 'naming')
@@ -103,7 +111,7 @@ class ImageFileTests(TestCase):
         for obj in allObjects:
             obj.delete()
 
-        shutil.rmtree(self.tmp_valid_dir)
+        shutil.rmtree(self._tmp_valid_parent, ignore_errors=True)
 
 
     def test_same_pixel_hash(self): ### CHECKED ### 
@@ -1523,18 +1531,23 @@ class DirectoryTests(TestCase):
 
         assert os.path.isdir(cls.validation_dir), 'Validation directory in FaceManageTests does not exist.'
 
-        # Copy the validation files to the /tmp directory
-        cls.tmp_valid_dir = '/tmp/img_validation'
-
-        if os.path.exists(cls.tmp_valid_dir):
-            shutil.rmtree(cls.tmp_valid_dir)
-
+        # A unique-per-class directory, not a fixed '/tmp/img_validation'
+        # path -- see ImageFileTests.setUp's own comment (same file) for
+        # why a shared literal path races under --parallel against this
+        # exact class.
+        cls._tmp_valid_parent = tempfile.mkdtemp(prefix='img_validation_')
+        cls.tmp_valid_dir = os.path.join(cls._tmp_valid_parent, 'validation')
         shutil.copytree(cls.validation_dir, cls.tmp_valid_dir)
 
         cls.face_file = os.path.join(cls.tmp_valid_dir, 'has_face_tags.jpg')
 
         create_image_file(cls.face_file)
         add_from_root_dir(cls.tmp_valid_dir)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._tmp_valid_parent, ignore_errors=True)
+        super().tearDownClass()
 
     def test_top_name(self):
         

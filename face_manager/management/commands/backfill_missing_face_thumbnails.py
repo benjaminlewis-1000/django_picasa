@@ -71,7 +71,10 @@ class Command(BaseCommand):
         for i, (img_id, faces) in enumerate(missing_by_image.items()):
             img_obj = faces[0].source_image_file
             try:
-                img_numpy = common.open_img_oriented(img_obj.filename, as_numpy=True)
+                img_numpy = common.open_img_oriented(
+                    img_obj.filename, as_numpy=True,
+                    extra_rotation_degrees=img_obj.confirmed_rotation_override_degrees,
+                )
                 if img_numpy is None:
                     raise OSError('decode returned None')
             except Exception as e:

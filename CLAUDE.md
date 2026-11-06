@@ -19,6 +19,12 @@ only buried in a session's own narrative further down.** Full detail/context for
 the dated write-up elsewhere in this file (search for a distinctive word from the bullet).
 
 **Open questions / follow-ups:**
+- **Reported (2026-11-05), not yet investigated: HDR video-face thumbnails look washed out again
+  (face 1146073, flagged by the user).** Possibly a regression of an HDR tone-mapping fix from an
+  earlier session (the user recalled something about 12-bit vs. 10-bit handling) -- not yet
+  located in this file's own history, not reproduced, not root-caused. Check this specific face's
+  source video's color/bit-depth metadata (`ffprobe`) and compare against whatever HDR handling
+  `extract_frame_near_timestamp()`/the thumbnail pipeline currently has before assuming anything.
 - **Three backfill/remediation jobs running concurrently (2026-11-03) -- see "session status
   snapshot" write-up (search "WIP backfill_verified_kps edit") for the full picture, including
   live progress numbers.** Two `backfill_verified_kps --lvface-sizes=B --shard-index {0,1}
@@ -1572,10 +1578,21 @@ has changed):
   them; passes every time in isolation or under `--parallel` (where each worker's process is
   shorter-lived). A real gap if ever investigated further: no test currently resets DRF's throttle
   cache between cases.
-- A leftover `/tmp/img_validation` directory from a PREVIOUS run (not cleaned up if a run was
-  killed/interrupted, e.g. by a background-task timeout) causes a real, unrelated-looking failure
-  (`shutil.Error: File exists`) in `filepopulator.tests.test_ingestion_core` -- not a flake, just
-  needs `rm -rf /tmp/img_validation` before re-running if a prior run didn't finish cleanly.
+- **FIXED (2026-11-06): `/tmp/img_validation` collisions in `filepopulator.tests.
+  test_ingestion_core`.** Previously documented here as merely "a leftover directory from an
+  interrupted prior run" -- re-investigated after it recurred mid-session with a SECOND distinct
+  symptom (`shutil.Error: File exists` during `copytree`, and separately `OSError: Directory not
+  empty` during `rmtree`) inside the same single `--parallel` run, which a stale-leftover theory
+  can't explain. Real root cause: `ImageFileTests.setUp()` (per-test-method) and `DirectoryTests.
+  setUpTestData()` (per-class) both hardcoded the identical literal path `/tmp/img_validation` --
+  under `--parallel`, Django distributes different test classes to different forked worker
+  processes sharing this container's one `/tmp`, so one worker's `rmtree`/`copytree` of that path
+  could race against another's at the exact same instant. Fixed by giving each a genuinely unique
+  directory via `tempfile.mkdtemp()` instead of a fixed path -- no collision is possible by
+  construction, and `DirectoryTests` also gained a `tearDownClass` to actually clean up (it had
+  none before). If this exact failure shape (a missing-file error that looks unrelated to what the
+  test is actually doing) ever resurfaces elsewhere, check for another hardcoded shared `/tmp` path
+  used by more than one test class first.
 
 `face_manager/test_face_cache.py` caches real `PyramidalDetector` output keyed on `sha256(image bytes) + sha256(pyramidal_detector.py source)`, so repeat runs against an unchanged image with an unchanged detector skip the CPU cost entirely (~4s → ~0.01s per image). Change either the image or the detector's code and the cache key changes automatically.
 

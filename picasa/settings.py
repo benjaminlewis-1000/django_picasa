@@ -682,6 +682,23 @@ CELERY_BEAT_SCHEDULE = {
         # vacuum-swap (3am Monday) jobs.
         'schedule': crontab(minute='0', hour='1'),
     },
+   'audit_image_rotation': {
+        'task': 'face_manager.audit_image_rotation',
+        # Pure geometry on already-stored Face.kps -- no image decode or
+        # model inference, so this is cheap; hourly, offset from
+        # reencode_missing_faces (:20) and clear_ignored_encodings (:35).
+        'schedule': crontab(minute='40', hour='*'),
+    },
+   'correct_image_rotation': {
+        'task': 'face_manager.correct_image_rotation',
+        # A SAFETY NET only, not the primary delivery path -- confirming
+        # in api.rotation_review_views dispatches an immediate on-demand
+        # task (face_manager.correct_image_rotation_ids_task) for fast
+        # turnaround; this sweep just catches whatever that dispatch
+        # ever misses (a lost broker message, a worker crash mid-task).
+        # Infrequent on purpose, offset from audit_image_rotation (:40).
+        'schedule': crontab(minute='10', hour='*'),
+    },
    'cleanup_stale_uploads': {
         'task': 'api.cleanup_stale_uploads',
         # Once daily is plenty -- UPLOAD_SESSION_TTL_HOURS (48h) means an
