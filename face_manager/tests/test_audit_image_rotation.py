@@ -99,6 +99,14 @@ class RunRotationAuditTests(TestCase):
             # face_kps_within_box_margin constraint otherwise.
             make_face(img, box_left=50, box_top=50, box_right=150, box_bottom=150,
                       kps=_flat_kps_for_eye_angle(90.0))
+            # _candidate_images_queryset() requires isProcessed=True (face
+            # detection has actually settled) -- make_image() leaves a
+            # fresh row at the real default (False); only once isProcessed
+            # flips True (as the real face_extraction task does once it's
+            # genuinely finished with an image) does this project consider
+            # its face/kps data complete enough to audit.
+            img.isProcessed = True
+            img.save(update_fields=['isProcessed'])
             self.images.append(img)
 
     def test_write_false_examines_but_does_not_persist(self):
@@ -161,6 +169,41 @@ class RunRotationAuditTests(TestCase):
         result = run_rotation_audit(write=False, max_images=None)
         self.assertEqual(result['examined'], 3)
 
+    def test_isprocessed_false_is_excluded_from_candidates(self):
+        # Real production finding (2026-11-06): isProcessed=False means
+        # face detection hasn't settled on this image at all yet -- it
+        # must never be examined (or have rotation_scanned_at_version
+        # bumped) while that's true, so it's naturally reconsidered once
+        # isProcessed flips True, rather than needing any separate
+        # "retry later" bookkeeping.
+        from face_manager.rotation_audit import run_rotation_audit
+
+        self.images[0].isProcessed = False
+        self.images[0].save(update_fields=['isProcessed'])
+
+        result = run_rotation_audit(write=True)
+        self.assertEqual(result['examined'], 2)
+        self.images[0].refresh_from_db()
+        self.assertEqual(self.images[0].rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
+        self.assertEqual(self.images[0].rotation_scanned_at_version, 0)
+
+    def test_a_face_still_missing_kps_excludes_the_whole_image(self):
+        # Real production finding (2026-11-06): with the kps backfill
+        # still in progress, an image can be isProcessed=True with SOME
+        # faces missing kps -- must be excluded entirely (not evaluated
+        # from only the subset of faces that happen to have kps already)
+        # until every one of its faces has kps.
+        from face_manager.rotation_audit import run_rotation_audit
+        from face_manager.tests import make_face
+
+        make_face(self.images[0], box_left=5, box_top=5, box_right=20, box_bottom=20, kps=None)
+
+        result = run_rotation_audit(write=True)
+        self.assertEqual(result['examined'], 2)
+        self.images[0].refresh_from_db()
+        self.assertEqual(self.images[0].rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
+        self.assertEqual(self.images[0].rotation_scanned_at_version, 0)
+
 
 class RunRotationAuditUntilDoneTests(TestCase):
     """run_rotation_audit_until_done() -- the looping wrapper used by the
@@ -179,6 +222,8 @@ class RunRotationAuditUntilDoneTests(TestCase):
             img = make_image(relative_fixture=fixture)
             make_face(img, box_left=50, box_top=50, box_right=150, box_bottom=150,
                       kps=_flat_kps_for_eye_angle(90.0))
+            img.isProcessed = True
+            img.save(update_fields=['isProcessed'])
             self.images.append(img)
 
     def test_loops_through_the_whole_backlog_in_one_call(self):

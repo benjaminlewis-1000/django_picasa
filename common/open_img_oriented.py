@@ -18,13 +18,16 @@ import django
 # right after it.
 CANONICAL_ROTATIONS_DEG = (90.0, -90.0, 180.0)
 
-# How far a degrees value may stray from an exact multiple of 90 (and
-# still be accepted as one) -- see is_cardinal_rotation()'s own
-# docstring. Generous enough to absorb ordinary floating-point/JS
-# rounding on a value a frontend built from repeated +/-90 button
-# presses, nowhere near loose enough to accept a genuinely different
-# angle (e.g. 45 or 123.4) by mistake.
-CARDINAL_ROTATION_TOLERANCE_DEGREES = 1.0
+# A human reviewer never actually thinks in signed angles -- asking the
+# frontend to send a float just reintroduces a cw-vs-ccw sign-convention
+# ambiguity ("does +90 mean clockwise?") that a plain direction word
+# sidesteps entirely. Case/whitespace-insensitive; a few common synonyms
+# per direction, not an exhaustive synonym dictionary.
+ROTATION_DIRECTION_TO_DEGREES = {
+    'cw': 90.0, 'clockwise': 90.0,
+    'ccw': -90.0, 'counterclockwise': -90.0, 'counter_clockwise': -90.0, 'counter-clockwise': -90.0,
+    '180': 180.0, 'half_turn': 180.0, 'halfturn': 180.0, 'flip': 180.0, 'upside_down': 180.0,
+}
 
 
 def circular_distance(a, b):
@@ -36,29 +39,24 @@ def snap_to_canonical_rotation(degrees):
     return min(CANONICAL_ROTATIONS_DEG, key=lambda c: circular_distance(degrees, c))
 
 
-def is_cardinal_rotation(degrees):
-    """True only for a degrees value that is (within
-    CARDINAL_ROTATION_TOLERANCE_DEGREES) a NONZERO multiple of 90 -- 90,
-    180, 270, -90, -180, -270, 450, etc. all count; 0, 360, -360 (no real
-    rotation) and any non-90-multiple angle (e.g. 45, 123.4) do not.
+def rotation_direction_to_degrees(direction):
+    """Maps a human-chosen rotation direction -- 'cw', 'ccw', or '180'
+    (plus a few common synonyms, case/whitespace-insensitive -- see
+    ROTATION_DIRECTION_TO_DEGREES) -- to the one of CANONICAL_ROTATIONS_
+    DEG it represents. Returns None for anything unrecognized (including
+    a non-string, or a numeric angle -- this is deliberately NOT a
+    degrees-validation function; a rotate-left/right UI only ever has 3
+    real outcomes, and a plain direction string is the only shape it can
+    ever actually produce).
 
-    This is the only shape a human's rotate-left/right UI (built from
-    repeated +/-90-degree button presses, per the frontend contract) can
-    ever actually produce -- a confirm action that commits a human-chosen
-    rotation must reject anything else outright rather than silently
-    snapping an arbitrary value to whichever canonical bucket happens to
-    be nearest (see snap_to_canonical_rotation's own tie-break risk right
-    at 0). The audit's OWN measured proposals don't go through this check
-    at all -- they're never anywhere near a multiple of 90 by construction
-    (a real photo's residual misorientation is essentially never an exact
-    quarter turn) and are snapped, not validated, when actually applied.
+    The audit's OWN measured proposals never go through this at all --
+    they're real floats, never close to an exact quarter turn by
+    construction, and are snapped via snap_to_canonical_rotation(), not
+    matched against a direction word, when actually applied.
     """
-    remainder = degrees % 90
-    if min(remainder, 90 - remainder) > CARDINAL_ROTATION_TOLERANCE_DEGREES:
-        return False
-    mod360 = degrees % 360
-    is_no_rotation = min(mod360, 360 - mod360) <= CARDINAL_ROTATION_TOLERANCE_DEGREES
-    return not is_no_rotation
+    if not isinstance(direction, str):
+        return None
+    return ROTATION_DIRECTION_TO_DEGREES.get(direction.strip().lower())
 
 
 def _pil_transpose_op(snapped_degrees):

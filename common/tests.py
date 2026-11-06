@@ -14,7 +14,7 @@ from PIL import Image
 from common.advisory_lock import advisory_lock
 from common.open_img_oriented import (
     open_img_oriented, apply_exif_orientation, apply_additional_rotation,
-    circular_distance, is_cardinal_rotation,
+    circular_distance, rotation_direction_to_degrees,
 )
 from common.equalize import clahe_equalize_bgr
 
@@ -89,32 +89,41 @@ def _diagonal_marker_image(width=200, height=150, color=(120, 60, 200)):
     return Image.fromarray(img)
 
 
-class IsCardinalRotationTests(TestCase):
-    """A human-confirmed rotation (the rotate-left/right UI) must be a
-    real, nonzero multiple of 90 -- never an arbitrary angle, and never
-    silently snapped to an ambiguous nearest bucket the way
-    snap_to_canonical_rotation() alone would (0 is exactly equidistant
-    between the 90 and -90 buckets -- an arbitrary tie-break, not a real
-    answer).
+class RotationDirectionToDegreesTests(TestCase):
+    """A human-confirmed rotation (the rotate-left/right UI) only ever
+    has 3 real possible outcomes -- clockwise, counter-clockwise, or a
+    half-turn -- and is communicated as a plain direction word, never a
+    signed angle (which would just reintroduce a cw-vs-ccw sign-
+    convention ambiguity a human reviewer doesn't think in).
     """
 
-    def test_exact_cardinal_values_are_accepted(self):
-        for degrees in (90.0, -90.0, 180.0, -180.0, 270.0, -270.0, 450.0, -450.0):
-            self.assertTrue(is_cardinal_rotation(degrees), degrees)
+    def test_canonical_direction_words_map_to_the_right_degrees(self):
+        self.assertEqual(rotation_direction_to_degrees('cw'), 90.0)
+        self.assertEqual(rotation_direction_to_degrees('ccw'), -90.0)
+        self.assertEqual(rotation_direction_to_degrees('180'), 180.0)
 
-    def test_no_rotation_is_rejected(self):
-        for degrees in (0.0, 360.0, -360.0, 720.0):
-            self.assertFalse(is_cardinal_rotation(degrees), degrees)
+    def test_common_synonyms_are_accepted(self):
+        self.assertEqual(rotation_direction_to_degrees('clockwise'), 90.0)
+        self.assertEqual(rotation_direction_to_degrees('counterclockwise'), -90.0)
+        self.assertEqual(rotation_direction_to_degrees('counter_clockwise'), -90.0)
+        self.assertEqual(rotation_direction_to_degrees('counter-clockwise'), -90.0)
+        self.assertEqual(rotation_direction_to_degrees('flip'), 180.0)
+        self.assertEqual(rotation_direction_to_degrees('half_turn'), 180.0)
+        self.assertEqual(rotation_direction_to_degrees('upside_down'), 180.0)
 
-    def test_non_cardinal_angles_are_rejected(self):
-        # Real angles an audit measurement would produce, or a typo/bug
-        # on the frontend side -- never a valid human-confirmed override.
-        for degrees in (10.0, -10.0, 45.0, -45.0, 84.8, 123.4, 100.0):
-            self.assertFalse(is_cardinal_rotation(degrees), degrees)
+    def test_case_and_whitespace_insensitive(self):
+        self.assertEqual(rotation_direction_to_degrees('  CW '), 90.0)
+        self.assertEqual(rotation_direction_to_degrees('Clockwise'), 90.0)
 
-    def test_small_floating_point_slop_around_a_cardinal_value_is_accepted(self):
-        for degrees in (89.5, 90.5, -90.3, 179.6, 180.4, -269.7):
-            self.assertTrue(is_cardinal_rotation(degrees), degrees)
+    def test_unrecognized_strings_are_rejected(self):
+        for direction in ('left', 'right', 'up', 'down', 'cww', '', 'rotate'):
+            self.assertIsNone(rotation_direction_to_degrees(direction))
+
+    def test_a_numeric_angle_is_rejected_not_treated_as_degrees(self):
+        # This function deliberately replaces degrees-based validation --
+        # a raw number (even a valid-looking one) is not a direction word.
+        for value in (90.0, -90, 180, None, {'id': 1}):
+            self.assertIsNone(rotation_direction_to_degrees(value))
 
     def test_circular_distance_wraps_correctly(self):
         self.assertAlmostEqual(circular_distance(350.0, 0.0), 10.0)

@@ -9,7 +9,7 @@ this codebase.
 """
 import time
 
-from django.db.models import Prefetch, Q
+from django.db.models import Count, Prefetch, Q
 
 from face_manager.models import Face
 from face_manager.rotation_geometry import (
@@ -49,11 +49,32 @@ DEFAULT_MAX_RUNTIME_SECONDS = 3000
 
 
 def _candidate_images_queryset():
+    """Real production breakdown checked 2026-11-06 (270,470 NOT_SCANNED
+    images): only 52 were isProcessed=False (not yet through face
+    detection at all); 33,762 had faces but at least one still missing
+    kps (the in-progress kps backfill, not a permanent state); 62,354
+    genuinely have zero faces at all; the remaining 174,302 were fully
+    ready to evaluate right now. isProcessed/kps-completeness are
+    required here (not just version-gated) so the first two groups are
+    never pulled into a batch at all -- they cost nothing and are
+    automatically reconsidered once face detection/kps backfill actually
+    finishes on them, with no separate "rescan later" bookkeeping needed,
+    since they were never marked scanned in the first place. An image
+    with genuinely zero faces still passes (Count(filter=...) over zero
+    rows is 0) and reaches evaluate_image(), which correctly reports
+    'no_usable_faces' for it once, same as before.
+    """
     ScanState = ImageFile.RotationScanState
-    return ImageFile.objects.filter(
-        Q(rotation_scan_state=ScanState.NOT_SCANNED) | Q(rotation_scan_state=ScanState.FLAGGED),
-        rotation_scanned_at_version__lt=ROTATION_SCAN_LOGIC_VERSION,
-    ).order_by('id')
+    return (
+        ImageFile.objects.filter(
+            Q(rotation_scan_state=ScanState.NOT_SCANNED) | Q(rotation_scan_state=ScanState.FLAGGED),
+            rotation_scanned_at_version__lt=ROTATION_SCAN_LOGIC_VERSION,
+            isProcessed=True,
+        )
+        .annotate(_faces_missing_kps=Count('face', filter=Q(face__kps__isnull=True)))
+        .filter(_faces_missing_kps=0)
+        .order_by('id')
+    )
 
 
 def evaluate_image(image, faces_with_kps):
