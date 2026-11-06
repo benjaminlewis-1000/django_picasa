@@ -7,6 +7,8 @@ FaceExtractor.reencode_missing_faces()'s own
 task-is-a-thin-wrapper-around-one-shared-function shape elsewhere in
 this codebase.
 """
+import time
+
 from django.db.models import Prefetch, Q
 
 from face_manager.models import Face
@@ -31,6 +33,19 @@ from filepopulator.models import ImageFile
 # entire backlog at once -- the scheduled hourly task naturally grinds
 # through a large backlog over many runs instead of one unbounded pass.
 DEFAULT_MAX_IMAGES_PER_RUN = 2000
+
+# The per-batch math itself is cheap (pure geometry on already-stored
+# kps, no image decode or model inference) -- the real constraint this
+# whole module exists to respect is MEMORY per batch (see above), not
+# wall-clock time. So rather than stopping after exactly one batch and
+# waiting for the next hourly tick, run_rotation_audit_until_done() below
+# keeps looping fresh, independently-bounded batches until either nothing
+# eligible remains or this time budget is spent -- a large backlog can
+# realistically be ground through in one scheduled run. Comfortably under
+# the hourly schedule interval (3600s) so the task reliably finishes (and
+# releases its advisory lock) before the next tick, rather than running
+# right up against it.
+DEFAULT_MAX_RUNTIME_SECONDS = 3000
 
 
 def _candidate_images_queryset():
@@ -145,3 +160,41 @@ def run_rotation_audit(write=False, max_images=DEFAULT_MAX_IMAGES_PER_RUN):
         )
 
     return {'examined': len(candidates), 'counts': counts, 'updated': len(to_update)}
+
+
+def run_rotation_audit_until_done(batch_size=DEFAULT_MAX_IMAGES_PER_RUN,
+                                   max_runtime_seconds=DEFAULT_MAX_RUNTIME_SECONDS):
+    """Repeatedly calls run_rotation_audit(write=True, max_images=
+    batch_size) -- never holding more than one batch's worth of data in
+    memory at once -- until either nothing eligible remains or
+    max_runtime_seconds is exceeded, whichever comes first. Used by the
+    scheduled task so a large backlog is ground through in one run
+    rather than trickling `batch_size` images per hourly tick.
+
+    write=True ONLY -- looping only makes forward progress because each
+    written batch bumps rotation_scanned_at_version, which is what makes
+    _candidate_images_queryset() return DIFFERENT rows on the next
+    iteration. A dry-run loop would just re-examine the identical first
+    batch forever (nothing persists to advance the query), so there's no
+    write=False variant of this function -- use run_rotation_audit()
+    directly (a single batch) for a dry-run preview instead.
+
+    Returns {'examined': int, 'updated': int, 'counts': {...}, 'batches': int,
+    'hit_time_limit': bool}.
+    """
+    start = time.monotonic()
+    totals = {'examined': 0, 'updated': 0, 'counts': {}, 'batches': 0, 'hit_time_limit': False}
+    while True:
+        result = run_rotation_audit(write=True, max_images=batch_size)
+        totals['examined'] += result['examined']
+        totals['updated'] += result['updated']
+        totals['batches'] += 1
+        for key, value in result['counts'].items():
+            totals['counts'][key] = totals['counts'].get(key, 0) + value
+
+        if result['examined'] == 0:
+            break
+        if time.monotonic() - start >= max_runtime_seconds:
+            totals['hit_time_limit'] = True
+            break
+    return totals
