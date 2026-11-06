@@ -131,12 +131,23 @@ UPRIGHT_TOLERANCE_DEG = 15.0
 
 
 # Bump this whenever this module's detection logic changes meaningfully
-# (e.g. a different agreement threshold, a smarter aggregation policy).
+# (e.g. a different agreement threshold, a smarter aggregation policy) OR
+# whenever face_manager.rotation_audit's own ELIGIBILITY gating changes in
+# a way that could make a past verdict unreliable -- e.g. 2026-11-06's
+# isProcessed/all-faces-have-kps requirement: before that, an image could
+# be judged from only the subset of its faces that happened to have kps
+# already, silently ignoring others still waiting on the kps backfill.
 # audit_image_rotation only re-evaluates an ImageFile whose
 # rotation_scanned_at_version is strictly less than this constant (or
 # whose rotation_scan_state is NOT_SCANNED) -- see
-# ImageFile.rotation_scanned_at_version's own docstring.
-ROTATION_SCAN_LOGIC_VERSION = 1
+# ImageFile.rotation_scanned_at_version's own docstring. Bumping this is
+# the right way to force a full re-scan (no manual DB reset needed): the
+# scan itself is cheap pure-geometry math on already-stored kps, no image
+# decode or inference, and should_overwrite_rotation_proposal() already
+# handles a fresh re-scan correctly overwriting a stale prior proposal.
+# A human CONFIRMED/DISMISSED_NOT_ROTATED row is untouched regardless --
+# _candidate_images_queryset() excludes both scan states outright.
+ROTATION_SCAN_LOGIC_VERSION = 2
 
 # Ordering used to decide whether a NEW proposal is allowed to overwrite
 # an EXISTING one for the same image: a write only takes effect if its

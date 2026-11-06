@@ -122,6 +122,7 @@ class RunRotationAuditTests(TestCase):
 
     def test_write_true_persists_the_flag(self):
         from face_manager.rotation_audit import run_rotation_audit
+        from face_manager.rotation_geometry import ROTATION_SCAN_LOGIC_VERSION
 
         result = run_rotation_audit(write=True)
         self.assertEqual(result['updated'], 3)
@@ -129,7 +130,7 @@ class RunRotationAuditTests(TestCase):
             img.refresh_from_db()
             self.assertEqual(img.rotation_scan_state, ImageFile.RotationScanState.FLAGGED)
             self.assertAlmostEqual(img.proposed_rotation_degrees, 90.0, delta=1)
-            self.assertEqual(img.rotation_scanned_at_version, 1)
+            self.assertEqual(img.rotation_scanned_at_version, ROTATION_SCAN_LOGIC_VERSION)
 
     def test_max_images_caps_the_batch(self):
         from face_manager.rotation_audit import run_rotation_audit
