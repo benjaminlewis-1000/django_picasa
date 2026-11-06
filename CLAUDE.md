@@ -1577,7 +1577,16 @@ has changed):
   limiter) accumulating across many tests sharing one long-lived process with no reset between
   them; passes every time in isolation or under `--parallel` (where each worker's process is
   shorter-lived). A real gap if ever investigated further: no test currently resets DRF's throttle
-  cache between cases.
+  cache between cases. **Confirmed 2026-11-06 this isn't specific to that one test** -- a different
+  test using the same `AccessKeyMediaThrottle` (`api.tests.test_media_serving.
+  RotationPreviewKeyedImageTests.test_unauthenticated_without_access_key_rejected`, added that
+  session) hit the identical `429 != 404` failure under a real `--parallel 8` run, confirming the
+  root cause is general throttle-state accumulation (whichever test happens to run late enough in
+  a given worker to have accumulated enough hits), not something tied to one specific test name.
+- `face_manager.tests.test_backfill_commands.BackfillVerifiedKpsTests.
+  test_resuming_with_lvface_enabled_does_not_skip_a_kps_only_face` -- intermittent, seen
+  repeatedly across `--parallel 8` runs throughout 2026-11-06's session; cause not yet chased
+  down (not previously listed in this section despite being hit many times that day).
 - **FIXED (2026-11-06): `/tmp/img_validation` collisions in `filepopulator.tests.
   test_ingestion_core`.** Previously documented here as merely "a leftover directory from an
   interrupted prior run" -- re-investigated after it recurred mid-session with a SECOND distinct

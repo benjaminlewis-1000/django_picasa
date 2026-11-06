@@ -1395,16 +1395,18 @@ class KeyedImageView(APIView):
           mobile client; every "show me the full photo" path goes through
           slideshow (live-resized from the original) instead. See
           CLAUDE.md.
-        rotation_preview: key type: image. Live-rotates the original file
-          and resizes, same as slideshow -- lets a human reviewer see the
-          corrected orientation before confirming, without pre-rendering/
-          storing anything. By default rotates by the image's own
-          proposed_rotation_degrees (404s if that's unset); an optional
-          &degrees=<float> query param previews an arbitrary rotation
-          instead (e.g. a reviewer dialing in a different correction than
-          what was proposed, or previewing one on an image never flagged
-          at all) -- always snapped to the nearest canonical 90-degree
-          value, same as an actual correction would be.
+        rotation_preview: key type: image. Live-rotates the original file by
+          its own ImageFile.proposed_rotation_degrees (snapped to the same
+          canonical 90-degree correction face_manager.rotation_correction.
+          apply_rotation_correction() would actually apply) and resizes,
+          same as slideshow -- lets a human reviewer see the corrected
+          orientation before confirming, without pre-rendering/storing
+          anything. 404s if the image has no proposed_rotation_degrees.
+          A further rotation the reviewer dials in beyond this (rotate-
+          left/right buttons) is a client-side transform on the already-
+          fetched image, not a separate backend request -- only the
+          FINAL chosen degrees is ever sent back, via the bulk_action
+          endpoint's confirm param.
         '''
 
         params = self.request.query_params
@@ -1532,14 +1534,8 @@ class KeyedImageView(APIView):
                 image = img_obj.thumbnail_small
             elif image_type == 'rotation_preview':
                 img_obj = getAndCheckID('image', id_key)
-                if 'degrees' in params.keys():
-                    preview_degrees = float(params['degrees'])
-                elif img_obj.proposed_rotation_degrees is not None:
-                    preview_degrees = img_obj.proposed_rotation_degrees
-                else:
-                    return err_404(
-                        'This image has no proposed_rotation_degrees -- pass &degrees= explicitly.'
-                    )
+                if img_obj.proposed_rotation_degrees is None:
+                    return err_404('This image has no proposed_rotation_degrees.')
                 image = img_obj.filename
                 if 'height' in params.keys():
                     height = int(params['height'])
@@ -1605,19 +1601,16 @@ class KeyedImageView(APIView):
             image = common.open_img_oriented(image, as_numpy=False, extra_rotation_degrees=extra_degrees)
 
             if image_type == 'rotation_preview' and image is not None and extra_degrees is None:
-                # Preview of a rotation NOT YET confirmed (either the
-                # audit's own proposal, or an explicit ?degrees= override
-                # -- preview_degrees, resolved above) --
+                # Preview of a PROPOSED (not yet confirmed) correction --
                 # confirmed_rotation_override_degrees (applied just above,
                 # if set) only takes effect once CONFIRMED; before that,
-                # show what confirming WOULD produce. Applied BEFORE the
+                # show what confirming WOULD produce using
+                # proposed_rotation_degrees directly. Applied BEFORE the
                 # resize math below, since a 90/-90 correction swaps
-                # width/height. The extra_degrees-is-None guard means an
-                # already-CONFIRMED image always shows its real, final
-                # rotation (open_img_oriented already applied it above)
-                # regardless of any ?degrees= passed -- there's nothing
-                # left to preview once it's been confirmed.
-                image = common.apply_additional_rotation(image, preview_degrees)
+                # width/height. The extra_degrees-is-None guard avoids
+                # double-applying the rotation for an already-CONFIRMED
+                # image (open_img_oriented already applied it above).
+                image = common.apply_additional_rotation(image, img_obj.proposed_rotation_degrees)
 
         # Resize image. Allow for upsampling now.
         w, h = image.size[:2]

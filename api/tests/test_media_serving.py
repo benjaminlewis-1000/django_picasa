@@ -121,39 +121,6 @@ class RotationPreviewKeyedImageTests(ApiTestCase):
         resp = self.anon_client.get(f"/api/keyed_image/rotation_preview/?id={self.image.id}")
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_explicit_degrees_override_works_without_any_proposed_rotation(self):
-        # The audit never touched this image (no proposed_rotation_degrees
-        # at all) -- a human manually dialing in a rotation via an
-        # explicit ?degrees= must still get a real preview, not a 404.
-        from PIL import Image
-
-        self.assertIsNone(self.image.proposed_rotation_degrees)
-        orig_w, orig_h = self.image.width, self.image.height
-        resp = self.client.get(f"/api/keyed_image/rotation_preview/?id={self.image.id}&degrees=90")
-        self.assertEqual(resp.status_code, status.HTTP_200_OK)
-
-        returned = Image.open(BytesIO(resp.content))
-        orig_ratio = orig_w / orig_h
-        returned_ratio = returned.width / returned.height
-        self.assertAlmostEqual(returned_ratio, 1 / orig_ratio, delta=0.05)
-
-    def test_explicit_degrees_override_takes_precedence_over_the_proposal(self):
-        from PIL import Image
-
-        # proposed_rotation_degrees (90, swaps aspect ratio) vs an
-        # explicit override of 180 (keeps aspect ratio) -- the override
-        # must win, confirming the frontend's rotate-left/right UI can
-        # preview something other than the audit's own guess.
-        self.image.proposed_rotation_degrees = 90.0
-        self.image.save(update_fields=['proposed_rotation_degrees'])
-        orig_w, orig_h = self.image.width, self.image.height
-
-        resp = self.client.get(f"/api/keyed_image/rotation_preview/?id={self.image.id}&degrees=180")
-        returned = Image.open(BytesIO(resp.content))
-        # 180 keeps the aspect ratio the same as the (un-rotated) original.
-        self.assertAlmostEqual(returned.width / returned.height, orig_w / orig_h, delta=0.05)
-
-
 class KeyedImageViewThrottleTests(ApiTestCase):
     """api/throttles.py -- real bug fixed 2026-10-26: these throttles
     never actually checked request.user.is_authenticated despite the
