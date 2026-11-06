@@ -162,17 +162,76 @@ class RunRotationAuditTests(TestCase):
         self.assertEqual(result['examined'], 3)
 
 
+class RunRotationAuditUntilDoneTests(TestCase):
+    """run_rotation_audit_until_done() -- the looping wrapper used by the
+    scheduled task so a large backlog is ground through within one run
+    (batches are cheap, pure-geometry math) instead of one batch per
+    hourly tick. Same 3-image fixture as RunRotationAuditTests above.
+    """
+
+    def setUp(self):
+        from face_manager.tests import make_face, make_image
+
+        self.images = []
+        for i, fixture in enumerate([
+            "naming/good/1.JPG", "naming/good/2.jpg", "naming/good/3.JPEG",
+        ]):
+            img = make_image(relative_fixture=fixture)
+            make_face(img, box_left=50, box_top=50, box_right=150, box_bottom=150,
+                      kps=_flat_kps_for_eye_angle(90.0))
+            self.images.append(img)
+
+    def test_loops_through_the_whole_backlog_in_one_call(self):
+        from face_manager.rotation_audit import run_rotation_audit_until_done
+
+        # batch_size=1 forces 3 real batches (one per image) within this
+        # ONE call, plus a 4th confirming the backlog is now empty -- if
+        # looping didn't work, only 1 of the 3 images would ever be
+        # examined.
+        result = run_rotation_audit_until_done(batch_size=1)
+        self.assertEqual(result['examined'], 3)
+        self.assertEqual(result['updated'], 3)
+        self.assertEqual(result['batches'], 4)
+        self.assertFalse(result['hit_time_limit'])
+        for img in self.images:
+            img.refresh_from_db()
+            self.assertEqual(img.rotation_scan_state, ImageFile.RotationScanState.FLAGGED)
+
+    def test_stops_at_the_time_limit_with_backlog_remaining(self):
+        from face_manager.rotation_audit import run_rotation_audit_until_done
+
+        # A time limit already expired before the first batch even runs
+        # -- the loop must still complete that one batch (never a
+        # zero-batch result) but then stop, correctly reporting
+        # hit_time_limit=True rather than silently claiming completion.
+        with patch('face_manager.rotation_audit.time.monotonic', side_effect=[0, 100, 100]):
+            result = run_rotation_audit_until_done(batch_size=1, max_runtime_seconds=1)
+
+        self.assertEqual(result['batches'], 1)
+        self.assertEqual(result['examined'], 1)
+        self.assertTrue(result['hit_time_limit'])
+
+    def test_an_empty_backlog_returns_immediately_with_one_batch(self):
+        from face_manager.rotation_audit import run_rotation_audit_until_done
+
+        ImageFile.objects.all().delete()
+        result = run_rotation_audit_until_done(batch_size=1)
+        self.assertEqual(result['examined'], 0)
+        self.assertEqual(result['batches'], 1)
+        self.assertFalse(result['hit_time_limit'])
+
+
 class AuditImageRotationTaskTests(TestCase):
     """The scheduled Celery task is a thin advisory-lock + crash-logging
-    wrapper around run_rotation_audit() -- same shape as this codebase's
-    other scheduled tasks (e.g. apply_collection_floor_change).
+    wrapper around run_rotation_audit_until_done() -- same shape as this
+    codebase's other scheduled tasks (e.g. apply_collection_floor_change).
     """
 
     def test_concurrent_run_is_skipped(self):
         from face_manager.tasks import audit_image_rotation_task
 
         with patch('face_manager.tasks.advisory_lock') as mock_lock, \
-             patch('face_manager.tasks.run_rotation_audit') as mock_run:
+             patch('face_manager.tasks.run_rotation_audit_until_done') as mock_run:
             mock_lock.return_value.__enter__.return_value = False
             audit_image_rotation_task()
 
@@ -182,19 +241,21 @@ class AuditImageRotationTaskTests(TestCase):
         from face_manager.tasks import audit_image_rotation_task
 
         with patch('face_manager.tasks.advisory_lock') as mock_lock, \
-             patch('face_manager.tasks.run_rotation_audit') as mock_run:
+             patch('face_manager.tasks.run_rotation_audit_until_done') as mock_run:
             mock_lock.return_value.__enter__.return_value = True
-            mock_run.return_value = {'examined': 0, 'counts': {}, 'updated': 0}
+            mock_run.return_value = {
+                'examined': 0, 'counts': {}, 'updated': 0, 'batches': 0, 'hit_time_limit': False,
+            }
             audit_image_rotation_task()
 
-        mock_run.assert_called_once_with(write=True)
+        mock_run.assert_called_once_with()
 
     def test_a_crash_is_recorded_as_an_application_error(self):
         from common.models import ApplicationError
         from face_manager.tasks import audit_image_rotation_task
 
         with patch('face_manager.tasks.advisory_lock') as mock_lock, \
-             patch('face_manager.tasks.run_rotation_audit', side_effect=RuntimeError("boom")):
+             patch('face_manager.tasks.run_rotation_audit_until_done', side_effect=RuntimeError("boom")):
             mock_lock.return_value.__enter__.return_value = True
             audit_image_rotation_task()
 

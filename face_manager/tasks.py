@@ -7,7 +7,7 @@ from .models import (
 )
 from assign_faces import faceAssigner
 from verification_clustering import cluster_all_unverified_faces
-from face_manager.rotation_audit import run_rotation_audit
+from face_manager.rotation_audit import run_rotation_audit_until_done
 from face_manager.rotation_correction import run_rotation_correction
 from celery import shared_task
 from django.conf import settings
@@ -498,20 +498,26 @@ def cluster_unverified_faces_task():
 @shared_task(ignore_result=True, name='face_manager.audit_image_rotation')
 def audit_image_rotation_task():
     """Scheduled wrapper around face_manager.rotation_audit.
-    run_rotation_audit() -- see that module and CLAUDE.md's
-    2026-11-03/11-05 orientation-detection write-up for the design.
+    run_rotation_audit_until_done() -- see that module and CLAUDE.md's
+    2026-11-03/11-05/11-06 orientation-detection write-up for the design.
     Same advisory-lock convention as the other scheduled tasks here;
     covers manual (management-command) and scheduled invocations alike.
+
+    Loops bounded batches (see run_rotation_audit_until_done()'s own
+    comment for why that's safe memory-wise) rather than stopping after
+    one, so a large backlog is ground through within this one run
+    instead of trickling one batch per hourly tick.
     """
     with advisory_lock('face_manager.audit_image_rotation') as acquired:
         if not acquired:
             settings.LOGGER.debug("Image rotation audit is locked, exiting.")
             return
         try:
-            result = run_rotation_audit(write=True)
+            result = run_rotation_audit_until_done()
             settings.LOGGER.debug(
                 f"audit_image_rotation_task: examined {result['examined']}, "
-                f"updated {result['updated']} -- {result['counts']}"
+                f"updated {result['updated']} across {result['batches']} batch(es) "
+                f"(hit_time_limit={result['hit_time_limit']}) -- {result['counts']}"
             )
         except Exception as e:
             _log_task_crash('audit_image_rotation_task', e)
