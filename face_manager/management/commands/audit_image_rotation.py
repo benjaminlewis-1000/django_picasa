@@ -26,7 +26,7 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument('--yes', action='store_true',
                              help="Actually write rotation_scan_state/proposed_rotation_degrees/"
-                                  "rotation_signal_source/rotation_scanned_at_version, looping "
+                                  "rotation_signal_source/rotation_scan_logic_hash, looping "
                                   "batches until done or the time limit. Without this, reports "
                                   "counts for a single batch only -- no DB writes.")
         parser.add_argument('--max-images', type=int, default=DEFAULT_MAX_IMAGES_PER_RUN,

@@ -139,26 +139,26 @@ class ResetRotationScanStateForReprocessingTests(TestCase):
     def setUp(self):
         self.image = make_image(relative_fixture="naming/good/1.JPG")
 
-    def test_not_scanned_stays_not_scanned_and_version_resets(self):
-        self.image.rotation_scanned_at_version = 1
+    def test_not_scanned_stays_not_scanned_and_hash_resets(self):
+        self.image.rotation_scan_logic_hash = 'deadbeefdeadbeef'
         self.image.reset_rotation_scan_state_for_reprocessing()
         self.assertEqual(self.image.rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
         self.assertIsNone(self.image.proposed_rotation_degrees)
         self.assertIsNone(self.image.rotation_signal_source)
-        self.assertEqual(self.image.rotation_scanned_at_version, 0)
+        self.assertEqual(self.image.rotation_scan_logic_hash, '')
 
     def test_flagged_is_reset_to_not_scanned(self):
         self.image.rotation_scan_state = ImageFile.RotationScanState.FLAGGED
         self.image.proposed_rotation_degrees = 93.2
         self.image.rotation_signal_source = ImageFile.RotationSignalSource.LANDMARK_SINGLE_FACE
-        self.image.rotation_scanned_at_version = 1
+        self.image.rotation_scan_logic_hash = 'deadbeefdeadbeef'
 
         self.image.reset_rotation_scan_state_for_reprocessing()
 
         self.assertEqual(self.image.rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
         self.assertIsNone(self.image.proposed_rotation_degrees)
         self.assertIsNone(self.image.rotation_signal_source)
-        self.assertEqual(self.image.rotation_scanned_at_version, 0)
+        self.assertEqual(self.image.rotation_scan_logic_hash, '')
 
     def test_confirmed_is_never_touched(self):
         # A human's decision must survive reprocessing that happens to
@@ -167,21 +167,21 @@ class ResetRotationScanStateForReprocessingTests(TestCase):
         # same confirmation) is allowed to coexist with CONFIRMED.
         self.image.rotation_scan_state = ImageFile.RotationScanState.CONFIRMED
         self.image.proposed_rotation_degrees = 90.0
-        self.image.rotation_scanned_at_version = 1
+        self.image.rotation_scan_logic_hash = 'deadbeefdeadbeef'
 
         self.image.reset_rotation_scan_state_for_reprocessing()
 
         self.assertEqual(self.image.rotation_scan_state, ImageFile.RotationScanState.CONFIRMED)
         self.assertEqual(self.image.proposed_rotation_degrees, 90.0)
-        self.assertEqual(self.image.rotation_scanned_at_version, 1)
+        self.assertEqual(self.image.rotation_scan_logic_hash, 'deadbeefdeadbeef')
 
     def test_dismissed_not_rotated_is_never_touched(self):
         self.image.rotation_scan_state = ImageFile.RotationScanState.DISMISSED_NOT_ROTATED
-        self.image.rotation_scanned_at_version = 1
+        self.image.rotation_scan_logic_hash = 'deadbeefdeadbeef'
 
         self.image.reset_rotation_scan_state_for_reprocessing()
 
         self.assertEqual(
             self.image.rotation_scan_state, ImageFile.RotationScanState.DISMISSED_NOT_ROTATED,
         )
-        self.assertEqual(self.image.rotation_scanned_at_version, 1)
+        self.assertEqual(self.image.rotation_scan_logic_hash, 'deadbeefdeadbeef')

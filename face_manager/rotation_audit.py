@@ -7,13 +7,16 @@ FaceExtractor.reencode_missing_faces()'s own
 task-is-a-thin-wrapper-around-one-shared-function shape elsewhere in
 this codebase.
 """
+import hashlib
+import inspect
+import sys
 import time
 
 from django.db.models import Count, Prefetch, Q
 
+from face_manager import rotation_geometry
 from face_manager.models import Face
 from face_manager.rotation_geometry import (
-    ROTATION_SCAN_LOGIC_VERSION,
     UPRIGHT_TOLERANCE_DEG,
     aggregate_orientation,
     circular_distance,
@@ -21,6 +24,22 @@ from face_manager.rotation_geometry import (
     should_overwrite_rotation_proposal,
 )
 from filepopulator.models import ImageFile
+
+
+def _rotation_scan_logic_hash():
+    """sha256(source of THIS module + rotation_geometry)[:16] -- any
+    meaningful change to either module's evaluation math or gating
+    conditions changes this automatically, so nobody has to remember to
+    hand-bump a version constant (this module used to require exactly
+    that; forgetting would silently keep stale verdicts around rather
+    than erroring loudly). Mirrors face_manager.test_face_cache's own
+    sha256(source)-keyed cache-invalidation pattern -- same tradeoff
+    accepted: a comment-only edit also triggers a harmless re-scan, which
+    costs nothing since this is cheap pure-geometry math on already-
+    stored kps, no image decode or model inference.
+    """
+    src = inspect.getsource(sys.modules[__name__]) + inspect.getsource(rotation_geometry)
+    return hashlib.sha256(src.encode('utf-8')).hexdigest()[:16]
 
 # A real, confirmed production incident (2026-11-06): the unbatched version
 # of this function loaded every eligible ImageFile PLUS every one of its
@@ -68,9 +87,9 @@ def _candidate_images_queryset():
     return (
         ImageFile.objects.filter(
             Q(rotation_scan_state=ScanState.NOT_SCANNED) | Q(rotation_scan_state=ScanState.FLAGGED),
-            rotation_scanned_at_version__lt=ROTATION_SCAN_LOGIC_VERSION,
             isProcessed=True,
         )
+        .exclude(rotation_scan_logic_hash=_rotation_scan_logic_hash())
         .annotate(_faces_missing_kps=Count('face', filter=Q(face__kps__isnull=True)))
         .filter(_faces_missing_kps=0)
         .order_by('id')
@@ -113,7 +132,7 @@ def run_rotation_audit(write=False, max_images=DEFAULT_MAX_IMAGES_PER_RUN):
     repeated calls) and either reports (write=False, the default) or
     persists (write=True) the resulting rotation_scan_state/
     proposed_rotation_degrees/rotation_signal_source/
-    rotation_scanned_at_version changes.
+    rotation_scan_logic_hash changes.
 
     Deliberately NOT the whole backlog in one call -- see
     DEFAULT_MAX_IMAGES_PER_RUN's own comment. `max_images=None` removes
@@ -123,6 +142,7 @@ def run_rotation_audit(write=False, max_images=DEFAULT_MAX_IMAGES_PER_RUN):
     Returns a dict: {'examined': int, 'counts': {...}, 'updated': int}.
     """
     ScanState = ImageFile.RotationScanState
+    current_hash = _rotation_scan_logic_hash()
 
     queryset = _candidate_images_queryset().prefetch_related(
         Prefetch('face_set', queryset=Face.objects.only('id', 'kps', 'source_image_file')),
@@ -148,14 +168,14 @@ def run_rotation_audit(write=False, max_images=DEFAULT_MAX_IMAGES_PER_RUN):
 
         if outcome['estimate'] is None:
             counts['ambiguous_disagreement'] += 1
-            image.rotation_scanned_at_version = ROTATION_SCAN_LOGIC_VERSION
+            image.rotation_scan_logic_hash = current_hash
             to_update.append(image)
             continue
 
         allowed = should_overwrite_rotation_proposal(image.rotation_signal_source, outcome['source'])
         if not allowed:
             counts['skipped_lower_priority'] += 1
-            image.rotation_scanned_at_version = ROTATION_SCAN_LOGIC_VERSION
+            image.rotation_scan_logic_hash = current_hash
             to_update.append(image)
             continue
 
@@ -169,14 +189,14 @@ def run_rotation_audit(write=False, max_images=DEFAULT_MAX_IMAGES_PER_RUN):
             image.rotation_scan_state = ScanState.NOT_SCANNED
             image.proposed_rotation_degrees = None
             image.rotation_signal_source = None
-        image.rotation_scanned_at_version = ROTATION_SCAN_LOGIC_VERSION
+        image.rotation_scan_logic_hash = current_hash
         to_update.append(image)
 
     if write:
         ImageFile.objects.bulk_update(
             to_update,
             ['rotation_scan_state', 'proposed_rotation_degrees',
-             'rotation_signal_source', 'rotation_scanned_at_version'],
+             'rotation_signal_source', 'rotation_scan_logic_hash'],
             batch_size=1000,
         )
 
@@ -193,7 +213,7 @@ def run_rotation_audit_until_done(batch_size=DEFAULT_MAX_IMAGES_PER_RUN,
     rather than trickling `batch_size` images per hourly tick.
 
     write=True ONLY -- looping only makes forward progress because each
-    written batch bumps rotation_scanned_at_version, which is what makes
+    written batch stamps rotation_scan_logic_hash, which is what makes
     _candidate_images_queryset() return DIFFERENT rows on the next
     iteration. A dry-run loop would just re-examine the identical first
     batch forever (nothing persists to advance the query), so there's no

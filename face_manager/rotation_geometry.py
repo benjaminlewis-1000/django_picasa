@@ -129,15 +129,6 @@ def aggregate_orientation(angles, agreement_threshold_deg=DEFAULT_AGREEMENT_THRE
 # still well short of a genuine quarter-turn.
 UPRIGHT_TOLERANCE_DEG = 15.0
 
-
-# Bump this whenever this module's detection logic changes meaningfully
-# (e.g. a different agreement threshold, a smarter aggregation policy).
-# audit_image_rotation only re-evaluates an ImageFile whose
-# rotation_scanned_at_version is strictly less than this constant (or
-# whose rotation_scan_state is NOT_SCANNED) -- see
-# ImageFile.rotation_scanned_at_version's own docstring.
-ROTATION_SCAN_LOGIC_VERSION = 1
-
 # Ordering used to decide whether a NEW proposal is allowed to overwrite
 # an EXISTING one for the same image: a write only takes effect if its
 # source's priority is >= the current proposal's source priority. Human

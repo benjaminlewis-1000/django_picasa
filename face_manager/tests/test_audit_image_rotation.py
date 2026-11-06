@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from django.test import TestCase
 
-from face_manager.rotation_audit import evaluate_image
+from face_manager.rotation_audit import _rotation_scan_logic_hash, evaluate_image
 from filepopulator.models import ImageFile
 
 
@@ -27,6 +27,33 @@ def _kps_for_eye_angle(angle_deg, eye_separation=50.0):
 
 def _fake_face(angle_deg):
     return SimpleNamespace(kps=_kps_for_eye_angle(angle_deg))
+
+
+class RotationScanLogicHashTests(TestCase):
+    """_rotation_scan_logic_hash() -- replaces a hand-maintained
+    ROTATION_SCAN_LOGIC_VERSION int with sha256(source of this module +
+    rotation_geometry)[:16], mirroring face_manager.test_face_cache's own
+    cache-invalidation pattern (per the user's 2026-11-06 request) so
+    nobody has to remember to bump a version number when the scan logic
+    changes.
+    """
+
+    def test_is_a_16_char_hex_string(self):
+        value = _rotation_scan_logic_hash()
+        self.assertEqual(len(value), 16)
+        int(value, 16)  # raises ValueError if not valid hex
+
+    def test_is_deterministic_across_calls(self):
+        self.assertEqual(_rotation_scan_logic_hash(), _rotation_scan_logic_hash())
+
+    def test_changes_if_either_hashed_module_source_changes(self):
+        before = _rotation_scan_logic_hash()
+        with patch('inspect.getsource', return_value="x = 'a change somewhere in the file'"):
+            after = _rotation_scan_logic_hash()
+        self.assertNotEqual(before, after)
+        # Patching nothing reproduces the original value -- confirms the
+        # difference above came from the patch, not leftover test state.
+        self.assertEqual(_rotation_scan_logic_hash(), before)
 
 
 class EvaluateImageTests(TestCase):
@@ -121,7 +148,7 @@ class RunRotationAuditTests(TestCase):
             self.assertIsNone(img.proposed_rotation_degrees)
 
     def test_write_true_persists_the_flag(self):
-        from face_manager.rotation_audit import run_rotation_audit
+        from face_manager.rotation_audit import _rotation_scan_logic_hash, run_rotation_audit
 
         result = run_rotation_audit(write=True)
         self.assertEqual(result['updated'], 3)
@@ -129,7 +156,7 @@ class RunRotationAuditTests(TestCase):
             img.refresh_from_db()
             self.assertEqual(img.rotation_scan_state, ImageFile.RotationScanState.FLAGGED)
             self.assertAlmostEqual(img.proposed_rotation_degrees, 90.0, delta=1)
-            self.assertEqual(img.rotation_scanned_at_version, 1)
+            self.assertEqual(img.rotation_scan_logic_hash, _rotation_scan_logic_hash())
 
     def test_max_images_caps_the_batch(self):
         from face_manager.rotation_audit import run_rotation_audit
@@ -158,8 +185,8 @@ class RunRotationAuditTests(TestCase):
         self.assertEqual(seen_ids, {img.id for img in self.images})
 
         # The whole eligible backlog is now exhausted -- a 4th call finds
-        # nothing left (every image's rotation_scanned_at_version is now
-        # >= ROTATION_SCAN_LOGIC_VERSION, excluding it from the next scan).
+        # nothing left (every image's rotation_scan_logic_hash now matches
+        # the current code's hash, excluding it from the next scan).
         result = run_rotation_audit(write=True, max_images=1)
         self.assertEqual(result['examined'], 0)
 
@@ -172,8 +199,8 @@ class RunRotationAuditTests(TestCase):
     def test_isprocessed_false_is_excluded_from_candidates(self):
         # Real production finding (2026-11-06): isProcessed=False means
         # face detection hasn't settled on this image at all yet -- it
-        # must never be examined (or have rotation_scanned_at_version
-        # bumped) while that's true, so it's naturally reconsidered once
+        # must never be examined (or have rotation_scan_logic_hash
+        # stamped) while that's true, so it's naturally reconsidered once
         # isProcessed flips True, rather than needing any separate
         # "retry later" bookkeeping.
         from face_manager.rotation_audit import run_rotation_audit
@@ -185,7 +212,7 @@ class RunRotationAuditTests(TestCase):
         self.assertEqual(result['examined'], 2)
         self.images[0].refresh_from_db()
         self.assertEqual(self.images[0].rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
-        self.assertEqual(self.images[0].rotation_scanned_at_version, 0)
+        self.assertEqual(self.images[0].rotation_scan_logic_hash, '')
 
     def test_a_face_still_missing_kps_excludes_the_whole_image(self):
         # Real production finding (2026-11-06): with the kps backfill
@@ -202,7 +229,7 @@ class RunRotationAuditTests(TestCase):
         self.assertEqual(result['examined'], 2)
         self.images[0].refresh_from_db()
         self.assertEqual(self.images[0].rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
-        self.assertEqual(self.images[0].rotation_scanned_at_version, 0)
+        self.assertEqual(self.images[0].rotation_scan_logic_hash, '')
 
 
 class RunRotationAuditUntilDoneTests(TestCase):
