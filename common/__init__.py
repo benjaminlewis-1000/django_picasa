@@ -8,7 +8,7 @@ pillow_heif.register_heif_opener()
 
 from .open_img_oriented import (
     open_img_oriented, apply_exif_orientation, apply_additional_rotation, snap_to_canonical_rotation,
-    is_meaningful_rotation,
+    is_cardinal_rotation,
 )
 from .equalize import clahe_equalize_bgr
 from .advisory_lock import advisory_lock

@@ -89,11 +89,18 @@ class RotationReviewBulkActionView(APIView):
         happens to match what the audit proposed -- there's no implicit
         "just accept the proposal" shorthand, so the frontend's rotate-
         left/right UI has one single code path regardless of whether the
-        reviewer touched those buttons). Snapped to the nearest canonical
-        90-degree value, same as any other correction. A `degrees` too
-        close to "no rotation" (see common.is_meaningful_rotation) is
-        rejected -- use `dismiss_ids` for that case instead. Overwrites
-        proposed_rotation_degrees with the given value and sets
+        reviewer touched those buttons). Must be a real, nonzero multiple
+        of 90 (90/180/270/-90/-180/-270/etc, within a small floating-point
+        tolerance -- see common.is_cardinal_rotation) -- the only shape a
+        rotate-left/right UI can ever actually produce; anything else
+        (too close to "no rotation", or a non-cardinal angle) is rejected
+        outright rather than silently snapped to an ambiguous nearest
+        bucket -- use `dismiss_ids` for "no rotation needed". Normalized
+        (common.snap_to_canonical_rotation) before being stored, so
+        proposed_rotation_degrees always ends up exactly 90.0/-90.0/180.0
+        for a human-confirmed row, never a near-multiple like 89.97.
+        Overwrites proposed_rotation_degrees with that normalized value
+        and sets
         rotation_scan_state -> CONFIRMED; an on-demand Celery task is
         then dispatched for exactly the ids that succeeded, to migrate
         their existing Faces' box/kps into the new coordinate space --
@@ -125,10 +132,13 @@ class RotationReviewBulkActionView(APIView):
                                   'reason': 'missing or invalid id/degrees'})
                 continue
 
-            if not common.is_meaningful_rotation(degrees):
+            if not common.is_cardinal_rotation(degrees):
                 rejected.append({
                     'id': image_id,
-                    'reason': 'degrees too close to no rotation -- use dismiss_ids instead',
+                    'reason': (
+                        'degrees must be a nonzero multiple of 90 -- use dismiss_ids for '
+                        '"no rotation needed"'
+                    ),
                 })
                 continue
 
@@ -137,7 +147,7 @@ class RotationReviewBulkActionView(APIView):
                 .filter(id=image_id, rotation_correction_applied=False)
                 .update(
                     rotation_scan_state=ScanState.CONFIRMED,
-                    proposed_rotation_degrees=degrees,
+                    proposed_rotation_degrees=common.snap_to_canonical_rotation(degrees),
                     rotation_signal_source=ImageFile.RotationSignalSource.HUMAN,
                 )
             )

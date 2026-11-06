@@ -18,12 +18,13 @@ import django
 # right after it.
 CANONICAL_ROTATIONS_DEG = (90.0, -90.0, 180.0)
 
-# How close a degrees value has to be to 0/360 ("no rotation") before it's
-# rejected as a real correction rather than snapped to one of the 3
-# canonical values -- see is_meaningful_rotation()'s own docstring. Half of
-# 90 -- exactly equidistant between "no rotation" and the nearest real
-# correction is already too ambiguous to accept.
-MIN_MEANINGFUL_ROTATION_DEGREES = 45.0
+# How far a degrees value may stray from an exact multiple of 90 (and
+# still be accepted as one) -- see is_cardinal_rotation()'s own
+# docstring. Generous enough to absorb ordinary floating-point/JS
+# rounding on a value a frontend built from repeated +/-90 button
+# presses, nowhere near loose enough to accept a genuinely different
+# angle (e.g. 45 or 123.4) by mistake.
+CARDINAL_ROTATION_TOLERANCE_DEGREES = 1.0
 
 
 def circular_distance(a, b):
@@ -35,20 +36,29 @@ def snap_to_canonical_rotation(degrees):
     return min(CANONICAL_ROTATIONS_DEG, key=lambda c: circular_distance(degrees, c))
 
 
-def is_meaningful_rotation(degrees):
-    """False for a degrees value close enough to 0 (no rotation) that it
-    shouldn't be accepted as a real correction at all -- e.g. a human
-    manually dialing in a rotation via repeated 90-degree UI adjustments
-    who lands back near the original orientation. snap_to_canonical_
-    rotation() always returns SOME value no matter how close to 0 degrees
-    is (0 itself is equidistant between the 90 and -90 buckets, an
-    arbitrary tie-break, not a real answer) -- callers that actually COMMIT
-    a human-chosen rotation (as opposed to the audit's own measurement,
-    which is never anywhere near 0 by construction -- see rotation_geometry.
-    py's UPRIGHT_TOLERANCE_DEG) must check this first and reject/ignore
-    instead of silently snapping a meaningless value to an arbitrary bucket.
+def is_cardinal_rotation(degrees):
+    """True only for a degrees value that is (within
+    CARDINAL_ROTATION_TOLERANCE_DEGREES) a NONZERO multiple of 90 -- 90,
+    180, 270, -90, -180, -270, 450, etc. all count; 0, 360, -360 (no real
+    rotation) and any non-90-multiple angle (e.g. 45, 123.4) do not.
+
+    This is the only shape a human's rotate-left/right UI (built from
+    repeated +/-90-degree button presses, per the frontend contract) can
+    ever actually produce -- a confirm action that commits a human-chosen
+    rotation must reject anything else outright rather than silently
+    snapping an arbitrary value to whichever canonical bucket happens to
+    be nearest (see snap_to_canonical_rotation's own tie-break risk right
+    at 0). The audit's OWN measured proposals don't go through this check
+    at all -- they're never anywhere near a multiple of 90 by construction
+    (a real photo's residual misorientation is essentially never an exact
+    quarter turn) and are snapped, not validated, when actually applied.
     """
-    return circular_distance(degrees, 0) >= MIN_MEANINGFUL_ROTATION_DEGREES
+    remainder = degrees % 90
+    if min(remainder, 90 - remainder) > CARDINAL_ROTATION_TOLERANCE_DEGREES:
+        return False
+    mod360 = degrees % 360
+    is_no_rotation = min(mod360, 360 - mod360) <= CARDINAL_ROTATION_TOLERANCE_DEGREES
+    return not is_no_rotation
 
 
 def _pil_transpose_op(snapped_degrees):
