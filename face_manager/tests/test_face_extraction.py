@@ -272,20 +272,16 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
     def _fake_detection(self, bbox, det_score):
         import insightface.app.common
         import numpy as np
-        # Integer dtype deliberately, not float32 -- get_square_face_img()
-        # slices img_numpy directly with values derived from this bbox,
-        # which needs __index__-capable (integer) values. A real
-        # detection's bbox is float32 too, but something upstream of
-        # here evidently normalizes it before this point in production;
-        # for this synthetic unit test, int is simplest and correct
-        # enough (only relative proportions matter for the gate itself).
+        # float32, matching a real detection's bbox dtype exactly --
+        # get_square_face_img() casts to int internally now (see its own
+        # comment), so this no longer needs to pre-cast to int itself.
         # kps centered in the bbox (not a hardcoded (0,0) placeholder) --
         # must satisfy the DB's face_kps_within_box_margin constraint,
         # same as any real detection's kps always would.
         bl, bt, br, bb = bbox
         cx, cy = (bl + br) / 2, (bt + bb) / 2
         return insightface.app.common.Face(
-            bbox=np.array(bbox, dtype=np.int64),
+            bbox=np.array(bbox, dtype=np.float32),
             kps=np.array([[cx, cy]] * 5, dtype=np.float32),
             det_score=det_score,
             embedding=np.ones(512, dtype=np.float32),  # ones, not zeros -- distinguishable from "never set"
