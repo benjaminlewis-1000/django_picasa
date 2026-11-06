@@ -14,7 +14,7 @@ from PIL import Image
 from common.advisory_lock import advisory_lock
 from common.open_img_oriented import (
     open_img_oriented, apply_exif_orientation, apply_additional_rotation,
-    circular_distance, is_meaningful_rotation,
+    circular_distance, is_cardinal_rotation,
 )
 from common.equalize import clahe_equalize_bgr
 
@@ -89,27 +89,32 @@ def _diagonal_marker_image(width=200, height=150, color=(120, 60, 200)):
     return Image.fromarray(img)
 
 
-class IsMeaningfulRotationTests(TestCase):
-    """Guards against snap_to_canonical_rotation()'s own tie-break near 0
-    degrees -- it always returns SOME canonical value no matter how close
-    to "no rotation" the input is, which is fine for the audit (its
-    measured angle is never near 0 by construction) but would be a real,
-    silent bug if a human-chosen override near 0 were accepted and
-    snapped to an arbitrary nearby bucket instead of being rejected.
+class IsCardinalRotationTests(TestCase):
+    """A human-confirmed rotation (the rotate-left/right UI) must be a
+    real, nonzero multiple of 90 -- never an arbitrary angle, and never
+    silently snapped to an ambiguous nearest bucket the way
+    snap_to_canonical_rotation() alone would (0 is exactly equidistant
+    between the 90 and -90 buckets -- an arbitrary tie-break, not a real
+    answer).
     """
 
-    def test_exact_canonical_values_are_meaningful(self):
-        for degrees in (90.0, -90.0, 180.0, 270.0):
-            self.assertTrue(is_meaningful_rotation(degrees), degrees)
+    def test_exact_cardinal_values_are_accepted(self):
+        for degrees in (90.0, -90.0, 180.0, -180.0, 270.0, -270.0, 450.0, -450.0):
+            self.assertTrue(is_cardinal_rotation(degrees), degrees)
 
-    def test_near_zero_is_not_meaningful(self):
-        for degrees in (0.0, 10.0, -10.0, 44.0, -44.0, 350.0, -350.0):
-            self.assertFalse(is_meaningful_rotation(degrees), degrees)
+    def test_no_rotation_is_rejected(self):
+        for degrees in (0.0, 360.0, -360.0, 720.0):
+            self.assertFalse(is_cardinal_rotation(degrees), degrees)
 
-    def test_the_45_degree_boundary(self):
-        self.assertTrue(is_meaningful_rotation(45.0))
-        self.assertTrue(is_meaningful_rotation(-45.0))
-        self.assertFalse(is_meaningful_rotation(44.9))
+    def test_non_cardinal_angles_are_rejected(self):
+        # Real angles an audit measurement would produce, or a typo/bug
+        # on the frontend side -- never a valid human-confirmed override.
+        for degrees in (10.0, -10.0, 45.0, -45.0, 84.8, 123.4, 100.0):
+            self.assertFalse(is_cardinal_rotation(degrees), degrees)
+
+    def test_small_floating_point_slop_around_a_cardinal_value_is_accepted(self):
+        for degrees in (89.5, 90.5, -90.3, 179.6, 180.4, -269.7):
+            self.assertTrue(is_cardinal_rotation(degrees), degrees)
 
     def test_circular_distance_wraps_correctly(self):
         self.assertAlmostEqual(circular_distance(350.0, 0.0), 10.0)

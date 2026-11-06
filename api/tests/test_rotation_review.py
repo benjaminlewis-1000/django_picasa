@@ -132,6 +132,30 @@ class RotationReviewBulkActionViewTests(ApiTestCase):
         self.img_a.refresh_from_db()
         self.assertEqual(self.img_a.rotation_scan_state, ImageFile.RotationScanState.FLAGGED)
 
+    def test_confirm_rejects_a_non_cardinal_angle(self):
+        # 45 degrees is nowhere near "no rotation" but also isn't
+        # something a rotate-left/right UI (built from repeated +/-90
+        # presses) could ever actually produce -- must be rejected
+        # outright, not silently snapped to whichever of 90/-90/180
+        # happens to be nearest.
+        resp = self.client.patch(
+            "/api/rotation_review/bulk_action/",
+            {'confirm': [{'id': self.img_a.id, 'degrees': 45.0}]}, format='json',
+        )
+        self.assertEqual(resp.data['confirmed'], 0)
+        self.assertEqual(len(resp.data['rejected']), 1)
+
+    def test_confirm_normalizes_a_near_cardinal_value_to_the_exact_canonical_angle(self):
+        # 269.6 (ordinary floating-point/JS slop around 270/-90) must be
+        # stored as the EXACT canonical value, never the raw input.
+        resp = self.client.patch(
+            "/api/rotation_review/bulk_action/",
+            {'confirm': [{'id': self.img_a.id, 'degrees': 269.6}]}, format='json',
+        )
+        self.assertEqual(resp.data['confirmed'], 1)
+        self.img_a.refresh_from_db()
+        self.assertEqual(self.img_a.proposed_rotation_degrees, -90.0)
+
     def test_confirm_rejects_an_already_corrected_image(self):
         self.img_a.rotation_correction_applied = True
         self.img_a.save(update_fields=['rotation_correction_applied'])
