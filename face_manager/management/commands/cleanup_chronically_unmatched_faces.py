@@ -75,6 +75,23 @@ class Command(BaseCommand):
                 pass
 
         updated = ImageFile.objects.filter(pk__in=image_ids).update(isProcessed=False)
+        # Any rotation-audit verdict on these images was computed from the
+        # kps of the faces just deleted above -- stale the instant this
+        # runs. Reset (never touching a human CONFIRMED/DISMISSED decision)
+        # so they re-enter the audit once redetection lands fresh kps,
+        # instead of staying permanently excluded by rotation_scan_logic_
+        # hash. See ImageFile.reset_rotation_scan_state_for_reprocessing.
+        ImageFile.objects.filter(
+            pk__in=image_ids,
+            rotation_scan_state__in=[
+                ImageFile.RotationScanState.NOT_SCANNED, ImageFile.RotationScanState.FLAGGED,
+            ],
+        ).update(
+            rotation_scan_state=ImageFile.RotationScanState.NOT_SCANNED,
+            proposed_rotation_degrees=None,
+            rotation_signal_source=None,
+            rotation_scan_logic_hash='',
+        )
 
         self.stdout.write(self.style.SUCCESS(f"Deleted {deleted} face(s)."))
         self.stdout.write(self.style.SUCCESS(f"Marked {updated} image(s) isProcessed=False for redetection."))

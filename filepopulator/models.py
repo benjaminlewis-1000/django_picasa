@@ -776,11 +776,16 @@ class ImageFile(models.Model):
     rotation_signal_source = models.CharField(
         max_length=32, choices=RotationSignalSource.choices, null=True, blank=True,
     )
-    # Compared via < against face_manager.rotation_geometry.ROTATION_SCAN_
-    # LOGIC_VERSION -- a stale version (or NOT_SCANNED) is eligible for
-    # re-scan; CONFIRMED/DISMISSED_NOT_ROTATED are human-decided and never
-    # re-scanned regardless of version.
-    rotation_scanned_at_version = models.IntegerField(default=0, db_default=0)
+    # sha256(source of face_manager.rotation_audit + face_manager.
+    # rotation_geometry)[:16] -- see rotation_audit._rotation_scan_logic_
+    # hash(). A mismatch against the CURRENT hash (or NOT_SCANNED) is
+    # eligible for re-scan; CONFIRMED/DISMISSED_NOT_ROTATED are
+    # human-decided and never re-scanned regardless. No human has to
+    # remember to bump a version number when the scan logic changes --
+    # any edit to either module's source changes the hash automatically
+    # (mirrors face_manager.test_face_cache's own sha256(source)-keyed
+    # cache-invalidation pattern). '' (never scanned) always mismatches.
+    rotation_scan_logic_hash = models.CharField(max_length=16, default='', db_default='', blank=True)
     # Set True once face_manager.rotation_correction.apply_rotation_
     # correction() has transformed every attached Face's box/kps into the
     # CONFIRMED rotation's coordinate space and regenerated their
@@ -808,6 +813,28 @@ class ImageFile(models.Model):
         if self.rotation_scan_state == self.RotationScanState.CONFIRMED and self.proposed_rotation_degrees is not None:
             return self.proposed_rotation_degrees
         return None
+
+    def reset_rotation_scan_state_for_reprocessing(self):
+        """Call this alongside setting isProcessed=False whenever existing
+        Face rows are being thrown out/redone for a reason OUTSIDE the
+        rotation-review pipeline's own control (an EXIF-orientation change
+        reprocessing the image, cleanup_chronically_unmatched_faces, etc.)
+        -- any prior NOT_SCANNED/FLAGGED verdict was computed from kps data
+        that's about to be deleted/replaced, so it's stale the moment this
+        runs, and (without this) rotation_scan_logic_hash would keep it
+        permanently excluded from re-audit even once fresh kps land.
+
+        Deliberately a no-op for CONFIRMED/DISMISSED_NOT_ROTATED -- those
+        are human decisions, never invalidated by a later face-data change
+        (face_manager.rotation_correction.apply_rotation_correction() sets
+        isProcessed=False itself as an internal step of applying a
+        CONFIRMED correction; that must never be undone by this).
+        """
+        if self.rotation_scan_state in (self.RotationScanState.NOT_SCANNED, self.RotationScanState.FLAGGED):
+            self.rotation_scan_state = self.RotationScanState.NOT_SCANNED
+            self.proposed_rotation_degrees = None
+            self.rotation_signal_source = None
+            self.rotation_scan_logic_hash = ''
 
     # thumbnail = models.ImageField(upload_to = settings.FILEPOPULATOR_THUMBNAIL_DIR, default = str(timezone.now) + '_thumbnail.jpg' )
 
