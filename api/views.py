@@ -1206,39 +1206,45 @@ class FaceViewSet(viewsets.ModelViewSet):
         return HttpResponse(json.dumps(js), content_type='application/json')
 
 def _set_image_cache_headers(response, image_type=None):
-    # Every image KeyedImageView serves is immutable for the lifetime of the
-    # URL that names it: face_thumbnail/source/full_* files are written once
-    # at ingestion time and never reassigned on an existing row (confirmed -
-    # nothing outside face_extract_encode.py's initial `new_face.face_thumbnail
-    # .save(...)` ever sets that field again), and person.highlight_img is
-    # the one field that *can* change, but the frontend already cache-busts
-    # that specific case itself via a `&v=<highlightVersion>` query param
-    # (see imageScreen.jsx) rather than reusing the same URL - so a plain
-    # long-lived cache here is safe for all of these. RANDOM_ACCESS_KEY is a
-    # stable server-wide constant too, not per-session, so the URL doesn't
-    # change between requests for the same image either. Previously this
-    # view set no cache headers at all, so browsers re-fetched (and this
-    # view re-decoded/re-resized/re-encoded) the same image on every single
-    # page load and re-scroll.
+    # Every image KeyedImageView serves is normally immutable for the
+    # lifetime of the URL that names it: face_thumbnail/source/full_* files
+    # are written once at ingestion time and never reassigned on an existing
+    # row (confirmed - nothing outside face_extract_encode.py's initial
+    # `new_face.face_thumbnail.save(...)` ever sets that field again), and
+    # person.highlight_img is the one field that *can* change, but the
+    # frontend already cache-busts that specific case itself via a
+    # `&v=<highlightVersion>` query param (see imageScreen.jsx) rather than
+    # reusing the same URL - so a long-lived cache is safe for all of these.
+    # RANDOM_ACCESS_KEY is a stable server-wide constant too, not
+    # per-session, so the URL doesn't change between requests for the same
+    # image either. Previously this view set no cache headers at all, so
+    # browsers re-fetched (and this view re-decoded/re-resized/re-encoded)
+    # the same image on every single page load and re-scroll.
     #
-    # rotation_preview is the one real exception (found 2026-11-06): unlike
-    # every type above, its content at a FIXED id/access_key genuinely can
-    # change without any frontend action to hang a cache-bust off of -- the
-    # scheduled audit can silently re-score a still-FLAGGED image and
-    # change its proposed_rotation_degrees before a reviewer ever looks at
-    # it, with no client-side signal that happened. A week-long immutable
-    # cache would show a stale proposed rotation with no way to detect or
-    # invalidate it. (slideshow/full_small don't have this problem: the
-    # only thing that changes what they serve for a given id is a human
-    # CONFIRMING via this same review API, which the confirming frontend
-    # already knows about and can self-bust the same way it already does
-    # for highlight_img -- a different viewer's stale cache of an image
-    # someone else just confirmed is a real but low-severity, self-healing
-    # edge case, not fixed here.)
+    # Real exception found 2026-11-06: face_array/face_source/slideshow/
+    # full_small ALL break the "immutable at this URL" assumption once the
+    # rotation-review feature's apply_rotation_correction() runs -- it
+    # regenerates a face's thumbnail file AND re-renders the full image at
+    # the SAME id-keyed URL, so a browser's already-cached response for
+    # that exact URL would keep serving the pre-correction bytes regardless
+    # of what the backend would now return fresh. The confirming frontend
+    # already knows which id(s) just changed and can self-bust its own
+    # cache the same way it does for highlight_img -- but rather than
+    # depend entirely on every caller remembering to do that, the default
+    # cache duration here was shortened from a week to 3 days, capping how
+    # long a missed self-bust (or a DIFFERENT viewer who never took any
+    # confirming action at all) can show stale content, while still keeping
+    # most of the real performance win for the overwhelming majority of
+    # images a rotation correction never touches.
+    #
+    # rotation_preview has a DIFFERENT, unfixable-by-duration-alone problem:
+    # its content at a fixed id can change from the backend's own scheduled
+    # audit silently re-scoring a still-FLAGGED image, with no frontend
+    # action to hang any cache-bust off of at all -- never cached.
     if image_type == 'rotation_preview':
         response['Cache-Control'] = 'no-cache'
     else:
-        response['Cache-Control'] = 'public, max-age=604800, immutable'
+        response['Cache-Control'] = 'public, max-age=259200, immutable'
     return response
 
 
