@@ -193,6 +193,23 @@ class KeyedImageViewThrottleTests(ApiTestCase):
         self.assertIn("max-age", resp["Cache-Control"])
         self.assertIn("immutable", resp["Cache-Control"])
 
+    def test_rotation_preview_is_not_long_cached(self):
+        # Real bug (2026-11-06): unlike every other KeyedImageView type,
+        # rotation_preview's content at a fixed id can change without any
+        # frontend-visible event to hang a cache-bust off of (the
+        # scheduled audit can silently re-score a still-FLAGGED image) --
+        # a week-long immutable cache would show a stale proposed
+        # rotation with no way to detect or invalidate it.
+        from filepopulator.models import ImageFile
+
+        img = ImageFile.objects.filter(id=self.face.source_image_file_id).first()
+        img.proposed_rotation_degrees = 92.0
+        img.save(update_fields=['proposed_rotation_degrees'])
+
+        resp = self.client.get(f"/api/keyed_image/rotation_preview/?id={img.id}")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertNotIn("immutable", resp["Cache-Control"])
+
     @staticmethod
     def _is_reddish(pixel):
         # BICUBIC resampling during face_source's resize blurs the drawn
