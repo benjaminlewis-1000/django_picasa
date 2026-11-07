@@ -19,6 +19,19 @@ only buried in a session's own narrative further down.** Full detail/context for
 the dated write-up elsewhere in this file (search for a distinctive word from the bullet).
 
 **Open questions / follow-ups:**
+- **Flagged (2026-11-06), not yet needed: the rotation-review ML classifier (`ImageFile.
+  RotationSignalSource.ML_CLASSIFIER`, planned as a second signal source alongside the current
+  landmark-geometry one -- see `face_manager/rotation_audit.py`/`rotation_geometry.py`) must NOT
+  share the same auto-invalidation mechanism as the landmark path once it's built.** The current
+  `rotation_scan_logic_hash` (`ImageFile`, sha256 of `rotation_audit.py` + `rotation_geometry.py`
+  source) is correct for the landmark path specifically because that scan is cheap pure geometry
+  on already-stored kps -- re-running the WHOLE backlog on every unrelated code edit costs nothing
+  real. A model-based classifier is genuinely expensive (real inference per image), so the same
+  "any source-line change anywhere re-triggers everyone" behavior would be wrong for it -- editing
+  something unrelated in the same file would force a full, costly re-run. Needs its own, separately
+  -tracked staleness field (e.g. a model/weights-version hash distinct from the landmark hash) so
+  the two signal sources invalidate independently -- not scoped or built, since the classifier
+  itself doesn't exist yet.
 - **Reported (2026-11-05), not yet investigated: HDR video-face thumbnails look washed out again
   (face 1146073, flagged by the user).** Possibly a regression of an HDR tone-mapping fix from an
   earlier session (the user recalled something about 12-bit vs. 10-bit handling) -- not yet
