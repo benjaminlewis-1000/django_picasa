@@ -17,7 +17,8 @@ from django.db.models import Count, Prefetch, Q
 from face_manager import rotation_geometry
 from face_manager.models import Face
 from face_manager.rotation_geometry import (
-    UPRIGHT_TOLERANCE_DEG,
+    UPRIGHT_TOLERANCE_MULTI_FACE_DEG,
+    UPRIGHT_TOLERANCE_SINGLE_FACE_DEG,
     aggregate_orientation,
     circular_distance,
     eye_angle_degrees,
@@ -118,11 +119,13 @@ def evaluate_image(image, faces_with_kps):
             return {'examined': True, 'estimate': None, 'source': None, 'significant': False}
         estimate, _inlier_count = result
         source = ImageFile.RotationSignalSource.LANDMARK_MULTI_FACE
+        tolerance = UPRIGHT_TOLERANCE_MULTI_FACE_DEG
     else:
         estimate = angles[0]
         source = ImageFile.RotationSignalSource.LANDMARK_SINGLE_FACE
+        tolerance = UPRIGHT_TOLERANCE_SINGLE_FACE_DEG
 
-    significant = circular_distance(estimate, 0) > UPRIGHT_TOLERANCE_DEG
+    significant = circular_distance(estimate, 0) > tolerance
     return {'examined': True, 'estimate': estimate, 'source': source, 'significant': significant}
 
 
