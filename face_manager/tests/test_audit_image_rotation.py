@@ -72,6 +72,27 @@ class EvaluateImageTests(TestCase):
         self.assertAlmostEqual(outcome['estimate'], 90.0, delta=1)
         self.assertEqual(outcome['source'], ImageFile.RotationSignalSource.LANDMARK_SINGLE_FACE)
 
+    def test_single_face_moderate_tilt_is_not_significant(self):
+        # Real production false-positive (2026-11-06, image id 29): a
+        # baby looking down at a spoon measured a genuine -25.5 degree
+        # eye-tilt -- ordinary head-tilt noise, not a rotated photo, but
+        # the OLD 15-degree single-face tolerance flagged it anyway and
+        # proposed a wrong "correction" that visibly rotated an already-
+        # upright photo sideways. A real production sweep found 91.4% of
+        # all single-face-sourced flags (14,342 of 15,688) were this same
+        # shape -- not near any real 90/180/270 rotation at all. Fixed by
+        # raising the single-face tolerance to 70 (per the user's own
+        # call), leaving the much stronger multi-face signal at 15.
+        outcome = evaluate_image(None, [_fake_face(-25.5)])
+        self.assertFalse(outcome['significant'])
+        self.assertEqual(outcome['source'], ImageFile.RotationSignalSource.LANDMARK_SINGLE_FACE)
+
+    def test_single_face_tolerance_boundary(self):
+        just_under = evaluate_image(None, [_fake_face(69.0)])
+        self.assertFalse(just_under['significant'])
+        just_over = evaluate_image(None, [_fake_face(71.0)])
+        self.assertTrue(just_over['significant'])
+
     def test_two_agreeing_rotated_faces_flagged_multi_face(self):
         outcome = evaluate_image(None, [_fake_face(88.0), _fake_face(92.0)])
         self.assertTrue(outcome['significant'])
@@ -88,6 +109,29 @@ class EvaluateImageTests(TestCase):
         outcome = evaluate_image(None, [_fake_face(1.0), _fake_face(-1.0)])
         self.assertFalse(outcome['significant'])
         self.assertEqual(outcome['source'], ImageFile.RotationSignalSource.LANDMARK_MULTI_FACE)
+
+    def test_two_faces_with_a_genuine_shared_tilt_is_not_significant(self):
+        # Real-data-informed case (2026-11-06 empirical audit, see
+        # CLAUDE.md): a random 30,000-face production sample found no
+        # clean bimodal structure in the multi-face distribution, but
+        # confirmed a real, if thin, population of genuinely-agreeing
+        # faces out past the OLD 15-degree tolerance -- e.g. a group
+        # photo taken at a natural angle, or people leaning in together,
+        # not an actually-rotated photo. Two faces independently agreeing
+        # on ~30 degrees of shared tilt is exactly this shape: real,
+        # consistent signal, but well short of an actual rotation. The
+        # old 15-degree multi-face tolerance would have wrongly flagged
+        # this; the new 40-degree tolerance (per the user's own call)
+        # correctly leaves it alone.
+        outcome = evaluate_image(None, [_fake_face(28.0), _fake_face(32.0)])
+        self.assertFalse(outcome['significant'])
+        self.assertEqual(outcome['source'], ImageFile.RotationSignalSource.LANDMARK_MULTI_FACE)
+
+    def test_multi_face_tolerance_boundary(self):
+        just_under = evaluate_image(None, [_fake_face(38.0), _fake_face(40.0)])
+        self.assertFalse(just_under['significant'])
+        just_over = evaluate_image(None, [_fake_face(40.0), _fake_face(42.0)])
+        self.assertTrue(just_over['significant'])
 
     def test_three_faces_outlier_dropped_still_significant(self):
         outcome = evaluate_image(None, [_fake_face(88.0), _fake_face(92.0), _fake_face(-30.0)])

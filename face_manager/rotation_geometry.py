@@ -123,11 +123,30 @@ def aggregate_orientation(angles, agreement_threshold_deg=DEFAULT_AGREEMENT_THRE
 
 # Below this many degrees of circular distance from 0, treat an estimate
 # as "basically upright" -- normal head-tilt noise, not a rotated photo.
-# The real validation sample (see CLAUDE.md's 2026-11-03 write-up) found
-# 99% of real faces within ~26 degrees of horizontal and nothing anywhere
-# near 90 degrees -- 15 sits comfortably inside that noise floor while
-# still well short of a genuine quarter-turn.
-UPRIGHT_TOLERANCE_DEG = 15.0
+# TWO separate tolerances, not one -- a real production incident
+# (2026-11-06) found the single multi/single-face threshold produced a
+# massive false-positive rate once the full library backlog actually ran:
+# of 15,688 single-face-sourced flags, only 8.6% had a proposed angle
+# anywhere near a real 90/180/270 rotation -- the other 91.4% were
+# ordinary head tilts (someone looking down at what's in their hands,
+# etc.) wrongly read as a rotated photo. A single face's own tilt is a
+# much weaker, noisier signal than two or more independent faces agreeing
+# on the same tilt (which is unlikely to happen by coincidence), so it
+# needs a much more conservative (higher) bar before being trusted.
+#
+# UPRIGHT_TOLERANCE_MULTI_FACE_DEG: raised from the original 15 to 40 per
+# the user's own call (2026-11-06), alongside the single-face fix above --
+# even with two or more faces agreeing, a real group photo can have a
+# genuinely shared tilt (people leaning in together, a photo taken at a
+# natural angle) well short of an actual rotated photo. Kept meaningfully
+# tighter than the single-face tolerance, since independent-face agreement
+# is still real, stronger evidence than any one face's own tilt.
+UPRIGHT_TOLERANCE_MULTI_FACE_DEG = 40.0
+
+# UPRIGHT_TOLERANCE_SINGLE_FACE_DEG: per the user's own call (2026-11-06),
+# pushed much closer to the real 90-degree rotation targets themselves --
+# a single face's tilt below this is treated as noise, not a rotation.
+UPRIGHT_TOLERANCE_SINGLE_FACE_DEG = 70.0
 
 # Ordering used to decide whether a NEW proposal is allowed to overwrite
 # an EXISTING one for the same image: a write only takes effect if its
