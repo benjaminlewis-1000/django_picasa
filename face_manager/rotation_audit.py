@@ -163,7 +163,22 @@ def run_rotation_audit(write=False, max_images=DEFAULT_MAX_IMAGES_PER_RUN):
         faces_with_kps = [f for f in image.face_set.all() if f.kps]
         outcome = evaluate_image(image, faces_with_kps)
         if outcome is None:
+            # Real production bug (2026-11-06): a genuinely zero-face
+            # image never got rotation_scan_logic_hash stamped here --
+            # with no gating to exclude it, every future batch (within
+            # the SAME run_rotation_audit_until_done() loop, and every
+            # future hourly tick) re-fetched and re-examined it again,
+            # forever. Confirmed live: one run "examined" 1,798,000 rows
+            # against a ~270K-image library, almost all no_usable_faces,
+            # for only 7,776 real updates -- nearly the entire time
+            # budget was spent repeatedly re-visiting the same ~62K
+            # genuinely-faceless images rather than making progress.
+            # Safe to stamp: if this image is ever reprocessed and gains
+            # a face, isProcessed=False resets via reset_rotation_scan_
+            # state_for_reprocessing(), clearing the hash too.
             counts['no_usable_faces'] += 1
+            image.rotation_scan_logic_hash = current_hash
+            to_update.append(image)
             continue
 
         if outcome['estimate'] is None:
