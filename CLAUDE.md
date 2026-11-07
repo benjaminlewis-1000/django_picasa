@@ -5340,3 +5340,86 @@ one-time read-only scan over `Face` rows with `kps` populated, flagging/aggregat
 image decode needed at all. A real ML orientation classifier (4-way CNN) would be more general
 (catches faceless photos too) but isn't obviously worth it given how cheaply the landmark-angle
 signal already covers this library's dominant case.
+
+## DONE (2026-11-06): rotation-review backend refined -- isProcessed/kps-complete gating, a plain
+cw/ccw/180 direction instead of a signed angle, and a self-maintaining re-scan trigger
+
+Follow-up to the rotation-review feature built across the preceding sessions (human-confirm API,
+decode-time virtual rotation, the on-demand+scheduled correction tasks -- see the dated write-ups
+immediately above). Three real refinements, all deployed to production the same day:
+
+**Audit eligibility gating.** `face_manager/rotation_audit.py`'s `_candidate_images_queryset()`
+previously examined any `NOT_SCANNED`/`FLAGGED` image regardless of whether face detection had
+actually finished on it -- real production breakdown (270,470 `NOT_SCANNED` images at the time):
+52 `isProcessed=False` (detection hasn't run at all), 33,762 had faces but at least one still
+missing `kps` (the in-progress kps backfill, not permanent), 62,354 genuinely faceless, 174,302
+fully ready. Without gating on this, an image could be judged from only the SUBSET of its faces
+that happened to have `kps` already, silently ignoring the rest -- a real, if subtle, correctness
+bug, not just a performance concern. Fixed: the candidate query now requires `isProcessed=True`
+AND zero faces missing `kps` (`Count(filter=Q(face__kps__isnull=True))==0`) before an image is
+ever examined -- the not-yet-ready images are simply never candidates, with no separate "retry
+later" bookkeeping needed, since they were never marked scanned in the first place and fall
+through naturally once detection/backfill genuinely finishes.
+
+New `ImageFile.reset_rotation_scan_state_for_reprocessing()` -- called alongside `isProcessed=
+False` at the two real external call sites that throw out/redo existing faces/kps outside the
+rotation pipeline's own control (`cleanup_chronically_unmatched_faces`; `filepopulator/scripts.py`'s
+orientation-change-reprocess branch didn't need it, since its own pre-existing fresh-object-reuse
+behavior already resets rotation state for free). Deliberately a no-op for `CONFIRMED`/
+`DISMISSED_NOT_ROTATED` -- a human decision must never be invalidated by later face-data churn,
+and `rotation_correction.py`'s OWN `isProcessed=False` step (applying a confirmed correction) must
+never be undone by this.
+
+**Direction string instead of a signed angle.** The confirm endpoint (`RotationReviewBulkAction
+View.patch()`) originally took `degrees` (validated against exactly 90/-90/180 via `common.
+is_cardinal_rotation()`/`validated_cardinal_rotation()`) -- per the user's explicit "massively
+over designed... we only need clockwise, counter clockwise, and 180" pushback, replaced with
+`direction: "cw"|"ccw"|"180"` (plus synonyms -- `clockwise`/`counterclockwise`/`counter_clockwise`/
+`flip`/`half_turn`/`upside_down`, case/whitespace-insensitive -- see `common.
+ROTATION_DIRECTION_TO_DEGREES`/`rotation_direction_to_degrees()`). A human reviewer doesn't think
+in signed angles, and a float just reintroduces a cw-vs-ccw sign-convention ambiguity a direction
+word sidesteps entirely. The "Rotation Review API" Claude Docs artifact was updated to match.
+
+**Self-maintaining re-scan trigger.** The gating fix above meant every already-`NOT_SCANNED`/
+`FLAGGED` row needed a full re-scan under the corrected logic -- originally done via a hand-bumped
+`ROTATION_SCAN_LOGIC_VERSION` int (1->2), but per the user's own suggestion ("do we have something
+to automatically bump the version if the code changes? Maybe we hash the function"), replaced
+entirely with `ImageFile.rotation_scan_logic_hash` (`CharField`, was `rotation_scanned_at_version`,
+an `IntegerField`) -- `face_manager.rotation_audit._rotation_scan_logic_hash()` computes
+`sha256(inspect.getsource(rotation_audit) + inspect.getsource(rotation_geometry))[:16]`, mirroring
+`face_manager/test_face_cache.py`'s own already-established sha256(source)-keyed cache-
+invalidation pattern. A row's stored hash mismatching the current one (or `''`, never scanned) is
+what makes it eligible, replacing the `<` comparison against a monotonic version number -- nobody
+has to remember to bump anything by hand going forward; any edit to either module's evaluation
+math OR its gating conditions (exactly what the isProcessed/kps fix above was) changes the hash
+automatically. `ROTATION_SCAN_LOGIC_VERSION` was removed entirely. The migration itself (int
+column -> char column, `filepopulator.0034`) gave every existing row a free full re-scan as a side
+effect, since no old int value can ever match a sha256 hex digest -- no separate manual reset
+needed.
+
+**Known, flagged-but-not-built limitation**: this hash-based auto-invalidation is only correct
+because the current scan is cheap pure-geometry math on already-stored `kps` (no decode/
+inference) -- re-running the WHOLE backlog on every unrelated code edit costs nothing real. A
+future ML classifier (`ImageFile.RotationSignalSource.ML_CLASSIFIER`, already planned as a second
+signal source) is genuinely expensive and must NOT share this same hash -- see the Open TODOs
+index entry (search "the rotation-review ML classifier") for the design note: it'll need its own,
+separately-tracked staleness field once actually built.
+
+**Validated and deployed**: full fast suite 1141/1142 (the one failure the already-documented,
+independently-reconfirmed-flaky `BackfillVerifiedKpsTests.
+test_resuming_with_lvface_enabled_does_not_skip_a_kps_only_face`, unrelated). Built on
+`backend_upgrade`, merged cleanly into `master` (no conflicts), migration applied live
+(`filepopulator.0034`), then a careful graceful restart that deliberately avoided disturbing the
+two long-running `backfill_verified_kps` shards (50,000+ CPU-minutes each, separate `docker exec`
+processes, not inside gunicorn/celery): gunicorn reloaded via `kill -HUP` on its master PID
+(verified via `ps aux` start times that all 4 workers actually picked up the new code, not just
+the signal being sent -- a HUP reload has left a stale worker alive before, see this file's own
+2026-10-30 write-up), celery worker/beat given a warm `SIGTERM` (waited for the one in-flight
+`face_manager.face_extraction` task to finish before exiting) then relaunched with the exact
+commands from `dockerize/startup.sh`. Confirmed live afterward: `manage.py check` clean,
+`celery inspect registered` shows all three rotation tasks, a live dry-run against production
+correctly computed the hash and evaluated real candidates, and the two backfill shards' CPU time
+counters kept climbing uninterrupted throughout. Real queue state at deploy time: 870 `FLAGGED`,
+**0 `CONFIRMED`, 0 `DISMISSED_NOT_ROTATED`** -- no human has actually started reviewing yet, so the
+full-backlog re-scan this deploy triggers (via the hash reset) has no in-progress review session
+to disrupt.
