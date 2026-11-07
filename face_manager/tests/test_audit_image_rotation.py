@@ -196,6 +196,30 @@ class RunRotationAuditTests(TestCase):
         result = run_rotation_audit(write=False, max_images=None)
         self.assertEqual(result['examined'], 3)
 
+    def test_no_usable_faces_still_gets_the_hash_stamped(self):
+        # Real production bug (2026-11-06): a genuinely zero-face image
+        # (isProcessed=True, no Face rows at all -- NOT the missing-kps
+        # case covered elsewhere) never got rotation_scan_logic_hash
+        # stamped, so it was re-examined on EVERY future batch forever --
+        # confirmed live: one run "examined" 1,798,000 rows against a
+        # ~270K-image library, almost all stuck re-visiting this same
+        # population. Must be stamped like every other examined outcome.
+        from face_manager.rotation_audit import _rotation_scan_logic_hash, run_rotation_audit
+        from face_manager.tests import make_image
+
+        faceless = make_image(relative_fixture="naming/good/4.jpeg")
+        faceless.isProcessed = True
+        faceless.save(update_fields=['isProcessed'])
+
+        result = run_rotation_audit(write=True)
+        self.assertEqual(result['counts']['no_usable_faces'], 1)
+        faceless.refresh_from_db()
+        self.assertEqual(faceless.rotation_scan_logic_hash, _rotation_scan_logic_hash())
+
+        # Re-running must NOT re-examine it a second time.
+        second = run_rotation_audit(write=True)
+        self.assertEqual(second['counts']['no_usable_faces'], 0)
+
     def test_isprocessed_false_is_excluded_from_candidates(self):
         # Real production finding (2026-11-06): isProcessed=False means
         # face detection hasn't settled on this image at all yet -- it
