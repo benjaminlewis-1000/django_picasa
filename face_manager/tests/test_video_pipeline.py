@@ -503,6 +503,48 @@ class LocateConfidentFaceNearTimestampTests(unittest.TestCase):
         self.assertIsNone(result)
         det_model.detect.assert_not_called()
 
+    def test_hdr_source_dispatches_to_ffmpeg_path_not_pyav(self):
+        # Found 2026-11-08 (face 1146073, a washed-out video thumbnail):
+        # an HDR-tagged source must never decode via the plain PyAV path
+        # (av.open) below -- it comes out un-tone-mapped. Confirms
+        # av.open() is never even called when color_transfer is HDR, and
+        # that the ffmpeg-pipe variant's result is returned as-is.
+        from video_face_pipeline import locate_confident_face_near_timestamp
+        fake_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        fake_result = (fake_frame, [40, 40, 60, 60], [[0, 0]] * 5, 0.8, 10.1)
+        with patch('video_face_pipeline.av.open') as mock_av_open, \
+                patch('video_face_pipeline._locate_confident_face_near_timestamp_ffmpeg',
+                      return_value=fake_result) as mock_ffmpeg_variant:
+            result = locate_confident_face_near_timestamp(
+                '/fake.mp4', 10.0, 'progressive', 0, (40, 40, 60, 60),
+                MagicMock(), 0.5, window_seconds=1.0, color_transfer='smpte2084',
+                avg_fps=30.0, width=1920, height=1080,
+            )
+        mock_av_open.assert_not_called()
+        mock_ffmpeg_variant.assert_called_once()
+        self.assertEqual(result, fake_result)
+
+    def test_non_hdr_source_still_uses_pyav_path(self):
+        # Sanity check for the dispatch itself, not just the HDR branch --
+        # a plain (non-HDR) color_transfer must keep using the existing
+        # PyAV path, not the new ffmpeg variant.
+        from video_face_pipeline import locate_confident_face_near_timestamp
+        container = self._mock_container([10.0])
+        det_model = MagicMock()
+        det_model.detect.return_value = (
+            np.array([[40, 40, 60, 60, 0.9]], dtype=np.float32),
+            np.zeros((1, 5, 2), dtype=np.float32),
+        )
+        with patch('video_face_pipeline.av.open', return_value=container) as mock_av_open, \
+                patch('video_face_pipeline._locate_confident_face_near_timestamp_ffmpeg') as mock_ffmpeg_variant:
+            result = locate_confident_face_near_timestamp(
+                '/fake.mp4', 10.0, 'progressive', 0, (40, 40, 60, 60), det_model, 0.5,
+                window_seconds=1.0, color_transfer='bt709',
+            )
+        mock_av_open.assert_called_once()
+        mock_ffmpeg_variant.assert_not_called()
+        self.assertIsNotNone(result)
+
 
 class RedetectConfidenceFallbackTests(unittest.TestCase):
     """_redetect_in_crop()/_redetect_full_frame_nearest() -- the fix for

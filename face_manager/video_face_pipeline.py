@@ -799,10 +799,88 @@ def extract_frame_near_timestamp(path, target_seconds, avg_fps, field_order, rot
         container.close()
 
 
+def _nearest_confident_detection(arr, det_model, min_score, old_cx, old_cy):
+    """Shared by both locate_confident_face_near_timestamp() variants --
+    runs a full-frame detection on one already-decoded frame and returns
+    whichever confident candidate's center lands nearest (old_cx, old_cy),
+    or None if nothing in the frame clears min_score."""
+    bboxes, kpss = det_model.detect(arr, max_num=0, metric='default')
+    if bboxes.shape[0] == 0:
+        return None
+    confident = bboxes[:, 4] >= min_score
+    if not confident.any():
+        return None
+    idxs = np.where(confident)[0]
+    centers = np.stack([
+        (bboxes[idxs, 0] + bboxes[idxs, 2]) / 2,
+        (bboxes[idxs, 1] + bboxes[idxs, 3]) / 2,
+    ], axis=1)
+    dists = np.linalg.norm(centers - np.array([old_cx, old_cy]), axis=1)
+    nearest = idxs[int(np.argmin(dists))]
+    return bboxes[nearest, :4].tolist(), kpss[nearest].tolist(), float(bboxes[nearest, 4])
+
+
+def _locate_confident_face_near_timestamp_ffmpeg(path, target_seconds, avg_fps, width, height,
+                                                   field_order, old_box, det_model, min_score,
+                                                   window_seconds, color_transfer,
+                                                   sar_scale_width=None):
+    """HDR-source variant of locate_confident_face_near_timestamp()'s
+    search -- same reasoning as _extract_frame_near_timestamp_ffmpeg
+    (confirmed 2026-11-08, face 1146073: PyAV's own bundled libavfilter
+    build lacks the zscale filter HDR tone-mapping needs, so the plain
+    PyAV path below decodes HDR sources as washed-out/wrong-colored raw
+    pixel data -- real enough to suppress or confuse full-frame detection,
+    and regardless, any confident match found that way would still get
+    saved as a washed-out thumbnail, exactly the user-visible regression
+    this was built to fix). Decodes via the same ffmpeg_frame_iterator()/
+    build_vf_filter() chain the main extraction pipeline already uses
+    (which includes the HDR tone-map filter) instead of PyAV, collects
+    every frame within the window, then runs the identical full-frame-
+    detection + nearest-to-old-box search as the PyAV path below. ffmpeg's
+    own raw pipe already auto-applies any container rotation, unlike
+    PyAV -- no separate rotation step needed here. Only reached for
+    HDR-tagged videos; every other video keeps using the PyAV path."""
+    vf_filter = build_vf_filter(field_order, color_transfer, sar_scale_width=sar_scale_width)
+
+    def collect(seek_seconds):
+        frames = []
+        n = 0
+        for frame in ffmpeg_frame_iterator(path, width, height, vf_filter=vf_filter, seek_seconds=seek_seconds):
+            t = seek_seconds + n / avg_fps
+            n += 1
+            if t > target_seconds + window_seconds:
+                break
+            if t >= target_seconds - window_seconds:
+                frames.append((t, frame.copy()))
+        return frames
+
+    seek_seconds = max(0.0, target_seconds - window_seconds)
+    candidates = collect(seek_seconds)
+    if not candidates and seek_seconds > 0:
+        # Same fallback as the PyAV path's own WMV/ASF seek-overshoot fix
+        # (2026-09-11) -- a fast seek can land well past the target
+        # window on some files; retry with a full sequential decode from
+        # the start rather than trusting it twice.
+        candidates = collect(0)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: abs(c[0] - target_seconds))
+
+    l, t, r, b = old_box
+    old_cx, old_cy = (l + r) / 2, (t + b) / 2
+    for frame_time, arr in candidates:
+        found = _nearest_confident_detection(arr, det_model, min_score, old_cx, old_cy)
+        if found is not None:
+            box, kps, score = found
+            return arr, box, kps, score, frame_time
+    return None
+
+
 def locate_confident_face_near_timestamp(path, target_seconds, field_order, rotation,
                                           old_box, det_model, min_score,
                                           window_seconds=1.5, color_transfer=None,
-                                          sar_scale_width=None):
+                                          sar_scale_width=None, avg_fps=None,
+                                          width=None, height=None):
     """Remediation helper for a video face whose stored box/kps don't
     actually bound a real face at its own target_seconds (see
     audit_video_face_geometry.py / CLAUDE.md's 2026-10-29 write-up) --
@@ -823,12 +901,27 @@ def locate_confident_face_near_timestamp(path, target_seconds, field_order, rota
 
     Returns (frame_bgr, box, kps, det_score, frame_seconds) for the
     best candidate found, or None if nothing confident turned up
-    anywhere in the window. HDR-tagged sources aren't specially
-    dispatched here (unlike extract_frame_near_timestamp) -- scoped to
-    the common case; an HDR video's frames come out washed-out/wrong-
-    colored via the plain PyAV path, which could itself suppress
-    detection, but this is a deliberate, documented scope limit rather
-    than building a second ffmpeg-subprocess-based window scanner."""
+    anywhere in the window.
+
+    HDR-tagged sources (color_transfer=smpte2084/arib-std-b67) are
+    dispatched to _locate_confident_face_near_timestamp_ffmpeg() instead
+    -- found 2026-11-08 (face 1146073, reported as a washed-out video
+    thumbnail): this function previously always used the plain PyAV path
+    below regardless of color_transfer, which decodes an HDR source as
+    raw, un-tone-mapped (washed-out) pixel data -- the one write path in
+    this file that had this gap, since every other caller that writes a
+    thumbnail already sources frames via extract_frame_near_timestamp()
+    or _compute_candidate_groups()'s frame_pixels, both already HDR-
+    aware. avg_fps/width/height are only used on that path (the raw
+    ffmpeg_frame_iterator() pipe needs them); unused on the PyAV path
+    below, which gets dimensions from the container itself."""
+    if is_hdr_transfer(color_transfer):
+        return _locate_confident_face_near_timestamp_ffmpeg(
+            path, target_seconds, avg_fps, width, height, field_order,
+            old_box, det_model, min_score, window_seconds, color_transfer,
+            sar_scale_width,
+        )
+
     container = av.open(path)
     try:
         stream = container.streams.video[0]
@@ -896,23 +989,10 @@ def locate_confident_face_near_timestamp(path, target_seconds, field_order, rota
         candidates.sort(key=lambda c: abs(c[0] - target_seconds))
 
         for frame_time, arr in candidates:
-            bboxes, kpss = det_model.detect(arr, max_num=0, metric='default')
-            if bboxes.shape[0] == 0:
-                continue
-            confident = bboxes[:, 4] >= min_score
-            if not confident.any():
-                continue
-            idxs = np.where(confident)[0]
-            centers = np.stack([
-                (bboxes[idxs, 0] + bboxes[idxs, 2]) / 2,
-                (bboxes[idxs, 1] + bboxes[idxs, 3]) / 2,
-            ], axis=1)
-            dists = np.linalg.norm(centers - np.array([old_cx, old_cy]), axis=1)
-            nearest = idxs[int(np.argmin(dists))]
-            return (
-                arr, bboxes[nearest, :4].tolist(), kpss[nearest].tolist(),
-                float(bboxes[nearest, 4]), frame_time,
-            )
+            found = _nearest_confident_detection(arr, det_model, min_score, old_cx, old_cy)
+            if found is not None:
+                box, kps, score = found
+                return arr, box, kps, score, frame_time
         return None
     finally:
         container.close()

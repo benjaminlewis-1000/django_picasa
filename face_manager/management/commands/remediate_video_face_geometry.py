@@ -325,6 +325,7 @@ class Command(BaseCommand):
                             video.filename, face.video_thumbnail_frame_seconds, field_order, rotation,
                             old_box, det_lightweight, MIN_SCORE, window_seconds=SEARCH_WINDOW_SECONDS,
                             color_transfer=color_transfer, sar_scale_width=sar_scale_width,
+                            avg_fps=avg_fps, width=width, height=height,
                         )
                     except Exception as e:
                         decode_failed.append((face.id, f'window search failed: {e}'))
