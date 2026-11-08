@@ -824,6 +824,23 @@ class RemediateVideoFaceGeometryTests(TestCase):
             call_command('remediate_video_face_geometry', '--recheck-all', stdout=out)
         self.assertIn("Checked 1 video face", out.getvalue())
 
+    def test_video_ids_restricts_to_those_videos(self):
+        # Built for a targeted recheck of a known-HDR subset (2026-11-08)
+        # without re-walking the whole library under --recheck-all alone.
+        target = self._make_video_face()
+        other = self._make_video_face()
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate:
+            MockExtractor.return_value.det10g_model.detect.return_value = self._dets([(70, 70, 130, 130, 0.9)])
+            out = io.StringIO()
+            call_command(
+                'remediate_video_face_geometry',
+                f'--video-ids={target.source_video_file_id}', stdout=out,
+            )
+        self.assertIn("Checked 1 video face", out.getvalue())
+        other.refresh_from_db()
+        self.assertEqual(other.box_left, 10)  # genuinely untouched
+
     def test_ok_face_gets_second_check_and_lvface_from_real_frame(self):
         """A triage-passed face now also gets a real (cheap) frame decode
         -- a second, independent validation via _redetect_in_crop against
