@@ -374,6 +374,32 @@ class VideoFaceSetBoxAndThumbnailOrphanTests(TestCase):
         )
         self.assertTrue(os.path.isfile(self.face.face_thumbnail.path))
 
+    def test_kps_beyond_frame_bounds_is_clamped_to_match_the_box_clamp(self):
+        # A face extremely close to the camera can have kps extrapolated
+        # beyond the frame (confirmed real 2026-11-08, a
+        # face_kps_within_box_margin IntegrityError) -- the box above
+        # gets clamped to the frame's real 320x240 bounds, so kps must be
+        # clamped the same way or the two fall out of consistency.
+        self.extractor._set_face_box_and_thumbnail(
+            self.face, self.frame, (10, 10, 600, 500),
+            kps=[[-20, -5], [700, -5], [300, 260], [0, 300], [400, 400]],
+        )
+        xs = self.face.kps[0::2]
+        ys = self.face.kps[1::2]
+        self.assertTrue(all(0 <= x <= 320 for x in xs))
+        self.assertTrue(all(0 <= y <= 240 for y in ys))
+        # Clamping lands exactly at the boundary for an out-of-range
+        # point, not some arbitrary smaller value.
+        self.assertEqual(xs[0], 0)
+        self.assertEqual(xs[1], 320)
+
+    def test_kps_already_within_bounds_is_left_unchanged(self):
+        kps_in_bounds = [[50, 50], [60, 50], [55, 60], [50, 70], [60, 70]]
+        self.extractor._set_face_box_and_thumbnail(
+            self.face, self.frame, (10, 10, 100, 100), kps=kps_in_bounds,
+        )
+        self.assertEqual(self.face.kps, [float(v) for pair in kps_in_bounds for v in pair])
+
 
 class LocateConfidentFaceNearTimestampTests(unittest.TestCase):
     """locate_confident_face_near_timestamp() -- the remediation search
