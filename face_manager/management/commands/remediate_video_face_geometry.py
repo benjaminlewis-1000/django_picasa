@@ -125,6 +125,11 @@ class Command(BaseCommand):
         parser.add_argument('--person-ids', type=str, default=None,
                              help='Comma-separated Person ids -- restrict to faces declared '
                                   'or proposed to these people.')
+        parser.add_argument('--video-ids', type=str, default=None,
+                             help='Comma-separated VideoFile ids -- restrict to faces on these '
+                                  'specific videos (e.g. a known-HDR subset needing a targeted '
+                                  'recheck under --recheck-all, without re-walking the whole '
+                                  'library).')
         parser.add_argument('--lvface-sizes', type=str, default='B',
                              help='Comma-separated LVFace sizes to (re)compute for a fixed '
                                   'face, using the frame/kps already decoded for the fix. '
@@ -148,10 +153,15 @@ class Command(BaseCommand):
         person_ids = None
         if options['person_ids']:
             person_ids = [int(s.strip()) for s in options['person_ids'].split(',') if s.strip()]
+        video_ids = None
+        if options['video_ids']:
+            video_ids = [int(s.strip()) for s in options['video_ids'].split(',') if s.strip()]
         lvface_sizes = [s.strip().upper() for s in options['lvface_sizes'].split(',') if s.strip()]
 
         qs = Face.objects.filter(source_video_file__isnull=False).exclude(face_thumbnail='') \
             .select_related('source_video_file')
+        if video_ids is not None:
+            qs = qs.filter(source_video_file_id__in=video_ids)
         if lvface_sizes and not recheck_all:
             # A "fixed" face always gets this field written (always overwritten, since its
             # kps just changed -- see this command's own docstring); an "already ok" face
