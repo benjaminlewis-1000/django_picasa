@@ -21,6 +21,7 @@ unit-tested directly with synthetic embeddings. VideoFaceExtractor is the
 Django/ONNX-touching orchestration layer around them, exercised only by
 the real-fixture (slow-tagged) integration test.
 """
+from common.error_log import log_error
 from django.conf import settings
 from django.core.files.base import ContentFile
 from face_manager.models import Person, Face
@@ -1297,7 +1298,22 @@ class VideoFaceExtractor(object):
         face.box_top = max(1, int(t))
         face.box_right = min(img_w, max(face.box_left + 1, int(r)))
         face.box_bottom = min(img_h, max(face.box_top + 1, int(b)))
-        face.kps = np.asarray(kps, dtype=float).reshape(-1).tolist()
+
+        # kps can legitimately extend beyond the frame bounds -- the
+        # detector's own box/kps regression both extrapolate past what's
+        # actually visible when a face is extremely close to the camera
+        # (confirmed 2026-11-08, real production IntegrityError against
+        # face_kps_within_box_margin: the RAW box/kps are mutually
+        # consistent, but the box above gets clamped to the frame while
+        # kps was left untouched, breaking that consistency). Clamp kps
+        # to the same frame bounds the box is clamped to, so the two stay
+        # consistent with each other -- this never discards a real face,
+        # it only brings an out-of-frame landmark back to the visible
+        # edge, same idea as the box clamp just above.
+        kps_arr = np.asarray(kps, dtype=float).reshape(-1, 2)
+        kps_arr[:, 0] = np.clip(kps_arr[:, 0], 0, img_w)
+        kps_arr[:, 1] = np.clip(kps_arr[:, 1], 0, img_h)
+        face.kps = kps_arr.reshape(-1).tolist()
         if det_score is not None:
             face.det_score = float(det_score)
         if timestamp_seconds is not None:
@@ -1440,11 +1456,30 @@ class VideoFaceExtractor(object):
             pooled_embs_if = np.array([r['emb_if'] for r in pooled_reps])
             centroid = _trimmed_centroid(pooled_embs_if)
 
-            # Provisional thumbnail: largest box among the pool.
+            # Provisional thumbnail: largest box among the pool, but
+            # never one whose box is clipped against the frame edges --
+            # a face that got very close to the camera naturally produces
+            # the largest raw box (the detector's own extrapolated-beyond-
+            # frame regression, see _set_face_box_and_thumbnail's kps
+            # clamp comment), which made plain "largest box wins" reliably
+            # pick the worst-framed, most zoomed-in moment as the
+            # thumbnail. Prefer the largest UNCLIPPED box instead; only
+            # fall back to a clipped one if every pooled rep is clipped
+            # (e.g. the person fills the frame for the entire clip).
             def _box_area(rep):
                 l, t, r, b = rep['box']
                 return max(0, r - l) * max(0, b - t)
-            provisional = max(pooled_reps, key=_box_area)
+
+            def _is_clipped(rep, margin=2):
+                img_h, img_w, _ = frame_pixels[rep['frame_idx']].shape
+                l, t, r, b = rep['box']
+                return (
+                    l <= margin or t <= margin
+                    or r >= img_w - margin or b >= img_h - margin
+                )
+
+            unclipped_reps = [r for r in pooled_reps if not _is_clipped(r)]
+            provisional = max(unclipped_reps or pooled_reps, key=_box_area)
 
             first_sample = min(tracks[m]['span'][0] for m in members)
             last_sample = max(tracks[m]['span'][1] for m in members)
@@ -1485,11 +1520,25 @@ class VideoFaceExtractor(object):
             face.video_last_timestamp_seconds = self._clamp_to_duration(
                 video_obj, cand['last_sample'] / fps, 'video_last_timestamp_seconds'
             )
-            self._set_face_box_and_thumbnail(
-                face, provisional_frame, provisional['box'], provisional['kps'],
-                provisional['frame_idx'] / fps, det_score=provisional['det_score'],
-            )
-            face.save()
+            try:
+                self._set_face_box_and_thumbnail(
+                    face, provisional_frame, provisional['box'], provisional['kps'],
+                    provisional['frame_idx'] / fps, det_score=provisional['det_score'],
+                )
+                face.save()
+            except Exception as e:
+                # One bad candidate (e.g. a box/kps combination the
+                # kps-clamp above didn't anticipate) must not discard
+                # every OTHER valid candidate group for this video --
+                # confirmed real 2026-11-08 (face_kps_within_box_margin
+                # IntegrityErrors aborting the whole video's extraction).
+                log_error(
+                    'video_face_pipeline.process_video',
+                    f'video {video_obj.id} ({video_obj.filename}) candidate '
+                    f'(first={cand["first_sample"]}, last={cand["last_sample"]}) '
+                    f'failed to save, skipping just this candidate: {e}',
+                )
+                continue
 
             self._classify_and_pick_thumbnail(face, cand['pooled_reps'], frame_pixels, fps)
             created.append(face)
