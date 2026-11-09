@@ -80,6 +80,7 @@ from django.core.management.base import BaseCommand
 from django.db.models import Q
 
 import lvface
+from common.advisory_lock import advisory_lock
 from common.error_log import log_error
 from face_manager.models import Face
 from video_face_pipeline import (
@@ -147,6 +148,31 @@ class Command(BaseCommand):
                                   'whole point of the skip.')
 
     def handle(self, *args, **options):
+        # Real, confirmed bug (2026-11-09, see CLAUDE.md): a library-wide
+        # run of this command and a second, --video-ids-targeted run were
+        # launched concurrently (different processes, overlapping face
+        # sets) -- each one freely rewrites a face's thumbnail file
+        # (writing a new random-suffixed name, then deleting what it
+        # read as the "old" path) with no coordination at all. When both
+        # processes touched the same face, one's cleanup deleted the
+        # file the other had just made current, leaving the Face row's
+        # face_thumbnail field pointing at a file that no longer exists
+        # -- permanently, since nothing else ever regenerates it. ~54
+        # video faces library-wide were found with exactly this symptom.
+        # A single named advisory lock (same mechanism/convention as
+        # find_and_encode_faces()/add_from_root_dir()) makes a second
+        # concurrent invocation of this whole command skip immediately
+        # instead of racing.
+        with advisory_lock('face_manager.remediate_video_face_geometry') as acquired:
+            if not acquired:
+                self.stdout.write(
+                    "Another remediate_video_face_geometry run already holds the lock -- "
+                    "skipping this invocation entirely rather than racing on thumbnail writes."
+                )
+                return
+            self._handle_locked(*args, **options)
+
+    def _handle_locked(self, *args, **options):
         dry_run = options['dry_run']
         limit = options['limit']
         recheck_all = options['recheck_all']
@@ -203,6 +229,7 @@ class Command(BaseCommand):
         decode_failed = []
         timed_out = []
         crashed = []
+        missing_thumbnail_count = 0
         t0 = time.time()
         ffprobe_cache = {}
 
@@ -219,32 +246,40 @@ class Command(BaseCommand):
                 signal.signal(signal.SIGALRM, _raise_face_timeout)
                 signal.alarm(PER_FACE_TIMEOUT_SECONDS)
                 try:
-                    # decode_face_thumbnail() swallows a missing/unreadable file the
-                    # same way as a garbage/undecodable one -- both land in
-                    # decode_failed. Previously a missing file (FileNotFoundError)
-                    # propagated past this point and was caught by the outer except
-                    # as a "crash" instead; collapsed deliberately during the
-                    # 2026-10-30 consolidation (see CLAUDE.md) since both are really
-                    # the same practical outcome: no usable thumbnail, face left
-                    # untouched, safe to retry later.
+                    # decode_face_thumbnail() returns None for both a missing
+                    # file and a garbage/undecodable one. A garbage file is a
+                    # real decode problem no amount of retrying fixes -- but a
+                    # MISSING file (confirmed 2026-11-09: ~54 real cases,
+                    # root-caused to two concurrent runs of this same command
+                    # racing on thumbnail replacement, now prevented by the
+                    # advisory lock above) has nothing wrong with the face
+                    # itself, just no cached crop to triage against. Rather
+                    # than dead-end those faces forever (nothing else ever
+                    # regenerates the file), treat a missing thumbnail the
+                    # same as a failed triage -- fall through to the real
+                    # fix path below, which only needs the face's stored box
+                    # (known from the DB regardless of the thumbnail file)
+                    # to search real video frames and produce a brand new
+                    # thumbnail.
                     thumb = decode_face_thumbnail(face)
-                    if thumb is None:
-                        decode_failed.append(face.id)
-                        continue
-
-                    h, w = thumb.shape[:2]
-                    bboxes, _ = det10g.detect(thumb, max_num=0, metric='default')
-                    confident = bboxes[:, 4] >= MIN_SCORE if bboxes.shape[0] else np.array([], dtype=bool)
-                    ok = False
-                    if confident.any():
-                        cx_lo, cx_hi = w * (1 - CENTER_FRACTION) / 2, w * (1 + CENTER_FRACTION) / 2
-                        cy_lo, cy_hi = h * (1 - CENTER_FRACTION) / 2, h * (1 + CENTER_FRACTION) / 2
-                        for i in np.where(confident)[0]:
-                            bcx = (bboxes[i, 0] + bboxes[i, 2]) / 2
-                            bcy = (bboxes[i, 1] + bboxes[i, 3]) / 2
-                            if cx_lo <= bcx <= cx_hi and cy_lo <= bcy <= cy_hi:
-                                ok = True
-                                break
+                    missing_thumbnail = thumb is None
+                    if missing_thumbnail:
+                        missing_thumbnail_count += 1
+                        ok = False
+                    else:
+                        h, w = thumb.shape[:2]
+                        bboxes, _ = det10g.detect(thumb, max_num=0, metric='default')
+                        confident = bboxes[:, 4] >= MIN_SCORE if bboxes.shape[0] else np.array([], dtype=bool)
+                        ok = False
+                        if confident.any():
+                            cx_lo, cx_hi = w * (1 - CENTER_FRACTION) / 2, w * (1 + CENTER_FRACTION) / 2
+                            cy_lo, cy_hi = h * (1 - CENTER_FRACTION) / 2, h * (1 + CENTER_FRACTION) / 2
+                            for i in np.where(confident)[0]:
+                                bcx = (bboxes[i, 0] + bboxes[i, 2]) / 2
+                                bcy = (bboxes[i, 1] + bboxes[i, 3]) / 2
+                                if cx_lo <= bcx <= cx_hi and cy_lo <= bcy <= cy_hi:
+                                    ok = True
+                                    break
                     video = face.source_video_file
                     old_box = (face.box_left, face.box_top, face.box_right, face.box_bottom)
 
@@ -417,7 +452,9 @@ class Command(BaseCommand):
             f"  {len(unresolved)} unresolved -- no confident detection anywhere nearby, left untouched.\n"
             f"  {len(decode_failed)} decode/ffprobe failures.\n"
             f"  {len(timed_out)} timed out (>{PER_FACE_TIMEOUT_SECONDS}s) -- left untouched, safe to retry later.\n"
-            f"  {len(crashed)} crashed on an unexpected error -- left untouched, logged below, safe to retry later."
+            f"  {len(crashed)} crashed on an unexpected error -- left untouched, logged below, safe to retry later.\n"
+            f"  ({missing_thumbnail_count} of the above had no thumbnail file on disk at all -- "
+            f"routed straight into the real-fix path above instead of being left stuck.)"
         )
         if crashed:
             self.stdout.write("\nCrashed face ids (first 50), flagged for later:")

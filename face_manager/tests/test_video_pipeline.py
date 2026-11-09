@@ -1149,14 +1149,20 @@ class RemediateVideoFaceGeometryTests(TestCase):
         _FaceTimeout was caught at the per-face level. Fixed originally
         by catching any unexpected exception at the per-face level.
 
-        After the 2026-10-30 decode_face_thumbnail() consolidation, a
-        missing file is no longer an exception at all -- the shared
-        helper swallows it into a plain None return, same as a garbage/
-        undecodable file, so this now lands in decode_failed rather than
-        crashed (a deliberate behavior change, see the comment at this
-        command's own decode call site) -- but the real property this
-        test guards (one bad face can't take down the whole run) still
-        holds and is still what's being checked here."""
+        Real bug #2 found 2026-11-09: a missing thumbnail used to be a
+        permanent dead end (counted as decode_failed and skipped
+        forever, since nothing else ever regenerates the file -- see
+        the real ~54-face production population this caused, root-
+        caused to two concurrent runs of this command racing on
+        thumbnail replacement, now prevented by this command's own
+        advisory lock). Fixed by falling through to the real fix path
+        (which only needs the face's stored box, not the thumbnail) --
+        here that still lands in decode_failed, but for a DIFFERENT
+        reason now (ffprobe failing against this test's deliberately
+        garbage video file content), not because the missing thumbnail
+        was treated as unrecoverable on its own. Either way, the real
+        property this test guards (one bad face can't take down the
+        whole run) still holds."""
         bad_face = self._make_video_face()
         os.remove(bad_face.face_thumbnail.path)
         good_face = self._make_video_face()
@@ -1166,7 +1172,92 @@ class RemediateVideoFaceGeometryTests(TestCase):
             call_command('remediate_video_face_geometry', stdout=out)
         self.assertIn("1 already fine", out.getvalue())
         self.assertIn("1 decode/ffprobe failures", out.getvalue())
+        self.assertIn("1 of the above had no thumbnail file on disk at all", out.getvalue())
         self.assertNotIn("1 crashed", out.getvalue())
+
+    def test_missing_thumbnail_gets_a_real_fix_attempt_instead_of_a_dead_end(self):
+        """Real bug found 2026-11-09 (see CLAUDE.md): a face whose
+        thumbnail file was deleted by a concurrent run (see the
+        advisory-lock tests below) used to be stuck as decode_failed
+        forever -- nothing else ever regenerates the file, and a face
+        that reaches this state on one run reaches it again on every
+        future run too. Confirms the real fix: a missing thumbnail now
+        routes into the exact same real-fix path a failed triage uses,
+        and a confident nearby detection genuinely resolves it (new
+        box/kps/thumbnail/embedding), not just a different-shaped
+        failure."""
+        face = self._make_video_face()
+        os.remove(face.face_thumbnail.path)
+        real_frame = np.ones((480, 640, 3), dtype=np.uint8) * 7
+
+        def _fake_set_box_and_thumbnail(f, *a, **kw):
+            # The real _set_face_box_and_thumbnail() writes a brand new
+            # thumbnail file as part of fixing a face -- mocked out
+            # here, so simulate that one real side effect (a fresh file
+            # existing on disk) rather than leaving face_thumbnail
+            # pointing at the file this test already deleted, which
+            # would otherwise fail Face.save()'s own existence check
+            # for a reason that has nothing to do with what's under
+            # test here.
+            f.face_thumbnail.save("refixed.jpg", ContentFile(_tiny_jpeg_bytes(size=(200, 200))), save=False)
+
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.ffprobe_info',
+                   return_value=(640, 480, 30.0, 'progressive', 0, None, None)), \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp',
+                   return_value=(real_frame, [12, 12, 48, 48], [[1, 1]] * 5, 0.88, 12.5)) as mock_locate, \
+             patch(f'{self.CMD_MODULE}.lvface') as mock_lvface:
+            mock_ext = MockExtractor.return_value
+            mock_ext._set_face_box_and_thumbnail.side_effect = _fake_set_box_and_thumbnail
+            mock_ext._encode_insightface.return_value = np.full(512, 0.4, dtype=np.float32)
+            mock_lvface.embed_from_image_array.return_value = np.full(512, 0.6, dtype=np.float32)
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        mock_locate.assert_called_once()
+        mock_ext._set_face_box_and_thumbnail.assert_called_once_with(
+            face, real_frame, [12, 12, 48, 48], [[1, 1]] * 5, timestamp_seconds=12.5, det_score=0.88,
+        )
+        self.assertIn("1 fixed via a confident nearby detection", out.getvalue())
+        self.assertIn("1 of the above had no thumbnail file on disk at all", out.getvalue())
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_512, [0.4] * 512)
+        self.assertEqual(face.face_encoding_lvface_b, [0.6] * 512)
+        self.assertEqual(face.face_encoding_lvface_b, [0.6] * 512)
+
+    def test_concurrent_run_is_skipped_not_raced(self):
+        """Real bug this whole fix exists for (2026-11-09, see CLAUDE.md):
+        a library-wide run and a second, --video-ids-targeted run of
+        this same command were launched concurrently and raced on
+        thumbnail replacement for faces both touched, permanently
+        orphaning ~54 faces' thumbnail files. A named advisory lock
+        (same convention as find_and_encode_faces()/add_from_root_dir())
+        makes a second concurrent invocation skip immediately instead.
+        A genuinely separate DB connection (not just a second
+        `with advisory_lock(...)` on the same one, which Postgres
+        advisory locks are reentrant for per-session) is needed to
+        simulate real contention."""
+        face = self._make_video_face()
+        cfg = connection.settings_dict
+        other_conn = psycopg2.connect(
+            dbname=cfg['NAME'], user=cfg['USER'], password=cfg['PASSWORD'],
+            host=cfg['HOST'] or 'localhost', port=cfg['PORT'] or 5432,
+        )
+        other_conn.autocommit = True
+        self.addCleanup(other_conn.close)
+        key = zlib.crc32(b'face_manager.remediate_video_face_geometry')
+        with other_conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", [key])
+            self.assertTrue(cur.fetchone()[0])
+        with patch(f'{self.CMD_MODULE}.VideoFaceExtractor') as MockExtractor, \
+             patch(f'{self.CMD_MODULE}.locate_confident_face_near_timestamp') as mock_locate:
+            MockExtractor.assert_not_called()
+            out = io.StringIO()
+            call_command('remediate_video_face_geometry', stdout=out)
+        mock_locate.assert_not_called()
+        MockExtractor.assert_not_called()
+        self.assertIn("already holds the lock", out.getvalue())
+        face.refresh_from_db()
+        self.assertEqual(face.box_left, 10)  # genuinely untouched
 
     def test_unexpected_error_on_one_face_does_not_abort_the_whole_run(self):
         """A genuinely unexpected failure (not a missing/undecodable
