@@ -232,10 +232,19 @@ class Command(BaseCommand):
         parser.add_argument('--num-train-images', type=int, default=24000)
         parser.add_argument('--num-val-images', type=int, default=2000)
         parser.add_argument('--batch-size', type=int, default=32)
-        parser.add_argument('--num-workers', type=int, default=2,
-                             help='DataLoader worker processes. Kept low by default -- these '
-                                  'compete for the same CPU headroom this whole command is '
-                                  'supposed to be respecting.')
+        parser.add_argument('--num-workers', type=int, default=0,
+                             help='DataLoader worker processes. Defaults to 0 (no worker '
+                                  'processes, no shared memory used) after a real crash '
+                                  '(2026-11-09): this container\'s /dev/shm is the Docker '
+                                  'default 64MB, and torch DataLoader workers pass batches '
+                                  'back to the main process through /dev/shm -- a handful of '
+                                  'in-flight 32x3x224x224 float32 batches across even 2 workers '
+                                  'exhausts that fast ("unable to allocate shared memory... No '
+                                  'space left on device"), not a disk-space problem despite the '
+                                  'message. Fixing this for real would need a bigger --shm-size '
+                                  'on the container (a disruptive recreate, not done here) -- 0 '
+                                  'workers avoids the whole mechanism, at some decode-vs-compute '
+                                  'overlap cost that matters little for a CPU-only job anyway.')
         parser.add_argument('--threads', type=int, default=8,
                              help="torch's own intra-op thread count, capped well below this "
                                   "host's full core count so a training burst doesn't by "
