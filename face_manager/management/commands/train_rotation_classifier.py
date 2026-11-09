@@ -65,8 +65,19 @@ DEFAULT_CHECKPOINT_PATH = '/models/rotation_classifier/checkpoint.pt'
 DEFAULT_ONNX_PATH = '/models/rotation_classifier/rotation_classifier.onnx'
 DEFAULT_SPLIT_PATH = '/models/rotation_classifier/split.json'
 
-CHECKPOINT_EVERY_STEPS = 200
-EVAL_EVERY_STEPS = 1000
+# Lowered from 200/1000 (2026-11-09, found live): under real CPU
+# contention from this project's own concurrent backfill/remediation
+# jobs (exactly the situation this command is designed to run under --
+# "when there's headroom", not in isolation), a step took ~40s with
+# --num-workers=0 -- at that rate a 90-minute burst reaches only ~step
+# 130, never hitting the OLD 200-step checkpoint interval at all. Every
+# burst would then end with zero checkpoint saved, for a different
+# reason than the earlier /dev/shm crash but the same practical result
+# (all progress lost, every single burst). Lowered enough that even a
+# genuinely slow, heavily-contended burst saves real progress well
+# before its time budget runs out.
+CHECKPOINT_EVERY_STEPS = 50
+EVAL_EVERY_STEPS = 250
 LR_DECAY_EVERY_STEPS = 2000
 LR_DECAY_FACTOR = 0.5
 
