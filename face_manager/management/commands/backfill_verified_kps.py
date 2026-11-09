@@ -106,7 +106,28 @@ IOU_OVERRIDE_THRESH = 0.5
 CROP_REDETECT_PAD_PCT = 0.6
 CROP_REDETECT_MIN_SCORE = 0.5
 
-PER_IMAGE_TIMEOUT_SECONDS = 60
+# A flat per-image budget was found 2026-11-08 to be routinely too
+# small for crowd/group photos: the matching/verification/LVFace loop
+# costs roughly one embedding call per face, so a 710-face image
+# genuinely needs much more wall time than a 2-face one -- not more
+# time due to contention. Real data from one run: of 74 images that hit
+# the old flat 60s budget, the median was 112.5 faces (max 710); a
+# handful (11, including 4 single-face images) timed out well below
+# what a single image should ever need regardless of face count, which
+# is a real contention signal the per-face scaling below doesn't and
+# shouldn't try to fix -- those are expected to recover on a later run
+# under lighter load, same as any other transient timeout. Capped so
+# one pathological image can't hang a shard indefinitely.
+PER_IMAGE_TIMEOUT_BASE_SECONDS = 60
+PER_IMAGE_TIMEOUT_PER_FACE_SECONDS = 0.5
+PER_IMAGE_TIMEOUT_MAX_SECONDS = 900
+
+
+def _image_timeout_seconds(n_faces):
+    return min(
+        PER_IMAGE_TIMEOUT_MAX_SECONDS,
+        PER_IMAGE_TIMEOUT_BASE_SECONDS + round(PER_IMAGE_TIMEOUT_PER_FACE_SECONDS * n_faces),
+    )
 
 
 class _ImageTimeout(Exception):
@@ -114,7 +135,7 @@ class _ImageTimeout(Exception):
 
 
 def _raise_image_timeout(signum, frame):
-    raise _ImageTimeout(f"Image processing exceeded {PER_IMAGE_TIMEOUT_SECONDS}s")
+    raise _ImageTimeout("Image processing exceeded its timeout budget")
 
 
 def _l2norm(a):
@@ -607,9 +628,10 @@ class Command(BaseCommand):
             # run to pick up (the already_done resumability check only
             # treats an image as finished once every one of its faces has
             # kps, so a partially-processed image is correctly retried).
+            image_timeout = _image_timeout_seconds(len(unresolved_faces))
             try:
                 signal.signal(signal.SIGALRM, _raise_image_timeout)
-                signal.alarm(PER_IMAGE_TIMEOUT_SECONDS)
+                signal.alarm(image_timeout)
                 try:
                     img_numpy = common.open_img_oriented(
                     img_obj.filename, as_numpy=True,
@@ -724,7 +746,10 @@ class Command(BaseCommand):
                 finally:
                     signal.alarm(0)
             except _ImageTimeout:
-                self.stdout.write(f"  TIMEOUT on {img_obj.filename} ({len(unresolved_faces)} faces) -- skipping remainder")
+                self.stdout.write(
+                    f"  TIMEOUT on {img_obj.filename} ({len(unresolved_faces)} faces, "
+                    f"budget {image_timeout}s) -- skipping remainder"
+                )
                 stats['timed_out'] += len(unresolved_faces)
                 continue
             except Exception as e:
