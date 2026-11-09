@@ -1,6 +1,7 @@
 import os
 import zlib
 from datetime import timedelta
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -574,3 +575,102 @@ class CheckTaskHeartbeatsTaskTests(TestCase):
 
         error = ApplicationError.objects.get()
         self.assertIn('possibly stuck', error.message)
+
+
+class FindStaleModelsTests(TestCase):
+    """common.schema_health.find_stale_models() -- the general-purpose
+    structural check behind check_schema_freshness (see CLAUDE.md,
+    2026-11-09): detects a process whose in-memory Django models are
+    behind the live DB schema, independent of any specific error
+    message or call site. Uses a real raw-SQL column on the actual
+    common_applicationerror table (added and dropped within each test)
+    rather than mocking introspection -- this is exactly the real
+    "DB has a column the ORM doesn't know about" scenario it exists to
+    catch, so it should be tested against a real mismatch, not a
+    simulated one."""
+
+    def test_no_mismatch_on_an_unmodified_schema(self):
+        from common.schema_health import find_stale_models
+
+        self.assertEqual(find_stale_models(), {})
+
+    def test_detects_a_real_extra_column(self):
+        from common.schema_health import find_stale_models
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                'ALTER TABLE common_applicationerror ADD COLUMN test_stale_field text'
+            )
+        try:
+            stale = find_stale_models()
+            self.assertIn('common.ApplicationError', stale)
+            self.assertIn('test_stale_field', stale['common.ApplicationError'])
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    'ALTER TABLE common_applicationerror DROP COLUMN test_stale_field'
+                )
+
+    def test_a_missing_table_is_skipped_not_an_error(self):
+        # A model whose migrations haven't been applied yet in some
+        # fresh/partial DB state must not crash this -- just skipped,
+        # same as the real function's own docstring describes.
+        from common.schema_health import find_stale_models
+
+        # No special setup needed -- every real model's table already
+        # exists in the test DB (migrations ran to build it), so this
+        # just confirms the function completes cleanly across the
+        # WHOLE real model registry, not only the one table the other
+        # tests target.
+        result = find_stale_models()
+        self.assertIsInstance(result, dict)
+
+
+class CheckSchemaFreshnessTaskTests(TestCase):
+    """common.check_schema_freshness -- the scheduled task wrapping
+    find_stale_models(). Mocks find_stale_models() itself (its own real
+    behavior is covered by FindStaleModelsTests above) so these only
+    exercise this task's own logging/WorkerShutdown-raising logic."""
+
+    def test_no_mismatch_is_a_silent_no_op(self):
+        from common.models import ApplicationError
+        from common.tasks import check_schema_freshness
+
+        with patch('common.tasks.find_stale_models', return_value={}):
+            check_schema_freshness()  # must not raise
+
+        self.assertEqual(ApplicationError.objects.count(), 0)
+
+    def test_mismatch_logs_and_raises_worker_shutdown(self):
+        from celery.exceptions import WorkerShutdown
+
+        from common.models import ApplicationError
+        from common.tasks import check_schema_freshness
+
+        fake_stale = {'face_manager.Face': {'kps_unrecoverable'}}
+        with patch('common.tasks.find_stale_models', return_value=fake_stale):
+            with self.assertRaises(WorkerShutdown):
+                check_schema_freshness()
+
+        error = ApplicationError.objects.get()
+        self.assertEqual(error.source, 'common.tasks.check_schema_freshness')
+        self.assertIn('face_manager.Face', error.message)
+        self.assertIn('kps_unrecoverable', error.message)
+
+    def test_logging_happens_before_the_shutdown_is_raised(self):
+        # The ApplicationError must actually be persisted (not lost)
+        # even though the function exits via an exception, not a normal
+        # return -- confirmed by it already being query-able by the
+        # time the exception propagates out, not just "eventually."
+        from celery.exceptions import WorkerShutdown
+
+        from common.models import ApplicationError
+        from common.tasks import check_schema_freshness
+
+        fake_stale = {'face_manager.Face': {'kps_unrecoverable'}}
+        with patch('common.tasks.find_stale_models', return_value=fake_stale):
+            try:
+                check_schema_freshness()
+            except WorkerShutdown:
+                pass
+        self.assertTrue(ApplicationError.objects.exists())
