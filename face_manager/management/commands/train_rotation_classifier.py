@@ -315,11 +315,16 @@ class Command(BaseCommand):
             os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
             model.eval()
             dummy = torch.zeros(1, 3, INPUT_SIZE, INPUT_SIZE)
+            # dynamo=False: torch 2.13's new default (dynamo=True) exporter
+            # needs the `onnxscript` package, not installed in this image
+            # (confirmed via a real smoke-test crash, 2026-11-09) -- the
+            # legacy TorchScript-based exporter doesn't need it and is
+            # otherwise equivalent for a model this simple.
             torch.onnx.export(
                 model, dummy, onnx_path,
                 input_names=['image'], output_names=['logits'],
                 dynamic_axes={'image': {0: 'batch'}, 'logits': {0: 'batch'}},
-                opset_version=17,
+                opset_version=17, dynamo=False,
             )
             model.train()
 
