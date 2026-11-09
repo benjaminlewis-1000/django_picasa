@@ -83,6 +83,19 @@ def _candidate_images_queryset():
     with genuinely zero faces still passes (Count(filter=...) over zero
     rows is 0) and reaches evaluate_image(), which correctly reports
     'no_usable_faces' for it once, same as before.
+
+    2026-11-09 (see CLAUDE.md): "missing kps" alone used to permanently
+    exclude an image the instant Face.kps_unrecoverable became a real,
+    expected permanent state (not just "backfill hasn't reached this
+    yet") -- a face confirmed to have no findable geometry would never
+    get kps, so the image would never pass this filter again, forever.
+    Counting only faces that are BOTH missing kps AND not yet confirmed
+    unrecoverable fixes that: a kps_unrecoverable face is excluded from
+    the blocking count the same way a face that already has kps is --
+    evaluate_image() below only ever reads faces_with_kps, so a
+    kps_unrecoverable face (which, by definition, never has one) simply
+    contributes nothing to the evaluation, same as it contributing
+    nothing today.
     """
     ScanState = ImageFile.RotationScanState
     return (
@@ -91,7 +104,9 @@ def _candidate_images_queryset():
             isProcessed=True,
         )
         .exclude(rotation_scan_logic_hash=_rotation_scan_logic_hash())
-        .annotate(_faces_missing_kps=Count('face', filter=Q(face__kps__isnull=True)))
+        .annotate(_faces_missing_kps=Count(
+            'face', filter=Q(face__kps__isnull=True, face__kps_unrecoverable=False),
+        ))
         .filter(_faces_missing_kps=0)
         .order_by('id')
     )
