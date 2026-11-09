@@ -401,6 +401,102 @@ class VideoFaceSetBoxAndThumbnailOrphanTests(TestCase):
         self.assertEqual(self.face.kps, [float(v) for pair in kps_in_bounds for v in pair])
 
 
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class ClassifyAndPickThumbnailFailureTests(TestCase):
+    """_classify_and_pick_thumbnail()'s own _set_face_box_and_thumbnail()+
+    face.save() call (the confident-match thumbnail re-pick) had no
+    failure handling at all -- found 2026-11-09 while confirming the
+    2026-11-08 face_kps_within_box_margin fix was fully closed. Unlike
+    process_video()'s OWN provisional-save call (already wrapped, skips
+    just one candidate), a failure here used to propagate out of
+    process_video() entirely, aborting every other already-good
+    candidate for the same video too. real_rep's kps lands well within
+    the FRAME (so _set_face_box_and_thumbnail's frame-bounds clamp
+    doesn't touch it) but well outside the small box's own +/-25%
+    margin -- exactly the real violation shape, reproduced via the
+    actual DB CHECK constraint, not a mocked exception."""
+
+    def setUp(self):
+        from video_face_pipeline import VideoFaceExtractor
+        from filepopulator.models import Directory, VideoFile
+        self.extractor = object.__new__(VideoFaceExtractor)
+
+        directory = Directory.objects.create(dir_path='/tmp/video_classify_fail_test')
+        self.video = VideoFile.objects.create(
+            filename='/tmp/video_classify_fail_test/a.mp4', directory=directory,
+            width=320, height=240, duration_seconds=10.0,
+        )
+        self.blank_person, _ = Person.objects.get_or_create(person_name=settings.BLANK_FACE_NAME)
+        self.matched_person = make_person('Someone Real')
+        self.face = Face(
+            source_video_file=self.video, declared_name=self.blank_person,
+            box_left=1, box_top=1, box_right=50, box_bottom=50,
+        )
+        self.frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        self.extractor._set_face_box_and_thumbnail(
+            self.face, self.frame, (10, 10, 60, 60), kps=[[30, 30]] * 5,
+        )
+        self.face.save()
+        self.original_thumbnail_name = self.face.face_thumbnail.name
+
+        # A minimal stand-in face_assigner: classify_unassigned() just
+        # declares a confident match (a real DB write, so refresh_from_db()
+        # picks it up exactly as the real one would), and the embedding
+        # arrays are sized/valued so every pooled rep scores identically
+        # (the specific similarity value doesn't matter here -- only that
+        # best_rep ends up chosen).
+        fa = MagicMock()
+        fa.gallery_offsets = {self.matched_person.id: (0, 1)}
+        fa.all_embeddings = np.ones((512, 1), dtype=np.float32)
+        fa.all_norms = np.array([1.0], dtype=np.float32)
+
+        def _fake_classify(face):
+            Face.objects.filter(pk=face.pk).update(poss_ident1=self.matched_person)
+        fa.classify_unassigned.side_effect = _fake_classify
+        self.extractor._face_assigner = fa  # face_assigner itself is a read-only lazy-build property
+
+    def test_a_failed_repick_is_logged_and_does_not_raise(self):
+        from common.models import ApplicationError
+        # Small box (10,10,60,60); kps far outside its +/-25% margin but
+        # still well within the 320x240 frame -- the frame-bounds clamp
+        # in _set_face_box_and_thumbnail does nothing here, so the DB's
+        # own face_kps_within_box_margin CHECK constraint is what
+        # actually rejects this, same as the real production incident.
+        bad_kps = [[300, 230]] * 5
+        pooled_reps = [{'emb_if': np.ones(512, dtype=np.float32), 'frame_idx': 0,
+                        'box': (10, 10, 60, 60), 'kps': bad_kps, 'det_score': 0.9}]
+
+        self.extractor._classify_and_pick_thumbnail(self.face, pooled_reps, [self.frame], fps=30.0)
+
+        self.assertTrue(
+            ApplicationError.objects.filter(
+                source='video_face_pipeline._classify_and_pick_thumbnail',
+                message__contains=str(self.face.id),
+            ).exists()
+        )
+        # The concise-formatting fix (2026-11-09): the logged message
+        # names the actual constraint, without Postgres's own multi-line
+        # DETAIL row dump (which would include this face's full 512-float
+        # embedding).
+        err = ApplicationError.objects.get(source='video_face_pipeline._classify_and_pick_thumbnail')
+        self.assertIn('face_kps_within_box_margin', err.message)
+        self.assertNotIn('DETAIL', err.message)
+
+    def test_other_candidates_are_unaffected_by_one_failed_repick(self):
+        # The real severity this fixes: process_video()'s for-loop must
+        # keep going to its OTHER candidates even when this one's re-pick
+        # fails -- simulated here by confirming the call simply returns
+        # (doesn't raise), which is what lets process_video()'s loop
+        # continue to its next iteration.
+        bad_kps = [[300, 230]] * 5
+        pooled_reps = [{'emb_if': np.ones(512, dtype=np.float32), 'frame_idx': 0,
+                        'box': (10, 10, 60, 60), 'kps': bad_kps, 'det_score': 0.9}]
+        try:
+            self.extractor._classify_and_pick_thumbnail(self.face, pooled_reps, [self.frame], fps=30.0)
+        except Exception as e:
+            self.fail(f"_classify_and_pick_thumbnail() must not raise, raised {e!r}")
+
+
 class LocateConfidentFaceNearTimestampTests(unittest.TestCase):
     """locate_confident_face_near_timestamp() -- the remediation search
     used by remediate_video_face_geometry.py to find a real fix for a

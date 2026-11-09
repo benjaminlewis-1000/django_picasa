@@ -24,6 +24,7 @@ the real-fixture (slow-tagged) integration test.
 from common.error_log import log_error
 from django.conf import settings
 from django.core.files.base import ContentFile
+from django.db import transaction
 from face_manager.models import Person, Face
 from filepopulator.models import VideoFile
 from io import BytesIO
@@ -115,6 +116,26 @@ FACENET_INPUT_SIZE = 160
 # compiled tape with near-continuous faces, which just falls back to the
 # pre-existing second-decode path instead of risking unbounded memory use.
 MAX_CACHED_FRAME_BYTES = 1_500_000_000
+
+
+def concise_db_error(e):
+    """A plain Django/psycopg2 IntegrityError's own str() includes
+    Postgres's full DETAIL text -- the entire failing row, embeddings
+    and all (confirmed real, 2026-11-09: a single face_kps_within_box_
+    margin violation logged a ~2KB row dump including a 512-float
+    embedding, truncated only by log_error()'s own blanket 4000-char
+    cap, which still left it dominated by unreadable floats rather
+    than the one fact that actually matters -- which constraint
+    failed). This keeps just the constraint-violation summary line
+    (everything before Postgres's own "DETAIL:" marker, if present),
+    falling back to the plain exception type+message for anything
+    else. Used at both IntegrityError-handling call sites in this
+    module so a log_error()/stdout message stays genuinely readable
+    instead of needing to scroll past a row dump to find the
+    constraint name."""
+    text = str(e)
+    summary = text.split('\nDETAIL:')[0].strip()
+    return f"{type(e).__name__}: {summary}"
 
 
 def cos_to_euclidean(cos_thresh):
@@ -1340,11 +1361,49 @@ class VideoFaceExtractor(object):
             return
 
         frame = frame_pixels[best_rep['frame_idx']]
-        self._set_face_box_and_thumbnail(
-            face, frame, best_rep['box'], best_rep['kps'], best_rep['frame_idx'] / fps,
-            det_score=best_rep['det_score'],
-        )
-        face.save()
+        try:
+            self._set_face_box_and_thumbnail(
+                face, frame, best_rep['box'], best_rep['kps'], best_rep['frame_idx'] / fps,
+                det_score=best_rep['det_score'],
+            )
+            # A real CHECK-constraint-violating save() must not poison
+            # any OUTER transaction this ever runs inside (none exists
+            # today -- see tasks.py -- but a savepoint here costs
+            # nothing and makes this robust regardless of future
+            # callers, rather than depending on always being the
+            # outermost/only transaction).
+            with transaction.atomic():
+                face.save()
+        except Exception as e:
+            # Real gap found 2026-11-09, investigating whether the
+            # already-fixed (2026-11-08) face_kps_within_box_margin bug
+            # was fully closed: process_video()'s OWN _set_face_box_and_
+            # thumbnail()+save() call (the provisional/first save) was
+            # already wrapped to skip just one bad candidate -- but this
+            # SECOND call site (the confident-match thumbnail re-pick)
+            # had no such guard, so a failure here still propagated all
+            # the way out of process_video() and aborted the WHOLE
+            # video's remaining candidates, same severity as the
+            # original bug just via a different code path. The failed
+            # UPDATE itself leaves the DB row's box/kps/thumbnail field
+            # at their already-valid provisional values (an UPDATE that
+            # violates a CHECK constraint is rejected atomically, never
+            # partially applied) -- the only real residual risk is the
+            # provisional thumbnail FILE having already been deleted by
+            # _set_face_box_and_thumbnail() before this exception fired
+            # (a real, pre-existing property of that function, not
+            # something fixed here), which would otherwise orphan the
+            # DB's still-correct filename reference. Left alone rather
+            # than solved here a second time: remediate_video_face_
+            # geometry.py (this same session) already detects and
+            # recovers exactly that "thumbnail file missing" case on a
+            # later run, via its own real-fix path.
+            log_error(
+                'video_face_pipeline._classify_and_pick_thumbnail',
+                f'face {face.id} (video {face.source_video_file_id}) thumbnail '
+                f're-pick failed, keeping the provisional thumbnail instead: '
+                f'{concise_db_error(e)}',
+            )
 
     @staticmethod
     def _clamp_to_duration(video_obj, seconds, label):
@@ -1605,7 +1664,12 @@ class VideoFaceExtractor(object):
                     face, provisional_frame, provisional['box'], provisional['kps'],
                     provisional['frame_idx'] / fps, det_score=provisional['det_score'],
                 )
-                face.save()
+                # Savepoint (see the sibling call in _classify_and_pick_
+                # thumbnail() for why) -- contains a failed save to just
+                # this one statement rather than depending on always
+                # being the outermost transaction.
+                with transaction.atomic():
+                    face.save()
             except Exception as e:
                 # One bad candidate (e.g. a box/kps combination the
                 # kps-clamp above didn't anticipate) must not discard
@@ -1616,7 +1680,7 @@ class VideoFaceExtractor(object):
                     'video_face_pipeline.process_video',
                     f'video {video_obj.id} ({video_obj.filename}) candidate '
                     f'(first={cand["first_sample"]}, last={cand["last_sample"]}) '
-                    f'failed to save, skipping just this candidate: {e}',
+                    f'failed to save, skipping just this candidate: {concise_db_error(e)}',
                 )
                 continue
 
