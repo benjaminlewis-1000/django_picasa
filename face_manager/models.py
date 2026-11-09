@@ -351,7 +351,21 @@ class Face(models.Model):
     # backfill_verified_kps.py's own LVFace-sentinel bookkeeping, which
     # is contingent on which --lvface-sizes flag a given run happened to
     # use and was never meant as a universal "no face" declaration.
-    kps_unrecoverable = models.BooleanField(default=False)
+    #
+    # db_default (not just default) -- real, confirmed incident 2026-11-09:
+    # a long-running celery worker process already in memory when this
+    # migration landed kept INSERTing Face rows with this column omitted
+    # entirely (default= is Python-side only, applied by the ORM when
+    # constructing a new instance, never a real Postgres DEFAULT), which
+    # violated the NOT NULL constraint on every single face match until
+    # the worker was restarted. Exactly the same root cause -- and the
+    # same fix -- CLAUDE.md already documents for face_extraction_
+    # timeout_count (filepopulator.0014). General lesson restated here
+    # since it bit this project twice: any new NOT-NULL field with a
+    # default, on a model written to by a long-running process, needs
+    # db_default to close the schema-skew window structurally rather
+    # than depending on migration-then-restart timing being tight.
+    kps_unrecoverable = models.BooleanField(default=False, db_default=False)
 
     # The detector's own confidence for this detection (insightface's
     # det_score, 0-1) -- NOT previously stored anywhere despite being
