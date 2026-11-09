@@ -415,19 +415,24 @@ class BackfillDetScoreRecheckMismatchedTransactionTests(TransactionTestCase):
             yield
         finally:
             with connection.cursor() as cursor:
+                # Kept in sync with Face.Meta.constraints' real definition
+                # (face_manager/models.py) -- 2026-11-09's edge-of-frame
+                # relaxation (box_left=0/box_top=0 skip the lower bound)
+                # included here too, so this test helper's "restored"
+                # constraint never silently diverges from the real one.
                 cursor.execute("""
                     ALTER TABLE face_manager_face ADD CONSTRAINT face_kps_within_box_margin CHECK (
                         kps IS NULL OR (
-                            kps[1] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
-                            AND kps[2] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
-                            AND kps[3] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
-                            AND kps[4] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
-                            AND kps[5] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
-                            AND kps[6] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
-                            AND kps[7] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
-                            AND kps[8] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
-                            AND kps[9] BETWEEN box_left - (box_right - box_left) * 0.25 AND box_right + (box_right - box_left) * 0.25
-                            AND kps[10] BETWEEN box_top - (box_bottom - box_top) * 0.25 AND box_bottom + (box_bottom - box_top) * 0.25
+                            (box_left = 0 OR kps[1] >= box_left - (box_right - box_left) * 0.25) AND kps[1] <= box_right + (box_right - box_left) * 0.25
+                            AND (box_top = 0 OR kps[2] >= box_top - (box_bottom - box_top) * 0.25) AND kps[2] <= box_bottom + (box_bottom - box_top) * 0.25
+                            AND (box_left = 0 OR kps[3] >= box_left - (box_right - box_left) * 0.25) AND kps[3] <= box_right + (box_right - box_left) * 0.25
+                            AND (box_top = 0 OR kps[4] >= box_top - (box_bottom - box_top) * 0.25) AND kps[4] <= box_bottom + (box_bottom - box_top) * 0.25
+                            AND (box_left = 0 OR kps[5] >= box_left - (box_right - box_left) * 0.25) AND kps[5] <= box_right + (box_right - box_left) * 0.25
+                            AND (box_top = 0 OR kps[6] >= box_top - (box_bottom - box_top) * 0.25) AND kps[6] <= box_bottom + (box_bottom - box_top) * 0.25
+                            AND (box_left = 0 OR kps[7] >= box_left - (box_right - box_left) * 0.25) AND kps[7] <= box_right + (box_right - box_left) * 0.25
+                            AND (box_top = 0 OR kps[8] >= box_top - (box_bottom - box_top) * 0.25) AND kps[8] <= box_bottom + (box_bottom - box_top) * 0.25
+                            AND (box_left = 0 OR kps[9] >= box_left - (box_right - box_left) * 0.25) AND kps[9] <= box_right + (box_right - box_left) * 0.25
+                            AND (box_top = 0 OR kps[10] >= box_top - (box_bottom - box_top) * 0.25) AND kps[10] <= box_bottom + (box_bottom - box_top) * 0.25
                         )
                     ) NOT VALID
                 """)

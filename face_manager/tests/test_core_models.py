@@ -80,6 +80,65 @@ class FaceKpsWithinBoxConstraintTests(TestCase):
         self.assertIsNone(face.kps)
         self.assertIsNotNone(face.id)
 
+    def test_negative_x_accepted_when_box_left_is_zero(self):
+        # 2026-11-09 (see CLAUDE.md): a face detected partially off the
+        # LEFT edge of the photo has a box that must be clamped to
+        # box_left=0 (Face.save() itself rejects a negative value), but
+        # its kps can legitimately still be negative -- the lower x-
+        # bound is skipped entirely when box_left=0, specifically to
+        # accommodate this, without ever touching the kps value itself.
+        face = make_face(
+            self.image, box_left=0, box_top=100, box_right=50, box_bottom=150,
+            kps=[-300, 110, 40, 110, 25, 125, 15, 140, 35, 140],
+        )
+        self.assertIsNotNone(face.id)
+
+    def test_negative_y_accepted_when_box_top_is_zero(self):
+        face = make_face(
+            self.image, box_left=100, box_top=0, box_right=150, box_bottom=50,
+            kps=[110, -300, 140, 10, 125, 25, 115, 40, 135, 40],
+        )
+        self.assertIsNotNone(face.id)
+
+    def test_negative_x_still_rejected_when_box_left_is_not_zero(self):
+        # The relaxation is specific to box_left=0 -- an ordinary face
+        # NOT pinned to the image edge must still be held to the real
+        # margin check on this side, same as before.
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                make_face(
+                    self.image, box_left=100, box_top=100, box_right=150, box_bottom=150,
+                    kps=[-300, 110, 140, 110, 125, 125, 115, 140, 135, 140],
+                )
+
+    def test_negative_y_still_rejected_when_box_top_is_not_zero(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                make_face(
+                    self.image, box_left=100, box_top=100, box_right=150, box_bottom=150,
+                    kps=[110, -300, 140, 110, 125, 125, 115, 140, 135, 140],
+                )
+
+    def test_upper_bound_still_enforced_even_when_box_left_is_zero(self):
+        # The relaxation only ever drops the LOWER bound -- a wildly
+        # too-large x value (the real anti-corruption case this
+        # constraint exists for) must still be rejected regardless of
+        # where the box sits.
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                make_face(
+                    self.image, box_left=0, box_top=100, box_right=50, box_bottom=150,
+                    kps=[900, 110, 40, 110, 25, 125, 15, 140, 35, 140],
+                )
+
+    def test_upper_bound_still_enforced_even_when_box_top_is_zero(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                make_face(
+                    self.image, box_left=100, box_top=0, box_right=150, box_bottom=50,
+                    kps=[110, 900, 140, 10, 125, 25, 115, 40, 135, 40],
+                )
+
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class PersonModelTests(TestCase):

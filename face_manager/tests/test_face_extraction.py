@@ -438,6 +438,115 @@ class AddNewFacePhotoCollectionGateTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class AddNewFaceEdgeOfFrameBoxTests(TestCase):
+    """add_new_face()'s box-clamping behavior for a face detected
+    partially off-frame (2026-11-09, see CLAUDE.md) -- a real production
+    bug where clamping box_right/box_bottom down to the image's own
+    width/height (while leaving kps, from the same raw detection,
+    untouched) made the DB's face_kps_within_box_margin constraint
+    reject the INSERT every single time, permanently stuck. box_left/
+    box_top must still clamp to >=0 (Face.save() itself rejects a
+    negative value); box_right/box_bottom no longer clamp to img_w/img_h
+    at all -- see FaceKpsWithinBoxConstraintTests for the DB-constraint
+    side of this fix."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.extractor = FaceExtractor()
+
+    def setUp(self):
+        self.directory, _ = Directory.objects.get_or_create(dir_path='/photos/edge_box_test')
+        # bulk_create, not .create() -- ImageFile.save() decodes the real
+        # file from disk, which this fixture doesn't need/have (same
+        # pattern AddNewFacePhotoCollectionGateTests._make_image_in_
+        # collection already uses).
+        image = ImageFile(
+            filename='/photos/edge_box_test/a.jpg', directory=self.directory, thumbnail_small="",
+            width=640, height=480, pixel_hash='hash', file_hash='fhash', dateTakenUTC=0,
+        )
+        ImageFile.objects.bulk_create([image])
+        self.image = ImageFile.objects.get(filename='/photos/edge_box_test/a.jpg')
+        self.img_numpy = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    def _detection(self, bbox, kps):
+        import insightface.app.common
+        return insightface.app.common.Face(
+            bbox=np.array(bbox, dtype=np.float32),
+            kps=np.array(kps, dtype=np.float32),
+            det_score=0.8, embedding=np.ones(512, dtype=np.float32), age=30, gender=0,
+        )
+
+    def test_box_extending_past_left_edge_is_clamped_to_zero_not_negative(self):
+        # Raw detection box starts at x=-80 (a person cut off by the
+        # photo's own left edge) -- box_left must come out >=0 (Face.
+        # save()'s own hard floor), even though the real detected
+        # position was negative.
+        det = self._detection(
+            bbox=[-80, 50, 100, 200],
+            kps=[[-30, 90], [60, 90], [10, 130], [-20, 170], [40, 170]],
+        )
+        self.extractor.add_new_face(det, self.image, self.img_numpy)
+        face = Face.objects.get(source_image_file=self.image)
+        self.assertEqual(face.box_left, 0)
+        self.assertEqual(face.box_right, 100)
+
+    def test_kps_is_stored_unmodified_even_though_the_box_was_clamped(self):
+        # The real point of this fix: kps must reflect the TRUE raw
+        # detection, not be adjusted to fit the (necessarily clamped)
+        # stored box -- moving it would corrupt LVFace's own alignment
+        # and any future kps-replay re-encode.
+        det = self._detection(
+            bbox=[-80, 50, 100, 200],
+            kps=[[-30, 90], [60, 90], [10, 130], [-20, 170], [40, 170]],
+        )
+        self.extractor.add_new_face(det, self.image, self.img_numpy)
+        face = Face.objects.get(source_image_file=self.image)
+        self.assertEqual(face.kps, [-30.0, 90.0, 60.0, 90.0, 10.0, 130.0, -20.0, 170.0, 40.0, 170.0])
+
+    def test_box_extending_past_right_edge_is_stored_unclamped(self):
+        # Raw detection box extends to x=720 on a 640px-wide image --
+        # box_right is no longer clamped down to 640 at all (unlike
+        # box_left/box_top, nothing requires box_right to stay within
+        # the image: Face.save() only rejects NEGATIVE values, and
+        # get_square_face_img() -- the real thumbnail cropping path --
+        # independently re-clamps straight from the raw detection bbox,
+        # never reading this stored column).
+        det = self._detection(
+            bbox=[400, 50, 720, 200],
+            kps=[[450, 90], [670, 90], [560, 130], [440, 170], [660, 170]],
+        )
+        self.extractor.add_new_face(det, self.image, self.img_numpy)
+        face = Face.objects.get(source_image_file=self.image)
+        self.assertEqual(face.box_right, 720)
+        self.assertEqual(face.kps, [450.0, 90.0, 670.0, 90.0, 560.0, 130.0, 440.0, 170.0, 660.0, 170.0])
+
+    def test_box_extending_past_bottom_edge_is_stored_unclamped(self):
+        det = self._detection(
+            bbox=[100, 300, 250, 550],
+            kps=[[150, 340], [220, 340], [175, 400], [140, 480], [210, 480]],
+        )
+        self.extractor.add_new_face(det, self.image, self.img_numpy)
+        face = Face.objects.get(source_image_file=self.image)
+        self.assertEqual(face.box_bottom, 550)
+
+    def test_a_realistic_off_frame_detection_saves_successfully(self):
+        # End-to-end regression for the real reported bug: a detection
+        # whose box needed left-clamping, with a kps point that was
+        # valid relative to the TRUE (unclamped) box but would have
+        # failed the old margin check against the artificially-shrunk
+        # one -- must now save without raising.
+        det = self._detection(
+            bbox=[-152, 446, 297, 1062],
+            kps=[[-36.19, 643.27], [154.48, 707.84], [2.12, 787.39], [-81.45, 874.91], [60.41, 929.19]],
+        )
+        self.extractor.add_new_face(det, self.image, self.img_numpy)
+        face = Face.objects.get(source_image_file=self.image)
+        self.assertEqual(face.box_left, 0)
+        self.assertIsNotNone(face.id)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class BackfillRelativeSizeTests(TestCase):
     """backfill_relative_size: pure-arithmetic backfill, no decode/model
     inference needed, so plain ImageFile/Face rows built directly
