@@ -108,18 +108,18 @@ def _load_or_create_split(split_path, num_train, num_val, seed):
     return train_ids, val_ids
 
 
-def _decode_upright(img_obj):
+def _decode_upright(filename, extra_rotation_degrees):
     """Real, already-EXIF-(and-any-confirmed-rotation-)corrected pixel
-    content for one ImageFile -- the ground-truth 'upright' example
-    this whole training scheme is built on. Returns None on a real
-    decode failure (a handful of genuinely corrupted/missing files are
-    expected at this library's scale -- skipped, not fatal, same
-    tolerance this project's other bulk-scan commands already have)."""
+    content for one image file -- the ground-truth 'upright' example
+    this whole training scheme is built on. Takes plain values (not an
+    ImageFile instance -- see _RotationDataset's own docstring for why)
+    so this never touches the ORM/a live DB connection. Returns None on
+    a real decode failure (a handful of genuinely corrupted/missing
+    files are expected at this library's scale -- skipped, not fatal,
+    same tolerance this project's other bulk-scan commands already
+    have)."""
     try:
-        arr = open_img_oriented(
-            img_obj.filename, as_numpy=True,
-            extra_rotation_degrees=img_obj.confirmed_rotation_override_degrees,
-        )
+        arr = open_img_oriented(filename, as_numpy=True, extra_rotation_degrees=extra_rotation_degrees)
     except (FileNotFoundError, OSError):
         return None
     return arr
@@ -148,12 +148,35 @@ class _RotationDataset:
     torch DataLoader either, and a plain iterable keeps this testable
     without a torch import at collection time. __getitem__ still works
     (sequence protocol), so torch.utils.data.DataLoader(this) works
-    unmodified regardless."""
+    unmodified regardless.
+
+    Deliberately resolves every image's (filename, confirmed-rotation-
+    override) up front in __init__ -- a single bulk query, run once in
+    the MAIN process -- rather than querying the ORM from __getitem__.
+    A DataLoader with num_workers > 0 forks worker PROCESSES that
+    inherit whatever DB connection object already existed at fork time;
+    letting multiple forked workers independently run ORM queries over
+    that same inherited connection is exactly the class of bug already
+    documented elsewhere in this codebase (CLAUDE.md's "--parallel test
+    worker" investigation) -- concurrent use of one psycopg2 connection
+    across processes is unsafe, not just slow. Resolving everything to
+    plain Python values up front means __getitem__ never touches the
+    ORM/a DB connection at all, so this is safe regardless of worker
+    count."""
 
     def __init__(self, image_ids, train, seed=0):
-        self.image_ids = image_ids
         self.train = train
         self._rng = __import__('random').Random(seed)
+        rows = ImageFile.objects.filter(id__in=image_ids).values_list(
+            'id', 'filename', 'rotation_scan_state', 'proposed_rotation_degrees',
+        )
+        self._file_info = {}
+        for image_id, filename, scan_state, proposed_degrees in rows:
+            extra = proposed_degrees if (
+                scan_state == ImageFile.RotationScanState.CONFIRMED and proposed_degrees is not None
+            ) else None
+            self._file_info[image_id] = (filename, extra)
+        self.image_ids = [iid for iid in image_ids if iid in self._file_info]
         # Train: one random rotation per visit (law-of-large-numbers
         # balanced across many steps/epochs, standard for this kind of
         # synthetic-rotation self-supervision -- no need to pre-
@@ -161,7 +184,7 @@ class _RotationDataset:
         # to all 4 rotations, for a complete, deterministic, reproducible
         # metric -- built once here rather than on the fly.
         if not train:
-            self._val_pairs = [(iid, k) for iid in image_ids for k in range(NUM_CLASSES)]
+            self._val_pairs = [(iid, k) for iid in self.image_ids for k in range(NUM_CLASSES)]
 
     def __len__(self):
         return len(self.image_ids) if self.train else len(self._val_pairs)
@@ -175,8 +198,8 @@ class _RotationDataset:
         else:
             image_id, k = self._val_pairs[idx]
 
-        img_obj = ImageFile.objects.get(id=image_id)
-        arr = _decode_upright(img_obj)
+        filename, extra_rotation_degrees = self._file_info[image_id]
+        arr = _decode_upright(filename, extra_rotation_degrees)
         if arr is None:
             # Skip a real decode failure by substituting a different
             # valid sample rather than crashing the whole DataLoader
