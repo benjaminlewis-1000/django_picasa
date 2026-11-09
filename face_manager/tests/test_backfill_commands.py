@@ -1010,7 +1010,8 @@ class BackfillVerifiedKpsTests(TestCase):
             time_module.sleep(2)
             return np.full(512, 0.4, dtype=np.float32)
 
-        with patch('face_manager.management.commands.backfill_verified_kps.PER_IMAGE_TIMEOUT_SECONDS', 1), \
+        with patch('face_manager.management.commands.backfill_verified_kps.PER_IMAGE_TIMEOUT_BASE_SECONDS', 1), \
+             patch('face_manager.management.commands.backfill_verified_kps.PER_IMAGE_TIMEOUT_PER_FACE_SECONDS', 0), \
              patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
                    return_value=np.zeros((1000, 1000, 3))), \
              patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
@@ -1026,6 +1027,23 @@ class BackfillVerifiedKpsTests(TestCase):
         # writes are lost to the timeout, matching the documented
         # "partial progress on an image is retried later" behavior.
         self.assertIsNotNone(face.kps)
+
+    def test_image_timeout_scales_with_face_count(self):
+        # Real data (2026-11-08): a flat 60s budget routinely timed out
+        # crowd photos (median 112.5 faces among 74 timed-out images,
+        # max 710) well before the matching/LVFace loop could finish --
+        # the budget must grow with how many faces are actually on the
+        # image, not stay flat.
+        from face_manager.management.commands.backfill_verified_kps import _image_timeout_seconds
+        self.assertEqual(_image_timeout_seconds(0), 60)
+        self.assertEqual(_image_timeout_seconds(2), 61)  # 60 + round(0.5*2)
+        self.assertGreater(_image_timeout_seconds(710), _image_timeout_seconds(2))
+
+    def test_image_timeout_is_capped_for_pathological_face_counts(self):
+        from face_manager.management.commands.backfill_verified_kps import (
+            PER_IMAGE_TIMEOUT_MAX_SECONDS, _image_timeout_seconds,
+        )
+        self.assertEqual(_image_timeout_seconds(100000), PER_IMAGE_TIMEOUT_MAX_SECONDS)
 
     def test_no_detections_leaves_face_untouched_and_counted(self):
         face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
