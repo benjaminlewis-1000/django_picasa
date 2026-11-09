@@ -741,10 +741,50 @@ class FaceExtractor(object):
 
         img_h, img_w, _ = img_numpy.shape
 
+        # Real, confirmed production bug (2026-11-09, see CLAUDE.md): a
+        # face detected partially off-frame (a person cut off by the
+        # photo's own edge) gets a raw bbox extending past the image
+        # bounds -- clamping box_right/box_bottom down to img_w/img_h
+        # here used to shrink the box WITHOUT touching kps (set above,
+        # from the same raw detection), so a kps point that was
+        # perfectly valid relative to the true detected box could fall
+        # outside face_kps_within_box_margin's 25% window once computed
+        # against the now-smaller stored box -- the INSERT then fails
+        # every single time (deterministic), and the image is retried
+        # forever every scheduled run with zero chance of success.
+        #
+        # Deliberately NOT fixed by adjusting kps instead -- kps feeds
+        # LVFace's own alignment (lvface.embed_from_image_array(...,
+        # new_face.kps, ...) a few lines below) and any future kps-
+        # replay re-encode (reencode_missing_faces()'s exact-replay
+        # path); moving it to satisfy a constraint would produce a
+        # face whose stored landmark points no longer match where the
+        # face actually was, degrading or corrupting those downstream
+        # uses for a box-storage convenience.
+        #
+        # box_right/box_bottom: simply stop clamping -- confirmed safe,
+        # not just convenient: get_square_face_img() (actual thumbnail
+        # cropping, below) independently re-clamps straight from the
+        # raw detection bbox, never reading these stored columns, and
+        # no live code elsewhere slices an array using them directly.
+        # Storing the true (occasionally over-width/over-height) value
+        # keeps box and kps mutually consistent, exactly as the
+        # detector produced them together, with zero constraint changes
+        # needed on this side.
+        #
+        # box_left/box_top: MUST stay clamped to >=0 -- Face.save()
+        # itself unconditionally rejects a negative value here
+        # (ValidationError, not bypassable), unlike the right/bottom
+        # sides which have no such floor. A kps point can still
+        # legitimately be negative on this side (the true detected
+        # position really was off-frame) even though the stored box
+        # can't be -- see this migration's own comment on the relaxed
+        # face_kps_within_box_margin constraint for how that specific,
+        # narrower mismatch is handled instead.
         bb_l = np.max((0, int(bb_l)))
         bb_t = np.max((0, int(bb_t)))
-        bb_r = np.min((int(bb_r), img_w))
-        bb_b = np.min((int(bb_b), img_h))
+        bb_r = int(bb_r)
+        bb_b = int(bb_b)
 
         new_face.box_top = bb_t
         new_face.box_bottom = bb_b

@@ -507,31 +507,51 @@ class Face(models.Model):
             # stays a true backstop against gross corruption rather than
             # a routine blocker on normal detections. NULL kps (not yet
             # backfilled) always passes trivially.
+            #
+            # 2026-11-09 (see CLAUDE.md): the lower x-bound is skipped
+            # entirely whenever box_left=0, and the lower y-bound
+            # whenever box_top=0 -- a face detected partially off-frame
+            # (cut off by the photo's own left/top edge) legitimately
+            # has a kps point before 0, but Face.save() itself
+            # unconditionally rejects a negative box_left/box_top, so
+            # the box on that side MUST be clamped to 0 while kps
+            # (deliberately left untouched -- see add_new_face()'s own
+            # comment on why moving it instead would corrupt LVFace
+            # alignment/future kps-replay re-encodes) legitimately isn't.
+            # The right/bottom side needs no equivalent relaxation: box_
+            # right/box_bottom are no longer clamped down to the image's
+            # own width/height at write time (add_new_face(), same
+            # commit), so box and kps stay mutually consistent there
+            # without any constraint change. The UPPER bound -- the
+            # constraint's real anti-corruption backstop -- is never
+            # relaxed on any side, by any condition: only the specific,
+            # narrow, well-understood "box pinned to 0" case loses its
+            # lower-bound check, not gross corruption in general.
             models.CheckConstraint(
                 condition=(
                     models.Q(kps__isnull=True) |
                     models.Q(RawSQL(
                         """
-                        kps[1] BETWEEN box_left - (box_right - box_left) * 0.25
-                                   AND box_right + (box_right - box_left) * 0.25
-                        AND kps[2] BETWEEN box_top - (box_bottom - box_top) * 0.25
-                                       AND box_bottom + (box_bottom - box_top) * 0.25
-                        AND kps[3] BETWEEN box_left - (box_right - box_left) * 0.25
-                                       AND box_right + (box_right - box_left) * 0.25
-                        AND kps[4] BETWEEN box_top - (box_bottom - box_top) * 0.25
-                                       AND box_bottom + (box_bottom - box_top) * 0.25
-                        AND kps[5] BETWEEN box_left - (box_right - box_left) * 0.25
-                                       AND box_right + (box_right - box_left) * 0.25
-                        AND kps[6] BETWEEN box_top - (box_bottom - box_top) * 0.25
-                                       AND box_bottom + (box_bottom - box_top) * 0.25
-                        AND kps[7] BETWEEN box_left - (box_right - box_left) * 0.25
-                                       AND box_right + (box_right - box_left) * 0.25
-                        AND kps[8] BETWEEN box_top - (box_bottom - box_top) * 0.25
-                                       AND box_bottom + (box_bottom - box_top) * 0.25
-                        AND kps[9] BETWEEN box_left - (box_right - box_left) * 0.25
-                                       AND box_right + (box_right - box_left) * 0.25
-                        AND kps[10] BETWEEN box_top - (box_bottom - box_top) * 0.25
-                                        AND box_bottom + (box_bottom - box_top) * 0.25
+                        (box_left = 0 OR kps[1] >= box_left - (box_right - box_left) * 0.25)
+                        AND kps[1] <= box_right + (box_right - box_left) * 0.25
+                        AND (box_top = 0 OR kps[2] >= box_top - (box_bottom - box_top) * 0.25)
+                        AND kps[2] <= box_bottom + (box_bottom - box_top) * 0.25
+                        AND (box_left = 0 OR kps[3] >= box_left - (box_right - box_left) * 0.25)
+                        AND kps[3] <= box_right + (box_right - box_left) * 0.25
+                        AND (box_top = 0 OR kps[4] >= box_top - (box_bottom - box_top) * 0.25)
+                        AND kps[4] <= box_bottom + (box_bottom - box_top) * 0.25
+                        AND (box_left = 0 OR kps[5] >= box_left - (box_right - box_left) * 0.25)
+                        AND kps[5] <= box_right + (box_right - box_left) * 0.25
+                        AND (box_top = 0 OR kps[6] >= box_top - (box_bottom - box_top) * 0.25)
+                        AND kps[6] <= box_bottom + (box_bottom - box_top) * 0.25
+                        AND (box_left = 0 OR kps[7] >= box_left - (box_right - box_left) * 0.25)
+                        AND kps[7] <= box_right + (box_right - box_left) * 0.25
+                        AND (box_top = 0 OR kps[8] >= box_top - (box_bottom - box_top) * 0.25)
+                        AND kps[8] <= box_bottom + (box_bottom - box_top) * 0.25
+                        AND (box_left = 0 OR kps[9] >= box_left - (box_right - box_left) * 0.25)
+                        AND kps[9] <= box_right + (box_right - box_left) * 0.25
+                        AND (box_top = 0 OR kps[10] >= box_top - (box_bottom - box_top) * 0.25)
+                        AND kps[10] <= box_bottom + (box_bottom - box_top) * 0.25
                         """,
                         (),
                         output_field=models.BooleanField(),
