@@ -715,6 +715,17 @@ CELERY_BEAT_SCHEDULE = {
         # registered task's own ~weekly cadence; same off-peak window.
         'schedule': crontab(minute='25', hour='1'),
     },
+   'check_schema_freshness': {
+        'task': 'common.check_schema_freshness',
+        # Every 5 minutes, deliberately much more frequent than this
+        # file's other schedules -- a real incident (2026-11-09, see
+        # CLAUDE.md) ran silently for roughly an hour before a human
+        # noticed a stale worker process erroring on every single face
+        # write; this closes that window down to single-digit minutes
+        # instead. Cheap (one introspection query per table), safe at
+        # this cadence.
+        'schedule': crontab(hour='*', minute='*/5'),
+    },
    'cleanup_orphaned_media': {
         'task': 'filepopulator.cleanup_orphaned_media',
         # Weekly, not daily -- this walks every file across 5 real media

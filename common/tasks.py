@@ -1,12 +1,14 @@
 from datetime import timedelta
 
 from celery import shared_task
+from celery.exceptions import WorkerShutdown
 from django.conf import settings
 from django.utils import timezone
 
 from common.advisory_lock import advisory_lock
 from common.error_log import log_error
 from common.models import TaskHeartbeat
+from common.schema_health import find_stale_models
 
 # Registry of recurring tasks worth watching for silence (see
 # TaskHeartbeat's own docstring for why this is a different failure mode
@@ -68,3 +70,41 @@ def check_task_heartbeats():
 
             settings.LOGGER.error(f"check_task_heartbeats: {message}")
             log_error('common.tasks.check_task_heartbeats', message, related_heartbeat_task_name=task_name)
+
+
+@shared_task(ignore_result=True, name='common.check_schema_freshness')
+def check_schema_freshness():
+    """Catches a real, confirmed failure mode (2026-11-09, see
+    CLAUDE.md): a long-running celery worker process keeps its Django
+    models loaded in memory from whenever it started -- if a migration
+    adds a new NOT-NULL column while it's still running, every write to
+    that table silently fails (caught by whichever per-row try/except
+    happens to wrap it, logged, and moved past) until a human notices
+    and manually restarts the worker, which could take hours. This runs
+    independently of any specific error message or call site -- see
+    common/schema_health.py's own docstring for why a periodic
+    structural self-check was chosen over chasing every existing (and
+    future) swallowed-exception site individually.
+
+    Raises WorkerShutdown, not os._exit() -- deliberate. Celery's
+    prefork pool executes tasks in child processes forked from the
+    master, which inherit the master's already-imported (stale) Python
+    modules -- os._exit() here would only kill the one pool child
+    running this task, and the master would just fork a REPLACEMENT
+    child from its own still-stale state, silently looping forever
+    without ever picking up fresh code. WorkerShutdown is celery's own
+    public API for "the whole worker (master + pool) needs to come
+    down," which is what actually lets the supervising process (see
+    dockerize/supervise_celery_worker.py) relaunch a genuinely fresh
+    process that re-imports everything from disk.
+    """
+    stale = find_stale_models()
+    if not stale:
+        return
+
+    message = "Stale model(s) detected -- the live DB has columns this process's code doesn't know about: " + "; ".join(
+        f"{model} missing {sorted(cols)}" for model, cols in sorted(stale.items())
+    )
+    settings.LOGGER.error(f"check_schema_freshness: {message}")
+    log_error('common.tasks.check_schema_freshness', message)
+    raise WorkerShutdown()

@@ -38,7 +38,24 @@ celery -A picasa beat -l INFO --pidfile="/locks/celerybeat.pid"  &
 #     celery -A picasa worker -l INFO -c 4 --max-tasks-per-child 3 -n worker${i}  --uid=1001 --gid=1001 &
 #     celery -A picasa worker -l INFO -c 4 --max-tasks-per-child 3 -n worker${i}  --uid=root --gid=root &
 # done
-celery -A picasa worker -l INFO -c 20 --max-tasks-per-child 3 -n worker  & # --uid=nobody --gid=nogroup &
+#
+# Wrapped in supervise_celery_worker.py (not run bare) -- real incident
+# 2026-11-09 (see CLAUDE.md): a long-running worker process keeps its
+# Django models loaded from whenever it started, so a migration landing
+# mid-session left it silently erroring on every single face write for
+# roughly an hour before a human noticed. common/tasks.py's
+# check_schema_freshness task now detects that class of problem itself
+# and raises WorkerShutdown to bring the whole worker down -- this
+# supervisor is what relaunches it immediately afterward, picking up
+# fresh code since /code is bind-mounted. Capped (5 restarts / 10
+# minutes) so a genuinely UNFIXED problem doesn't spin forever burning
+# CPU and flooding logs; past the cap it writes a real, visible
+# ApplicationError via a direct one-off manage.py call -- NOT routed
+# through celery, since the whole point is it must still work when
+# celery itself is what's broken.
+python3 /code/dockerize/supervise_celery_worker.py 5 600 \
+    '["python", "/code/manage.py", "shell", "-c", "from common.error_log import log_error; log_error(\"dockerize.startup.supervise_celery_worker\", \"celery worker restarted 5 times in 600s and was NOT relaunched again -- face/video processing and every other scheduled task is down. Needs manual investigation.\")"]' \
+    -- celery -A picasa worker -l INFO -c 20 --max-tasks-per-child 3 -n worker &
 
 # Previously ran with gunicorn's defaults (1 sync worker, 1 thread), which
 # serializes *every* request - including every single face-thumbnail image
