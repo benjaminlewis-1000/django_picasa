@@ -185,35 +185,43 @@ def _unresolved_faces_q(lvface_sizes, sentinel):
     fetched and then filtered in Python. 2026-10-31's mixed-image fix
     still pulled every face on an image (including fully-settled ones,
     with their full embedding arrays) just to immediately discard most
-    of them; this pushes the same "done" check into the query itself."""
+    of them; this pushes the same "done" check into the query itself.
+
+    2026-11-09: a face with kps_unrecoverable=True is done regardless of
+    lvface_sizes -- if no kps will ever exist, no LVFace embedding (any
+    size, not just whichever ones a past run happened to request) can
+    ever be computed either, since LVFace needs the same detection/kps
+    this command failed to recover. This also closes a real gap the old
+    LVFace-sentinel-only signal had: with --lvface-sizes='' (kps-only
+    mode), there was no way to mark a face done without kps at all --
+    `not lvface_sizes` used to just return Q(kps__isnull=True), with no
+    escape hatch, so a confirmed-unrecoverable face was reselected by
+    every future run forever even in that mode."""
+    done = Q(kps_unrecoverable=True)
     if not lvface_sizes:
-        return Q(kps__isnull=True)
+        return ~(done | Q(kps__isnull=False))
     done_with_kps = Q(kps__isnull=False)
-    done_without_kps = Q(kps__isnull=True)
     for size in lvface_sizes:
         field = f'face_encoding_lvface_{size.lower()}'
         done_with_kps &= Q(**{f'{field}__isnull': False})
-        done_without_kps &= Q(**{field: sentinel})
-    return ~(done_with_kps | done_without_kps)
+    return ~(done | done_with_kps)
 
 
 def _face_is_done(face, lvface_sizes, sentinel):
     """A face is done either the normal way (real kps + every requested
-    LVFace size populated) or via _mark_no_face_found()'s permanent
-    "confirmed nothing here" marker (kps stays NULL forever by design,
-    but every requested LVFace size is the sentinel). Without the second
-    branch, a marked face would have no kps and get re-examined by every
-    future run forever -- exactly the wasted-recompute problem marking
-    it was meant to solve."""
+    LVFace size populated) or via kps_unrecoverable=True -- the permanent
+    "confirmed nothing here" marker _mark_no_face_found() sets, which
+    makes a face done regardless of lvface_sizes (see _unresolved_faces_q's
+    own docstring for why: no kps means no LVFace embedding of any size
+    can ever be computed either)."""
+    if face.kps_unrecoverable:
+        return True
     if not lvface_sizes:
         return face.kps is not None
-    if face.kps is not None:
-        return all(
-            getattr(face, f'face_encoding_lvface_{size.lower()}') is not None
-            for size in lvface_sizes
-        )
+    if face.kps is None:
+        return False
     return all(
-        list(getattr(face, f'face_encoding_lvface_{size.lower()}') or []) == sentinel
+        getattr(face, f'face_encoding_lvface_{size.lower()}') is not None
         for size in lvface_sizes
     )
 
@@ -380,8 +388,19 @@ class Command(BaseCommand):
         the sentinel (reclassify_candidates, the gallery-building code in
         this very file) as "not a usable embedding," not as "unknown."
 
-        Deliberately does NOT touch kps -- there's no equivalent "no kps"
-        sentinel in this codebase, and NULL already correctly means that.
+        2026-11-09: also sets Face.kps_unrecoverable=True unconditionally
+        (regardless of lvface_sizes) -- the general-purpose, run-
+        independent "no kps is ever coming" signal other readers (e.g.
+        rotation_audit.py) can check without reaching into this
+        command's own LVFace-sentinel bookkeeping. Previously, with
+        --lvface-sizes='' (kps-only mode), update_fields stayed empty
+        and this method did nothing at all -- not even incrementing its
+        own stat -- a real gap the dedicated flag closes.
+
+        Deliberately does NOT touch kps itself -- there's no equivalent
+        "no kps" sentinel VALUE in this codebase, and NULL already
+        correctly means that; kps_unrecoverable is what distinguishes
+        "NULL, not yet attempted" from "NULL, confirmed unrecoverable."
         Only applied to crop_redetect_empty (not crop_redetect_ambiguous,
         where a real face likely IS there, just unclear which candidate
         -- marking that as 'confirmed nothing' would be actively wrong)."""
@@ -389,14 +408,14 @@ class Command(BaseCommand):
             stats['marked_no_face_found'] += 1
             return
         sentinel = list(settings.NON_DETECTED_FACE_ENCODING)
-        update_fields = []
+        update_fields = ['kps_unrecoverable']
+        face.kps_unrecoverable = True
         for size in lvface_sizes:
             field = f'face_encoding_lvface_{size.lower()}'
             face.set_embedding(field, sentinel)
             update_fields += [field, Face.EMBEDDING_FIELD_HV_MIRRORS[field]]
-        if update_fields:
-            face.save(update_fields=update_fields)
-            stats['marked_no_face_found'] += 1
+        face.save(update_fields=update_fields)
+        stats['marked_no_face_found'] += 1
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
@@ -446,9 +465,17 @@ class Command(BaseCommand):
             ).values_list('source_image_file_id', flat=True).distinct()
             base_trigger_filter['source_image_file_id__in'] = target_image_ids
 
+        # Same per-row-not-cross-relation discipline as above re: the
+        # kps_unrecoverable exclude -- a face already confirmed
+        # unrecoverable must never re-trigger its image on its own, but
+        # doing it as Face.objects.filter(**base_trigger_filter).exclude(
+        # kps_unrecoverable=True) (one single queryset, not a separate
+        # cross-relation exclude on ImageFile) keeps that guarantee: it
+        # excludes THIS face's own row, not some other face's on the
+        # same image.
         trigger_image_ids = Face.objects.filter(**base_trigger_filter).exclude(
             face_encoding_512=sentinel
-        ).values_list('source_image_file_id', flat=True).distinct()
+        ).exclude(kps_unrecoverable=True).values_list('source_image_file_id', flat=True).distinct()
 
         trigger_images = ImageFile.objects.filter(id__in=trigger_image_ids)
 
@@ -642,85 +669,107 @@ class Command(BaseCommand):
                         continue
                     detections = app.get(img_numpy)
 
+                    # A whole-image pass finding literally nothing used to
+                    # be a dead end -- every unresolved face on this image
+                    # was just left stuck, re-examined (and failing the
+                    # same way) on every future run forever, never
+                    # reaching _crop_redetect() or getting marked
+                    # kps_unrecoverable. Found 2026-11-09 (see CLAUDE.md):
+                    # now falls through to the SAME unmatched_rows handling
+                    # below as a face that failed the IOU match, rather
+                    # than a separate early exit -- matched_rows just
+                    # stays empty so every face is treated as unmatched,
+                    # and _crop_redetect()'s own independent app.get(crop)
+                    # call still gets a real, fair chance (it isn't
+                    # redundant with the whole-image pass -- detecting
+                    # inside a tight crop around just this one box can
+                    # succeed where the whole-image pass didn't, e.g. a
+                    # tiny face that's too small relative to the full
+                    # frame).
+                    matched_rows = set()
                     if not detections:
                         stats['no_detections'] += len(unresolved_faces)
-                        continue
-
-                    existing_boxes = torch.tensor(
-                        [[f.box_left, f.box_top, f.box_right, f.box_bottom] for f in unresolved_faces],
-                        dtype=torch.float32,
-                    )
-                    detect_boxes = torch.tensor([d.bbox.tolist() for d in detections], dtype=torch.float32)
-                    iou = bops.distance_box_iou(existing_boxes, detect_boxes).numpy()
-                    rows, cols = linear_sum_assignment(-iou)
-
-                    matched_rows = set()
-                    for r, c in zip(rows, cols):
-                        if float(iou[r, c]) < IOU_THRESH:
-                            continue
-                        matched_rows.add(int(r))
-                        face = unresolved_faces[int(r)]
-                        det = detections[int(c)]
-                        this_iou = float(iou[r, c])
-
-                        if not _kps_matches_box(det['kps'], face.box_left, face.box_top, face.box_right, face.box_bottom):
-                            stats['geometry_rejected'] += 1
-                            continue
-
-                        has_trusted_encoding = (
-                            face.face_encoding_512 is not None
-                            and list(face.face_encoding_512) != sentinel
+                    else:
+                        existing_boxes = torch.tensor(
+                            [[f.box_left, f.box_top, f.box_right, f.box_bottom] for f in unresolved_faces],
+                            dtype=torch.float32,
                         )
+                        detect_boxes = torch.tensor([d.bbox.tolist() for d in detections], dtype=torch.float32)
+                        iou = bops.distance_box_iou(existing_boxes, detect_boxes).numpy()
+                        rows, cols = linear_sum_assignment(-iou)
 
-                        verified = True
-                        tier = 'unverified'
-                        if has_trusted_encoding:
-                            fresh_emb = _l2norm(det['embedding'])
-                            stored_emb = _l2norm(np.array(face.face_encoding_512, dtype=np.float32))
-                            sim = float(np.dot(fresh_emb, stored_emb))
-                            if sim >= HIGH_CONFIDENCE_SIM:
-                                tier = 'high_confidence'
-                            elif sim >= GRAY_ZONE_SIM and this_iou >= GRAY_ZONE_MIN_IOU and (
-                                face.relative_size is not None and face.relative_size <= GRAY_ZONE_MAX_RELATIVE_SIZE
+                        for r, c in zip(rows, cols):
+                            if float(iou[r, c]) < IOU_THRESH:
+                                continue
+                            matched_rows.add(int(r))
+                            face = unresolved_faces[int(r)]
+                            det = detections[int(c)]
+                            this_iou = float(iou[r, c])
+
+                            if not _kps_matches_box(det['kps'], face.box_left, face.box_top, face.box_right, face.box_bottom):
+                                stats['geometry_rejected'] += 1
+                                continue
+
+                            has_trusted_encoding = (
+                                face.face_encoding_512 is not None
+                                and list(face.face_encoding_512) != sentinel
+                            )
+
+                            verified = True
+                            tier = 'unverified'
+                            if has_trusted_encoding:
+                                fresh_emb = _l2norm(det['embedding'])
+                                stored_emb = _l2norm(np.array(face.face_encoding_512, dtype=np.float32))
+                                sim = float(np.dot(fresh_emb, stored_emb))
+                                if sim >= HIGH_CONFIDENCE_SIM:
+                                    tier = 'high_confidence'
+                                elif sim >= GRAY_ZONE_SIM and this_iou >= GRAY_ZONE_MIN_IOU and (
+                                    face.relative_size is not None and face.relative_size <= GRAY_ZONE_MAX_RELATIVE_SIZE
+                                ):
+                                    tier = 'gray_zone'
+                                elif this_iou >= IOU_OVERRIDE_THRESH and (
+                                    int((iou[r, :] >= IOU_OVERRIDE_THRESH).sum()) == 1
+                                ):
+                                    # The stored embedding doesn't match well enough to
+                                    # trust via similarity, but the box match is
+                                    # confident AND unambiguous (no other detection in
+                                    # this image also clears the bar against this same
+                                    # existing box) -- real evidence the GEOMETRY is
+                                    # right even though identity isn't being judged
+                                    # here at all (see IOU_OVERRIDE_THRESH's own
+                                    # comment). face_encoding_512 is deliberately left
+                                    # untouched, same as every other tier -- only
+                                    # kps/det_score/LVFace get written.
+                                    tier = 'iou_override'
+                                else:
+                                    verified = False
+                                    stats['similarity_rejected'] += 1
+
+                            if not verified:
+                                continue
+
+                            if self._save_kps_and_lvface(
+                                face, det['kps'], float(det.det_score), img_numpy, img_obj,
+                                lvface_sizes, stats, tier, dry_run,
                             ):
-                                tier = 'gray_zone'
-                            elif this_iou >= IOU_OVERRIDE_THRESH and (
-                                int((iou[r, :] >= IOU_OVERRIDE_THRESH).sum()) == 1
-                            ):
-                                # The stored embedding doesn't match well enough to
-                                # trust via similarity, but the box match is
-                                # confident AND unambiguous (no other detection in
-                                # this image also clears the bar against this same
-                                # existing box) -- real evidence the GEOMETRY is
-                                # right even though identity isn't being judged
-                                # here at all (see IOU_OVERRIDE_THRESH's own
-                                # comment). face_encoding_512 is deliberately left
-                                # untouched, same as every other tier -- only
-                                # kps/det_score/LVFace get written.
-                                tier = 'iou_override'
-                            else:
-                                verified = False
-                                stats['similarity_rejected'] += 1
-
-                        if not verified:
-                            continue
-
-                        if self._save_kps_and_lvface(
-                            face, det['kps'], float(det.det_score), img_numpy, img_obj,
-                            lvface_sizes, stats, tier, dry_run,
-                        ):
-                            new_faces_this_run += 1
+                                new_faces_this_run += 1
 
                     unmatched_rows = [r for r in range(len(unresolved_faces)) if r not in matched_rows]
                     for r in unmatched_rows:
                         stats['no_match'] += 1
                         face = unresolved_faces[r]
-                        has_trusted_encoding = (
-                            face.face_encoding_512 is not None
-                            and list(face.face_encoding_512) != sentinel
-                        )
-                        if not has_trusted_encoding:
-                            continue  # nothing to recover a geometry match FOR
+                        # 2026-11-09 (see CLAUDE.md): previously gated on
+                        # has_trusted_encoding ("nothing to recover a
+                        # geometry match FOR") -- but _crop_redetect()'s
+                        # result only ever gets a GEOMETRY check
+                        # (_kps_matches_box), never a similarity
+                        # comparison, so that gate was wrongly skipping
+                        # this fallback for the 68% of this backlog with
+                        # no stored embedding at all, leaving them
+                        # permanently unresolved with no real attempt
+                        # ever made. Every unmatched face now gets the
+                        # same crop-based chance regardless of whether it
+                        # has a trusted encoding.
                         cr = _crop_redetect(
                             app, img_numpy,
                             (face.box_left, face.box_top, face.box_right, face.box_bottom),

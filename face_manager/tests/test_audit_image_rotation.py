@@ -299,6 +299,48 @@ class RunRotationAuditTests(TestCase):
         self.assertEqual(self.images[0].rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
         self.assertEqual(self.images[0].rotation_scan_logic_hash, '')
 
+    def test_a_face_marked_kps_unrecoverable_does_not_exclude_the_image(self):
+        # 2026-11-09 (see CLAUDE.md): a face Face.kps_unrecoverable=True
+        # is confirmed to never get kps at all -- "missing kps" alone
+        # used to permanently exclude this image from ever being
+        # evaluated again, which stopped being correct once
+        # kps_unrecoverable became a real, expected permanent state
+        # rather than "the backfill just hasn't reached this yet."
+        # Complements the test above (a face that's STILL just missing
+        # kps, not yet confirmed unrecoverable, must still block).
+        from face_manager.rotation_audit import run_rotation_audit
+        from face_manager.tests import make_face
+
+        make_face(
+            self.images[0], box_left=5, box_top=5, box_right=20, box_bottom=20,
+            kps=None, kps_unrecoverable=True,
+        )
+
+        result = run_rotation_audit(write=True)
+        self.assertEqual(result['examined'], 3)
+        self.images[0].refresh_from_db()
+        self.assertEqual(self.images[0].rotation_scan_state, ImageFile.RotationScanState.FLAGGED)
+
+    def test_a_still_pending_face_still_blocks_alongside_an_unrecoverable_one(self):
+        # On the same image, a genuinely-still-missing (not yet marked)
+        # face must still block even when a DIFFERENT face on the same
+        # image is already confirmed kps_unrecoverable -- confirms the
+        # fix is a per-face carve-out, not an accidental "any
+        # kps_unrecoverable face makes the whole image pass" bug.
+        from face_manager.rotation_audit import run_rotation_audit
+        from face_manager.tests import make_face
+
+        make_face(
+            self.images[0], box_left=5, box_top=5, box_right=20, box_bottom=20,
+            kps=None, kps_unrecoverable=True,
+        )
+        make_face(self.images[0], box_left=25, box_top=25, box_right=40, box_bottom=40, kps=None)
+
+        result = run_rotation_audit(write=True)
+        self.assertEqual(result['examined'], 2)
+        self.images[0].refresh_from_db()
+        self.assertEqual(self.images[0].rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
+
 
 class RunRotationAuditUntilDoneTests(TestCase):
     """run_rotation_audit_until_done() -- the looping wrapper used by the

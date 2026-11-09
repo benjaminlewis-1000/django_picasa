@@ -337,6 +337,22 @@ class Face(models.Model):
                 size=10, blank=True, null=True
             )
 
+    # Permanent "we looked, there's nothing findable here" marker for a
+    # face whose kps is NULL and will never be filled in -- distinct from
+    # kps simply not having been attempted/backfilled YET. Set only by a
+    # real recovery attempt (backfill_verified_kps.py's whole-image match
+    # AND crop-based fallback both failing) -- false by default just
+    # means "not yet determined," not "recoverable." Added 2026-11-09 (see
+    # CLAUDE.md) specifically so readers that need "will this face ever
+    # get kps" (e.g. rotation_audit.py's eligibility gate, which used to
+    # require every face on an image to already have kps, permanently
+    # excluding an image with a genuinely-unrecoverable face) have a
+    # single, general-purpose signal to check instead of reaching into
+    # backfill_verified_kps.py's own LVFace-sentinel bookkeeping, which
+    # is contingent on which --lvface-sizes flag a given run happened to
+    # use and was never meant as a universal "no face" declaration.
+    kps_unrecoverable = models.BooleanField(default=False)
+
     # The detector's own confidence for this detection (insightface's
     # det_score, 0-1) -- NOT previously stored anywhere despite being
     # available on every detection since day one. Added 2026-09-18 after

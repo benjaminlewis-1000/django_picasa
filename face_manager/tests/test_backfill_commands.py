@@ -533,10 +533,17 @@ class UnresolvedFacesQueryTests(TestCase):
         )
         self.assertEqual(matched_ids, {partial.id})
 
-    def test_sentinel_marked_no_kps_counts_as_done(self):
+    def test_kps_unrecoverable_counts_as_done_regardless_of_lvface_sizes(self):
         from face_manager.management.commands.backfill_verified_kps import _unresolved_faces_q
 
+        # Mirrors exactly what _mark_no_face_found() actually does: the
+        # LVFace sentinel for whichever sizes were requested AT THE TIME,
+        # plus the general-purpose kps_unrecoverable=True flag that makes
+        # the face done regardless of which (if any) lvface_sizes a LATER
+        # run requests -- no kps means no LVFace embedding of any size
+        # can ever be computed.
         marked = self._face()
+        marked.kps_unrecoverable = True
         marked.set_embedding('face_encoding_lvface_b', self.sentinel)
         marked.save()  # kps stays NULL, by design
 
@@ -548,6 +555,35 @@ class UnresolvedFacesQueryTests(TestCase):
             .values_list('id', flat=True)
         )
         self.assertEqual(matched_ids, {unmarked.id})
+
+        # Done even under a DIFFERENT lvface_sizes request than whatever
+        # was active when it got marked, and even in kps-only mode ([]).
+        for sizes in (['S', 'L'], [], ['B']):
+            matched_ids = set(
+                Face.objects.filter(source_image_file=self.image)
+                .filter(_unresolved_faces_q(sizes, self.sentinel))
+                .values_list('id', flat=True)
+            )
+            self.assertEqual(matched_ids, {unmarked.id}, f"sizes={sizes}")
+
+    def test_lvface_sentinel_alone_without_the_flag_is_not_done(self):
+        """A pre-2026-11-09 row that only ever got the old LVFace-sentinel
+        marking (no kps_unrecoverable flag, since the flag didn't exist
+        yet) must NOT be silently treated as done -- it should surface as
+        a real candidate again so a future run's crop_redetect fallback
+        gets a chance to run and set the flag properly this time."""
+        from face_manager.management.commands.backfill_verified_kps import _unresolved_faces_q
+
+        legacy_marked = self._face()
+        legacy_marked.set_embedding('face_encoding_lvface_b', self.sentinel)
+        legacy_marked.save()  # kps_unrecoverable left at its False default
+
+        matched_ids = set(
+            Face.objects.filter(source_image_file=self.image)
+            .filter(_unresolved_faces_q(['B'], self.sentinel))
+            .values_list('id', flat=True)
+        )
+        self.assertEqual(matched_ids, {legacy_marked.id})
 
     def test_matches_face_is_done_negation_exactly_across_a_mixed_set(self):
         from face_manager.management.commands.backfill_verified_kps import (
@@ -570,7 +606,11 @@ class UnresolvedFacesQueryTests(TestCase):
         f3 = self._face()
         f3.set_embedding('face_encoding_lvface_s', self.sentinel)
         f3.set_embedding('face_encoding_lvface_b', self.sentinel)
-        f3.save()  # sentinel-done, kps NULL
+        f3.save()  # LVFace sentinel ONLY, no kps_unrecoverable flag --
+                   # NOT done (2026-11-09: the flag is now the sole
+                   # "confirmed unrecoverable" signal, not the sentinel
+                   # alone -- see test_lvface_sentinel_alone_without_the_
+                   # flag_is_not_done above)
         faces.append(f3)
 
         f4 = self._face()
@@ -578,6 +618,11 @@ class UnresolvedFacesQueryTests(TestCase):
         f4.set_embedding('face_encoding_lvface_s', [0.5] * 512)
         f4.save()  # kps present, lvface_b still missing -- unresolved
         faces.append(f4)
+
+        f5 = self._face()
+        f5.kps_unrecoverable = True
+        f5.save()  # confirmed unrecoverable -- done regardless of lvface
+        faces.append(f5)
 
         expected_unresolved = {
             f.id for f in faces if not _face_is_done(f, lvface_sizes, self.sentinel)
@@ -865,6 +910,60 @@ class BackfillVerifiedKpsTests(TestCase):
         face.refresh_from_db()
         self.assertIsNone(face.kps)
         self.assertEqual(list(face.face_encoding_lvface_b), [-999.0] * 512)
+        self.assertTrue(face.kps_unrecoverable)
+
+    def test_crop_redetect_tried_and_recovers_a_face_with_no_stored_encoding(self):
+        # 2026-11-09 (see CLAUDE.md): real production gap -- 68% of the
+        # kps-missing backlog has face_encoding_512 NULL, and the
+        # unmatched_rows fallback used to gate crop_redetect on
+        # has_trusted_encoding ("nothing to recover a geometry match
+        # FOR"), skipping it entirely for this population with no real
+        # attempt ever made. _crop_redetect()'s result only ever gets a
+        # GEOMETRY check (_kps_matches_box), never a similarity
+        # comparison, so there was never a real reason to gate it on
+        # having a stored embedding -- this confirms a NULL-encoding face
+        # now gets the same fallback chance as a trusted-encoding one.
+        face = make_face(
+            self.image, declared_name=self.person,
+            box_left=10, box_top=10, box_right=50, box_bottom=50,
+            relative_size=0.03,
+        )
+        self.assertIsNone(face.face_encoding_512)
+        whole_image_dets = [self._FakeDetection([25, 25, 65, 65], 0.85, [[45.0, 45.0]] * 5, [0.0] * 512)]
+        crop_kps = [[30.0, 30.0]] * 5
+        crop_det = self._FakeDetection([5, 5, 45, 45], 0.75, crop_kps, [0.0] * 512)
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.side_effect = [whole_image_dets, [crop_det]]
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNotNone(face.kps)
+        self.assertAlmostEqual(face.det_score, 0.75, places=4)
+        self.assertEqual(face.face_encoding_lvface_b, [0.4] * 512)
+        self.assertFalse(face.kps_unrecoverable)
+
+    def test_crop_redetect_tried_and_marks_unrecoverable_with_no_stored_encoding(self):
+        # Companion failure case: a NULL-encoding face where BOTH the
+        # whole-image pass and the crop fallback find nothing must still
+        # get marked kps_unrecoverable -- not silently skip the marking
+        # just because it never had a trusted encoding to begin with.
+        face = make_face(
+            self.image, declared_name=self.person,
+            box_left=10, box_top=10, box_right=50, box_bottom=50,
+            relative_size=0.03,
+        )
+        whole_image_dets = [self._FakeDetection([25, 25, 65, 65], 0.85, [[45.0, 45.0]] * 5, [0.0] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build:
+            mock_build.return_value.get.side_effect = [whole_image_dets, []]
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNone(face.kps)
+        self.assertTrue(face.kps_unrecoverable)
+        self.assertEqual(list(face.face_encoding_lvface_b), [-999.0] * 512)
 
     def test_crop_redetect_empty_dry_run_does_not_write_sentinel(self):
         stored = [1.0] + [0.0] * 511
@@ -1045,7 +1144,15 @@ class BackfillVerifiedKpsTests(TestCase):
         )
         self.assertEqual(_image_timeout_seconds(100000), PER_IMAGE_TIMEOUT_MAX_SECONDS)
 
-    def test_no_detections_leaves_face_untouched_and_counted(self):
+    def test_no_detections_falls_through_to_crop_redetect_and_marks_unrecoverable(self):
+        # 2026-11-09 (see CLAUDE.md): a whole-image pass finding literally
+        # nothing used to be a dead end -- every future run would
+        # re-examine the same image and fail the same way forever. It now
+        # falls through to the SAME unmatched_rows handling as an IOU
+        # miss: _crop_redetect() gets a real, independent chance (its own
+        # app.get(crop) call), and here it ALSO finds nothing (the shared
+        # mock returns [] unconditionally for every call), so the face is
+        # marked kps_unrecoverable -- never re-examined again.
         face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
         with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
                    return_value=np.zeros((1000, 1000, 3))), \
@@ -1054,6 +1161,27 @@ class BackfillVerifiedKpsTests(TestCase):
             call_command('backfill_verified_kps')
         face.refresh_from_db()
         self.assertIsNone(face.kps)
+        self.assertTrue(face.kps_unrecoverable)
+        self.assertEqual(list(face.face_encoding_lvface_b), [-999.0] * 512)
+
+    def test_no_detections_then_crop_redetect_recovers_the_face(self):
+        # Companion case: the whole-image pass finds nothing, but the
+        # crop-based fallback DOES -- confirms the fallback isn't only
+        # reachable from an IOU miss, it's reachable from a totally empty
+        # whole-image pass too.
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512, relative_size=0.03)
+        crop_kps = [[30.0, 30.0]] * 5
+        crop_det = self._FakeDetection([5, 5, 45, 45], 0.75, crop_kps, [0.0] * 512)
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.side_effect = [[], [crop_det]]
+            call_command('backfill_verified_kps')
+        face.refresh_from_db()
+        self.assertIsNotNone(face.kps)
+        self.assertFalse(face.kps_unrecoverable)
+        self.assertAlmostEqual(face.det_score, 0.75, places=4)
 
     def test_dry_run_saves_nothing(self):
         face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
