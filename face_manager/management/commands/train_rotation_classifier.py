@@ -384,13 +384,24 @@ class Command(BaseCommand):
                     export_onnx()
                     self.stdout.write(f"  new best val_acc={acc:.4f} -- exported {onnx_path}")
 
-        save_checkpoint()
+        # Real bug found via a smoke test (2026-11-09): this final save/eval
+        # used to save the checkpoint BEFORE running this final eval, so a
+        # genuinely new best accuracy reached only here (the loop's own
+        # periodic eval, every EVAL_EVERY_STEPS, might not land exactly on
+        # the last step) was computed but never actually written into the
+        # checkpoint's best_val_acc -- a resumed run would then report
+        # "best val acc so far: 0.000" even after a real improving run.
+        # best_val_acc must be updated BEFORE the save that persists it.
         acc, per_class_acc = run_eval()
+        is_new_best = acc > best_val_acc
+        if is_new_best:
+            best_val_acc = acc
+        save_checkpoint()
         self.stdout.write(
             f"\nStopped at step {global_step} ({'time budget reached' if ran_out_of_time else 'train loader exhausted -- one full epoch'}).\n"
-            f"Final val_acc={acc:.4f} per_class={per_class_acc}. Best val_acc so far: {max(best_val_acc, acc):.4f}.\n"
+            f"Final val_acc={acc:.4f} per_class={per_class_acc}. Best val_acc so far: {best_val_acc:.4f}.\n"
             f"Checkpoint saved to {checkpoint_path}. Run this command again to resume."
         )
-        if acc > best_val_acc:
+        if is_new_best:
             export_onnx()
             self.stdout.write(f"Exported final ONNX model to {onnx_path}")
