@@ -114,11 +114,40 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   bake-in, drop old columns) still not started** -- nothing reads any `_hv` column yet. LVFace-S/L
   are still stuck flat (now ~5% coverage, still nothing actively populating them beyond one-off
   investigation work) -- not blocking, investigation-only.
-- **LVFace-B threshold (0.30, no bucketing) is validated and already used for targeted
-  reclassification, but HOW to integrate it into the live `classify_unassigned()` pipeline is a
-  genuinely open, unmade decision** -- see the 2026-11-03 "session status snapshot" entry for the
-  options considered (replace insightface entirely / require agreement between both / use as a
-  secondary gate) and current coverage numbers.
+- **LVFace-B threshold re-validated at scale (2026-11-10), and the earlier "<0.4% FPR" figure
+  does not hold once measured realistically -- HOW to integrate it into the live
+  `classify_unassigned()` pipeline is still a genuinely open, unmade decision.** Re-ran the
+  2026-10-31 leave-one-out methodology at current scale (461 validated galleries, size
+  10-25,984, vs. 152 before; 1,500-face negative sample drawn from the 187,022 confirmed-
+  `.ignore`/`.realignore` faces that now have LVFace-B). Gallery-size bucketing still isn't
+  needed -- TPR is consistent (96-98%) across every size bucket at threshold=0.30. But FPR,
+  measured as "does this junk face clear the bar against ANY of the 461 galleries" (the real
+  production exposure for a single global threshold, not one gallery in isolation), is far
+  worse than the earlier figure: at threshold=0.30, **TPR 97.3%, FPR 10.5%** (vs. the earlier
+  "<0.4%", almost certainly measured per-gallery rather than max-over-all-competing-galleries).
+  Tightening the threshold trades TPR away fairly linearly with no clean elbow (0.40 -> TPR
+  94.7%/FPR 6.5%; 0.45 -> TPR 92.0%/FPR 5.7%) -- getting FPR down near insightface's own
+  0.03-0.4% range will likely need a second signal (margin-above-threshold, a det_score floor --
+  the same combo that fixed insightface's magnet-gallery false-positive problem on 2026-09-21),
+  not a bare cosine cutoff alone. **Confirmed the halfvec mirror (`face_encoding_lvface_b_hv`)
+  gives functionally identical results to the float32 field** (TPR 97.30% vs 97.34%, FPR 10.47%
+  vs 10.53% at threshold=0.30) -- the dual-write/pgvector migration's precision tradeoff holds up
+  under this real workload too. Validation script: `scratch/validate_lvface_threshold.py`-style,
+  not yet committed anywhere durable (lived in session scratchpad). See the 2026-11-03 "session
+  status snapshot" entry for the integration options already considered (replace insightface
+  entirely / require agreement between both / use as a secondary gate) and current coverage
+  numbers -- still unresolved, now with a clearer FPR picture to decide against.
+- **TODO, deliberately deferred: clear LVFace-B encodings for confirmed-`.ignore`/`.realignore`
+  faces, mirroring `clear_confirmed_ignore_face_encodings()`'s existing insightface-only
+  behavior.** Currently LVFace-B is NOT cleared for confirmed-ignore faces at all (confirmed
+  2026-11-10: insightface's `face_encoding_512` is correctly 0% populated there, but LVFace-B
+  sits at 65.8%/187,008 and climbing as the joined kps+LVFace backfill works through them) --
+  a real, growing gap against the established "don't keep embeddings for confirmed-junk faces"
+  policy. **Deliberately NOT fixed yet, per explicit instruction**: this exact population is the
+  negative-pool test data the threshold-design work above depends on -- clearing it out now
+  would remove the only large, real "confirmed not a match" sample available for tuning LVFace-B
+  thresholds/margins. Revisit once the LVFace-B threshold/integration decision above is actually
+  settled and the migration (if any) is live.
 - **PhotoVerify 429 investigation -- real findings, not yet resolved.** See the 2026-11-03
   "session status snapshot" entry (search "PhotoVerify 429"). Backend throttle logic confirmed
   correct; root cause looks like an intermittent client-side bug (PhotoVerify sometimes doesn't
