@@ -52,8 +52,11 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
     bursts, needs continued relaunching as each one finishes. val_acc progression so far: 0.75
     (run3) -> 0.84 (run4).
   - **Orientation validation via face landmarks** (`rotation_audit.py`'s scheduled task) running
-    normally, but the human review queue (870 flagged as of last check) has had zero actual
-    reviews done -- no human has started working through it yet.
+    normally. **Correction (2026-11-10): human review IS actively happening**, contradicting an
+    earlier note here that claimed zero reviews -- that note was stale (true only briefly right
+    after the 2026-11-06 deploy triggered a full backlog re-scan, before anyone had gotten to it
+    yet). Live `rotation_scan_state` counts as of 2026-11-10: 10 `confirmed`, 86
+    `dismissed_not_rotated`, 4,628 `flagged` (still awaiting review), 269,623 `not_scanned`.
   - **Self-healing celery worker supervisor, half-deployed.** `common.check_schema_freshness`
     (detects a long-running worker's in-memory models falling behind the live DB schema, raises
     WorkerShutdown) is live and scheduled. The actual supervisor that would relaunch the worker
