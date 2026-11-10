@@ -132,11 +132,50 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   not a bare cosine cutoff alone. **Confirmed the halfvec mirror (`face_encoding_lvface_b_hv`)
   gives functionally identical results to the float32 field** (TPR 97.30% vs 97.34%, FPR 10.47%
   vs 10.53% at threshold=0.30) -- the dual-write/pgvector migration's precision tradeoff holds up
-  under this real workload too. Validation script: `scratch/validate_lvface_threshold.py`-style,
-  not yet committed anywhere durable (lived in session scratchpad). See the 2026-11-03 "session
-  status snapshot" entry for the integration options already considered (replace insightface
-  entirely / require agreement between both / use as a secondary gate) and current coverage
-  numbers -- still unresolved, now with a clearer FPR picture to decide against.
+  under this real workload too. Validation script committed: `scratch_validate_lvface_threshold.py`.
+  See the 2026-11-03 "session status snapshot" entry for the integration options already
+  considered (replace insightface entirely / require agreement between both / use as a secondary
+  gate) and current coverage numbers.
+
+  **Margin-gate sweep (same day, `scratch_validate_lvface_threshold_margin.py`): det_score floor
+  is nearly a no-op (nothing in this DB has `det_score < 0.5`, confirmed 2026-09-21); margin
+  (own-person p99 minus best-OTHER-person p99) is the real lever, but with a low ceiling.** Best
+  cut/cost ratio sits around margin=0.08 (cuts ~1.8x more FPR than TPR given up). At
+  threshold=0.30: margin=0.00 -> TPR 96.1%/FPR 10.1%; margin=0.08 -> TPR 93.8%/FPR 7.0%;
+  margin=0.18 -> TPR 88.2%/FPR 3.9% (floor -- further margin barely moves FPR past this point).
+  Margin-gating alone does not get LVFace-B anywhere near insightface's own 0.03-0.4% FPR range.
+
+  **Agreement-gating test (same day, `scratch_validate_lvface_agreement.py` +
+  `scratch_validate_lvface_agreement_negatives.py`): real, but modest, FPR improvement -- capped
+  by how correlated the two embedding spaces actually are.** Positive side (461 people, paired
+  leave-one-out insightface+LVFace-B scores on the SAME real confirmed faces): correlation 0.892.
+  AND-gating (both must pass) costs 2-2.7pp of real TPR vs. LVFace-B alone (e.g. at
+  LV-thresh=0.26/IF-thresh=0.40: AND=96.6% vs. LV-alone~97%); OR-gating only recovers ~1.2-1.4pp
+  extra TPR over LVFace-B alone. **Negative side could NOT be tested with stored data** (confirmed
+  2026-11-10: insightface's `face_encoding_512` is already cleared for every confirmed-ignore
+  face via `clear_confirmed_ignore_face_encodings()` -- see the TODO right below) --
+  worked around by freshly re-encoding insightface via the SAME kps-replay mechanism
+  `FaceExtractor.reencode_missing_faces()` already uses in production (`rec_model.get(img,
+  insightface.app.common.Face(kps=kps_arr))`), entirely read-only/in-memory, for a bounded
+  500-face sample. Real result at threshold=0.30/0.40: LV-alone FPR 11.0%, insightface-alone
+  (bare threshold, NOT the production margin/det_score-gated version -- not apples-to-apples with
+  the "<0.4%" figure elsewhere in this file) FPR 10.6%, **AND-gate FPR 8.2%** -- a real ~20-25%
+  relative cut, consistent across every threshold tested (0.22/0.26/0.30/0.35), but capped by a
+  0.837 correlation between the two signals even on junk faces -- they largely agree on the same
+  hard/ambiguous cases, so agreement-gating is a real but non-dramatic win, not a free lunch.
+
+  **The user's own tiered-confidence design (both agree -> high; disagree but close -> medium;
+  otherwise -> reject) has real support in the data, not yet built.** Among real matches that
+  pass LVFace-B but fail insightface's bare threshold, 64% are "close" (within 0.05 of also
+  passing) rather than a wild disagreement -- a genuine middle population exists. A three-tier
+  design could recover some of AND-gating's TPR cost without reopening OR-gating's much larger
+  FPR exposure, but this specific tier hasn't been simulated end-to-end (only the "does a close
+  middle population exist at all" precondition has been checked) -- would need its own sweep
+  before being treated as validated.
+
+  **Status: investigation only, nothing built or integrated.** The user is deciding the actual
+  integration approach (replace / AND-gate / tiered) in the morning -- do not implement any
+  change to `classify_unassigned()` or `assign_faces.py` until that decision is made.
 - **TODO, deliberately deferred: clear LVFace-B encodings for confirmed-`.ignore`/`.realignore`
   faces, mirroring `clear_confirmed_ignore_face_encodings()`'s existing insightface-only
   behavior.** Currently LVFace-B is NOT cleared for confirmed-ignore faces at all (confirmed
