@@ -256,6 +256,30 @@ class faceAssigner():
         self.SIZE_NUDGE_REF_SIZE = 0.04
         self.SIZE_NUDGE_MAX = 0.02
 
+        # LVFace-B secondary veto -- added 2026-11-10 after a real
+        # investigation into "magnet gallery" false positives (David Redd,
+        # Leslie Williams, Emma, Elder Tim Call, Luca Wilson -- the same 5
+        # problem galleries DET_SCORE_FLOOR/CANDIDATE_MARGIN_FLOOR above
+        # were validated against). insightface and LVFace-B are
+        # independently-trained embedding spaces; for a gallery where
+        # insightface's own embedding geometry is the specific problem
+        # (not image quality), LVFace-B doesn't inherit that blind spot --
+        # real validation found LVFace-B alone already captures ~all of
+        # this benefit (near-identical to the bigger LVFace-L model), so
+        # there's no reason to wait on L's much thinner coverage. Applied
+        # as a VETO on top of insightface's already-chosen candidates
+        # (not a parallel ranking system) -- cheap (only ever checked
+        # against the handful of candidates that already passed the
+        # margin gate above, not the whole roster) and fail-open: a query
+        # face or candidate gallery without enough real LVFace-B data
+        # simply skips this check rather than being blocked by it, same
+        # convention as DET_SCORE_FLOOR's NULL handling. No bucketing by
+        # gallery size (validated: TPR consistent 96-98% across every
+        # size bucket tested at this threshold, unlike insightface's own
+        # BUCKET_THRESHOLDS, which DOES need bucketing).
+        self.LVFACE_VETO_THRESHOLD = 0.30
+        self.LVFACE_VETO_MIN_GALLERY = 10
+
         # Added 2026-10-13 after a real investigation (prompted by the
         # user noticing video faces miss classification much more often
         # than image faces): video's detector (det_500m, a lighter model
@@ -325,6 +349,13 @@ class faceAssigner():
         # faceAssigner built without going through load_encodings() (unit
         # tests that set embedding_dict/norm_dict directly).
         self.threshold_dict = {}
+
+        # Same reasoning, for the LVFace-B veto (see LVFACE_VETO_THRESHOLD
+        # above) -- empty means the veto never finds a gallery to check
+        # against, so classify_unassigned() falls back to its fail-open
+        # default (skip the veto) for a faceAssigner built without going
+        # through load_encodings().
+        self.lvface_gallery_dict = {}
 
         # Same fallback reasoning, for the video-only sub-gallery (see
         # MIN_VIDEO_SUBGALLERY_SIZE below) -- an empty video_gallery_offsets
@@ -435,6 +466,11 @@ class faceAssigner():
         self.embedding_dict = {}
         self.norm_dict = {}
         self.threshold_dict = {}
+        # Per-person LVFace-B gallery (see LVFACE_VETO_THRESHOLD's own
+        # comment in __init__) -- a normalized (n, 512) array of that
+        # person's real LVFace-B embeddings, built from the SAME per-
+        # person query as embedding_dict below (no extra DB round trip).
+        self.lvface_gallery_dict = {}
         # Per-person video-only sub-gallery (see MIN_VIDEO_SUBGALLERY_SIZE
         # and _build_video_concatenated_gallery()) -- only populated for
         # candidates with enough video-sourced faces to trust.
@@ -449,14 +485,17 @@ class faceAssigner():
             cached_date = combo_dict.get('built_date')
             today = datetime.now().date()
 
-            # 'threshold_dict'/'video_embedding_dict' missing means this
-            # cache predates the
-            # cohesion/span nudge -- force a full rebuild rather than
-            # silently falling back to the flat bucket threshold for
-            # every candidate (which is what a plain .get() default would
-            # do), since that's exactly the un-nudged behavior this
-            # feature exists to replace.
-            has_threshold_dict = 'threshold_dict' in combo_dict and 'video_embedding_dict' in combo_dict
+            # 'threshold_dict'/'video_embedding_dict'/'lvface_gallery_dict'
+            # missing means this cache predates the cohesion/span nudge,
+            # the video sub-gallery, or the LVFace-B veto respectively --
+            # force a full rebuild rather than silently falling back to
+            # the flat bucket threshold (or no LVFace-B veto data at all)
+            # for every candidate, since that's exactly the un-upgraded
+            # behavior each of these features exists to replace.
+            has_threshold_dict = (
+                'threshold_dict' in combo_dict and 'video_embedding_dict' in combo_dict
+                and 'lvface_gallery_dict' in combo_dict
+            )
 
             if has_threshold_dict and cached_date is not None and (today - cached_date).days < self.CACHE_MAX_AGE_DAYS:
                 cache_is_valid = True
@@ -469,13 +508,15 @@ class faceAssigner():
                 else:
                     print("Daily cache check: face data changed since last build -- rebuilding full cache.")
             else:
-                print("Cache predates the cohesion/span threshold nudge or video sub-gallery -- rebuilding full cache.")
+                print("Cache predates the cohesion/span threshold nudge, video sub-gallery, or LVFace-B "
+                      "veto gallery -- rebuilding full cache.")
 
             if cache_is_valid:
                 self.candidate_dict = combo_dict['candidate_dict']
                 self.embedding_dict = combo_dict['embedding_dict']
                 self.norm_dict = combo_dict['norm_dict']
                 self.threshold_dict = combo_dict['threshold_dict']
+                self.lvface_gallery_dict = combo_dict['lvface_gallery_dict']
                 self.video_embedding_dict = combo_dict['video_embedding_dict']
                 self.video_norm_dict = combo_dict['video_norm_dict']
 
@@ -486,7 +527,8 @@ class faceAssigner():
             if face_id in self.candidate_dict.keys() and \
                face_id in self.embedding_dict.keys() and \
                face_id in self.norm_dict.keys() and \
-               face_id in self.threshold_dict.keys():
+               face_id in self.threshold_dict.keys() and \
+               face_id in self.lvface_gallery_dict.keys():
                 # print(f'No need to process this face {face_id}')
                 continue
             # print(f"Processing face {face_id}")
@@ -498,16 +540,58 @@ class faceAssigner():
 
             person_data = Face.objects \
                 .filter(faces_person & long_encoded & has_long)
-            data = person_data.values_list('id', 'face_encoding_512', 'dateTakenUTC', 'source_video_file_id')
+            data = person_data.values_list(
+                'id', 'face_encoding_512', 'face_encoding_512_hv', 'dateTakenUTC',
+                'source_video_file_id', 'face_encoding_lvface_b', 'face_encoding_lvface_b_hv',
+            )
 
-            df = pd.DataFrame(data, columns=['id', 'face_encoding_512', 'dateTakenUTC', 'source_video_file_id'])
+            df = pd.DataFrame(data, columns=[
+                'id', 'face_encoding_512', 'face_encoding_512_hv', 'dateTakenUTC',
+                'source_video_file_id', 'face_encoding_lvface_b', 'face_encoding_lvface_b_hv',
+            ])
 
-            cmp_embedding = np.array(df['face_encoding_512'].tolist())
+            # Prefers the halfvec mirror -- cut over 2026-11-10 after the
+            # pgvector migration's phase-1 drift validation (float16
+            # rounding error ~1e-5, three orders of magnitude below
+            # CANDIDATE_MARGIN_FLOOR) -- falling back to the float32 value
+            # PER ROW for the rare case still missing its mirror (a small
+            # historical backfill lag, or a test fixture that sets the
+            # float32 field directly without going through
+            # Face.set_embedding()), rather than excluding that row from
+            # the gallery entirely.
+            effective_512 = df['face_encoding_512_hv'].where(
+                df['face_encoding_512_hv'].notna(), df['face_encoding_512']
+            )
+            cmp_embedding = np.array(effective_512.tolist())
             norm_list = np.linalg.norm(cmp_embedding, axis=1)
             self.embedding_dict[face_id] = cmp_embedding.T
             assert self.embedding_dict[face_id].shape[0] == 512
             assert self.embedding_dict[face_id].shape[1] == len(norm_list)
             self.norm_dict[face_id] = norm_list
+
+            # LVFace-B gallery for the veto (see LVFACE_VETO_THRESHOLD's
+            # own comment) -- a real subset of this same person_data pull
+            # (partial LVFace-B coverage is expected and fine: the veto
+            # is fail-open below LVFACE_VETO_MIN_GALLERY). Filtered in
+            # Python, not via the DB query above, so partial LVFace-B
+            # coverage never shrinks embedding_dict/threshold_dict (an
+            # independent concern) -- only this dict. Same hv-preferred-
+            # with-per-row-float32-fallback pattern as face_encoding_512
+            # above.
+            lv_sentinel = list(settings.NON_DETECTED_FACE_ENCODING)
+            effective_lv = df['face_encoding_lvface_b_hv'].where(
+                df['face_encoding_lvface_b_hv'].notna(), df['face_encoding_lvface_b']
+            )
+            lv_mask = effective_lv.apply(
+                lambda v: v is not None and v != lv_sentinel
+            ).to_numpy()
+            if lv_mask.any():
+                lv_embedding = np.array(effective_lv[lv_mask].tolist())
+                lv_norm = np.linalg.norm(lv_embedding, axis=1, keepdims=True)
+                lv_norm[lv_norm == 0] = 1
+                self.lvface_gallery_dict[face_id] = lv_embedding / lv_norm
+            else:
+                self.lvface_gallery_dict[face_id] = np.zeros((0, 512))
 
             # Video-only sub-gallery for this person (see
             # MIN_VIDEO_SUBGALLERY_SIZE's own comment in __init__) -- lets
@@ -565,12 +649,16 @@ class faceAssigner():
             # time 13.7s -> 0.84s and steady-state resident memory
             # 7.08GB -> 2.80GB once loaded, and shrank the pickle file
             # itself from 2.4GB to 1.19GB.
-            self.candidate_dict[face_id] = df.drop(columns=['face_encoding_512'])
+            self.candidate_dict[face_id] = df.drop(columns=[
+                'face_encoding_512', 'face_encoding_512_hv',
+                'face_encoding_lvface_b', 'face_encoding_lvface_b_hv',
+            ])
             assert len(norm_list) == len(self.candidate_dict[face_id])
 
         if changed:
             all_dict = {'candidate_dict': self.candidate_dict,
                         'embedding_dict': self.embedding_dict,
+                        'lvface_gallery_dict': self.lvface_gallery_dict,
                         'norm_dict': self.norm_dict,
                         'threshold_dict': self.threshold_dict,
                         'video_embedding_dict': self.video_embedding_dict,
@@ -802,7 +890,14 @@ class faceAssigner():
         unassigned() already does it, unchanged; only the similarity/
         percentile computation is batched, by passing each face's
         finished row through to the existing per-face method."""
-        encodings = np.stack([np.array(f.face_encoding_512) for f in faces])
+        # Prefers the halfvec mirror (see classify_unassigned()'s own
+        # query_encoding comment for the cutover rationale), falling back
+        # to the float32 field for the rare legacy row somehow still
+        # missing its mirror rather than crashing on a None.
+        encodings = np.stack([
+            np.array(f.face_encoding_512_hv if f.face_encoding_512_hv is not None else f.face_encoding_512)
+            for f in faces
+        ])
         norms = np.linalg.norm(encodings, axis=1)
         batch_similarity = (
             (encodings @ self.all_embeddings) / (self.all_norms[None, :] * norms[:, None])
@@ -974,7 +1069,13 @@ class faceAssigner():
         # a real per-face DB query for the source_image_file FK, since
         # execute()'s queryset doesn't select_related it.)
 
-        query_encoding = np.array(unassigned_face.face_encoding_512)
+        # Prefers the halfvec mirror -- cut over 2026-11-10 as part of the
+        # pgvector/halfvec migration (phase 1's drift validation found
+        # float16 rounding error ~1e-5, three orders of magnitude below
+        # CANDIDATE_MARGIN_FLOOR) -- falling back to the float32 field for
+        # the rare legacy row somehow still missing its mirror.
+        query_hv = unassigned_face.face_encoding_512_hv
+        query_encoding = np.array(query_hv if query_hv is not None else unassigned_face.face_encoding_512)
         query_encoding_norm = np.linalg.norm(query_encoding)
         # comparison_mat = np.ones((len(self.likely_people_ids), self.N_COMPARISONS)) * 999
 
@@ -1166,6 +1267,59 @@ class faceAssigner():
             )[0]
         else:
             possible_idcs = np.array([], dtype=int)
+
+        # LVFace-B veto (see LVFACE_VETO_THRESHOLD's own comment in
+        # __init__) -- a real, independently-trained second embedding
+        # space applied as a secondary check on top of insightface's
+        # already-chosen candidates, not a parallel ranking system. Only
+        # ever checked against the (typically 1-5) candidates that
+        # already passed the margin gate above, so this stays cheap
+        # regardless of total gallery count. Fail-open in both
+        # directions: skipped entirely if this query face has no real
+        # LVFace-B encoding yet (still backfilling), and skipped for one
+        # specific candidate if THAT candidate's LVFace-B gallery is too
+        # small to trust (LVFACE_VETO_MIN_GALLERY) -- neither case blocks
+        # classification, it just behaves as if this veto doesn't exist
+        # yet for that case.
+        # lv_margin_by_idx records each surviving candidate's LVFace-B
+        # margin (lv_p99 - LVFACE_VETO_THRESHOLD) for the ranking step
+        # below -- NOT used to decide accept/reject beyond the veto
+        # itself (that stays a strict pass/fail gate, per the user's own
+        # explicit call: a blended score should only break ties among
+        # already-accepted candidates, never let a strong score on one
+        # signal buy back a candidate the other signal rejects -- see
+        # CLAUDE.md's "tiered-confidence"/OR-gate findings for why a
+        # blended ACCEPT criterion specifically underperforms a strict
+        # AND). A candidate the veto fail-opened on (no LVFace-B data
+        # either side) has no entry here, treated as a neutral 0 below.
+        lv_margin_by_idx = {}
+        # Prefers the halfvec mirror, same per-row fallback as
+        # query_encoding/embedding_dict above.
+        query_lv_raw = unassigned_face.face_encoding_lvface_b_hv
+        if query_lv_raw is None:
+            query_lv_raw = unassigned_face.face_encoding_lvface_b
+        if (
+            len(possible_idcs) > 0
+            and query_lv_raw is not None
+            and query_lv_raw != settings.NON_DETECTED_FACE_ENCODING
+        ):
+            query_lv = np.array(query_lv_raw, dtype=np.float64)
+            query_lv_norm = np.linalg.norm(query_lv)
+            if query_lv_norm > 0:
+                query_lv = query_lv / query_lv_norm
+                keep = []
+                for idx in possible_idcs:
+                    candidate_id = int(metrics_array[idx, 2])
+                    lv_gallery = self.lvface_gallery_dict.get(candidate_id)
+                    if lv_gallery is None or lv_gallery.shape[0] < self.LVFACE_VETO_MIN_GALLERY:
+                        keep.append(idx)  # not enough LVFace-B data to veto on -- fail-open
+                        continue
+                    lv_p99 = np.percentile(lv_gallery @ query_lv, 99)
+                    if lv_p99 >= self.LVFACE_VETO_THRESHOLD:
+                        keep.append(idx)
+                        lv_margin_by_idx[idx] = float(lv_p99) - self.LVFACE_VETO_THRESHOLD
+                possible_idcs = np.array(keep, dtype=int)
+
         if self.DEBUG:
             print(possible_idcs, "poss len is", len(possible_idcs))
             print(metrics_array[possible_idcs, :])
@@ -1212,7 +1366,23 @@ class faceAssigner():
             scores = metrics_array[possible_idcs, 0]
             assign_ids = metrics_array[possible_idcs, 2].astype(np.int64)
 
-            order = np.argsort(scores)[::-1]
+            # Ranking (which already-accepted candidate becomes poss_
+            # ident1 vs. 2 vs. ...) uses a COMBINED margin -- insightface's
+            # own margin above its threshold, plus LVFace-B's margin above
+            # ITS threshold (0 if the veto fail-opened for that candidate,
+            # i.e. no real penalty or bonus for missing data) -- so a
+            # candidate both signals are confident about outranks one
+            # insightface alone is equally confident about. This only
+            # changes ORDER among candidates that already passed both
+            # gates, and what's actually SAVED as weight_N stays
+            # insightface's own raw score (`scores` below, unchanged) --
+            # the combined margin is a ranking signal, not a displayed
+            # confidence number, per the user's explicit call.
+            insightface_margin = scores - metrics_array[possible_idcs, 1]
+            lv_margin_arr = np.array([lv_margin_by_idx.get(idx, 0.0) for idx in possible_idcs])
+            combined_rank_score = insightface_margin + lv_margin_arr
+
+            order = np.argsort(combined_rank_score)[::-1]
             order = order[:5]
             # save=False + one save() at the end: up to 5 calls here (one
             # per ranked candidate), and Face.save() does real validation

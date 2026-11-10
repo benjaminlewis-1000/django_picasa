@@ -730,6 +730,200 @@ class DetScoreMarginGateTests(TestCase):
         self.assertEqual(mock_set.call_args[0][0], assigner.ignore_person_id)
 
 
+class LvfaceVetoGateTests(TestCase):
+    """LVFACE_VETO_THRESHOLD/LVFACE_VETO_MIN_GALLERY: added 2026-11-10
+    after a real investigation into "magnet gallery" false positives
+    (Leslie Williams, David Redd, Luca Wilson -- see CLAUDE.md). A
+    candidate that already clears insightface's own margin gate must
+    ALSO clear a real, independently-trained second embedding space
+    (LVFace-B) before being proposed -- a strict veto, fail-open (never
+    fail-closed) whenever either side lacks real LVFace-B data. Also
+    covers the same-day halfvec cutover (face_encoding_512_hv/
+    face_encoding_lvface_b_hv preferred over the float32 fields) and the
+    combined-margin ranking tweak (orders already-accepted candidates by
+    insightface-margin + LVFace-margin, but the SAVED weight stays
+    insightface's own raw score)."""
+
+    def _ref(self, sim):
+        v = np.zeros(512)
+        v[0] = sim
+        v[1] = np.sqrt(max(0.0, 1 - sim ** 2))
+        return v
+
+    def _make_face_with_single_candidate(
+        self, insightface_sim, lvface_sim=None, gallery_size=600,
+        lv_gallery_size=50, query_has_lvface=True,
+    ):
+        assigner = faceAssigner()
+        person = make_person(f"LV candidate {insightface_sim}-{lvface_sim}-{lv_gallery_size}")
+        assigner.likely_people_ids = [person.id]
+
+        ref = self._ref(insightface_sim)
+        assigner.embedding_dict = {person.id: np.tile(ref.reshape(512, 1), (1, gallery_size))}
+        assigner.norm_dict = {person.id: np.ones(gallery_size)}
+        assigner._build_concatenated_gallery()
+
+        if lvface_sim is not None and lv_gallery_size > 0:
+            lv_ref = self._ref(lvface_sim)
+            assigner.lvface_gallery_dict = {
+                person.id: np.tile(lv_ref.reshape(1, 512), (lv_gallery_size, 1))
+            }
+        else:
+            assigner.lvface_gallery_dict = {person.id: np.zeros((0, 512))}
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+        face = make_face(img, declared_name=blank_person)
+        query = np.zeros(512)
+        query[0] = 1.0
+        face.face_encoding_512 = query.tolist()
+        if query_has_lvface:
+            face.face_encoding_lvface_b = query.tolist()
+        face.det_score = 0.9
+        face.save()
+        return assigner, face, person
+
+    def _passing_insightface_sim(self, assigner):
+        return assigner.BUCKET_THRESHOLDS[-1] + assigner.CANDIDATE_MARGIN_FLOOR + 0.05
+
+    def test_veto_rejects_candidate_insightface_would_have_accepted(self):
+        assigner = faceAssigner()
+        sim = self._passing_insightface_sim(assigner)
+        assigner, face, person = self._make_face_with_single_candidate(
+            insightface_sim=sim, lvface_sim=0.10,  # well below LVFACE_VETO_THRESHOLD=0.30
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, assigner.ignore_person_id)
+
+    def test_veto_accepts_when_lvface_also_clears_threshold(self):
+        assigner = faceAssigner()
+        sim = self._passing_insightface_sim(assigner)
+        assigner, face, person = self._make_face_with_single_candidate(
+            insightface_sim=sim, lvface_sim=0.50,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, person.id)
+
+    def test_query_without_lvface_encoding_skips_veto(self):
+        # Query face has no LVFace-B encoding at all (still backfilling)
+        # -- the veto must not block it, even though the candidate's own
+        # LVFace-B gallery would have failed it if checked.
+        assigner = faceAssigner()
+        sim = self._passing_insightface_sim(assigner)
+        assigner, face, person = self._make_face_with_single_candidate(
+            insightface_sim=sim, lvface_sim=0.10, query_has_lvface=False,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, person.id)
+
+    def test_candidate_gallery_too_small_skips_veto_for_that_candidate(self):
+        # The candidate's own LVFace-B gallery has fewer than
+        # LVFACE_VETO_MIN_GALLERY real entries -- not enough to trust,
+        # so the veto fail-opens for this specific candidate even though
+        # its (tiny) LVFace-B gallery would otherwise have failed it.
+        assigner = faceAssigner()
+        sim = self._passing_insightface_sim(assigner)
+        assigner, face, person = self._make_face_with_single_candidate(
+            insightface_sim=sim, lvface_sim=0.10,
+            lv_gallery_size=assigner.LVFACE_VETO_MIN_GALLERY - 1,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, person.id)
+
+    def test_halfvec_only_query_and_gallery_still_classify_correctly(self):
+        # Confirms the 2026-11-10 halfvec cutover: a face/gallery with
+        # ONLY the _hv mirror populated (no float32 value at all) must
+        # still classify correctly, not just avoid crashing.
+        assigner = faceAssigner()
+        person = make_person("HV only candidate")
+        assigner.likely_people_ids = [person.id]
+
+        sim = self._passing_insightface_sim(assigner)
+        ref = self._ref(sim)
+        assigner.embedding_dict = {person.id: np.tile(ref.reshape(512, 1), (1, 600))}
+        assigner.norm_dict = {person.id: np.ones(600)}
+        assigner._build_concatenated_gallery()
+        assigner.lvface_gallery_dict = {person.id: np.zeros((0, 512))}
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+        face = make_face(img, declared_name=blank_person)
+        query = np.zeros(512)
+        query[0] = 1.0
+        face.face_encoding_512_hv = query.tolist()  # hv ONLY, no float32
+        face.det_score = 0.9
+        face.save()
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, person.id)
+
+    def test_combined_rank_score_reorders_candidates_weight_stays_insightface_score(self):
+        # Candidate A: much higher raw insightface score, but only
+        # barely clears the LVFace-B veto. Candidate B: a thinner
+        # insightface margin, but a strong LVFace-B margin. The COMBINED
+        # margin favors B, so B must rank first (poss_ident1) -- but the
+        # weight SAVED for B stays its own raw insightface score, not the
+        # combined value (ranking signal only, per the user's own call).
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        cmf = assigner.CANDIDATE_MARGIN_FLOOR
+        lv_threshold = assigner.LVFACE_VETO_THRESHOLD
+
+        person_a = make_person("Rank A (high insightface, weak lvface)")
+        person_b = make_person("Rank B (lower insightface, strong lvface)")
+        assigner.likely_people_ids = [person_a.id, person_b.id]
+
+        sim_a = threshold + cmf + 0.10
+        sim_b = threshold + cmf + 0.02
+        assigner.embedding_dict = {
+            person_a.id: np.tile(self._ref(sim_a).reshape(512, 1), (1, 600)),
+            person_b.id: np.tile(self._ref(sim_b).reshape(512, 1), (1, 600)),
+        }
+        assigner.norm_dict = {person_a.id: np.ones(600), person_b.id: np.ones(600)}
+        assigner._build_concatenated_gallery()
+
+        lv_sim_a = lv_threshold + 0.01
+        lv_sim_b = lv_threshold + 0.20
+        assigner.lvface_gallery_dict = {
+            person_a.id: np.tile(self._ref(lv_sim_a).reshape(1, 512), (50, 1)),
+            person_b.id: np.tile(self._ref(lv_sim_b).reshape(1, 512), (50, 1)),
+        }
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+        face = make_face(img, declared_name=blank_person)
+        query = np.zeros(512)
+        query[0] = 1.0
+        face.face_encoding_512 = query.tolist()
+        face.face_encoding_lvface_b = query.tolist()
+        face.det_score = 0.9
+        face.save()
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+
+        self.assertEqual(mock_set.call_count, 2)
+        first_person_id, first_precedence, first_weight = mock_set.call_args_list[0][0][:3]
+        self.assertEqual(first_precedence, 1)
+        self.assertEqual(first_person_id, person_b.id)
+        self.assertAlmostEqual(first_weight, sim_b, places=4)
+
+
 class SizeNudgeMarginGateTests(TestCase):
     """SIZE_NUDGE_REF_SIZE/SIZE_NUDGE_MAX: added 2026-10-20 after a real
     investigation into whether Face.relative_size helps classification --
