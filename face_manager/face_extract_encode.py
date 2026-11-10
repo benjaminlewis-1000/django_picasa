@@ -791,9 +791,14 @@ class FaceExtractor(object):
         # sides which have no such floor. A kps point can still
         # legitimately be negative on this side (the true detected
         # position really was off-frame) even though the stored box
-        # can't be -- see this migration's own comment on the relaxed
-        # face_kps_within_box_margin constraint for how that specific,
-        # narrower mismatch is handled instead.
+        # can't be -- face_kps_within_box_margin's CENTROID-based design
+        # (Face.Meta.constraints, same file as this comment's own
+        # module) absorbs this naturally: the other 4 points pull the
+        # 5-point average back toward the box even when one point is
+        # negative, with no box-position-conditional logic needed at
+        # all (an earlier version of this fix needed exactly that, and
+        # it was a real, narrower blind spot -- see that constraint's
+        # own comment for the full history).
         bb_l = np.max((0, int(bb_l)))
         bb_t = np.max((0, int(bb_t)))
         bb_r = int(bb_r)

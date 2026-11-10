@@ -54,7 +54,17 @@ class BackfillDetScoreTests(TestCase):
         def __init__(self, bbox, det_score, kps=None):
             self.bbox = np.array(bbox, dtype=np.float32)
             self.det_score = det_score
-            self._kps = kps if kps is not None else [[1.0, 2.0]] * 5
+            # Default kps centered on bbox (not a fixed, often-off-box
+            # (1,2) placeholder) -- must satisfy the DB's centroid-based
+            # face_kps_within_box_margin constraint (face_manager/
+            # models.py) whenever a test doesn't care about the exact
+            # kps value and just needs something that will save.
+            if kps is not None:
+                self._kps = kps
+            else:
+                bl, bt, br, bb = bbox
+                cx, cy = (bl + br) / 2, (bt + bb) / 2
+                self._kps = [[cx, cy]] * 5
 
         def __getitem__(self, key):
             if key == 'kps':
@@ -400,7 +410,17 @@ class BackfillDetScoreRecheckMismatchedTransactionTests(TransactionTestCase):
         def __init__(self, bbox, det_score, kps=None):
             self.bbox = np.array(bbox, dtype=np.float32)
             self.det_score = det_score
-            self._kps = kps if kps is not None else [[1.0, 2.0]] * 5
+            # Default kps centered on bbox (not a fixed, often-off-box
+            # (1,2) placeholder) -- must satisfy the DB's centroid-based
+            # face_kps_within_box_margin constraint (face_manager/
+            # models.py) whenever a test doesn't care about the exact
+            # kps value and just needs something that will save.
+            if kps is not None:
+                self._kps = kps
+            else:
+                bl, bt, br, bb = bbox
+                cx, cy = (bl + br) / 2, (bt + bb) / 2
+                self._kps = [[cx, cy]] * 5
 
         def __getitem__(self, key):
             if key == 'kps':
@@ -416,23 +436,19 @@ class BackfillDetScoreRecheckMismatchedTransactionTests(TransactionTestCase):
         finally:
             with connection.cursor() as cursor:
                 # Kept in sync with Face.Meta.constraints' real definition
-                # (face_manager/models.py) -- 2026-11-09's edge-of-frame
-                # relaxation (box_left=0/box_top=0 skip the lower bound)
-                # included here too, so this test helper's "restored"
-                # constraint never silently diverges from the real one.
+                # (face_manager/models.py) -- 2026-11-09's centroid-based
+                # redesign included here too, so this test helper's
+                # "restored" constraint never silently diverges from the
+                # real one.
                 cursor.execute("""
                     ALTER TABLE face_manager_face ADD CONSTRAINT face_kps_within_box_margin CHECK (
                         kps IS NULL OR (
-                            (box_left = 0 OR kps[1] >= box_left - (box_right - box_left) * 0.25) AND kps[1] <= box_right + (box_right - box_left) * 0.25
-                            AND (box_top = 0 OR kps[2] >= box_top - (box_bottom - box_top) * 0.25) AND kps[2] <= box_bottom + (box_bottom - box_top) * 0.25
-                            AND (box_left = 0 OR kps[3] >= box_left - (box_right - box_left) * 0.25) AND kps[3] <= box_right + (box_right - box_left) * 0.25
-                            AND (box_top = 0 OR kps[4] >= box_top - (box_bottom - box_top) * 0.25) AND kps[4] <= box_bottom + (box_bottom - box_top) * 0.25
-                            AND (box_left = 0 OR kps[5] >= box_left - (box_right - box_left) * 0.25) AND kps[5] <= box_right + (box_right - box_left) * 0.25
-                            AND (box_top = 0 OR kps[6] >= box_top - (box_bottom - box_top) * 0.25) AND kps[6] <= box_bottom + (box_bottom - box_top) * 0.25
-                            AND (box_left = 0 OR kps[7] >= box_left - (box_right - box_left) * 0.25) AND kps[7] <= box_right + (box_right - box_left) * 0.25
-                            AND (box_top = 0 OR kps[8] >= box_top - (box_bottom - box_top) * 0.25) AND kps[8] <= box_bottom + (box_bottom - box_top) * 0.25
-                            AND (box_left = 0 OR kps[9] >= box_left - (box_right - box_left) * 0.25) AND kps[9] <= box_right + (box_right - box_left) * 0.25
-                            AND (box_top = 0 OR kps[10] >= box_top - (box_bottom - box_top) * 0.25) AND kps[10] <= box_bottom + (box_bottom - box_top) * 0.25
+                            (kps[1] + kps[3] + kps[5] + kps[7] + kps[9]) / 5.0
+                                BETWEEN box_left - (box_right - box_left) * 0.10
+                                    AND box_right + (box_right - box_left) * 0.10
+                            AND (kps[2] + kps[4] + kps[6] + kps[8] + kps[10]) / 5.0
+                                BETWEEN box_top - (box_bottom - box_top) * 0.10
+                                    AND box_bottom + (box_bottom - box_top) * 0.10
                         )
                     ) NOT VALID
                 """)
@@ -1075,18 +1091,20 @@ class BackfillVerifiedKpsTests(TestCase):
     def test_db_constraint_rejection_does_not_crash_the_whole_command(self):
         # Real production crash, 2026-10-26: _kps_matches_box()'s own
         # pre-check is deliberately looser (centroid within one box-
-        # width/-height of the box's own center) than the DB's
-        # face_kps_within_box_margin constraint (every one of the 5
-        # points individually within a 25% margin) -- a kps with 4
-        # clustered points and one wild outlier can clear the pre-check
-        # (its centroid still lands near the box center) while the
-        # outlier point alone fails the DB's tighter, per-point
-        # requirement. An uncaught IntegrityError here killed an entire
-        # shard outright in real production; must be caught and counted
-        # instead, not fatal.
+        # width/-height of the box's own center -- for this test's
+        # [10,10,50,50] box, centroid x within [-10,70]) than the DB's
+        # face_kps_within_box_margin constraint (2026-11-09: centroid
+        # within a 10% margin -- for this box, x within [6,54]) -- a kps
+        # with 4 clustered points and one wild-enough-to-matter outlier
+        # can clear the pre-check while still failing the DB's tighter
+        # check. An uncaught IntegrityError here killed an entire shard
+        # outright in real production; must be caught and counted
+        # instead, not fatal. Outlier chosen to land the centroid at
+        # x=60 -- inside the pre-check's [-10,70] but outside the DB
+        # constraint's [6,54].
         stored = [0.6] * 512
         face = self._make_face_with_encoding([10, 10, 50, 50], stored)
-        sneaky_kps = [[30.0, 30.0], [30.0, 30.0], [30.0, 30.0], [30.0, 30.0], [150.0, 30.0]]
+        sneaky_kps = [[30.0, 30.0], [30.0, 30.0], [30.0, 30.0], [30.0, 30.0], [180.0, 30.0]]
         fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, sneaky_kps, [0.6] * 512)]
         with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
                    return_value=np.zeros((1000, 1000, 3))), \

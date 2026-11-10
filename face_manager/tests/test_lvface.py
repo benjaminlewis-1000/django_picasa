@@ -803,16 +803,12 @@ class ReencodeMissingFacesMismatchedKpsTransactionTests(TransactionTestCase):
                 cursor.execute("""
                     ALTER TABLE face_manager_face ADD CONSTRAINT face_kps_within_box_margin CHECK (
                         kps IS NULL OR (
-                            (box_left = 0 OR kps[1] >= box_left - (box_right - box_left) * 0.25) AND kps[1] <= box_right + (box_right - box_left) * 0.25
-                            AND (box_top = 0 OR kps[2] >= box_top - (box_bottom - box_top) * 0.25) AND kps[2] <= box_bottom + (box_bottom - box_top) * 0.25
-                            AND (box_left = 0 OR kps[3] >= box_left - (box_right - box_left) * 0.25) AND kps[3] <= box_right + (box_right - box_left) * 0.25
-                            AND (box_top = 0 OR kps[4] >= box_top - (box_bottom - box_top) * 0.25) AND kps[4] <= box_bottom + (box_bottom - box_top) * 0.25
-                            AND (box_left = 0 OR kps[5] >= box_left - (box_right - box_left) * 0.25) AND kps[5] <= box_right + (box_right - box_left) * 0.25
-                            AND (box_top = 0 OR kps[6] >= box_top - (box_bottom - box_top) * 0.25) AND kps[6] <= box_bottom + (box_bottom - box_top) * 0.25
-                            AND (box_left = 0 OR kps[7] >= box_left - (box_right - box_left) * 0.25) AND kps[7] <= box_right + (box_right - box_left) * 0.25
-                            AND (box_top = 0 OR kps[8] >= box_top - (box_bottom - box_top) * 0.25) AND kps[8] <= box_bottom + (box_bottom - box_top) * 0.25
-                            AND (box_left = 0 OR kps[9] >= box_left - (box_right - box_left) * 0.25) AND kps[9] <= box_right + (box_right - box_left) * 0.25
-                            AND (box_top = 0 OR kps[10] >= box_top - (box_bottom - box_top) * 0.25) AND kps[10] <= box_bottom + (box_bottom - box_top) * 0.25
+                            (kps[1] + kps[3] + kps[5] + kps[7] + kps[9]) / 5.0
+                                BETWEEN box_left - (box_right - box_left) * 0.10
+                                    AND box_right + (box_right - box_left) * 0.10
+                            AND (kps[2] + kps[4] + kps[6] + kps[8] + kps[10]) / 5.0
+                                BETWEEN box_top - (box_bottom - box_top) * 0.10
+                                    AND box_bottom + (box_bottom - box_top) * 0.10
                         )
                     ) NOT VALID
                 """)
@@ -1113,9 +1109,15 @@ class UpdateExistingFaceLvfaceEncodingTests(TestCase):
 
     def _new_data(self, bbox):
         import insightface.app.common
+        # kps centered on bbox, not a fixed (0,0) placeholder -- must
+        # satisfy the DB's centroid-based face_kps_within_box_margin
+        # constraint (face_manager/models.py), same as any real
+        # detection's kps always would.
+        bl, bt, br, bb = bbox
+        cx, cy = (bl + br) / 2, (bt + bb) / 2
         return insightface.app.common.Face(
             bbox=np.array(bbox, dtype=np.float32),
-            kps=np.zeros((5, 2), dtype=np.float32),
+            kps=np.array([[cx, cy]] * 5, dtype=np.float32),
             det_score=0.9,
             embedding=np.ones(512, dtype=np.float32),
             age=30, gender=0,
