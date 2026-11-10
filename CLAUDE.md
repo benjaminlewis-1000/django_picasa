@@ -19,6 +19,48 @@ only buried in a session's own narrative further down.** Full detail/context for
 the dated write-up elsewhere in this file (search for a distinctive word from the bullet).
 
 **Open questions / follow-ups:**
+- **Session status snapshot (2026-11-09/10) -- several threads in progress at once, noted here so
+  they're not lost.** Search "box clamping without kps consistency" and "centroid check, not
+  per-point" for the full write-ups behind the constraint-related items below.
+  - **Image kps backfill (`backfill_verified_kps --lvface-sizes=B`) still running** (~14,162
+    image faces still missing kps as of 2026-11-10). **Needs a recheck now that
+    `face_kps_within_box_margin` has been redesigned** (centroid + edge-relaxation + 20% margin,
+    far looser than the original per-point 25% design) -- an earlier investigation into this same
+    backlog found ~74% of a sample "genuinely dead" (no detectable face anywhere near the stored
+    box, even via crop-redetect) under the OLD constraint; some of that population may actually
+    recover under the new one and just hasn't been retried since the fix landed. Worth a fresh
+    sample-based check before assuming the dead-tail percentage still holds.
+  - **LVFace-B backfill -- two separate, differently-sized populations, easy to conflate.** The
+    kps-missing population (above) is what the currently-running job actually touches. A much
+    larger, separate population -- **205,375 image faces that already have kps but were never
+    given LVFace-B** (older than the LVFace-B feature itself) -- is NOT touched by this job at
+    all (its trigger condition requires a kps-missing face on the image; an image where every
+    face already has kps never gets selected, regardless of LVFace-B status). Needs its own,
+    separately-scoped run once the kps backlog clears. Live coverage as of 2026-11-10: overall
+    74.1% (617,622/833,234), image 72.6%, video 96.0% (essentially done).
+  - **Orientation classifier training** (`train_rotation_classifier`) still running in 90-minute
+    bursts, needs continued relaunching as each one finishes. val_acc progression so far: 0.75
+    (run3) -> 0.84 (run4).
+  - **Orientation validation via face landmarks** (`rotation_audit.py`'s scheduled task) running
+    normally, but the human review queue (870 flagged as of last check) has had zero actual
+    reviews done -- no human has started working through it yet.
+  - **Self-healing celery worker supervisor, half-deployed.** `common.check_schema_freshness`
+    (detects a long-running worker's in-memory models falling behind the live DB schema, raises
+    WorkerShutdown) is live and scheduled. The actual supervisor that would relaunch the worker
+    afterward (`dockerize/supervise_celery_worker.py`, wrapping the worker launch in
+    `startup.sh`) is built and tested but NOT yet live in production -- `startup.sh` is a
+    single-file bind mount, so picking it up needs a full `docker compose up -d --force-recreate
+    picasa`, deliberately deferred since it would kill every current foreground job (the kps
+    backfill, training run, etc.). Needs a deliberate quiet moment to actually flip on.
+  - **Error-to-video linking feature (tie `ApplicationError` rows to their source `VideoFile`,
+    human-dismiss-with-resolution-status design) -- fully designed through several rounds of user
+    feedback this session, never explicitly approved to build.** No schema change made yet,
+    per this file's own "plan before schema changes, wait for yes" standing rule.
+  - **Retry-cap safety net for image face_extraction, proposed but not built.** Mirrors
+    `VideoFile`'s `face_extraction_failed`/timeout-count pattern -- came up when 2 images were
+    found permanently stuck (hourly retried forever, zero chance of success). That SPECIFIC root
+    cause got fixed directly (the constraint redesign above), but the general gap -- nothing caps
+    retries for any *future* stuck image, for a different reason -- remains open.
 - **Flagged (2026-11-06), not yet needed: the rotation-review ML classifier (`ImageFile.
   RotationSignalSource.ML_CLASSIFIER`, planned as a second signal source alongside the current
   landmark-geometry one -- see `face_manager/rotation_audit.py`/`rotation_geometry.py`) must NOT
