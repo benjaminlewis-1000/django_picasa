@@ -223,6 +223,36 @@ class ResetFace(APIView):
         return HttpResponse(json.dumps({'success': True}), content_type='application/json')
 
 
+class RejectAllProposed(APIView):
+
+    # "None of the above": decline every candidate currently proposed for
+    # this face (poss_ident1..5), not just drop the face back in the
+    # pool. Unlike ResetFace, this calls reject_association() per
+    # candidate, which records each one in rejected_fields so
+    # classify_unassigned() won't immediately re-propose the exact same
+    # names. Reads the candidate ids off the Face itself rather than
+    # trusting the client, since the mobile UI never sends person ids for
+    # this action.
+    permission_classes = (IsAuthenticated,)
+
+    def patch(self, request, *args, **kwargs):
+
+        selected_id = kwargs['id']
+        face_object = Face.objects.get(id=selected_id)
+
+        possible_ids = [
+            pid for pid in (
+                face_object.poss_ident1_id, face_object.poss_ident2_id,
+                face_object.poss_ident3_id, face_object.poss_ident4_id,
+                face_object.poss_ident5_id,
+            ) if pid is not None
+        ]
+        for pid in possible_ids:
+            face_object.reject_association(pid)
+
+        return HttpResponse(json.dumps({'success': True}), content_type='application/json')
+
+
 class IgnoreCandidatesList(APIView):
     """Still-unlabeled faces whose top classifier guess (poss_ident1) is
     `.ignore`. The mobile "review ignored faces" grid bulk-confirms these

@@ -54,6 +54,7 @@ urlpatterns = [
     path(r'mobile/labeling_groups/', mobile_views.LabelingGroupsView.as_view(), name='labeling_groups'),
     path(r'mobile/unlabeled_instance/<int:id>/', mobile_views.UnlabeledMobileInfo.as_view(), name='unlabeled_instances'),
     path(r'mobile/reset/<int:id>/', mobile_views.ResetFace.as_view(), name='reset'),
+    path(r'mobile/reject_proposed/<int:id>/', mobile_views.RejectAllProposed.as_view(), name='reject_proposed'),
     path(r'mobile/name_list/', mobile_views.MobileNameList.as_view(), name='name_list'),
     path(r'mobile/ignore_candidates/', mobile_views.IgnoreCandidatesList.as_view(), name='ignore_candidates'),
     path(r'mobile/bulk_confirm_ignore/', mobile_views.BulkConfirmIgnore.as_view(), name='bulk_confirm_ignore'),
