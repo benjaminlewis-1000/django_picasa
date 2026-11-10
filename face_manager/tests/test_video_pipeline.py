@@ -350,7 +350,7 @@ class VideoFaceSetBoxAndThumbnailOrphanTests(TestCase):
         # requires a thumbnail to already be attached), then the row is
         # saved for real, standing in for "an already-saved Face row".
         self.extractor._set_face_box_and_thumbnail(
-            self.face, self.frame, (10, 10, 60, 60), kps=[[0, 0]] * 5,
+            self.face, self.frame, (10, 10, 60, 60), kps=[[35, 35]] * 5,
         )
         self.face.save()
         first_thumbnail_path = self.face.face_thumbnail.path
@@ -358,7 +358,7 @@ class VideoFaceSetBoxAndThumbnailOrphanTests(TestCase):
 
         # Second call -- the real re-pick path.
         self.extractor._set_face_box_and_thumbnail(
-            self.face, self.frame, (20, 20, 70, 70), kps=[[0, 0]] * 5,
+            self.face, self.frame, (20, 20, 70, 70), kps=[[45, 45]] * 5,
         )
 
         self.assertFalse(os.path.isfile(first_thumbnail_path))
@@ -860,7 +860,10 @@ class RemediateVideoFaceGeometryTests(TestCase):
             source_video_file=video,
             box_left=10, box_top=10, box_right=50, box_bottom=50,
             video_thumbnail_frame_seconds=overrides.pop('video_thumbnail_frame_seconds', 12.3),
-            kps=[1.0] * 10,
+            # Centered on the box above (not a fixed (1,1) placeholder)
+            # -- must satisfy the DB's centroid-based face_kps_within_
+            # box_margin constraint (face_manager/models.py).
+            kps=[30.0, 30.0] * 5,
             **overrides,
         )
         face.face_thumbnail.save("thumb.jpg", ContentFile(_tiny_jpeg_bytes(size=(200, 200))), save=False)
@@ -1087,7 +1090,7 @@ class RemediateVideoFaceGeometryTests(TestCase):
         face2 = Face(
             declared_name=face1.declared_name, source_video_file=video,
             box_left=10, box_top=10, box_right=50, box_bottom=50,
-            video_thumbnail_frame_seconds=20.0, kps=[1.0] * 10,
+            video_thumbnail_frame_seconds=20.0, kps=[30.0, 30.0] * 5,
         )
         face2.face_thumbnail.save("thumb2.jpg", ContentFile(_tiny_jpeg_bytes(size=(200, 200))), save=False)
         face2.save()

@@ -40,12 +40,25 @@ from face_manager.tests import make_face, make_person, make_image, make_preexist
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class FaceKpsWithinBoxConstraintTests(TestCase):
-    """DB-level structural backstop (migration 0019, see CLAUDE.md) for
-    the real kps/box translation bug found 2026-10-26 -- a 25%-margin
-    CHECK constraint that a wildly-mismatched kps (the actual failure
-    mode, off by thousands of pixels) can never pass, while real,
-    legitimately-slightly-off-box landmarks (extreme pose/expression)
-    still can."""
+    """DB-level structural backstop for the real kps/box translation bug
+    found 2026-10-26 (see CLAUDE.md) -- a wildly-mismatched kps (the
+    actual failure mode, off by thousands of pixels) can never pass.
+
+    2026-11-09: redesigned from a strict per-point margin check to a
+    looser CENTROID check (the mean of the 5 points, not each one
+    individually, must fall within the box ± 10%) -- the per-point
+    design rejected two classes of real, legitimate faces: an extreme
+    head-tilt/profile pose where one or two individual landmarks
+    (typically the mouth corners) legitimately sit well outside a
+    tightly-fit box even though the overall configuration clearly
+    corresponds to that face (test_extreme_pose_* below, using real
+    production kps/box values); and a face detected partially off the
+    image's own edge, whose box must be clamped to 0 while its kps
+    legitimately isn't (test_edge_of_frame_* below) -- this used to need
+    its own position-conditional relaxation (box_left=0/box_top=0),
+    itself a real but narrow blind spot (the constraint couldn't tell
+    "genuinely clamped" from "coincidentally at pixel 0" apart), no
+    longer needed at all since the centroid absorbs it naturally."""
 
     def setUp(self):
         self.image = make_image()
@@ -64,11 +77,6 @@ class FaceKpsWithinBoxConstraintTests(TestCase):
         self.assertIsNotNone(face.id)
 
     def test_kps_slightly_outside_box_within_margin_is_accepted(self):
-        # A landmark a few pixels past the box edge (plausible under an
-        # extreme pose) must not be rejected -- the whole reason this
-        # constraint uses a 25% margin, not a strict zero one (see its
-        # own comment for the real, measured false-positive rate at
-        # zero margin).
         face = make_face(
             self.image, box_left=100, box_top=100, box_right=150, box_bottom=150,
             kps=[95, 110, 140, 110, 125, 125, 115, 140, 135, 140],
@@ -80,63 +88,81 @@ class FaceKpsWithinBoxConstraintTests(TestCase):
         self.assertIsNone(face.kps)
         self.assertIsNotNone(face.id)
 
-    def test_negative_x_accepted_when_box_left_is_zero(self):
-        # 2026-11-09 (see CLAUDE.md): a face detected partially off the
-        # LEFT edge of the photo has a box that must be clamped to
-        # box_left=0 (Face.save() itself rejects a negative value), but
-        # its kps can legitimately still be negative -- the lower x-
-        # bound is skipped entirely when box_left=0, specifically to
-        # accommodate this, without ever touching the kps value itself.
+    def test_extreme_pose_with_two_points_outside_old_margin_is_accepted(self):
+        # Real production case (2026-11-09, see CLAUDE.md): a person
+        # lying down, head tilted back -- 2 of the 5 landmarks (the
+        # mouth corners) land well above the box's own top edge, enough
+        # to fail the old per-point 25% margin on their own, but the
+        # 5-point centroid still falls cleanly inside the box since the
+        # other 3 points pull it back. Visually confirmed as a real,
+        # correctly-detected face, not corruption.
         face = make_face(
-            self.image, box_left=0, box_top=100, box_right=50, box_bottom=150,
-            kps=[-300, 110, 40, 110, 25, 125, 15, 140, 35, 140],
+            self.image, box_left=2066, box_top=1733, box_right=2374, box_bottom=2148,
+            kps=[
+                2238.7421875, 2023.3155517578125, 2159.802734375, 1989.6998291015625,
+                2211.890869140625, 1819.0377197265625, 2281.8330078125, 1590.990966796875,
+                2233.5224609375, 1565.503173828125,
+            ],
         )
         self.assertIsNotNone(face.id)
 
-    def test_negative_y_accepted_when_box_top_is_zero(self):
+    def test_edge_of_frame_face_with_box_left_zero_is_accepted(self):
+        # Real production case -- a face detected partially off the
+        # LEFT edge of the photo: box_left is clamped to 0 (Face.save()
+        # itself rejects a negative value), but several kps x-values are
+        # still genuinely negative. No position-conditional constraint
+        # logic needed -- the centroid (~19.9, comfortably inside
+        # [0, 297]) absorbs this on its own.
         face = make_face(
-            self.image, box_left=100, box_top=0, box_right=150, box_bottom=50,
-            kps=[110, -300, 140, 10, 125, 25, 115, 40, 135, 40],
+            self.image, box_left=0, box_top=446, box_right=297, box_bottom=1062,
+            kps=[
+                -36.187172, 643.2746, 154.4798, 707.8366, 2.118241, 787.387,
+                -81.44768, 874.9121, 60.407658, 929.1918,
+            ],
         )
         self.assertIsNotNone(face.id)
 
-    def test_negative_x_still_rejected_when_box_left_is_not_zero(self):
-        # The relaxation is specific to box_left=0 -- an ordinary face
-        # NOT pinned to the image edge must still be held to the real
-        # margin check on this side, same as before.
-        with self.assertRaises(IntegrityError):
-            with transaction.atomic():
-                make_face(
-                    self.image, box_left=100, box_top=100, box_right=150, box_bottom=150,
-                    kps=[-300, 110, 140, 110, 125, 125, 115, 140, 135, 140],
-                )
+    def test_edge_of_frame_profile_face_needs_the_10pct_margin(self):
+        # Real production case -- the one genuine false positive found
+        # empirically at a STRICT (zero-margin) centroid check: a
+        # child's profile face, box flush against the left edge
+        # (box_left=0), whose centroid sits ~7px past box_left. The 10%
+        # margin exists specifically to absorb cases like this one.
+        face = make_face(
+            self.image, box_left=0, box_top=503, box_right=205, box_bottom=828,
+            kps=[
+                -38.50234, 629.7934, 34.655674, 628.76135, -42.251812, 696.6966,
+                -24.030853, 755.61786, 32.982437, 753.3437,
+            ],
+        )
+        self.assertIsNotNone(face.id)
 
-    def test_negative_y_still_rejected_when_box_top_is_not_zero(self):
-        with self.assertRaises(IntegrityError):
-            with transaction.atomic():
-                make_face(
-                    self.image, box_left=100, box_top=100, box_right=150, box_bottom=150,
-                    kps=[110, -300, 140, 110, 125, 125, 115, 140, 135, 140],
-                )
-
-    def test_upper_bound_still_enforced_even_when_box_left_is_zero(self):
-        # The relaxation only ever drops the LOWER bound -- a wildly
-        # too-large x value (the real anti-corruption case this
-        # constraint exists for) must still be rejected regardless of
-        # where the box sits.
+    def test_gross_corruption_still_rejected_even_at_an_edge_of_frame_box(self):
+        # The centroid design must not accidentally become MORE
+        # permissive at an edge-of-frame box than elsewhere -- a wildly
+        # wrong kps (the real corruption class this constraint exists
+        # for) must still be rejected even when box_left=0.
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 make_face(
                     self.image, box_left=0, box_top=100, box_right=50, box_bottom=150,
-                    kps=[900, 110, 40, 110, 25, 125, 15, 140, 35, 140],
+                    kps=[900] * 10,
                 )
 
-    def test_upper_bound_still_enforced_even_when_box_top_is_zero(self):
+    def test_one_wildly_wrong_point_among_four_good_ones_is_still_rejected(self):
+        # A single point can legitimately sit outside the OLD per-point
+        # margin (extreme pose, see above) without tripping the new
+        # centroid check -- but it must not be possible to smuggle a
+        # genuinely corrupted point through just because the other 4
+        # are fine; the corrupted point still has to drag the 5-point
+        # AVERAGE far enough to matter, and a single point offset by
+        # hundreds of pixels (not the subtle few-dozen-pixel pose
+        # variation seen in real faces) does exactly that.
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 make_face(
-                    self.image, box_left=100, box_top=0, box_right=150, box_bottom=50,
-                    kps=[110, 900, 140, 10, 125, 25, 115, 40, 135, 40],
+                    self.image, box_left=100, box_top=100, box_right=150, box_bottom=150,
+                    kps=[1000, 1000, 125, 125, 125, 125, 125, 125, 125, 125],
                 )
 
 

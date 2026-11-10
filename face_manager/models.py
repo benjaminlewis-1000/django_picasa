@@ -496,62 +496,60 @@ class Face(models.Model):
             # thousands of pixels from its own face's box for ~360k
             # faces in production. Fixed at the source, but the DB
             # itself should refuse to store this class of corruption
-            # again regardless of which code path writes it. A 25%
-            # margin (not zero) is deliberate -- checked empirically
-            # against 2,682 real, presumed-good production faces: a
-            # strict zero-margin check already rejects 5.07% of them
-            # (real landmark points can legitimately sit just past a
-            # tight SCRFD box edge under an extreme pose/expression),
-            # while 25% leaves only 0.30% -- nowhere near the
-            # thousands-of-pixels scale the real bug produced, so this
-            # stays a true backstop against gross corruption rather than
-            # a routine blocker on normal detections. NULL kps (not yet
-            # backfilled) always passes trivially.
+            # again regardless of which code path writes it. NULL kps
+            # (not yet backfilled) always passes trivially.
             #
-            # 2026-11-09 (see CLAUDE.md): the lower x-bound is skipped
-            # entirely whenever box_left=0, and the lower y-bound
-            # whenever box_top=0 -- a face detected partially off-frame
-            # (cut off by the photo's own left/top edge) legitimately
-            # has a kps point before 0, but Face.save() itself
-            # unconditionally rejects a negative box_left/box_top, so
-            # the box on that side MUST be clamped to 0 while kps
-            # (deliberately left untouched -- see add_new_face()'s own
-            # comment on why moving it instead would corrupt LVFace
-            # alignment/future kps-replay re-encodes) legitimately isn't.
-            # The right/bottom side needs no equivalent relaxation: box_
-            # right/box_bottom are no longer clamped down to the image's
-            # own width/height at write time (add_new_face(), same
-            # commit), so box and kps stay mutually consistent there
-            # without any constraint change. The UPPER bound -- the
-            # constraint's real anti-corruption backstop -- is never
-            # relaxed on any side, by any condition: only the specific,
-            # narrow, well-understood "box pinned to 0" case loses its
-            # lower-bound check, not gross corruption in general.
+            # 2026-11-09 (see CLAUDE.md): redesigned from a strict
+            # per-point margin check to a looser CENTROID check -- the
+            # mean of the 5 kps points must fall within the box, ± a 10%
+            # margin. The original per-point design rejected two
+            # different classes of real, legitimate faces: one or two
+            # individual landmarks (typically the mouth corners) can
+            # genuinely sit well outside a tightly-fit box under an
+            # extreme head-tilt/profile pose, even though the overall
+            # landmark configuration clearly corresponds to that face
+            # and box; separately, a face detected partially off the
+            # image's own left/top edge needs its box clamped to 0
+            # (Face.save() itself rejects a negative box_left/box_top)
+            # while its kps legitimately isn't, which used to need its
+            # own special-cased relaxation (box_left=0/box_top=0) --
+            # itself a real but narrow blind spot (the constraint can't
+            # tell "genuinely clamped" from "coincidentally at pixel 0"
+            # apart), since removed because the centroid naturally
+            # absorbs this case too without any position-conditional
+            # logic at all. A single wildly-wrong point still can't drag
+            # a 5-point AVERAGE far enough to survive gross corruption
+            # (the real bug this constraint exists for shifted a kps by
+            # thousands of pixels), while real pose variation in
+            # individual points no longer matters at all -- only the
+            # overall landmark-to-box correspondence does. Checked
+            # empirically against 5,000 real, presumed-good production
+            # faces (0.000-0.020% false-positive rate across several
+            # samples, lower than the old per-point design's 0.040%) and
+            # against simulated gross corruption (offsets from 800 to
+            # 4,000px, deliberately smaller than the real bug's
+            # thousands-of-pixels scale): 100% caught at zero margin,
+            # 99.8% still caught even at the deliberately-small 800px end
+            # once the 10% margin was added to absorb the last remaining
+            # real false positive found (a profile face's centroid
+            # sitting ~7px past a box flush against the image edge). 10%
+            # (not the old design's 25%) deliberately chosen tighter,
+            # since a centroid check is already structurally far more
+            # forgiving than a per-point one at any given percentage --
+            # a handful of existing test fixtures' own placeholder kps
+            # values needed updating to real-shaped values to satisfy
+            # this margin rather than loosening it for their convenience.
             models.CheckConstraint(
                 condition=(
                     models.Q(kps__isnull=True) |
                     models.Q(RawSQL(
                         """
-                        (box_left = 0 OR kps[1] >= box_left - (box_right - box_left) * 0.25)
-                        AND kps[1] <= box_right + (box_right - box_left) * 0.25
-                        AND (box_top = 0 OR kps[2] >= box_top - (box_bottom - box_top) * 0.25)
-                        AND kps[2] <= box_bottom + (box_bottom - box_top) * 0.25
-                        AND (box_left = 0 OR kps[3] >= box_left - (box_right - box_left) * 0.25)
-                        AND kps[3] <= box_right + (box_right - box_left) * 0.25
-                        AND (box_top = 0 OR kps[4] >= box_top - (box_bottom - box_top) * 0.25)
-                        AND kps[4] <= box_bottom + (box_bottom - box_top) * 0.25
-                        AND (box_left = 0 OR kps[5] >= box_left - (box_right - box_left) * 0.25)
-                        AND kps[5] <= box_right + (box_right - box_left) * 0.25
-                        AND (box_top = 0 OR kps[6] >= box_top - (box_bottom - box_top) * 0.25)
-                        AND kps[6] <= box_bottom + (box_bottom - box_top) * 0.25
-                        AND (box_left = 0 OR kps[7] >= box_left - (box_right - box_left) * 0.25)
-                        AND kps[7] <= box_right + (box_right - box_left) * 0.25
-                        AND (box_top = 0 OR kps[8] >= box_top - (box_bottom - box_top) * 0.25)
-                        AND kps[8] <= box_bottom + (box_bottom - box_top) * 0.25
-                        AND (box_left = 0 OR kps[9] >= box_left - (box_right - box_left) * 0.25)
-                        AND kps[9] <= box_right + (box_right - box_left) * 0.25
-                        AND (box_top = 0 OR kps[10] >= box_top - (box_bottom - box_top) * 0.25)
-                        AND kps[10] <= box_bottom + (box_bottom - box_top) * 0.25
+                        (kps[1] + kps[3] + kps[5] + kps[7] + kps[9]) / 5.0
+                            BETWEEN box_left - (box_right - box_left) * 0.10
+                                AND box_right + (box_right - box_left) * 0.10
+                        AND (kps[2] + kps[4] + kps[6] + kps[8] + kps[10]) / 5.0
+                            BETWEEN box_top - (box_bottom - box_top) * 0.10
+                                AND box_bottom + (box_bottom - box_top) * 0.10
                         """,
                         (),
                         output_field=models.BooleanField(),
