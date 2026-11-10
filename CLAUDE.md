@@ -164,18 +164,30 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
   0.837 correlation between the two signals even on junk faces -- they largely agree on the same
   hard/ambiguous cases, so agreement-gating is a real but non-dramatic win, not a free lunch.
 
-  **The user's own tiered-confidence design (both agree -> high; disagree but close -> medium;
-  otherwise -> reject) has real support in the data, not yet built.** Among real matches that
-  pass LVFace-B but fail insightface's bare threshold, 64% are "close" (within 0.05 of also
-  passing) rather than a wild disagreement -- a genuine middle population exists. A three-tier
-  design could recover some of AND-gating's TPR cost without reopening OR-gating's much larger
-  FPR exposure, but this specific tier hasn't been simulated end-to-end (only the "does a close
-  middle population exist at all" precondition has been checked) -- would need its own sweep
-  before being treated as validated.
+  **The tiered-confidence design was simulated end-to-end (2026-11-10, `scratch_validate_
+  lvface_tiered.py`) and the result is a clean negative: a raw-score "closeness" medium tier is
+  a losing trade at every width tested, with a cleaner (n=2,000 negatives, Wilson 95% CIs,
+  cached raw scores for free re-sweeping) FPR estimate than the earlier "muddy" 500-face one.**
+  At LV_thresh=0.30/IF_thresh=0.40, the plain AND-gate baseline is TPR 96.47% [96.1-96.8%], FPR
+  6.40% [5.4-7.6%]. Sweeping the medium tier's "how close counts" cutoff from 0.002 (barely any
+  slack) up to 0.12: the TPR-recovered-per-FPR-added ratio never exceeds ~0.32 (best at
+  shortfall=0.03: +0.51pp TPR for +1.60pp FPR) and is as low as 0.16-0.24 at the tightest
+  cutoffs tested -- there's no sweet spot, tight or loose, where rescuing "close" near-misses is
+  a good trade. Likely cause: near-threshold negatives are nearly as dense as near-threshold
+  positives (consistent with the margin-sweep finding above that negatives cluster close to
+  threshold too, not cleanly separated from it) -- rescuing "close" on raw score pulls in almost
+  as much junk as real matches, even at a 0.002 cutoff. **The plain AND-gate remains the best
+  operating point found across every experiment run today** (margin-gating, agreement-gating,
+  tiered) -- better than LVFace-B alone (TPR 97.3%/FPR 9.8%) or OR-gating (TPR 97.5%/FPR 11.7%).
+  Untested, and a plausible next step if tiering is still wanted: a MARGIN-based "close"
+  (relative to each query's own best-competitor gap, the stronger lever from the margin sweep)
+  rather than a raw-threshold-shortfall "close" -- this specific negative result only rules out
+  the literal raw-score interpretation, not every possible tiered design.
 
-  **Status: investigation only, nothing built or integrated.** The user is deciding the actual
-  integration approach (replace / AND-gate / tiered) in the morning -- do not implement any
-  change to `classify_unassigned()` or `assign_faces.py` until that decision is made.
+  **Status: investigation only, nothing built or integrated.** Given today's results, AND-gating
+  looks like the strongest candidate so far; the actual integration decision (replace / AND-gate
+  / a margin-based tiered variant) is still the user's to make -- do not implement any change to
+  `classify_unassigned()`/`assign_faces.py` until that decision is made.
 - **TODO, deliberately deferred: clear LVFace-B encodings for confirmed-`.ignore`/`.realignore`
   faces, mirroring `clear_confirmed_ignore_face_encodings()`'s existing insightface-only
   behavior.** Currently LVFace-B is NOT cleared for confirmed-ignore faces at all (confirmed
