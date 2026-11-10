@@ -436,19 +436,17 @@ class BackfillDetScoreRecheckMismatchedTransactionTests(TransactionTestCase):
         finally:
             with connection.cursor() as cursor:
                 # Kept in sync with Face.Meta.constraints' real definition
-                # (face_manager/models.py) -- 2026-11-09's centroid-based
-                # redesign included here too, so this test helper's
-                # "restored" constraint never silently diverges from the
-                # real one.
+                # (face_manager/models.py) -- 2026-11-09/10's centroid +
+                # edge-relaxation redesign included here too, so this
+                # test helper's "restored" constraint never silently
+                # diverges from the real one.
                 cursor.execute("""
                     ALTER TABLE face_manager_face ADD CONSTRAINT face_kps_within_box_margin CHECK (
                         kps IS NULL OR (
-                            (kps[1] + kps[3] + kps[5] + kps[7] + kps[9]) / 5.0
-                                BETWEEN box_left - (box_right - box_left) * 0.10
-                                    AND box_right + (box_right - box_left) * 0.10
-                            AND (kps[2] + kps[4] + kps[6] + kps[8] + kps[10]) / 5.0
-                                BETWEEN box_top - (box_bottom - box_top) * 0.10
-                                    AND box_bottom + (box_bottom - box_top) * 0.10
+                            (box_left = 0 OR (kps[1] + kps[3] + kps[5] + kps[7] + kps[9]) / 5.0 >= box_left - (box_right - box_left) * 0.20)
+                            AND (kps[1] + kps[3] + kps[5] + kps[7] + kps[9]) / 5.0 <= box_right + (box_right - box_left) * 0.20
+                            AND (box_top = 0 OR (kps[2] + kps[4] + kps[6] + kps[8] + kps[10]) / 5.0 >= box_top - (box_bottom - box_top) * 0.20)
+                            AND (kps[2] + kps[4] + kps[6] + kps[8] + kps[10]) / 5.0 <= box_bottom + (box_bottom - box_top) * 0.20
                         )
                     ) NOT VALID
                 """)
@@ -1101,7 +1099,8 @@ class BackfillVerifiedKpsTests(TestCase):
         # outright in real production; must be caught and counted
         # instead, not fatal. Outlier chosen to land the centroid at
         # x=60 -- inside the pre-check's [-10,70] but outside the DB
-        # constraint's [6,54].
+        # constraint's [2,58] (box isn't edge-of-frame, so the
+        # box_left=0 relaxation doesn't apply here either).
         stored = [0.6] * 512
         face = self._make_face_with_encoding([10, 10, 50, 50], stored)
         sneaky_kps = [[30.0, 30.0], [30.0, 30.0], [30.0, 30.0], [30.0, 30.0], [180.0, 30.0]]

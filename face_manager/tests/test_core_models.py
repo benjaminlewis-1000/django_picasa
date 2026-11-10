@@ -44,21 +44,20 @@ class FaceKpsWithinBoxConstraintTests(TestCase):
     found 2026-10-26 (see CLAUDE.md) -- a wildly-mismatched kps (the
     actual failure mode, off by thousands of pixels) can never pass.
 
-    2026-11-09: redesigned from a strict per-point margin check to a
+    2026-11-09/10: redesigned from a strict per-point margin check to a
     looser CENTROID check (the mean of the 5 points, not each one
-    individually, must fall within the box ± 10%) -- the per-point
-    design rejected two classes of real, legitimate faces: an extreme
-    head-tilt/profile pose where one or two individual landmarks
-    (typically the mouth corners) legitimately sit well outside a
-    tightly-fit box even though the overall configuration clearly
-    corresponds to that face (test_extreme_pose_* below, using real
-    production kps/box values); and a face detected partially off the
-    image's own edge, whose box must be clamped to 0 while its kps
-    legitimately isn't (test_edge_of_frame_* below) -- this used to need
-    its own position-conditional relaxation (box_left=0/box_top=0),
-    itself a real but narrow blind spot (the constraint couldn't tell
-    "genuinely clamped" from "coincidentally at pixel 0" apart), no
-    longer needed at all since the centroid absorbs it naturally."""
+    individually, must fall within the box ± 20%), PLUS the lower
+    x-bound is skipped entirely when box_left=0 and the lower y-bound
+    when box_top=0 -- a face detected partially off the image's own
+    edge needs its box clamped to 0 (Face.save() itself rejects a
+    negative box_left/box_top) while its kps legitimately isn't.
+    Both the 20% figure and the edge-relaxation were sized directly
+    against real production data, not guessed: a first, centroid-only/
+    10%-margin/no-edge-relaxation design left 63 real existing
+    production rows unable to validate -- every one individually
+    confirmed as a real, legitimate face (not corruption), split 79%
+    edge-of-frame and 21% extreme-pose. The combination here covers all
+    63 with zero remaining exceptions."""
 
     def setUp(self):
         self.image = make_image()
@@ -122,12 +121,11 @@ class FaceKpsWithinBoxConstraintTests(TestCase):
         )
         self.assertIsNotNone(face.id)
 
-    def test_edge_of_frame_profile_face_needs_the_10pct_margin(self):
-        # Real production case -- the one genuine false positive found
-        # empirically at a STRICT (zero-margin) centroid check: a
-        # child's profile face, box flush against the left edge
-        # (box_left=0), whose centroid sits ~7px past box_left. The 10%
-        # margin exists specifically to absorb cases like this one.
+    def test_edge_of_frame_profile_face_is_accepted(self):
+        # Real production case -- a child's profile face, box flush
+        # against the left edge (box_left=0): the edge-relaxation skips
+        # the lower x-bound entirely here, so this passes regardless of
+        # the specific margin percentage.
         face = make_face(
             self.image, box_left=0, box_top=503, box_right=205, box_bottom=828,
             kps=[
@@ -136,6 +134,31 @@ class FaceKpsWithinBoxConstraintTests(TestCase):
             ],
         )
         self.assertIsNotNone(face.id)
+
+    def test_edge_relaxation_accepts_a_centroid_far_beyond_the_plain_margin(self):
+        # Proves the edge-relaxation does real work beyond the 20%
+        # margin alone: box_left=0, box_right=50 (width 50, 20% margin
+        # =10, so a plain margin-only check would require centroid
+        # x >= -10) -- a centroid at x=-20 is well past that, but still
+        # accepted here purely because box_left=0 drops the lower bound
+        # entirely.
+        face = make_face(
+            self.image, box_left=0, box_top=50, box_right=50, box_bottom=100,
+            kps=[-20, 75] * 5,
+        )
+        self.assertIsNotNone(face.id)
+
+    def test_same_centroid_rejected_when_box_left_is_not_zero(self):
+        # The exact same out-of-margin centroid as above, but on a box
+        # that does NOT touch the left edge -- the relaxation must not
+        # apply here, so the plain 20% margin governs and this is
+        # correctly rejected.
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                make_face(
+                    self.image, box_left=5, box_top=50, box_right=55, box_bottom=100,
+                    kps=[-20, 75] * 5,
+                )
 
     def test_gross_corruption_still_rejected_even_at_an_edge_of_frame_box(self):
         # The centroid design must not accidentally become MORE

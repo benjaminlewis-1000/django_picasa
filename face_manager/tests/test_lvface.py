@@ -803,12 +803,10 @@ class ReencodeMissingFacesMismatchedKpsTransactionTests(TransactionTestCase):
                 cursor.execute("""
                     ALTER TABLE face_manager_face ADD CONSTRAINT face_kps_within_box_margin CHECK (
                         kps IS NULL OR (
-                            (kps[1] + kps[3] + kps[5] + kps[7] + kps[9]) / 5.0
-                                BETWEEN box_left - (box_right - box_left) * 0.10
-                                    AND box_right + (box_right - box_left) * 0.10
-                            AND (kps[2] + kps[4] + kps[6] + kps[8] + kps[10]) / 5.0
-                                BETWEEN box_top - (box_bottom - box_top) * 0.10
-                                    AND box_bottom + (box_bottom - box_top) * 0.10
+                            (box_left = 0 OR (kps[1] + kps[3] + kps[5] + kps[7] + kps[9]) / 5.0 >= box_left - (box_right - box_left) * 0.20)
+                            AND (kps[1] + kps[3] + kps[5] + kps[7] + kps[9]) / 5.0 <= box_right + (box_right - box_left) * 0.20
+                            AND (box_top = 0 OR (kps[2] + kps[4] + kps[6] + kps[8] + kps[10]) / 5.0 >= box_top - (box_bottom - box_top) * 0.20)
+                            AND (kps[2] + kps[4] + kps[6] + kps[8] + kps[10]) / 5.0 <= box_bottom + (box_bottom - box_top) * 0.20
                         )
                     ) NOT VALID
                 """)
