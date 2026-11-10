@@ -547,6 +547,107 @@ class AddNewFaceEdgeOfFrameBoxTests(TestCase):
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class FindAndEncodeFacesBelowFloorAssertTests(TestCase):
+    """Regression test for a real, pre-existing bug found 2026-11-09
+    (see CLAUDE.md) while verifying the edge-of-frame box fix above: the
+    per-face sanity-check loop at the end of _find_and_encode_faces_
+    locked() (`for face in img_faces: assert face.face_encoding_512 is
+    not None ...`) predates below_collection_floor() -- a deliberate,
+    documented feature (add_new_face() itself, same file) where a too-
+    small/low-confidence detection is saved WITHOUT a real embedding on
+    purpose. The assert never learned about that exception, so it fired
+    a confusing, empty-message "Error matching faces" log line on every
+    image containing one -- previously invisible because these specific
+    62 images were always blocked earlier by an unrelated box/kps bug;
+    fixing that let real traffic reach this landmine for the first
+    time. Not a data-correctness bug even before this fix (isProcessed=
+    True is set BEFORE this loop runs, so the image was always marked
+    done correctly regardless) -- purely a false-alarm log line."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.extractor = FaceExtractor()
+
+    def _make_image_in_collection(self, collection, path):
+        directory, _ = Directory.objects.get_or_create(
+            dir_path=os.path.dirname(path), defaults={'collection': collection},
+        )
+        if directory.collection_id != (collection.id if collection else None):
+            directory.collection = collection
+            directory.save()
+        image = ImageFile(
+            filename=path, directory=directory, thumbnail_small="",
+            width=640, height=480, pixel_hash='hash', file_hash='fhash', dateTakenUTC=0,
+        )
+        ImageFile.objects.bulk_create([image])
+        return ImageFile.objects.get(filename=path)
+
+    def _fake_detection(self, bbox, det_score):
+        import insightface.app.common
+        bl, bt, br, bb = bbox
+        cx, cy = (bl + br) / 2, (bt + bb) / 2
+        return insightface.app.common.Face(
+            bbox=np.array(bbox, dtype=np.float32),
+            kps=np.array([[cx, cy]] * 5, dtype=np.float32),
+            det_score=det_score,
+            embedding=np.ones(512, dtype=np.float32),
+            age=30, gender=0,
+        )
+
+    def test_below_floor_face_does_not_raise_or_block_processing(self):
+        from filepopulator.models import PhotoCollection
+
+        collection = PhotoCollection.objects.create(
+            name='Below Floor End To End', root_directory='/photos/floor_e2e_test', min_face_det_score=0.6,
+        )
+        img = self._make_image_in_collection(collection, '/photos/floor_e2e_test/a.jpg')
+        img_numpy = np.zeros((480, 640, 3), dtype=np.uint8)
+        # det_score=0.5 is below the collection's 0.6 floor -- withheld
+        # embedding is the correct, intended outcome, not a bug.
+        det = self._fake_detection([100, 100, 200, 200], det_score=0.5)
+
+        with patch.object(self.extractor, 'app') as mock_app, \
+             patch('face_manager.face_extract_encode.common.open_img_oriented', return_value=img_numpy):
+            mock_app.get.return_value = [det]
+            self.extractor.find_and_encode_faces()
+
+        img.refresh_from_db()
+        self.assertTrue(img.isProcessed)
+        face = Face.objects.get(source_image_file=img)
+        self.assertIsNone(face.face_encoding_512)
+        self.assertTrue(face.reencoded)
+
+    def test_mixed_image_above_and_below_floor_both_handled_correctly(self):
+        # A realistic case: one face clears the floor (gets a real
+        # embedding), another doesn't (withheld) -- both must coexist on
+        # the same image without the below-floor one tripping the assert
+        # loop for the whole image.
+        from filepopulator.models import PhotoCollection
+
+        collection = PhotoCollection.objects.create(
+            name='Mixed Floor End To End', root_directory='/photos/floor_e2e_mixed', min_face_det_score=0.6,
+        )
+        img = self._make_image_in_collection(collection, '/photos/floor_e2e_mixed/a.jpg')
+        img_numpy = np.zeros((480, 640, 3), dtype=np.uint8)
+        below = self._fake_detection([10, 10, 60, 60], det_score=0.5)
+        above = self._fake_detection([300, 300, 450, 450], det_score=0.9)
+
+        with patch.object(self.extractor, 'app') as mock_app, \
+             patch('face_manager.face_extract_encode.common.open_img_oriented', return_value=img_numpy):
+            mock_app.get.return_value = [below, above]
+            self.extractor.find_and_encode_faces()
+
+        img.refresh_from_db()
+        self.assertTrue(img.isProcessed)
+        faces = {f.relative_size: f for f in Face.objects.filter(source_image_file=img)}
+        below_face = min(faces.values(), key=lambda f: f.relative_size)
+        above_face = max(faces.values(), key=lambda f: f.relative_size)
+        self.assertIsNone(below_face.face_encoding_512)
+        self.assertIsNotNone(above_face.face_encoding_512)
+
+
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class BackfillRelativeSizeTests(TestCase):
     """backfill_relative_size: pure-arithmetic backfill, no decode/model
     inference needed, so plain ImageFile/Face rows built directly

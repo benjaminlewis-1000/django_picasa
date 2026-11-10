@@ -542,9 +542,22 @@ class FaceExtractor(object):
                 assert img_obj.isProcessed == True, 'Image isProcessed flag was not set'
 
                 for face in img_faces:
+                    assert face.reencoded == True
+                    # A face below its collection's own detection floor
+                    # (too small/low-confidence) deliberately never gets
+                    # a real embedding -- see below_collection_floor()'s
+                    # own docstring, and add_new_face()'s use of it just
+                    # above. This loop predates that gating feature and
+                    # didn't know about the exception; found 2026-11-09
+                    # (see CLAUDE.md) once a separate fix let more images
+                    # actually reach this code instead of failing
+                    # earlier on an unrelated bug -- every one of these
+                    # faces was processing correctly the whole time, this
+                    # was a false-alarm log line, not a real failure.
+                    if below_collection_floor(img_obj.directory.collection, face.det_score, face.relative_size):
+                        continue
                     assert face.face_encoding_512 is not None
                     assert len(face.face_encoding_512) == 512
-                    assert face.reencoded == True
             except Exception as e:
                 # A failure anywhere in the IOU-matching/reconciliation
                 # logic above (originally several hand-rolled cases left
