@@ -1369,17 +1369,33 @@ class faceAssigner():
             # Ranking (which already-accepted candidate becomes poss_
             # ident1 vs. 2 vs. ...) uses a COMBINED margin -- insightface's
             # own margin above its threshold, plus LVFace-B's margin above
-            # ITS threshold (0 if the veto fail-opened for that candidate,
-            # i.e. no real penalty or bonus for missing data) -- so a
-            # candidate both signals are confident about outranks one
-            # insightface alone is equally confident about. This only
-            # changes ORDER among candidates that already passed both
-            # gates, and what's actually SAVED as weight_N stays
-            # insightface's own raw score (`scores` below, unchanged) --
-            # the combined margin is a ranking signal, not a displayed
-            # confidence number, per the user's explicit call.
+            # ITS threshold -- so a candidate both signals are confident
+            # about outranks one insightface alone is equally confident
+            # about. This only changes ORDER among candidates that already
+            # passed both gates, and what's actually SAVED as weight_N
+            # stays insightface's own raw score (`scores` below,
+            # unchanged) -- the combined margin is a ranking signal, not a
+            # displayed confidence number, per the user's explicit call.
+            #
+            # A candidate missing a real LVFace-B margin (the veto fail-
+            # opened for it -- no query encoding yet, or its own gallery
+            # too small) substitutes its OWN insightface margin in place
+            # of the missing term, rather than defaulting to 0 -- found
+            # and fixed 2026-11-10 (per the user's own catch): defaulting
+            # to 0 would systematically rank a missing-data candidate
+            # BELOW an equally-confident candidate that happens to already
+            # have LVFace-B, purely because of backfill timing, not match
+            # quality. Substituting the insightface margin for itself
+            # (equivalent to doubling it) keeps the combined score's scale
+            # consistent whether one or two signals actually contributed,
+            # with no bias either direction. This bias shrinks to nothing
+            # as LVFace-B coverage approaches 100% going forward (every
+            # new face gets it at extraction time already).
             insightface_margin = scores - metrics_array[possible_idcs, 1]
-            lv_margin_arr = np.array([lv_margin_by_idx.get(idx, 0.0) for idx in possible_idcs])
+            lv_margin_arr = np.array([
+                lv_margin_by_idx.get(idx, insightface_margin[i])
+                for i, idx in enumerate(possible_idcs)
+            ])
             combined_rank_score = insightface_margin + lv_margin_arr
 
             order = np.argsort(combined_rank_score)[::-1]

@@ -923,6 +923,60 @@ class LvfaceVetoGateTests(TestCase):
         self.assertEqual(first_person_id, person_b.id)
         self.assertAlmostEqual(first_weight, sim_b, places=4)
 
+    def test_missing_lvface_data_does_not_rank_below_a_trivial_real_margin(self):
+        # Found 2026-11-10 (the user's own catch): defaulting a missing
+        # LVFace margin to 0 would systematically rank a no-data
+        # candidate BELOW an equally-confident-on-insightface candidate
+        # that merely has a trivially small (barely-passing) real
+        # LVFace-B margin -- purely an artifact of backfill timing, not
+        # match quality. Candidate A and B have the IDENTICAL insightface
+        # margin; A's own LVFace-B gallery is too small to trust
+        # (LVFACE_VETO_MIN_GALLERY - 1, fail-opens with no real margin),
+        # B's LVFace-B margin is real but tiny (barely clears the veto).
+        # A must rank ABOVE B: the missing-data substitution (doubling
+        # A's own insightface margin) comfortably beats B's real-but-
+        # trivial LVFace bonus.
+        assigner = faceAssigner()
+        threshold = assigner.BUCKET_THRESHOLDS[-1]
+        cmf = assigner.CANDIDATE_MARGIN_FLOOR
+        lv_threshold = assigner.LVFACE_VETO_THRESHOLD
+
+        person_a = make_person("Rank A (no lvface data, same insightface)")
+        person_b = make_person("Rank B (trivial real lvface margin)")
+        assigner.likely_people_ids = [person_a.id, person_b.id]
+
+        shared_sim = threshold + cmf + 0.10
+        assigner.embedding_dict = {
+            person_a.id: np.tile(self._ref(shared_sim).reshape(512, 1), (1, 600)),
+            person_b.id: np.tile(self._ref(shared_sim).reshape(512, 1), (1, 600)),
+        }
+        assigner.norm_dict = {person_a.id: np.ones(600), person_b.id: np.ones(600)}
+        assigner._build_concatenated_gallery()
+
+        lv_sim_b = lv_threshold + 0.001  # barely passes -- a real but trivial margin
+        assigner.lvface_gallery_dict = {
+            person_a.id: np.zeros((assigner.LVFACE_VETO_MIN_GALLERY - 1, 512)),
+            person_b.id: np.tile(self._ref(lv_sim_b).reshape(1, 512), (50, 1)),
+        }
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+        face = make_face(img, declared_name=blank_person)
+        query = np.zeros(512)
+        query[0] = 1.0
+        face.face_encoding_512 = query.tolist()
+        face.face_encoding_lvface_b = query.tolist()
+        face.det_score = 0.9
+        face.save()
+
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner.classify_unassigned(face)
+
+        self.assertEqual(mock_set.call_count, 2)
+        first_person_id, first_precedence = mock_set.call_args_list[0][0][:2]
+        self.assertEqual(first_precedence, 1)
+        self.assertEqual(first_person_id, person_a.id)
+
 
 class SizeNudgeMarginGateTests(TestCase):
     """SIZE_NUDGE_REF_SIZE/SIZE_NUDGE_MAX: added 2026-10-20 after a real
