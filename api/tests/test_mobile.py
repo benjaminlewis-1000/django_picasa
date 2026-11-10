@@ -249,6 +249,42 @@ class MobileViewTests(ApiTestCase):
         # No double-count: it was already the blank sentinel's face.
         self.assertEqual(blank.face_declared.count(), blank_faces_before)
 
+    def test_reject_proposed_declines_every_candidate_and_remembers_them(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = self.make_image()
+        alice = Person.objects.create(person_name="Alice")
+        bob = Person.objects.create(person_name="Bob")
+        face = self.make_face(
+            img,
+            declared_name=blank,
+            poss_ident1=alice, weight_1=0.9,
+            poss_ident2=bob, weight_2=0.5,
+        )
+
+        resp = self.client.patch(f"/api/mobile/reject_proposed/{face.id}/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        face.refresh_from_db()
+        # Both candidates cleared...
+        self.assertIsNone(face.poss_ident1_id)
+        self.assertIsNone(face.poss_ident2_id)
+        # ...and recorded so classify_unassigned() won't re-propose them.
+        self.assertCountEqual(face.rejected_fields, [alice.id, bob.id])
+        # Still sitting in the unassigned pool, not wiped to NULL.
+        self.assertEqual(face.declared_name_id, blank.id)
+
+    def test_reject_proposed_with_no_candidates_is_a_no_op(self):
+        blank = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = self.make_image()
+        face = self.make_face(img, declared_name=blank)
+
+        resp = self.client.patch(f"/api/mobile/reject_proposed/{face.id}/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        face.refresh_from_db()
+        self.assertEqual(face.declared_name_id, blank.id)
+        self.assertFalse(face.rejected_fields)
+
     def _ignore_candidate(self, **overrides):
         """An unlabeled face whose #1 guess is .ignore -- what the mobile
         ignore-review grid lists."""
