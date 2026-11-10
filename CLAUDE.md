@@ -30,14 +30,24 @@ the dated write-up elsewhere in this file (search for a distinctive word from th
     box, even via crop-redetect) under the OLD constraint; some of that population may actually
     recover under the new one and just hasn't been retried since the fix landed. Worth a fresh
     sample-based check before assuming the dead-tail percentage still holds.
-  - **LVFace-B backfill -- two separate, differently-sized populations, easy to conflate.** The
-    kps-missing population (above) is what the currently-running job actually touches. A much
-    larger, separate population -- **205,375 image faces that already have kps but were never
-    given LVFace-B** (older than the LVFace-B feature itself) -- is NOT touched by this job at
-    all (its trigger condition requires a kps-missing face on the image; an image where every
-    face already has kps never gets selected, regardless of LVFace-B status). Needs its own,
-    separately-scoped run once the kps backlog clears. Live coverage as of 2026-11-10: overall
-    74.1% (617,622/833,234), image 72.6%, video 96.0% (essentially done).
+  - **DONE (2026-11-10): the kps-missing and LVFace-B-missing populations are now backfilled in
+    one joined pass, not two separate campaigns.** `backfill_verified_kps.py`'s trigger query
+    previously only selected an image if it had a kps-missing face -- the much larger,
+    separate population (**205,375 image faces that already have kps but were never given
+    LVFace-B**, older than the LVFace-B feature itself) was never touched at all, which is
+    exactly why LVFace-B image coverage (72.6%) had been lagging far behind kps coverage
+    (98.2%) despite the same job running. Fixed by broadening the trigger to also select on any
+    requested LVFace size being missing, plus a new `_save_lvface_only()` fast path that
+    computes the embedding directly from a face's already-trusted `kps` -- skipping
+    detection/IOU-matching entirely for faces that don't need it. A mixed image (one kps-missing
+    face, one LVFace-only face) now resolves both in a single pass. Tested (5 new dedicated
+    tests plus the existing 44-test class, all passing), merged to `master`, and the live
+    production job (PID 3965147, started 16:16 with the old code) was killed and relaunched
+    (PID 3995621, 21:29) with the identical flags so it actually picks up the new logic --
+    confirmed via its own first log line: trigger population jumped from the old kps-only scope
+    to **53,921 images** to process. Live coverage as of 2026-11-10 (pre-relaunch baseline, not
+    yet re-measured post-relaunch): overall 74.1% (617,622/833,234), image 72.6%, video 96.0%
+    (essentially done on the video side already).
   - **Orientation classifier training** (`train_rotation_classifier`) still running in 90-minute
     bursts, needs continued relaunching as each one finishes. val_acc progression so far: 0.75
     (run3) -> 0.84 (run4).
