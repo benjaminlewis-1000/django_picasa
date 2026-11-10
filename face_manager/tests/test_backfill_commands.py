@@ -1682,6 +1682,120 @@ class BackfillVerifiedKpsTests(TestCase):
             call_command('backfill_verified_kps', "--lvface-sizes=")
             mock_build.return_value.get.assert_not_called()
 
+    def test_lvface_only_image_is_now_triggered_and_skips_detection(self):
+        # 2026-11-10 (see CLAUDE.md, search "joined"): an image where
+        # EVERY face already has kps but is still missing LVFace-B used
+        # to never be selected as a trigger at all (the old trigger
+        # query only ever checked kps__isnull=True). Now it is -- and
+        # since kps is already known-good, detection/IOU-matching never
+        # needs to run at all; LVFace is computed directly from the
+        # existing kps.
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        face.kps = [30.0] * 10
+        face.det_score = 0.9
+        face.save()
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            call_command('backfill_verified_kps', '--lvface-sizes=B')
+            mock_build.return_value.get.assert_not_called()
+
+        face.refresh_from_db()
+        self.assertEqual(face.face_encoding_lvface_b, [0.4] * 512)
+
+    def test_lvface_only_path_never_touches_kps_or_det_score(self):
+        # The fast path must not rewrite anything it didn't need to --
+        # kps/det_score stay exactly as they already were.
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        original_kps = [11.0] * 10
+        face.kps = original_kps
+        face.det_score = 0.77
+        face.save()
+
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector'), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            call_command('backfill_verified_kps', '--lvface-sizes=B')
+
+        face.refresh_from_db()
+        self.assertEqual(face.kps, original_kps)
+        self.assertAlmostEqual(face.det_score, 0.77, places=4)
+
+    def test_mixed_image_handles_kps_missing_and_lvface_only_faces_together(self):
+        # One face genuinely missing kps (goes through detect+match),
+        # one face that already has kps and only needs LVFace (goes
+        # through the fast path) -- both on the SAME image, in one pass.
+        kps_missing_face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        lvface_only_face = make_face(
+            self.image, declared_name=self.person,
+            box_left=200, box_top=200, box_right=240, box_bottom=240,
+        )
+        lvface_only_face.face_encoding_512 = [0.7] * 512
+        lvface_only_face.kps = [220.0, 220.0] * 5
+        lvface_only_face.det_score = 0.85
+        lvface_only_face.relative_size = 0.5
+        lvface_only_face.save()
+
+        fresh_kps = [[30.0, 30.0]] * 5
+        fake_dets = [self._FakeDetection([10, 10, 50, 50], 0.9, fresh_kps, [0.6] * 512)]
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector') as mock_build, \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)):
+            mock_build.return_value.get.return_value = fake_dets
+            call_command('backfill_verified_kps', '--lvface-sizes=B')
+
+        kps_missing_face.refresh_from_db()
+        lvface_only_face.refresh_from_db()
+        self.assertIsNotNone(kps_missing_face.kps)
+        self.assertEqual(kps_missing_face.face_encoding_lvface_b, [0.4] * 512)
+        self.assertEqual(lvface_only_face.kps, [220.0, 220.0] * 5)  # untouched
+        self.assertEqual(lvface_only_face.face_encoding_lvface_b, [0.4] * 512)
+
+    def test_lvface_only_path_respects_below_collection_floor(self):
+        from filepopulator.models import PhotoCollection
+        collection = PhotoCollection.objects.create(
+            name='LVFace Only Floor Test', root_directory='/photos/lvface_only_floor_test',
+            min_face_det_score=0.9,
+        )
+        self.image.directory.collection = collection
+        self.image.directory.save()
+
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        face.kps = [30.0] * 10
+        face.det_score = 0.5  # below the 0.9 floor
+        face.save()
+
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector'), \
+             patch('lvface.embed_from_image_array', return_value=np.full(512, 0.4, dtype=np.float32)) as mock_lv:
+            call_command('backfill_verified_kps', '--lvface-sizes=B')
+            mock_lv.assert_not_called()
+
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+
+    def test_lvface_only_path_dry_run_writes_nothing(self):
+        face = self._make_face_with_encoding([10, 10, 50, 50], [0.6] * 512)
+        face.kps = [30.0] * 10
+        face.det_score = 0.9
+        face.save()
+
+        with patch('face_manager.management.commands.backfill_verified_kps.common.open_img_oriented',
+                   return_value=np.zeros((1000, 1000, 3))), \
+             patch('face_manager.management.commands.backfill_verified_kps._build_full_detector'), \
+             patch('lvface.embed_from_image_array') as mock_lv:
+            call_command('backfill_verified_kps', '--lvface-sizes=B', '--dry-run')
+            mock_lv.assert_not_called()
+
+        face.refresh_from_db()
+        self.assertIsNone(face.face_encoding_lvface_b)
+
 
 class BackfillVideoDetScoreTests(TestCase):
     """backfill_video_det_score management command: re-extracts the

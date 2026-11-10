@@ -373,6 +373,46 @@ class Command(BaseCommand):
             any_lvface_saved = True
         return any_lvface_saved
 
+    def _save_lvface_only(self, face, img_numpy, img_obj, lvface_sizes, stats, dry_run):
+        """Companion to _save_kps_and_lvface() for a face that ALREADY
+        has real kps and is only missing a requested LVFace size (the
+        2026-11-10 "joined" trigger, see CLAUDE.md) -- skips detection/
+        IOU-matching entirely, computing directly from the existing,
+        already-correct kps. There is nothing to verify here the way
+        the detect+match path needs to (no fresh candidate to compare
+        against a stored embedding) -- the kps is already trusted, by
+        definition, or it wouldn't be sitting on the row at all.
+        Mirrors _save_kps_and_lvface()'s below_collection_floor gating
+        and per-size save loop exactly, just without the kps/det_score
+        write (nothing to write -- already correct)."""
+        if dry_run:
+            stats['saved_lvface_only'] += 1
+            return False
+
+        if below_collection_floor(img_obj.directory.collection, face.det_score, face.relative_size):
+            stats['below_collection_floor_skip'] += 1
+            return False
+
+        any_lvface_saved = False
+        for size in lvface_sizes:
+            field = f'face_encoding_lvface_{size.lower()}'
+            if getattr(face, field) is not None:
+                continue  # this specific size is already done; another one isn't
+            try:
+                emb = lvface.embed_from_image_array(
+                    img_numpy, face.kps, input_is_bgr=False, size=size,
+                )
+            except Exception as e:
+                self.stdout.write(f"  LVFace-{size} failed for face {face.id}: {e}")
+                continue
+            if emb is None:
+                continue
+            face.set_embedding(field, emb.tolist())
+            face.save(update_fields=[field, Face.EMBEDDING_FIELD_HV_MIRRORS[field]])
+            stats['saved_lvface_only'] += 1
+            any_lvface_saved = True
+        return any_lvface_saved
+
     def _mark_no_face_found(self, face, lvface_sizes, stats, dry_run):
         """2026-10-31 (see CLAUDE.md): for a face where BOTH detection
         attempts came back genuinely empty -- the whole-image pass never
@@ -446,7 +486,23 @@ class Command(BaseCommand):
         # whole image excluded (the exclude() matches the OTHER face),
         # even though the real-encoded one should still trigger it.
         # Found via a real test failure, not assumed.
-        base_trigger_filter = dict(source_image_file__isnull=False, kps__isnull=True)
+        #
+        # 2026-11-10 (see CLAUDE.md): broadened from "kps missing" alone
+        # to "kps missing OR missing a currently-requested LVFace size"
+        # -- joined per explicit direction, rather than run as two
+        # separate campaigns. Before this, an image where every face
+        # already had kps was NEVER selected as a trigger at all, no
+        # matter how many of its faces were still missing LVFace --
+        # stranding a population (205k+ image faces) far larger than
+        # the kps-missing one this command was originally built for.
+        # The per-face loop below (_unresolved_faces_q) already knew
+        # how to recognize an LVFace-only gap; only the image-level
+        # trigger needed widening to match it.
+        trigger_q = Q(kps__isnull=True)
+        for size in lvface_sizes:
+            field = f'face_encoding_lvface_{size.lower()}'
+            trigger_q |= Q(**{f'{field}__isnull': True})
+        base_trigger_filter_qs = Face.objects.filter(source_image_file__isnull=False).filter(trigger_q)
         if person_ids is not None:
             # Same "query at the Face level, not via a cross-relation
             # exclude()" discipline as above -- this is an additional
@@ -463,17 +519,21 @@ class Command(BaseCommand):
                 Q(declared_name_id__in=person_ids) | Q(poss_ident1_id__in=person_ids),
                 source_image_file__isnull=False,
             ).values_list('source_image_file_id', flat=True).distinct()
-            base_trigger_filter['source_image_file_id__in'] = target_image_ids
+            base_trigger_filter_qs = base_trigger_filter_qs.filter(source_image_file_id__in=target_image_ids)
 
         # Same per-row-not-cross-relation discipline as above re: the
         # kps_unrecoverable exclude -- a face already confirmed
         # unrecoverable must never re-trigger its image on its own, but
-        # doing it as Face.objects.filter(**base_trigger_filter).exclude(
-        # kps_unrecoverable=True) (one single queryset, not a separate
-        # cross-relation exclude on ImageFile) keeps that guarantee: it
-        # excludes THIS face's own row, not some other face's on the
-        # same image.
-        trigger_image_ids = Face.objects.filter(**base_trigger_filter).exclude(
+        # doing it as base_trigger_filter_qs.exclude(kps_unrecoverable=
+        # True) (one single queryset, not a separate cross-relation
+        # exclude on ImageFile) keeps that guarantee: it excludes THIS
+        # face's own row, not some other face's on the same image.
+        # Confirmed zero overlap (2026-11-10) between sentinel-512 and
+        # the new kps-present-missing-lvface population, so this exclude
+        # stays safe to apply unconditionally across both trigger
+        # reasons rather than needing to be scoped to just the
+        # kps-missing case.
+        trigger_image_ids = base_trigger_filter_qs.exclude(
             face_encoding_512=sentinel
         ).exclude(kps_unrecoverable=True).values_list('source_image_file_id', flat=True).distinct()
 
@@ -667,6 +727,24 @@ class Command(BaseCommand):
                     if img_numpy is None:
                         stats['decode_failed'] += len(unresolved_faces)
                         continue
+
+                    # Split: a face already carrying real kps doesn't
+                    # need detection/IOU-matching at all to get its
+                    # LVFace computed -- handle those directly here,
+                    # before paying for app.get() at all, and only run
+                    # the expensive detect+match path below for faces
+                    # genuinely missing kps. See _save_lvface_only()'s
+                    # own docstring and this file's 2026-11-10 trigger-
+                    # query comment (search "joined") for why this split
+                    # exists.
+                    faces_needing_kps = [f for f in unresolved_faces if f.kps is None]
+                    faces_needing_lvface_only = [f for f in unresolved_faces if f.kps is not None]
+                    for face in faces_needing_lvface_only:
+                        if self._save_lvface_only(face, img_numpy, img_obj, lvface_sizes, stats, dry_run):
+                            new_faces_this_run += 1
+                    if not faces_needing_kps:
+                        continue
+
                     detections = app.get(img_numpy)
 
                     # A whole-image pass finding literally nothing used to
@@ -688,10 +766,10 @@ class Command(BaseCommand):
                     # frame).
                     matched_rows = set()
                     if not detections:
-                        stats['no_detections'] += len(unresolved_faces)
+                        stats['no_detections'] += len(faces_needing_kps)
                     else:
                         existing_boxes = torch.tensor(
-                            [[f.box_left, f.box_top, f.box_right, f.box_bottom] for f in unresolved_faces],
+                            [[f.box_left, f.box_top, f.box_right, f.box_bottom] for f in faces_needing_kps],
                             dtype=torch.float32,
                         )
                         detect_boxes = torch.tensor([d.bbox.tolist() for d in detections], dtype=torch.float32)
@@ -702,7 +780,7 @@ class Command(BaseCommand):
                             if float(iou[r, c]) < IOU_THRESH:
                                 continue
                             matched_rows.add(int(r))
-                            face = unresolved_faces[int(r)]
+                            face = faces_needing_kps[int(r)]
                             det = detections[int(c)]
                             this_iou = float(iou[r, c])
 
@@ -754,10 +832,10 @@ class Command(BaseCommand):
                             ):
                                 new_faces_this_run += 1
 
-                    unmatched_rows = [r for r in range(len(unresolved_faces)) if r not in matched_rows]
+                    unmatched_rows = [r for r in range(len(faces_needing_kps)) if r not in matched_rows]
                     for r in unmatched_rows:
                         stats['no_match'] += 1
-                        face = unresolved_faces[r]
+                        face = faces_needing_kps[r]
                         # 2026-11-09 (see CLAUDE.md): previously gated on
                         # has_trusted_encoding ("nothing to recover a
                         # geometry match FOR") -- but _crop_redetect()'s
