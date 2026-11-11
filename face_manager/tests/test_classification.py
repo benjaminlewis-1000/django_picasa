@@ -770,6 +770,7 @@ class LvfaceVetoGateTests(TestCase):
             }
         else:
             assigner.lvface_gallery_dict = {person.id: np.zeros((0, 512))}
+        assigner._build_concatenated_lv_gallery()
 
         blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
         img = make_image()
@@ -797,6 +798,49 @@ class LvfaceVetoGateTests(TestCase):
         mock_set.assert_called_once()
         called_person_id = mock_set.call_args[0][0]
         self.assertEqual(called_person_id, assigner.ignore_person_id)
+
+    def test_batched_veto_rejects_candidate_via_classify_batch_safely(self):
+        # The SAME scenario as test_veto_rejects_candidate_insightface_
+        # would_have_accepted, but going through _classify_batch_safely()
+        # (the real path a scheduled execute() run actually takes) rather
+        # than calling classify_unassigned() directly -- exercises the
+        # batched/vectorized LVFace veto precompute (added 2026-11-10 to
+        # fix a real ~15-19% per-face slowdown the original per-face loop
+        # caused), not the per-face fallback path the tests above use.
+        assigner = faceAssigner()
+        sim = self._passing_insightface_sim(assigner)
+        assigner, face, person = self._make_face_with_single_candidate(
+            insightface_sim=sim, lvface_sim=0.10,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner._classify_batch_safely([face])
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, assigner.ignore_person_id)
+
+    def test_batched_veto_accepts_via_classify_batch_safely(self):
+        assigner = faceAssigner()
+        sim = self._passing_insightface_sim(assigner)
+        assigner, face, person = self._make_face_with_single_candidate(
+            insightface_sim=sim, lvface_sim=0.50,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner._classify_batch_safely([face])
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, person.id)
+
+    def test_batched_veto_fails_open_when_query_has_no_lvface(self):
+        assigner = faceAssigner()
+        sim = self._passing_insightface_sim(assigner)
+        assigner, face, person = self._make_face_with_single_candidate(
+            insightface_sim=sim, lvface_sim=0.10, query_has_lvface=False,
+        )
+        with patch.object(Face, "set_possible_person") as mock_set:
+            assigner._classify_batch_safely([face])
+        mock_set.assert_called_once()
+        called_person_id = mock_set.call_args[0][0]
+        self.assertEqual(called_person_id, person.id)
 
     def test_veto_accepts_when_lvface_also_clears_threshold(self):
         assigner = faceAssigner()
