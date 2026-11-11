@@ -18,7 +18,7 @@ from django.views.decorators.csrf import ensure_csrf_cookie
 from django_filters.rest_framework import DjangoFilterBackend
 from face_manager.models import Person, Face
 from face_manager.live_counts import compute_live_face_counts
-from filepopulator.models import ImageFile, Directory, VideoFile, PhotoCollection
+from filepopulator.models import ImageFile, Directory, VideoFile, PhotoCollection, below_collection_floor_q
 from io import BytesIO
 from PIL import Image, ExifTags, ImageDraw
 from queue import Queue
@@ -477,11 +477,26 @@ class PersonListView(APIView):
                 num_blanks_video = blanks_qs.filter(source_video_file__isnull=False).count()
                 p_dict['num_possibilities_video'] = num_blanks_video
                 p_dict['num_possibilities_image'] = num_blanks - num_blanks_video
+                # Backs the sidebar's new "No proposal yet" subordinate row
+                # (2026-11-10) - the complementary population to blanks_qs
+                # above (poss_ident1 IS NULL instead of IS NOT NULL),
+                # excluding faces below their own collection's quality
+                # floor so this surfaces genuine classification gaps (ran,
+                # should have gotten a proposal, didn't) rather than the
+                # ~57k faces that were excluded on purpose for being too
+                # small/low-confidence to ever get one. See
+                # PersonParamView's `no_proposal` param for the matching
+                # gallery listing.
+                p_dict['num_no_proposal'] = Face.objects.filter(
+                    declared_name__person_name=settings.BLANK_FACE_NAME,
+                    poss_ident1__isnull=True,
+                ).exclude(below_collection_floor_q()).count()
             else:
                 p_dict['num_possibilities'] = counts['num_possibilities']
                 p_dict['num_possibilities_video'] = counts['num_possibilities_video']
                 p_dict['num_possibilities_image'] = counts['num_possibilities'] - counts['num_possibilities_video']
                 p_dict['num_unverified_faces'] = counts['num_unverified_faces']
+                p_dict['num_no_proposal'] = 0
 
             # Count backing the frontend's ".ignore" sidebar subordinate
             # row ("Flagged for review") - see PersonParamView's
@@ -534,11 +549,22 @@ class PersonListView(APIView):
                 ).count()
                 p_dict['num_review_flagged_unverified'] = num_flagged_unverified
                 p_dict['num_unverified_faces'] = max(0, p_dict['num_unverified_faces'] - num_flagged_unverified)
+                # Backs the sidebar's new ".ignore" "Flagged, lost proposal"
+                # subordinate row (2026-11-10) - faces that WERE flagged for
+                # review but currently have no poss_ident1 at all, as
+                # opposed to having been legitimately reassigned to a real
+                # person (not surfaced here - see PersonParamView's
+                # `no_proposal` param comment). Same quality-floor exclusion
+                # as Unassigned's num_no_proposal above, same reasoning.
+                p_dict['num_review_flagged_no_proposal'] = Face.objects.filter(
+                    mobile_review_hidden=True, poss_ident1__isnull=True,
+                ).exclude(below_collection_floor_q()).count()
             else:
                 p_dict['num_review_flagged'] = 0
                 p_dict['num_review_flagged_video'] = 0
                 p_dict['num_review_flagged_image'] = 0
                 p_dict['num_review_flagged_unverified'] = 0
+                p_dict['num_review_flagged_no_proposal'] = 0
 
             result_list.append(p_dict)
 
@@ -640,6 +666,24 @@ class PersonParamView(APIView):
         # someone." Only meaningful on the face_poss branch below.
         do_flagged_only = params.get('flagged', '').lower() == 'true'
 
+        # New sub-populations (2026-11-10, per the user's own request while
+        # running a fresh classification pass over Unassigned): faces that
+        # SHOULD have gotten a poss_ident1 proposal but didn't, as distinct
+        # from the known, deliberately-excluded population of faces too
+        # small/low-confidence for their own collection to ever get one (see
+        # PhotoCollection.min_face_det_score/min_face_relative_size, the
+        # Classification Settings tool's per-collection floors) - a glitch
+        # in a classification run looks identical to "no candidate" unless
+        # that quality floor is excluded too, via below_collection_floor_q().
+        # Meaningful on face_declared for the Unassigned sentinel (the
+        # inverse of that branch's own poss_ident1__isnull=False filter
+        # below) and on face_poss for .ignore's flagged sub-view (faces
+        # that WERE flagged for review but have since lost their .ignore
+        # proposal entirely, rather than being legitimately reassigned to
+        # a real person - that reassignment case is correct and intentionally
+        # not surfaced here).
+        no_proposal_only = params.get('no_proposal', '').lower() == 'true'
+
         # Populated only for field == 'face_declared' with
         # only_unverified=true - see there for what this is.
         cluster_groups = {}
@@ -678,9 +722,17 @@ class PersonParamView(APIView):
                 # count override above - same reasoning (2026-10-21): faces
                 # with no candidate suggestion at all are excluded from
                 # Unassigned's own gallery/count here, not from the Face
-                # table itself.
+                # table itself. no_proposal_only (2026-11-10) flips this to
+                # the complementary population instead, for the sidebar's
+                # "No proposal yet" audit row - see that param's own comment
+                # above.
+                exclude_below_floor = False
                 if person_obj.person_name == settings.BLANK_FACE_NAME:
-                    default_query &= Q(poss_ident1__isnull=False)
+                    if no_proposal_only:
+                        default_query &= Q(poss_ident1__isnull=True)
+                        exclude_below_floor = True
+                    else:
+                        default_query &= Q(poss_ident1__isnull=False)
                 unverified_query = Q(validated=False)
                 # verification_cluster_group (face_manager/
                 # verification_clustering.py's nightly job) only ever gets
@@ -694,6 +746,8 @@ class PersonParamView(APIView):
                 # singleton, always still verified individually.
                 if do_only_unverified:
                     faces_qs = Face.objects.filter(default_query & unverified_query)
+                    if exclude_below_floor:
+                        faces_qs = faces_qs.exclude(below_collection_floor_q())
                     # Frontend's ".ignore" sidebar subordinate row on the
                     # verify screen ("Flagged & unverified") - faces
                     # already confirmed to .ignore but not yet verified,
@@ -734,62 +788,91 @@ class PersonParamView(APIView):
                     }
                     faces = [fid for fid, _ in page_rows]
                 else:
+                    declared_qs = Face.objects.filter(default_query)
+                    if exclude_below_floor:
+                        declared_qs = declared_qs.exclude(below_collection_floor_q())
                     faces = list(
-                        Face.objects.filter(default_query).order_by('id').values_list('id', flat=True)[start:end]
+                        declared_qs.order_by('id').values_list('id', flat=True)[start:end]
                     )
             else:
 
-                poss_query = Q(poss_ident1=person_obj)
-                # mobile_review_hidden is a general-purpose "hide from the
-                # mobile app's own queues" flag - set not just by the
-                # .ignore-review flow this `flagged` param models, but also
-                # by the mobile app's plain "Skip" action on any *real*
-                # person's suggestion queue (HideFromMobile/
-                # LabelingGroupsView, api/mobile_views.py). Only .ignore
-                # has a frontend view that actually surfaces flagged faces
-                # (the "Flagged for review" sidebar row) - filtering by it
-                # for every other person made a mobile-skipped candidate
-                # disappear from their gallery entirely, with nowhere to
-                # find it again, while their sidebar count (a separately
-                # stored field, untouched by this query) still included
-                # it. Scope the filtering to .ignore specifically instead
-                # of applying it to every person's face_poss query.
-                if person_obj.person_name == settings.SOFT_IGNORE_NAME:
-                    if do_flagged_only:
-                        poss_query &= Q(mobile_review_hidden=True)
-                    else:
-                        # Complementary to the flagged branch above - a
-                        # face already pulled aside for closer review
-                        # shouldn't also keep showing up in .ignore's own
-                        # main candidate list. Together these two branches
-                        # partition .ignore's poss_ident1 set with no
-                        # overlap either way.
-                        poss_query &= (Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False))
-
-                # Frontend's confirm-queue media filter (imageScreen.jsx,
-                # 2026-09-18) - lets a person confirm image-sourced faces,
-                # video-sourced faces, or both, separately. source_video_file
-                # is null for an ordinary photo-sourced face, set for one
-                # extracted from a video frame.
-                if media_filter == 'image':
-                    poss_query &= Q(source_video_file__isnull=True)
-                elif media_filter == 'video':
-                    poss_query &= Q(source_video_file__isnull=False)
-
-                # Was: fetch every matching row, then sort descending by
-                # weight_1 in Python - fine when the whole set was always
-                # returned anyway, but that meant materializing and sorting
-                # the entire queryset (all of .ignore's ~100k rows) on
-                # every single request regardless of how much was actually
-                # shown. weight_1 is a plain column, so Postgres can do
-                # this ordering directly, which is also what makes real
-                # LIMIT/OFFSET slicing possible here.
-                weight_order = 'weight_1' if sort_ascending else '-weight_1'
-                faces = list(
-                    Face.objects.filter(poss_query).order_by(weight_order).values_list('id', flat=True)[start:end]
+                # .ignore's "Flagged, lost proposal" sub-view (2026-11-10):
+                # faces that WERE flagged for review (mobile_review_hidden=
+                # True) but whose poss_ident1 is no longer .ignore AT ALL -
+                # as opposed to having been legitimately reassigned to a
+                # real person, which this deliberately does NOT surface.
+                # Structurally distinct from the ordinary poss_query below
+                # (which always requires poss_ident1=person_obj, i.e. a
+                # non-null value) - there is no "poss_ident1 is null" case
+                # reachable through that shape, so this replaces it
+                # entirely rather than ANDing onto it.
+                no_proposal_lost_flagged = (
+                    person_obj.person_name == settings.SOFT_IGNORE_NAME
+                    and do_flagged_only and no_proposal_only
                 )
-                if page == 1:
-                    total_matching = Face.objects.filter(poss_query).count()
+                if no_proposal_lost_flagged:
+                    poss_query = Q(mobile_review_hidden=True, poss_ident1__isnull=True)
+                    faces = list(
+                        Face.objects.filter(poss_query)
+                        .exclude(below_collection_floor_q())
+                        .order_by('id').values_list('id', flat=True)[start:end]
+                    )
+                    if page == 1:
+                        total_matching = (
+                            Face.objects.filter(poss_query).exclude(below_collection_floor_q()).count()
+                        )
+                else:
+                    poss_query = Q(poss_ident1=person_obj)
+                    # mobile_review_hidden is a general-purpose "hide from the
+                    # mobile app's own queues" flag - set not just by the
+                    # .ignore-review flow this `flagged` param models, but also
+                    # by the mobile app's plain "Skip" action on any *real*
+                    # person's suggestion queue (HideFromMobile/
+                    # LabelingGroupsView, api/mobile_views.py). Only .ignore
+                    # has a frontend view that actually surfaces flagged faces
+                    # (the "Flagged for review" sidebar row) - filtering by it
+                    # for every other person made a mobile-skipped candidate
+                    # disappear from their gallery entirely, with nowhere to
+                    # find it again, while their sidebar count (a separately
+                    # stored field, untouched by this query) still included
+                    # it. Scope the filtering to .ignore specifically instead
+                    # of applying it to every person's face_poss query.
+                    if person_obj.person_name == settings.SOFT_IGNORE_NAME:
+                        if do_flagged_only:
+                            poss_query &= Q(mobile_review_hidden=True)
+                        else:
+                            # Complementary to the flagged branch above - a
+                            # face already pulled aside for closer review
+                            # shouldn't also keep showing up in .ignore's own
+                            # main candidate list. Together these two branches
+                            # partition .ignore's poss_ident1 set with no
+                            # overlap either way.
+                            poss_query &= (Q(mobile_review_hidden__isnull=True) | Q(mobile_review_hidden=False))
+
+                    # Frontend's confirm-queue media filter (imageScreen.jsx,
+                    # 2026-09-18) - lets a person confirm image-sourced faces,
+                    # video-sourced faces, or both, separately. source_video_file
+                    # is null for an ordinary photo-sourced face, set for one
+                    # extracted from a video frame.
+                    if media_filter == 'image':
+                        poss_query &= Q(source_video_file__isnull=True)
+                    elif media_filter == 'video':
+                        poss_query &= Q(source_video_file__isnull=False)
+
+                    # Was: fetch every matching row, then sort descending by
+                    # weight_1 in Python - fine when the whole set was always
+                    # returned anyway, but that meant materializing and sorting
+                    # the entire queryset (all of .ignore's ~100k rows) on
+                    # every single request regardless of how much was actually
+                    # shown. weight_1 is a plain column, so Postgres can do
+                    # this ordering directly, which is also what makes real
+                    # LIMIT/OFFSET slicing possible here.
+                    weight_order = 'weight_1' if sort_ascending else '-weight_1'
+                    faces = list(
+                        Face.objects.filter(poss_query).order_by(weight_order).values_list('id', flat=True)[start:end]
+                    )
+                    if page == 1:
+                        total_matching = Face.objects.filter(poss_query).count()
 
             id_list = list(faces)
             video_face_ids = list(

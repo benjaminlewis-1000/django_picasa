@@ -1,4 +1,5 @@
 from django.db import models
+from django.db.models import Q, F
 from django.conf import settings
 from django.forms import ModelForm
 from django.core.validators import MinValueValidator, MaxValueValidator, RegexValidator
@@ -330,6 +331,45 @@ def below_collection_floor(collection, det_score, relative_size):
         if relative_size is None or relative_size < collection.min_face_relative_size:
             return True
     return False
+
+
+def below_collection_floor_q():
+    """QuerySet-level equivalent of below_collection_floor() above, as a
+    Q object for face_manager.Face.objects.filter()/.exclude() -- same
+    floor semantics, evaluated in the DB across however many rows
+    instead of called per-row in Python. Used by the Unassigned/.ignore
+    "no proposal" review sub-populations (api/views.py) to separate
+    genuinely-glitched faces (should have gotten a classifier proposal,
+    didn't) from faces that never get one on purpose because they're
+    below their own collection's configured quality floor.
+
+    A face's collection comes from whichever of source_image_file/
+    source_video_file is set (exactly one always is) -- neither ImageFile
+    nor VideoFile has a direct `collection` FK of its own (only a plural
+    `collections` M2M, "visible from"); the singular "home" collection
+    lives on Directory and is reached via .directory.collection from
+    either side. A null collection, or a collection with neither floor
+    set, never counts as "below floor" here either, matching
+    below_collection_floor(None, ...).
+    """
+    def _metric_below(prefix, metric, floor_field):
+        # metric (det_score/relative_size) is a plain field on Face
+        # itself -- only the floor being compared against lives behind
+        # the source_image_file/source_video_file -> directory ->
+        # collection join.
+        floor_path = f'{prefix}__directory__collection__{floor_field}'
+        return Q(**{f'{floor_path}__isnull': False}) & (
+            Q(**{f'{metric}__isnull': True}) |
+            Q(**{f'{metric}__lt': F(floor_path)})
+        )
+
+    def _for_prefix(prefix):
+        return Q(**{f'{prefix}__isnull': False}) & (
+            _metric_below(prefix, 'det_score', 'min_face_det_score') |
+            _metric_below(prefix, 'relative_size', 'min_face_relative_size')
+        )
+
+    return _for_prefix('source_image_file') | _for_prefix('source_video_file')
 
 
 class Directory(models.Model):
