@@ -279,6 +279,21 @@ class faceAssigner():
         # BUCKET_THRESHOLDS, which DOES need bucketing).
         self.LVFACE_VETO_THRESHOLD = 0.30
         self.LVFACE_VETO_MIN_GALLERY = 10
+        # Caps how many of a candidate's real LVFace-B entries
+        # load_encodings() keeps for the veto check -- found necessary
+        # 2026-11-10: a real timing investigation (the veto added 9-16ms/
+        # face, a genuine regression) traced most of that cost to
+        # np.percentile() scaling with gallery size, and some candidates'
+        # LVFace-B galleries are huge (up to 31,498 entries in real
+        # production data; mean 715). Same SAMPLE_CAP value (300) this
+        # project's own LVFace-B threshold-validation scripts already
+        # used, on the grounds that a p99 estimate over a few hundred
+        # samples is statistically indistinguishable from the same
+        # estimate over the full population (already validated there,
+        # not re-derived here) -- unlike COHESION_SAMPLE_CAP below, which
+        # exists for an unrelated reason (bounding an O(n^2) cost, not a
+        # percentile's own scaling).
+        self.LVFACE_VETO_GALLERY_SAMPLE_CAP = 300
 
         # Added 2026-10-13 after a real investigation (prompted by the
         # user noticing video faces miss classification much more often
@@ -587,6 +602,16 @@ class faceAssigner():
             ).to_numpy()
             if lv_mask.any():
                 lv_embedding = np.array(effective_lv[lv_mask].tolist())
+                # Bounds the per-check cost for a huge gallery (see
+                # LVFACE_VETO_GALLERY_SAMPLE_CAP's own comment) -- a
+                # random subsample, not a truncation, so it doesn't
+                # systematically favor whichever rows happened to be
+                # fetched first.
+                if lv_embedding.shape[0] > self.LVFACE_VETO_GALLERY_SAMPLE_CAP:
+                    sample_idx = np.random.choice(
+                        lv_embedding.shape[0], self.LVFACE_VETO_GALLERY_SAMPLE_CAP, replace=False
+                    )
+                    lv_embedding = lv_embedding[sample_idx]
                 lv_norm = np.linalg.norm(lv_embedding, axis=1, keepdims=True)
                 lv_norm[lv_norm == 0] = 1
                 self.lvface_gallery_dict[face_id] = lv_embedding / lv_norm
