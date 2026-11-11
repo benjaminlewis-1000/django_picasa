@@ -100,7 +100,7 @@ class ClassifyUnassignedArraySizingTests(TestCase):
         with patch.object(Face, "set_possible_person") as mock_set:
             self.assigner.classify_unassigned(self.face)
 
-        mock_set.assert_called_once_with(self.assigner.ignore_person_id, 1, 1.0)
+        mock_set.assert_called_once_with(self.assigner.ignore_person_id, 1, 1.0, save=True)
 
 
 class P99ThresholdLookupTests(TestCase):
@@ -265,7 +265,7 @@ class ClassifyUnassignedBucketGateTests(TestCase):
         # best-scoring candidate anyway -- confirms it took the reject
         # path, not a confident accept, for the identical similarity
         # value that DID pass for the large-gallery candidate above.
-        mock_set.assert_called_once_with(self.small_person.id, 1, self.mid_similarity)
+        mock_set.assert_called_once_with(self.small_person.id, 1, self.mid_similarity, save=True)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
@@ -372,7 +372,7 @@ class WindowedClassificationTests(TestCase):
         self.query_face.save()
         with patch.object(Face, "set_possible_person") as mock_set:
             self.assigner.classify_unassigned(self.query_face)
-        mock_set.assert_called_once_with(self.person.id, 1, self.distant_sim)
+        mock_set.assert_called_once_with(self.person.id, 1, self.distant_sim, save=True)
 
     def test_true_positive_still_accepted_when_windowed(self):
         # Query dated EARLY, matching the genuinely-similar "close"
