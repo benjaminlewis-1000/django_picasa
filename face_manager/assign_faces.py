@@ -279,6 +279,21 @@ class faceAssigner():
         # BUCKET_THRESHOLDS, which DOES need bucketing).
         self.LVFACE_VETO_THRESHOLD = 0.30
         self.LVFACE_VETO_MIN_GALLERY = 10
+        # Caps how many of a candidate's real LVFace-B entries
+        # load_encodings() keeps for the veto check -- found necessary
+        # 2026-11-10: a real timing investigation (the veto added 9-16ms/
+        # face, a genuine regression) traced most of that cost to
+        # np.percentile() scaling with gallery size, and some candidates'
+        # LVFace-B galleries are huge (up to 31,498 entries in real
+        # production data; mean 715). Same SAMPLE_CAP value (300) this
+        # project's own LVFace-B threshold-validation scripts already
+        # used, on the grounds that a p99 estimate over a few hundred
+        # samples is statistically indistinguishable from the same
+        # estimate over the full population (already validated there,
+        # not re-derived here) -- unlike COHESION_SAMPLE_CAP below, which
+        # exists for an unrelated reason (bounding an O(n^2) cost, not a
+        # percentile's own scaling).
+        self.LVFACE_VETO_GALLERY_SAMPLE_CAP = 300
 
         # Added 2026-10-13 after a real investigation (prompted by the
         # user noticing video faces miss classification much more often
@@ -356,11 +371,6 @@ class faceAssigner():
         # default (skip the veto) for a faceAssigner built without going
         # through load_encodings().
         self.lvface_gallery_dict = {}
-        # Batched-veto counterpart to lvface_gallery_dict -- same fallback
-        # reasoning (empty means every candidate fail-opens, since
-        # lv_gallery_offsets.get() finds nothing for any of them).
-        self.lv_gallery_offsets = {}
-        self.all_lv_embeddings = np.zeros((512, 0))
 
         # Same fallback reasoning, for the video-only sub-gallery (see
         # MIN_VIDEO_SUBGALLERY_SIZE below) -- an empty video_gallery_offsets
@@ -592,6 +602,16 @@ class faceAssigner():
             ).to_numpy()
             if lv_mask.any():
                 lv_embedding = np.array(effective_lv[lv_mask].tolist())
+                # Bounds the per-check cost for a huge gallery (see
+                # LVFACE_VETO_GALLERY_SAMPLE_CAP's own comment) -- a
+                # random subsample, not a truncation, so it doesn't
+                # systematically favor whichever rows happened to be
+                # fetched first.
+                if lv_embedding.shape[0] > self.LVFACE_VETO_GALLERY_SAMPLE_CAP:
+                    sample_idx = np.random.choice(
+                        lv_embedding.shape[0], self.LVFACE_VETO_GALLERY_SAMPLE_CAP, replace=False
+                    )
+                    lv_embedding = lv_embedding[sample_idx]
                 lv_norm = np.linalg.norm(lv_embedding, axis=1, keepdims=True)
                 lv_norm[lv_norm == 0] = 1
                 self.lvface_gallery_dict[face_id] = lv_embedding / lv_norm
@@ -694,7 +714,6 @@ class faceAssigner():
 
         self._build_concatenated_gallery()
         self._build_video_concatenated_gallery()
-        self._build_concatenated_lv_gallery()
         self._build_person_cache()
 
         print(f"Dataframe preloading: {time.time() - ss:.2f} seconds")
@@ -793,43 +812,6 @@ class faceAssigner():
         else:
             self.all_video_embeddings = np.zeros((512, 0))
             self.all_video_norms = np.zeros(0)
-
-    def _build_concatenated_lv_gallery(self):
-        """Same technique as _build_concatenated_gallery(), over
-        lvface_gallery_dict instead -- lets _classify_batch_safely()
-        compute the LVFace-B veto's own per-candidate p99 for an ENTIRE
-        batch in one vectorized pass (one np.percentile call per
-        candidate across every face in the batch), the same way
-        insightface's own sim_99th already is, instead of a per-face
-        Python loop. Found and fixed 2026-11-10: the original per-face
-        loop added ~9ms/face (~15-19% relative slowdown on top of the
-        existing classification cost) -- confirmed via a direct before/
-        after timing comparison on the same real faces, not assumed.
-
-        Only candidates with at least LVFACE_VETO_MIN_GALLERY real
-        LVFace-B entries get a real offset range here --
-        lv_gallery_offsets.get(person_id) returning None for everyone
-        else is exactly the fail-open signal the batched veto logic in
-        classify_unassigned() checks for (same meaning as a missing
-        gallery_offsets entry never applies to insightface, since every
-        likely person always has SOME insightface gallery -- LVFace-B
-        coverage is still partial, so this one genuinely can be empty
-        for a given person)."""
-        self.lv_gallery_offsets = {}
-        cursor = 0
-        chunks = []
-        for person_id, gallery in self.lvface_gallery_dict.items():
-            n = gallery.shape[0]
-            if n < self.LVFACE_VETO_MIN_GALLERY:
-                continue
-            self.lv_gallery_offsets[person_id] = (cursor, cursor + n)
-            chunks.append(gallery.T)  # (512, n) -- matches all_embeddings' own convention
-            cursor += n
-
-        if chunks:
-            self.all_lv_embeddings = np.concatenate(chunks, axis=1)
-        else:
-            self.all_lv_embeddings = np.zeros((512, 0))
 
     def execute(self, redo_all: bool = False) -> None:
         """
@@ -992,45 +974,6 @@ class faceAssigner():
                     video_sim_99th = np.percentile(video_similarity[v_lo:v_hi], 99)
                     sim99[row, col] = max(sim99[row, col], video_sim_99th)
 
-        # LVFace-B veto precompute -- batched the SAME way as sim99 above
-        # (one np.percentile call per candidate across the whole batch,
-        # not one call per face). Found and fixed 2026-11-10: a naive
-        # per-face loop here (the original implementation) added ~9ms/
-        # face, a real ~15-19% relative slowdown on top of the existing
-        # classification cost, confirmed via a direct timing comparison.
-        # lv_query_valid marks which faces in the batch have a real
-        # LVFace-B encoding to check at all (a face without one fail-
-        # opens entirely, same as before); lv_sim99 stays at -inf for any
-        # (face, candidate) pair where the CANDIDATE lacks enough real
-        # LVFace-B data (lv_gallery_offsets has no entry for it) -- -inf
-        # is never treated as a real score below (same inert-sentinel
-        # convention rejected_fields already uses above), so that
-        # specific candidate fail-opens too, independent of the others.
-        lv_queries = np.zeros((num_faces, 512))
-        lv_query_valid = np.zeros(num_faces, dtype=bool)
-        lv_sentinel = list(settings.NON_DETECTED_FACE_ENCODING)
-        for row, face in enumerate(faces):
-            raw = face.face_encoding_lvface_b_hv
-            if raw is None:
-                raw = face.face_encoding_lvface_b
-            if raw is None or raw == lv_sentinel:
-                continue
-            v = np.array(raw, dtype=np.float64)
-            n = np.linalg.norm(v)
-            if n > 0:
-                lv_queries[row] = v / n
-                lv_query_valid[row] = True
-
-        lv_sim99 = np.full((num_faces, num_people), -np.inf)
-        if self.all_lv_embeddings.shape[1] > 0 and lv_query_valid.any():
-            lv_batch_similarity = lv_queries @ self.all_lv_embeddings
-            for col, db_id in enumerate(person_ids):
-                lv_range = self.lv_gallery_offsets.get(db_id)
-                if lv_range is None:
-                    continue
-                lv_lo, lv_hi = lv_range
-                lv_sim99[:, col] = np.percentile(lv_batch_similarity[:, lv_lo:lv_hi], 99, axis=1)
-
         for row, face in enumerate(faces):
             rejected_ids = face.rejected_fields if face.rejected_fields is not None else []
             row_sim99 = sim99[row].copy()
@@ -1042,7 +985,6 @@ class faceAssigner():
                 face.id, face,
                 precomputed_similarity=batch_similarity[row],
                 precomputed_candidates=(person_ids, row_sim99, thresholds),
-                precomputed_lv_candidates=(lv_sim99[row], bool(lv_query_valid[row])),
             )
 
     def _verify_classification_invariant(self):
@@ -1110,14 +1052,12 @@ class faceAssigner():
             from common.error_log import log_error
             log_error('face_manager.assign_faces.execute', message)
 
-    def _classify_one_safely(self, face_id, face, precomputed_similarity=None, precomputed_candidates=None,
-                              precomputed_lv_candidates=None):
+    def _classify_one_safely(self, face_id, face, precomputed_similarity=None, precomputed_candidates=None):
         try:
             self.classify_unassigned(
                 face,
                 precomputed_similarity=precomputed_similarity,
                 precomputed_candidates=precomputed_candidates,
-                precomputed_lv_candidates=precomputed_lv_candidates,
             )
         except Exception as e:
             # A failure classifying one face must not abort the entire
@@ -1131,8 +1071,7 @@ class faceAssigner():
 
 
 
-    def classify_unassigned(self, unassigned_face: Face, debug_face_id = None, precomputed_similarity=None,
-                             precomputed_candidates=None, precomputed_lv_candidates=None) -> None:
+    def classify_unassigned(self, unassigned_face: Face, debug_face_id = None, precomputed_similarity=None, precomputed_candidates=None) -> None:
         """
         DOCSTRING
         """
@@ -1379,53 +1318,32 @@ class faceAssigner():
         # AND). A candidate the veto fail-opened on (no LVFace-B data
         # either side) has no entry here, treated as a neutral 0 below.
         lv_margin_by_idx = {}
-        if len(possible_idcs) > 0 and precomputed_lv_candidates is not None:
-            # Batched fast path (found and fixed 2026-11-10: the per-face
-            # loop below added ~9ms/face, ~15-19% relative slowdown,
-            # confirmed via direct timing). _classify_batch_safely()
-            # already computed every candidate's LVFace-B p99 for the
-            # WHOLE BATCH in one vectorized pass (same technique as
-            # sim99 above) -- lv_sim99_row is aligned 1:1 with
-            # candidate_id_arr here (both came from the same
-            # precomputed_candidates person_ids ordering), so this is
-            # pure array indexing, no percentile computation at all.
-            lv_sim99_row, lv_has_query = precomputed_lv_candidates
-            if lv_has_query:
-                lv_scores = lv_sim99_row[possible_idcs]
-                has_lv_gallery = lv_scores > -np.inf
-                keep_mask = (~has_lv_gallery) | (lv_scores >= self.LVFACE_VETO_THRESHOLD)
-                for i, idx in enumerate(possible_idcs):
-                    if has_lv_gallery[i] and keep_mask[i]:
-                        lv_margin_by_idx[int(idx)] = float(lv_scores[i]) - self.LVFACE_VETO_THRESHOLD
-                possible_idcs = possible_idcs[keep_mask]
-        elif len(possible_idcs) > 0:
-            # Original per-face path -- still correct and used whenever
-            # this is called directly, without going through
-            # _classify_batch_safely() (e.g. _verify_classification_
-            # invariant()'s retry, or a direct test call).
-            #
-            # Prefers the halfvec mirror, same per-row fallback as
-            # query_encoding/embedding_dict above.
-            query_lv_raw = unassigned_face.face_encoding_lvface_b_hv
-            if query_lv_raw is None:
-                query_lv_raw = unassigned_face.face_encoding_lvface_b
-            if query_lv_raw is not None and query_lv_raw != settings.NON_DETECTED_FACE_ENCODING:
-                query_lv = np.array(query_lv_raw, dtype=np.float64)
-                query_lv_norm = np.linalg.norm(query_lv)
-                if query_lv_norm > 0:
-                    query_lv = query_lv / query_lv_norm
-                    keep = []
-                    for idx in possible_idcs:
-                        candidate_id = int(metrics_array[idx, 2])
-                        lv_gallery = self.lvface_gallery_dict.get(candidate_id)
-                        if lv_gallery is None or lv_gallery.shape[0] < self.LVFACE_VETO_MIN_GALLERY:
-                            keep.append(idx)  # not enough LVFace-B data to veto on -- fail-open
-                            continue
-                        lv_p99 = np.percentile(lv_gallery @ query_lv, 99)
-                        if lv_p99 >= self.LVFACE_VETO_THRESHOLD:
-                            keep.append(idx)
-                            lv_margin_by_idx[idx] = float(lv_p99) - self.LVFACE_VETO_THRESHOLD
-                    possible_idcs = np.array(keep, dtype=int)
+        # Prefers the halfvec mirror, same per-row fallback as
+        # query_encoding/embedding_dict above.
+        query_lv_raw = unassigned_face.face_encoding_lvface_b_hv
+        if query_lv_raw is None:
+            query_lv_raw = unassigned_face.face_encoding_lvface_b
+        if (
+            len(possible_idcs) > 0
+            and query_lv_raw is not None
+            and query_lv_raw != settings.NON_DETECTED_FACE_ENCODING
+        ):
+            query_lv = np.array(query_lv_raw, dtype=np.float64)
+            query_lv_norm = np.linalg.norm(query_lv)
+            if query_lv_norm > 0:
+                query_lv = query_lv / query_lv_norm
+                keep = []
+                for idx in possible_idcs:
+                    candidate_id = int(metrics_array[idx, 2])
+                    lv_gallery = self.lvface_gallery_dict.get(candidate_id)
+                    if lv_gallery is None or lv_gallery.shape[0] < self.LVFACE_VETO_MIN_GALLERY:
+                        keep.append(idx)  # not enough LVFace-B data to veto on -- fail-open
+                        continue
+                    lv_p99 = np.percentile(lv_gallery @ query_lv, 99)
+                    if lv_p99 >= self.LVFACE_VETO_THRESHOLD:
+                        keep.append(idx)
+                        lv_margin_by_idx[idx] = float(lv_p99) - self.LVFACE_VETO_THRESHOLD
+                possible_idcs = np.array(keep, dtype=int)
 
         if self.DEBUG:
             print(possible_idcs, "poss len is", len(possible_idcs))
