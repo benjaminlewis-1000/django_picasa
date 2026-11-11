@@ -833,11 +833,23 @@ class faceAssigner():
         # unassigned_face.declared_name.person_name on every face (the
         # concurrent-processing guard just below) -- without this, that's
         # a separate DB round trip per face on top of everything else.
+        #
+        # select_related('source_image_file', 'source_video_file'):
+        # confirmed via direct profiling (2026-11-10) that Face.save()'s
+        # box-dimension check reads self.source_image_file.height/width
+        # (or the video equivalent) on every single call -- without this,
+        # that's a SECOND per-face DB round trip (fetching the whole
+        # ImageFile/VideoFile row) on top of the UPDATE save() itself
+        # issues, doubling the real per-face DB cost for no reason (only
+        # height/width are ever read). Exactly one of the two FKs is set
+        # per row (Meta.constraints), so select_related'ing both is safe
+        # and free for whichever one is actually NULL.
+        select_related_fields = ('declared_name', 'source_image_file', 'source_video_file')
         if redo_all:
-            unassigned = Face.objects.filter(unassigned_crit & has_long & long_encoded).select_related('declared_name').order_by('?')
+            unassigned = Face.objects.filter(unassigned_crit & has_long & long_encoded).select_related(*select_related_fields).order_by('?')
         else:
             no_suggestions = Q(poss_ident1__person_name=None)
-            unassigned = Face.objects.filter(unassigned_crit & has_long & long_encoded).filter(no_suggestions).select_related('declared_name').order_by('?')
+            unassigned = Face.objects.filter(unassigned_crit & has_long & long_encoded).filter(no_suggestions).select_related(*select_related_fields).order_by('?')
 
         if self.DEBUG:
             unassigned = unassigned[:1001]
@@ -974,6 +986,7 @@ class faceAssigner():
                     video_sim_99th = np.percentile(video_similarity[v_lo:v_hi], 99)
                     sim99[row, col] = max(sim99[row, col], video_sim_99th)
 
+        faces_to_save = []
         for row, face in enumerate(faces):
             rejected_ids = face.rejected_fields if face.rejected_fields is not None else []
             row_sim99 = sim99[row].copy()
@@ -981,11 +994,38 @@ class faceAssigner():
                 col = person_col.get(rid)
                 if col is not None:
                     row_sim99[col] = -np.inf
-            self._classify_one_safely(
+            succeeded = self._classify_one_safely(
                 face.id, face,
                 precomputed_similarity=batch_similarity[row],
                 precomputed_candidates=(person_ids, row_sim99, thresholds),
+                save=False,
             )
+            if succeeded:
+                faces_to_save.append(face)
+
+        # One bulk_update() for the whole batch instead of up to
+        # CLASSIFY_BATCH_SIZE individual Face.save() calls -- see
+        # classify_unassigned()'s save= docstring for why this is safe
+        # (only poss_identN/weight_N ever change here). Confirmed via
+        # direct profiling (2026-11-10) that Face.save() costs ~9-17ms/
+        # face even after removing its own N+1 query, almost entirely
+        # per-row UPDATE round-trip + redundant box/thumbnail
+        # revalidation -- bulk_update collapses that to one query per
+        # batch. batch_size=None (the whole list in one call) is safe at
+        # CLASSIFY_BATCH_SIZE=200 -- Django's own bulk_update chunks
+        # internally if ever given a much larger list. Only faces that
+        # classified successfully (see _classify_one_safely's return
+        # value) are included -- a face that raised partway through is
+        # excluded entirely, matching the old per-face behavior where an
+        # exception before the branch's final .save() meant nothing was
+        # ever persisted for it.
+        if faces_to_save:
+            _POSS_IDENT_FIELDS = [
+                f'poss_ident{i}' for i in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1)
+            ] + [
+                f'weight_{i}' for i in range(1, Face.NUM_POSSIBLE_IDENTITIES + 1)
+            ]
+            Face.objects.bulk_update(faces_to_save, _POSS_IDENT_FIELDS)
 
     def _verify_classification_invariant(self):
         """Safety net, run at the end of every execute() call: a face
@@ -1052,13 +1092,24 @@ class faceAssigner():
             from common.error_log import log_error
             log_error('face_manager.assign_faces.execute', message)
 
-    def _classify_one_safely(self, face_id, face, precomputed_similarity=None, precomputed_candidates=None):
+    def _classify_one_safely(self, face_id, face, precomputed_similarity=None, precomputed_candidates=None, save=True):
+        """Returns True on success, False if classify_unassigned() raised
+        -- callers batching saves via bulk_update() (save=False) use this
+        to exclude a face that failed partway through (e.g. mid-loop in
+        the matched-candidate branch) from the write, since it may be
+        left with partially-mutated, inconsistent in-memory field state
+        that was never meant to be persisted (the old per-face save()
+        path never wrote anything for such a face either, since the
+        exception happens before that branch's own final .save()
+        call)."""
         try:
             self.classify_unassigned(
                 face,
                 precomputed_similarity=precomputed_similarity,
                 precomputed_candidates=precomputed_candidates,
+                save=save,
             )
+            return True
         except Exception as e:
             # A failure classifying one face must not abort the entire
             # scheduled run -- every other already-queued face in this
@@ -1067,13 +1118,29 @@ class faceAssigner():
             # above for the bug this specifically guards against.
             print(f"Exception classifying face {face_id}: {e}")
             settings.LOGGER.error(f"Exception classifying face {face_id}: {e}")
+            return False
 
 
 
 
-    def classify_unassigned(self, unassigned_face: Face, debug_face_id = None, precomputed_similarity=None, precomputed_candidates=None) -> None:
+    def classify_unassigned(self, unassigned_face: Face, debug_face_id = None, precomputed_similarity=None, precomputed_candidates=None, save: bool = True) -> None:
         """
         DOCSTRING
+
+        save=False skips every internal Face.save() call (every branch
+        below only ever touches poss_identN/weight_N via
+        set_possible_person(), never box/thumbnail/declared_name/etc.) --
+        lets _classify_batch_safely() collect the touched-but-unsaved
+        Face instances across a whole batch and write them with one
+        Face.objects.bulk_update() instead of up to CLASSIFY_BATCH_SIZE
+        individual Face.save() calls. Face.save() does real, unrelated
+        validation (box bounds, a thumbnail-existence check) on every
+        call regardless of which fields actually changed -- redundant
+        here since classification never touches those fields, and a
+        real, measured cost (see CLASSIFY_BATCH_SIZE's own comment history
+        and the 2026-11-10 select_related fix just above in execute()).
+        Callers that need the old per-face-save behavior (direct tests,
+        the invariant-check retry, etc.) get it for free via the default.
         """
         if self.DEBUG:
             print("=" * 80)
@@ -1122,7 +1189,7 @@ class faceAssigner():
             # self.num_likely_people), a size-0 array here would make
             # np.max()/np.argmax() in the "no match" branch below raise
             # ValueError on an empty reduction.
-            unassigned_face.set_possible_person(self._cached_person(self.ignore_person_id), 1, 1.0)
+            unassigned_face.set_possible_person(self._cached_person(self.ignore_person_id), 1, 1.0, save=save)
             return
 
         # Used below regardless of which branch builds metrics_array
@@ -1362,7 +1429,7 @@ class faceAssigner():
                 # print("Need to reject the person")
                 max_idx = np.argmax(metrics_array[:, 0])
                 max_id = candidate_id_arr[max_idx]
-                unassigned_face.set_possible_person(self._cached_person(int(max_id)), 1, metric_max)
+                unassigned_face.set_possible_person(self._cached_person(int(max_id)), 1, metric_max, save=save)
             else:
                 # This weight answers a different question than a real
                 # match's weight does: not "how confident is this specific
@@ -1386,7 +1453,7 @@ class faceAssigner():
                 closest_call_margin = np.min(margins_below_threshold)  # smallest gap = nearest to passing
                 clamped_margin = np.clip(closest_call_margin, 0, self.IGNORE_WEIGHT_MARGIN_CLAMP)
                 weight = clamped_margin / self.IGNORE_WEIGHT_MARGIN_CLAMP  # 0 (marginal) .. 1 (far from everyone)
-                unassigned_face.set_possible_person(self._cached_person(self.ignore_person_id), 1, weight)
+                unassigned_face.set_possible_person(self._cached_person(self.ignore_person_id), 1, weight, save=save)
         else:
             scores = metrics_array[possible_idcs, 0]
             assign_ids = metrics_array[possible_idcs, 2].astype(np.int64)
@@ -1434,5 +1501,6 @@ class faceAssigner():
                 # print(assign_ids[order_idx], precedence_idx, scores[order_idx])
                 candidate_person = self._cached_person(int(assign_ids[order_idx]))
                 unassigned_face.set_possible_person(candidate_person, precedence_idx + 1, float(scores[order_idx]), save=False)
-            unassigned_face.save()
+            if save:
+                unassigned_face.save()
 
