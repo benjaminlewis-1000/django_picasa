@@ -449,23 +449,27 @@ class PersonListView(APIView):
             p_dict['further_images_unlikely'] = p.further_images_unlikely
 
             if p.person_name == settings.BLANK_FACE_NAME:
-                # poss_ident1__isnull=False excludes faces with no
-                # candidate suggestion at all (2026-10-21, per the user's
-                # own call) - these are mostly tiny/low-quality detections
-                # the recognition pipeline never produced a guess for,
-                # overwhelmingly belonging to people already declared
-                # .ignore, that aren't worth surfacing for manual review.
-                # This population isn't static (the backend's own pipeline
-                # keeps assigning them faces over time), so it's excluded
-                # here at display/count time rather than deleted or
-                # permanently reclassified - scoped to this web-facing
-                # count/listing only; mobile_views.py/assign_faces.py's own
-                # Unassigned-population queries are untouched, since they
-                # need the true full population to do their jobs.
+                # Below-floor exclusion only (2026-11-12, per the user's own
+                # call) - originally (2026-10-21) this also required
+                # poss_ident1__isnull=False, excluding every face the
+                # classifier never produced a guess for. That was a crude
+                # proxy for "too tiny/low-quality to be worth reviewing,"
+                # which below_collection_floor_q() now tests directly and
+                # correctly - so the poss_ident1 split (and the separate
+                # "No proposal yet" audit row it backed, now removed) is
+                # redundant: a face either belongs in Unassigned's review
+                # queue (above the floor) or it doesn't, regardless of
+                # whether a candidate guess exists for it. This population
+                # isn't static (the backend's own pipeline keeps assigning
+                # faces over time), so it's excluded here at display/count
+                # time rather than deleted or permanently reclassified -
+                # scoped to this web-facing count/listing only;
+                # mobile_views.py/assign_faces.py's own Unassigned-population
+                # queries are untouched, since they need the true full
+                # population to do their jobs.
                 blanks_qs = Face.objects.filter(
                     declared_name__person_name=settings.BLANK_FACE_NAME,
-                    poss_ident1__isnull=False,
-                )
+                ).exclude(below_collection_floor_q())
                 num_blanks = blanks_qs.count()
                 p_dict['num_possibilities'] = num_blanks
                 p_dict['num_unverified_faces'] = num_blanks
@@ -477,26 +481,11 @@ class PersonListView(APIView):
                 num_blanks_video = blanks_qs.filter(source_video_file__isnull=False).count()
                 p_dict['num_possibilities_video'] = num_blanks_video
                 p_dict['num_possibilities_image'] = num_blanks - num_blanks_video
-                # Backs the sidebar's new "No proposal yet" subordinate row
-                # (2026-11-10) - the complementary population to blanks_qs
-                # above (poss_ident1 IS NULL instead of IS NOT NULL),
-                # excluding faces below their own collection's quality
-                # floor so this surfaces genuine classification gaps (ran,
-                # should have gotten a proposal, didn't) rather than the
-                # ~57k faces that were excluded on purpose for being too
-                # small/low-confidence to ever get one. See
-                # PersonParamView's `no_proposal` param for the matching
-                # gallery listing.
-                p_dict['num_no_proposal'] = Face.objects.filter(
-                    declared_name__person_name=settings.BLANK_FACE_NAME,
-                    poss_ident1__isnull=True,
-                ).exclude(below_collection_floor_q()).count()
             else:
                 p_dict['num_possibilities'] = counts['num_possibilities']
                 p_dict['num_possibilities_video'] = counts['num_possibilities_video']
                 p_dict['num_possibilities_image'] = counts['num_possibilities'] - counts['num_possibilities_video']
                 p_dict['num_unverified_faces'] = counts['num_unverified_faces']
-                p_dict['num_no_proposal'] = 0
 
             # Count backing the frontend's ".ignore" sidebar subordinate
             # row ("Flagged for review") - see PersonParamView's
@@ -549,13 +538,18 @@ class PersonListView(APIView):
                 ).count()
                 p_dict['num_review_flagged_unverified'] = num_flagged_unverified
                 p_dict['num_unverified_faces'] = max(0, p_dict['num_unverified_faces'] - num_flagged_unverified)
-                # Backs the sidebar's new ".ignore" "Flagged, lost proposal"
+                # Backs the sidebar's ".ignore" "Flagged, lost proposal"
                 # subordinate row (2026-11-10) - faces that WERE flagged for
                 # review but currently have no poss_ident1 at all, as
                 # opposed to having been legitimately reassigned to a real
                 # person (not surfaced here - see PersonParamView's
                 # `no_proposal` param comment). Same quality-floor exclusion
-                # as Unassigned's num_no_proposal above, same reasoning.
+                # reasoning as below_collection_floor_q() elsewhere.
+                # (Unassigned's own equivalent "No proposal yet" row was
+                # removed 2026-11-12, per the user - redundant with
+                # Unassigned's main view once the floor fix landed. This
+                # row stays: it's a distinct population, mobile-flagged
+                # faces specifically, not just "any Unassigned face".)
                 # Real bug, found and fixed 2026-11-12: mobile_review_hidden
                 # alone doesn't scope this to "not yet adjudicated" - it's
                 # set by the mobile app on ANY person's queue, and survives
@@ -683,22 +677,15 @@ class PersonParamView(APIView):
         # someone." Only meaningful on the face_poss branch below.
         do_flagged_only = params.get('flagged', '').lower() == 'true'
 
-        # New sub-populations (2026-11-10, per the user's own request while
-        # running a fresh classification pass over Unassigned): faces that
-        # SHOULD have gotten a poss_ident1 proposal but didn't, as distinct
-        # from the known, deliberately-excluded population of faces too
-        # small/low-confidence for their own collection to ever get one (see
-        # PhotoCollection.min_face_det_score/min_face_relative_size, the
-        # Classification Settings tool's per-collection floors) - a glitch
-        # in a classification run looks identical to "no candidate" unless
-        # that quality floor is excluded too, via below_collection_floor_q().
-        # Meaningful on face_declared for the Unassigned sentinel (the
-        # inverse of that branch's own poss_ident1__isnull=False filter
-        # below) and on face_poss for .ignore's flagged sub-view (faces
-        # that WERE flagged for review but have since lost their .ignore
-        # proposal entirely, rather than being legitimately reassigned to
-        # a real person - that reassignment case is correct and intentionally
-        # not surfaced here).
+        # (2026-11-10, per the user's own request while running a fresh
+        # classification pass; narrowed 2026-11-12 once the quality floor
+        # fix made Unassigned's own split redundant - see that branch's own
+        # comment below.) Still meaningful on face_poss for .ignore's
+        # flagged sub-view: faces that WERE flagged for review but have
+        # since lost their .ignore proposal entirely, rather than being
+        # legitimately reassigned/adjudicated (that case is correct and
+        # intentionally not surfaced here - see no_proposal_lost_flagged
+        # below).
         no_proposal_only = params.get('no_proposal', '').lower() == 'true'
 
         # Populated only for field == 'face_declared' with
@@ -736,20 +723,17 @@ class PersonParamView(APIView):
 
                 default_query = Q(declared_name=person_obj)
                 # Keep this in sync with PersonListView's own BLANK_FACE_NAME
-                # count override above - same reasoning (2026-10-21): faces
-                # with no candidate suggestion at all are excluded from
-                # Unassigned's own gallery/count here, not from the Face
-                # table itself. no_proposal_only (2026-11-10) flips this to
-                # the complementary population instead, for the sidebar's
-                # "No proposal yet" audit row - see that param's own comment
-                # above.
+                # count override above - same reasoning (2026-11-12, replacing
+                # the original 2026-10-21/2026-11-10 poss_ident1-based split):
+                # a face either belongs in Unassigned's review queue (above
+                # its collection's quality floor) or it doesn't, regardless
+                # of whether the classifier produced a candidate guess for
+                # it - no_proposal_only no longer applies to Unassigned (it's
+                # still used below for .ignore's distinct "Flagged, lost
+                # proposal" row).
                 exclude_below_floor = False
                 if person_obj.person_name == settings.BLANK_FACE_NAME:
-                    if no_proposal_only:
-                        default_query &= Q(poss_ident1__isnull=True)
-                        exclude_below_floor = True
-                    else:
-                        default_query &= Q(poss_ident1__isnull=False)
+                    exclude_below_floor = True
                 unverified_query = Q(validated=False)
                 # verification_cluster_group (face_manager/
                 # verification_clustering.py's nightly job) only ever gets
