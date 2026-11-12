@@ -321,14 +321,26 @@ def below_collection_floor(collection, det_score, relative_size):
 
     collection=None (or a collection with neither floor set) always
     returns False -- no floor means every detection qualifies, the
-    default collection's own unchanged behavior."""
+    default collection's own unchanged behavior.
+
+    relative_size=None does NOT fail the floor on its own (fixed
+    2026-11-12) -- confirmed live that ~96% of Unassigned's "no
+    proposal" faces missing relative_size are video-sourced, with
+    otherwise ordinary det_score values (0.5-0.87 in a random sample).
+    Video-frame face extraction apparently never computes/stores
+    relative_size at all, so treating a missing value as "too small"
+    was silently excluding thousands of perfectly reasonable detections
+    from ever getting a real embedding/proposal, not just from the
+    audit view this function also backs. det_score=None still fails
+    (unchanged) -- no equivalent evidence it's a pipeline gap rather
+    than a genuine missing-confidence case."""
     if collection is None:
         return False
     if collection.min_face_det_score is not None:
         if det_score is None or det_score < collection.min_face_det_score:
             return True
     if collection.min_face_relative_size is not None:
-        if relative_size is None or relative_size < collection.min_face_relative_size:
+        if relative_size is not None and relative_size < collection.min_face_relative_size:
             return True
     return False
 
@@ -351,22 +363,31 @@ def below_collection_floor_q():
     either side. A null collection, or a collection with neither floor
     set, never counts as "below floor" here either, matching
     below_collection_floor(None, ...).
+
+    null_fails (det_score=True, relative_size=False) mirrors
+    below_collection_floor()'s own 2026-11-12 fix -- see that
+    function's docstring for why relative_size=NULL shouldn't count as
+    "below floor" (a video-pipeline data gap, not a real small-face
+    signal) while det_score=NULL still does.
     """
-    def _metric_below(prefix, metric, floor_field):
+    def _metric_below(prefix, metric, floor_field, null_fails):
         # metric (det_score/relative_size) is a plain field on Face
         # itself -- only the floor being compared against lives behind
         # the source_image_file/source_video_file -> directory ->
         # collection join.
         floor_path = f'{prefix}__directory__collection__{floor_field}'
-        return Q(**{f'{floor_path}__isnull': False}) & (
-            Q(**{f'{metric}__isnull': True}) |
-            Q(**{f'{metric}__lt': F(floor_path)})
-        )
+        floor_is_set = Q(**{f'{floor_path}__isnull': False})
+        if null_fails:
+            return floor_is_set & (
+                Q(**{f'{metric}__isnull': True}) |
+                Q(**{f'{metric}__lt': F(floor_path)})
+            )
+        return floor_is_set & Q(**{f'{metric}__isnull': False}) & Q(**{f'{metric}__lt': F(floor_path)})
 
     def _for_prefix(prefix):
         return Q(**{f'{prefix}__isnull': False}) & (
-            _metric_below(prefix, 'det_score', 'min_face_det_score') |
-            _metric_below(prefix, 'relative_size', 'min_face_relative_size')
+            _metric_below(prefix, 'det_score', 'min_face_det_score', null_fails=True) |
+            _metric_below(prefix, 'relative_size', 'min_face_relative_size', null_fails=False)
         )
 
     return _for_prefix('source_image_file') | _for_prefix('source_video_file')

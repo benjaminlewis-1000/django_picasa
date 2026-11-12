@@ -556,8 +556,25 @@ class PersonListView(APIView):
                 # person (not surfaced here - see PersonParamView's
                 # `no_proposal` param comment). Same quality-floor exclusion
                 # as Unassigned's num_no_proposal above, same reasoning.
+                # Real bug, found and fixed 2026-11-12: mobile_review_hidden
+                # alone doesn't scope this to "not yet adjudicated" - it's
+                # set by the mobile app on ANY person's queue, and survives
+                # every subsequent declared_name change (by design - it's a
+                # permanent audit trail, see the "Flagged & unverified" row).
+                # declared_name IS the adjudication signal: Unassigned means
+                # no decision has been made yet; .ignore means a human (or
+                # the pipeline) already decided this face belongs there,
+                # same as any other real person - so only Unassigned
+                # belongs here. (A first attempt at this fix also allowed
+                # declared_name=.ignore through, reasoning it was "not yet
+                # reassigned to a real person" - wrong, per the user: being
+                # declared .ignore already IS the adjudication, which is
+                # also why Q/close_unassigned resolving a face here was
+                # resurfacing it on reload - its declared_name became
+                # .ignore, which the old filter still allowed through.)
                 p_dict['num_review_flagged_no_proposal'] = Face.objects.filter(
                     mobile_review_hidden=True, poss_ident1__isnull=True,
+                    declared_name__person_name=settings.BLANK_FACE_NAME,
                 ).exclude(below_collection_floor_q()).count()
             else:
                 p_dict['num_review_flagged'] = 0
@@ -811,7 +828,26 @@ class PersonParamView(APIView):
                     and do_flagged_only and no_proposal_only
                 )
                 if no_proposal_lost_flagged:
-                    poss_query = Q(mobile_review_hidden=True, poss_ident1__isnull=True)
+                    # mobile_review_hidden alone isn't enough to scope this to
+                    # "not yet adjudicated" - it's a general-purpose flag the
+                    # mobile app sets on ANY person's queue, and survives
+                    # every subsequent declared_name change by design (a
+                    # permanent audit trail - see the "Flagged & unverified"
+                    # row). declared_name IS the adjudication signal:
+                    # Unassigned means no decision has been made; .ignore
+                    # means a human (or the pipeline) already decided this
+                    # face belongs there, same as any real person - so only
+                    # Unassigned belongs here (confirmed live, 2026-11-12:
+                    # 133 distinct real people's faces were wrongly showing
+                    # up before this was scoped at all; a first attempt at
+                    # scoping it also wrongly allowed .ignore through, which
+                    # was why Q/close_unassigned here kept resurfacing the
+                    # same face on reload - resolving it sets declared_name
+                    # to .ignore, which that looser filter still matched).
+                    poss_query = Q(
+                        mobile_review_hidden=True, poss_ident1__isnull=True,
+                        declared_name__person_name=settings.BLANK_FACE_NAME,
+                    )
                     faces = list(
                         Face.objects.filter(poss_query)
                         .exclude(below_collection_floor_q())
