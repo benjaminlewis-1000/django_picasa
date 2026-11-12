@@ -1455,6 +1455,18 @@ class VideoFaceExtractor(object):
         face.kps = kps_arr.reshape(-1).tolist()
         if det_score is not None:
             face.det_score = float(det_score)
+
+        # Same formula face_extract_encode.py uses for image faces --
+        # min(box_w, box_h) / min(frame_w, frame_h). Never computed here
+        # before (found 2026-11-12: 96% of all relative_size-missing
+        # faces are video-sourced, silently failing any collection's
+        # min_face_relative_size floor and the classification size-nudge
+        # regardless of how good the detection actually is). Computed
+        # from the already-clamped box, so it's always in (0, 1].
+        box_w = face.box_right - face.box_left
+        box_h = face.box_bottom - face.box_top
+        frame_min_dim = min(img_w, img_h)
+        face.relative_size = min(box_w, box_h) / frame_min_dim if frame_min_dim > 0 else 0
         if timestamp_seconds is not None:
             face.video_thumbnail_frame_seconds = self._clamp_to_duration(
                 face.source_video_file, timestamp_seconds, 'video_thumbnail_frame_seconds'

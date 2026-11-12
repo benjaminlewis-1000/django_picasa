@@ -400,6 +400,25 @@ class VideoFaceSetBoxAndThumbnailOrphanTests(TestCase):
         )
         self.assertEqual(self.face.kps, [float(v) for pair in kps_in_bounds for v in pair])
 
+    def test_relative_size_is_computed_same_as_image_pipeline(self):
+        # Found 2026-11-12: video faces never had relative_size computed
+        # at all, silently failing any min_face_relative_size floor and
+        # the classification size-nudge regardless of detection quality.
+        # Frame is 320x240 (min dim 240); box is 60x40 -> min(60,40)/240.
+        self.extractor._set_face_box_and_thumbnail(
+            self.face, self.frame, (10, 10, 70, 50), kps=[[35, 35]] * 5,
+        )
+        self.assertAlmostEqual(self.face.relative_size, 40 / 240)
+
+    def test_relative_size_uses_the_clamped_box_not_the_raw_one(self):
+        # Box extends past the 320x240 frame on the right/bottom -- the
+        # box gets clamped to (10, 10, 320, 240) first, so relative_size
+        # must reflect that clamped 310x230 box, not the raw 600x500 one.
+        self.extractor._set_face_box_and_thumbnail(
+            self.face, self.frame, (10, 10, 600, 500), kps=[[35, 35]] * 5,
+        )
+        self.assertAlmostEqual(self.face.relative_size, 230 / 240)
+
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
 class ClassifyAndPickThumbnailFailureTests(TestCase):
