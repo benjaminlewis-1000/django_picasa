@@ -81,6 +81,19 @@ EVAL_EVERY_STEPS = 250
 LR_DECAY_EVERY_STEPS = 2000
 LR_DECAY_FACTOR = 0.5
 
+# Same panorama/giant-image hang already documented in
+# backfill_verified_kps.py (search CLAUDE.md for "a single
+# uninterruptible C call") -- a huge or extreme-aspect-ratio image can
+# make open_img_oriented()'s underlying PIL decode/resize call run for
+# a very long time (practically unbounded in the worst case seen so
+# far), and since it's a single C call, no SIGALRM-based timeout can
+# interrupt it once started. Checked here against ImageFile's already-
+# stored width/height (zero decode cost) before ever reaching
+# _decode_upright(), using the same thresholds already validated
+# against this library's real population there.
+MAX_IMAGE_PIXELS = 25_000_000
+MAX_ASPECT_RATIO = 2.5
+
 
 def _sample_image_ids(num_train, num_val, seed):
     """Random, reproducible (given a fixed seed) split of real,
@@ -180,9 +193,15 @@ class _RotationDataset:
         self._rng = __import__('random').Random(seed)
         rows = ImageFile.objects.filter(id__in=image_ids).values_list(
             'id', 'filename', 'rotation_scan_state', 'proposed_rotation_degrees',
+            'width', 'height',
         )
         self._file_info = {}
-        for image_id, filename, scan_state, proposed_degrees in rows:
+        for image_id, filename, scan_state, proposed_degrees, width, height in rows:
+            if width and height:
+                if width * height > MAX_IMAGE_PIXELS:
+                    continue
+                if max(width, height) / min(width, height) > MAX_ASPECT_RATIO:
+                    continue
             extra = proposed_degrees if (
                 scan_state == ImageFile.RotationScanState.CONFIRMED and proposed_degrees is not None
             ) else None

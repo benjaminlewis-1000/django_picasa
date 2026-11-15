@@ -4,15 +4,20 @@ preprocessing helpers for the planned ML orientation-classifier signal
 itself (loads a real torchvision backbone + pretrained weights, needs
 network access the first time) is exercised separately, tagged slow.
 """
+import os
 import unittest
 
 import numpy as np
 from django.test import TestCase, tag
 
+from face_manager.management.commands.train_rotation_classifier import (
+    MAX_ASPECT_RATIO, MAX_IMAGE_PIXELS, _RotationDataset,
+)
 from face_manager.rotation_classifier_model import (
     INPUT_SIZE, NUM_CLASSES, apply_synthetic_rotation, letterbox_to_square,
     to_model_input, undo_rotation_degrees,
 )
+from filepopulator.models import Directory, ImageFile
 
 
 def _asymmetric_image(h=60, w=100):
@@ -137,6 +142,61 @@ class UndoRotationDegreesTests(unittest.TestCase):
         self.assertEqual(undo_rotation_degrees(1), -undo_rotation_degrees(3))
         self.assertNotEqual(undo_rotation_degrees(1), 0.0)
         self.assertEqual(abs(undo_rotation_degrees(2)), 180.0)
+
+
+def _fake_image_row(path, width, height):
+    """A fabricated ImageFile row with arbitrary width/height, via
+    bulk_create -- same reasoning as tests/__init__.py's own
+    make_preexisting_image_row: ImageFile.save() unconditionally decodes
+    the real file, which doesn't exist here at all. These tests only
+    need the DB-stored width/height columns _RotationDataset reads, never
+    the real pixels."""
+    directory, _ = Directory.objects.get_or_create(dir_path=os.path.dirname(path))
+    image = ImageFile(
+        filename=path, directory=directory, thumbnail_small="",
+        width=width, height=height, isProcessed=False,
+    )
+    ImageFile.objects.bulk_create([image])
+    return ImageFile.objects.get(filename=path)
+
+
+class RotationDatasetGeometryGuardTests(TestCase):
+    """The MAX_IMAGE_PIXELS/MAX_ASPECT_RATIO guard added after a real
+    training hang (2026-11-15): a giant or extreme-aspect-ratio image's
+    decode/resize call inside open_img_oriented() can run effectively
+    unbounded, and since it's a single C call, no SIGALRM timeout can
+    interrupt it -- so this has to be caught before ever attempting the
+    decode, using only the already-stored width/height columns."""
+
+    def test_normal_image_is_kept(self):
+        img = _fake_image_row("ok.jpg", width=4000, height=3000)
+        ds = _RotationDataset([img.id], train=True)
+        self.assertEqual(ds.image_ids, [img.id])
+
+    def test_excessive_pixel_count_is_excluded(self):
+        # Comfortably over MAX_IMAGE_PIXELS at an ordinary 4:3 aspect
+        # ratio (so this is testing the pixel-count check specifically,
+        # not aspect ratio).
+        side = int((MAX_IMAGE_PIXELS * 1.5) ** 0.5)
+        img = _fake_image_row("huge.jpg", width=side, height=side)
+        ds = _RotationDataset([img.id], train=True)
+        self.assertEqual(ds.image_ids, [])
+
+    def test_excessive_aspect_ratio_is_excluded(self):
+        # A real panorama shape: well under MAX_IMAGE_PIXELS on its own,
+        # but far past MAX_ASPECT_RATIO -- confirms the aspect-ratio
+        # check catches what the pixel-count check alone would miss.
+        img = _fake_image_row("pano.jpg", width=3000, height=3000 // int(MAX_ASPECT_RATIO + 2))
+        ds = _RotationDataset([img.id], train=True)
+        self.assertEqual(ds.image_ids, [])
+
+    def test_mixed_population_keeps_only_the_normal_image(self):
+        ok = _fake_image_row("ok2.jpg", width=4000, height=3000)
+        side = int((MAX_IMAGE_PIXELS * 1.5) ** 0.5)
+        huge = _fake_image_row("huge2.jpg", width=side, height=side)
+        pano = _fake_image_row("pano2.jpg", width=3000, height=3000 // int(MAX_ASPECT_RATIO + 2))
+        ds = _RotationDataset([ok.id, huge.id, pano.id], train=True)
+        self.assertEqual(ds.image_ids, [ok.id])
 
 
 @tag("slow")
