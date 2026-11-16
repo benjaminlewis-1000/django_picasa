@@ -23,7 +23,10 @@ from django.db import connection
 from django.db.models import Count, IntegerField, OuterRef, Q, Subquery, Value
 from django.db.models.functions import Coalesce
 
+from django.conf import settings
+
 from face_manager.models import Face, Person
+from filepopulator.models import below_collection_floor_q
 
 
 def annotate_live_face_counts(queryset):
@@ -70,11 +73,41 @@ def annotate_live_face_counts(queryset):
         .order_by().values('poss_ident1')
         .annotate(c=Count('id')).values('c')
     )
+    # Backs the frontend's per-person "ignore review" gallery group - faces
+    # flagged on .ignore (mobile_review_hidden) whose classifier-ranked
+    # next-best guess (poss_ident2) is this person. Scoped to poss_ident1
+    # being the actual .ignore sentinel (not just "any flagged face") and
+    # excluded by the same quality floor as every other review population -
+    # see below_collection_floor_q()'s own docstring. Relies on
+    # face_manager_face_poss_ident2_covering (0025) for an index-only scan,
+    # same reasoning as poss1_sq/poss1_video_sq above.
+    ignore_person_id = (
+        Person.objects.filter(person_name=settings.SOFT_IGNORE_NAME).values_list('id', flat=True).first()
+    )
+    poss2_sq = (
+        Face.objects.filter(
+            poss_ident2=OuterRef('pk'), mobile_review_hidden=True, poss_ident1_id=ignore_person_id,
+        )
+        .exclude(below_collection_floor_q())
+        .order_by().values('poss_ident2')
+        .annotate(c=Count('id')).values('c')
+    )
+    poss2_video_sq = (
+        Face.objects.filter(
+            poss_ident2=OuterRef('pk'), mobile_review_hidden=True, poss_ident1_id=ignore_person_id,
+            source_video_file__isnull=False,
+        )
+        .exclude(below_collection_floor_q())
+        .order_by().values('poss_ident2')
+        .annotate(c=Count('id')).values('c')
+    )
     return queryset.annotate(
         num_faces=Coalesce(Subquery(faces_sq.values('c')[:1], output_field=IntegerField()), Value(0)),
         num_unverified_faces=Coalesce(Subquery(faces_sq.values('u')[:1], output_field=IntegerField()), Value(0)),
         num_possibilities=Coalesce(Subquery(poss1_sq, output_field=IntegerField()), Value(0)),
         num_possibilities_video=Coalesce(Subquery(poss1_video_sq, output_field=IntegerField()), Value(0)),
+        num_ignore_review=Coalesce(Subquery(poss2_sq, output_field=IntegerField()), Value(0)),
+        num_ignore_review_video=Coalesce(Subquery(poss2_video_sq, output_field=IntegerField()), Value(0)),
     )
 
 
@@ -92,6 +125,8 @@ def _chunk_live_counts(id_chunk):
             'num_possibilities': p.num_possibilities,
             'num_possibilities_video': p.num_possibilities_video,
             'num_unverified_faces': p.num_unverified_faces,
+            'num_ignore_review': p.num_ignore_review,
+            'num_ignore_review_video': p.num_ignore_review_video,
         }
         for p in people
     }
@@ -117,7 +152,8 @@ def compute_live_face_counts(person_ids, n_threads=4):
     in Python.
 
     Returns {person_id: {'num_faces': ..., 'num_possibilities': ...,
-    'num_possibilities_video': ..., 'num_unverified_faces': ...}}.
+    'num_possibilities_video': ..., 'num_unverified_faces': ...,
+    'num_ignore_review': ..., 'num_ignore_review_video': ...}}.
     """
     person_ids = list(person_ids)
     if not person_ids:

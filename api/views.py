@@ -487,6 +487,20 @@ class PersonListView(APIView):
                 p_dict['num_possibilities_image'] = counts['num_possibilities'] - counts['num_possibilities_video']
                 p_dict['num_unverified_faces'] = counts['num_unverified_faces']
 
+            # Backs the "ignore review" gallery group on every person's own
+            # screen (personSidebar.jsx/gallery.jsx) - the classifier's
+            # next-best guess (poss_ident2) for a face that's actually
+            # sitting flagged on .ignore. Computed for every person
+            # (unlike num_review_flagged below, which is .ignore-only) -
+            # see live_counts.py's poss2_sq for the exact scope/floor
+            # exclusion. The .ignore person itself is never a meaningful
+            # target here (poss_ident2 is always a real candidate person,
+            # never the .ignore sentinel), so this naturally comes back 0
+            # for .ignore without needing a special case.
+            p_dict['num_ignore_review'] = counts['num_ignore_review']
+            p_dict['num_ignore_review_video'] = counts['num_ignore_review_video']
+            p_dict['num_ignore_review_image'] = counts['num_ignore_review'] - counts['num_ignore_review_video']
+
             # Count backing the frontend's ".ignore" sidebar subordinate
             # row ("Flagged for review") - see PersonParamView's
             # `flagged` param above for what this actually counts.
@@ -710,10 +724,14 @@ class PersonParamView(APIView):
         id_key = kwargs['id']
         field = kwargs['field']
 
-        if field not in ['face_declared', 'face_poss', 'directory']:
-            return render_404(request, f"Requested type '{field}' not in ['face_declared', 'face_poss', 'directory']")
+        if field not in ['face_declared', 'face_poss', 'face_ignore_review', 'directory']:
+            return render_404(
+                request,
+                f"Requested type '{field}' not in "
+                "['face_declared', 'face_poss', 'face_ignore_review', 'directory']",
+            )
 
-        if field in ['face_declared', 'face_poss']:
+        if field in ['face_declared', 'face_poss', 'face_ignore_review']:
             try:
                 person_obj = Person.objects.get(id=id_key)
             except Exception as e:
@@ -795,6 +813,37 @@ class PersonParamView(APIView):
                     faces = list(
                         declared_qs.order_by('id').values_list('id', flat=True)[start:end]
                     )
+            elif field == 'face_ignore_review':
+                # Every real person's own "ignore review" gallery group
+                # (2026-11-16): faces sitting flagged on .ignore whose
+                # classifier-ranked next-best guess (poss_ident2) is THIS
+                # person - reviewed in the context of their own gallery
+                # instead of anonymously from .ignore's queue. Scoped to
+                # poss_ident1 actually being the .ignore sentinel (not just
+                # "any flagged face") and excluded by the same quality
+                # floor as every other review population - see
+                # live_counts.py's matching poss2_sq subquery, which backs
+                # this same population's sidebar count (num_ignore_review).
+                # Declining a guess here (close_assigned) doesn't remove
+                # the face from .ignore - it shifts poss_ident3->poss_ident2
+                # etc. server-side (Face.reject_association()), so this
+                # face may still appear here (now via a newly-promoted
+                # poss_ident2) or under a different person entirely on the
+                # next fetch - no client-side slot tracking needed.
+                ignore_review_query = Q(
+                    poss_ident2=person_obj, mobile_review_hidden=True,
+                    poss_ident1__person_name=settings.SOFT_IGNORE_NAME,
+                )
+                if media_filter == 'image':
+                    ignore_review_query &= Q(source_video_file__isnull=True)
+                elif media_filter == 'video':
+                    ignore_review_query &= Q(source_video_file__isnull=False)
+                ignore_review_qs = Face.objects.filter(ignore_review_query).exclude(below_collection_floor_q())
+                faces = list(
+                    ignore_review_qs.order_by('-weight_2', 'id').values_list('id', flat=True)[start:end]
+                )
+                if page == 1:
+                    total_matching = ignore_review_qs.count()
             else:
 
                 # .ignore's "Flagged, lost proposal" sub-view (2026-11-10):
