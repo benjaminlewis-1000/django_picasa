@@ -103,6 +103,149 @@ class ClassifyUnassignedArraySizingTests(TestCase):
         mock_set.assert_called_once_with(self.assigner.ignore_person_id, 1, 1.0, save=True)
 
 
+@override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
+class NextBestGuessesTests(TestCase):
+    """classify_unassigned()'s "no match cleared threshold" branches (the
+    plain ignore case, and the "ignore itself was rejected, promote the
+    best guess" case) now also populate poss_ident2../weight_2.. with
+    the next-best REAL-person candidates by raw similarity -- added
+    2026-11-16 per the user's own request, so a human reviewing a
+    flagged `.ignore` face gets below-threshold candidate guesses to
+    confirm/decline instead of only a bare reject. See
+    _populate_next_best_guesses()'s own docstring for the full design."""
+
+    def _make_face_with_candidates(self, similarities, gallery_size=10, rejected_fields=None):
+        """similarities: {Person: cosine_similarity_to_a_fixed_query}."""
+        assigner = faceAssigner()
+        people = list(similarities.keys())
+        assigner.likely_people_ids = [p.id for p in people]
+
+        query = np.zeros(512)
+        query[0] = 1.0
+
+        embedding_dict = {}
+        norm_dict = {}
+        for person in people:
+            sim = similarities[person]
+            ref = query.copy()
+            ref[0] = sim
+            ref[1] = np.sqrt(max(0.0, 1 - sim ** 2))
+            embedding_dict[person.id] = np.tile(ref.reshape(512, 1), (1, gallery_size))
+            norm_dict[person.id] = np.ones(gallery_size)
+        assigner.embedding_dict = embedding_dict
+        assigner.norm_dict = norm_dict
+        assigner._build_concatenated_gallery()
+
+        blank_person = Person.objects.get(person_name=settings.BLANK_FACE_NAME)
+        img = make_image()
+        face = make_face(img, declared_name=blank_person)
+        face.face_encoding_512 = query.tolist()
+        if rejected_fields is not None:
+            face.rejected_fields = rejected_fields
+        face.save()
+        return assigner, face
+
+    def test_next_best_guesses_ranked_by_similarity_descending(self):
+        threshold = faceAssigner().BUCKET_THRESHOLDS[0]  # gallery_size=10 -> smallest bucket
+        p_mid = make_person("Mid")
+        p_low = make_person("Low")
+        p_lowest = make_person("Lowest")
+        similarities = {
+            p_mid: threshold - 0.05,
+            p_low: threshold - 0.15,
+            p_lowest: threshold - 0.25,
+        }
+        assigner, face = self._make_face_with_candidates(similarities)
+
+        assigner.classify_unassigned(face)
+        face.refresh_from_db()
+
+        self.assertEqual(face.poss_ident1_id, assigner.ignore_person_id)
+        self.assertEqual(face.poss_ident2_id, p_mid.id)
+        self.assertAlmostEqual(face.weight_2, threshold - 0.05, places=3)
+        self.assertEqual(face.poss_ident3_id, p_low.id)
+        self.assertAlmostEqual(face.weight_3, threshold - 0.15, places=3)
+        self.assertEqual(face.poss_ident4_id, p_lowest.id)
+        self.assertAlmostEqual(face.weight_4, threshold - 0.25, places=3)
+        # Only 3 real candidates exist -- slot 5 must stay empty, not
+        # carry over some stale/default value.
+        self.assertIsNone(face.poss_ident5_id)
+        self.assertEqual(face.weight_5, 0.0)
+
+    def test_capped_at_four_next_best_guesses(self):
+        threshold = faceAssigner().BUCKET_THRESHOLDS[0]
+        people = [make_person(f"Candidate {i}") for i in range(6)]
+        similarities = {p: threshold - 0.05 * (i + 1) for i, p in enumerate(people)}
+        assigner, face = self._make_face_with_candidates(similarities)
+
+        assigner.classify_unassigned(face)
+        face.refresh_from_db()
+
+        self.assertEqual(face.poss_ident1_id, assigner.ignore_person_id)
+        guessed_ids = [face.poss_ident2_id, face.poss_ident3_id, face.poss_ident4_id, face.poss_ident5_id]
+        self.assertEqual(len(guessed_ids), 4)
+        self.assertNotIn(None, guessed_ids)
+        # The two weakest (lowest-similarity) candidates must not have
+        # made the cut -- only the top 4 of the 6 fit in poss_ident2..5.
+        self.assertNotIn(people[4].id, guessed_ids)
+        self.assertNotIn(people[5].id, guessed_ids)
+
+    def test_negative_similarity_clipped_to_zero_not_rejected_as_invalid_weight(self):
+        # set_possible_person() asserts weight >= 0 -- a candidate whose
+        # raw cosine similarity is negative (points the opposite
+        # direction from the query) must still be storable, clipped to 0
+        # rather than raising.
+        p = make_person("Opposite Direction")
+        assigner, face = self._make_face_with_candidates({p: -0.4})
+
+        assigner.classify_unassigned(face)  # must not raise
+        face.refresh_from_db()
+
+        self.assertEqual(face.poss_ident1_id, assigner.ignore_person_id)
+        self.assertEqual(face.poss_ident2_id, p.id)
+        self.assertEqual(face.weight_2, 0.0)
+
+    def test_stale_slot_from_an_earlier_run_is_cleared_when_no_longer_filled(self):
+        threshold = faceAssigner().BUCKET_THRESHOLDS[0]
+        p = make_person("Only Remaining Candidate")
+        assigner, face = self._make_face_with_candidates({p: threshold - 0.05})
+
+        # Simulate a stale guess left over from a PRIOR run (e.g. a
+        # candidate that's since been rejected or removed from the
+        # gallery) sitting in poss_ident3 -- must be cleared, not left
+        # stale, once this run only has one real candidate to offer.
+        stale_person = make_person("Stale")
+        face.poss_ident3 = stale_person
+        face.weight_3 = 0.42
+        face.save()
+
+        assigner.classify_unassigned(face)
+        face.refresh_from_db()
+
+        self.assertIsNone(face.poss_ident3_id)
+        self.assertEqual(face.weight_3, 0.0)
+
+    def test_ignore_rejected_excludes_the_promoted_candidate_from_next_best_guesses(self):
+        # When ignore itself has been rejected (a human already said "no,
+        # this IS a real person"), the single best candidate is promoted
+        # straight to poss_ident1 -- it must not ALSO reappear as a
+        # poss_ident2 next-best guess.
+        threshold = faceAssigner().BUCKET_THRESHOLDS[0]
+        p_best = make_person("Best")
+        p_second = make_person("Second")
+        similarities = {p_best: threshold - 0.05, p_second: threshold - 0.15}
+        assigner, face = self._make_face_with_candidates(similarities)
+        face.rejected_fields = [assigner.ignore_person_id]
+        face.save()
+
+        assigner.classify_unassigned(face)
+        face.refresh_from_db()
+
+        self.assertEqual(face.poss_ident1_id, p_best.id)
+        self.assertEqual(face.poss_ident2_id, p_second.id)
+        self.assertNotIn(p_best.id, [face.poss_ident3_id, face.poss_ident4_id, face.poss_ident5_id])
+
+
 class P99ThresholdLookupTests(TestCase):
     """_p99_threshold_for_gallery_size() implements the gallery-size-
     adaptive accept/reject gate (see CLAUDE.md's "Face-classification
@@ -265,7 +408,11 @@ class ClassifyUnassignedBucketGateTests(TestCase):
         # best-scoring candidate anyway -- confirms it took the reject
         # path, not a confident accept, for the identical similarity
         # value that DID pass for the large-gallery candidate above.
-        mock_set.assert_called_once_with(self.small_person.id, 1, self.mid_similarity, save=True)
+        # save=False (deferred to a final real Face.save() the mock
+        # doesn't see) -- small_person is also the sole next-best-guess
+        # candidate, but it's correctly excluded from that since it's
+        # already poss_ident1 here, so this stays the only call.
+        mock_set.assert_called_once_with(self.small_person.id, 1, self.mid_similarity, save=False)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")
@@ -372,7 +519,11 @@ class WindowedClassificationTests(TestCase):
         self.query_face.save()
         with patch.object(Face, "set_possible_person") as mock_set:
             self.assigner.classify_unassigned(self.query_face)
-        mock_set.assert_called_once_with(self.person.id, 1, self.distant_sim, save=True)
+        # save=False (deferred to a final real Face.save() the mock
+        # doesn't see) -- self.person is also the sole next-best-guess
+        # candidate, but it's correctly excluded since it's already
+        # poss_ident1 here, so this stays the only call.
+        mock_set.assert_called_once_with(self.person.id, 1, self.distant_sim, save=False)
 
     def test_true_positive_still_accepted_when_windowed(self):
         # Query dated EARLY, matching the genuinely-similar "close"
@@ -459,8 +610,12 @@ class IgnoreWeightMarginTests(TestCase):
         with patch.object(Face, "set_possible_person") as mock_set:
             assigner.classify_unassigned(face)
 
-        mock_set.assert_called_once()
-        _, precedence, weight = mock_set.call_args[0]
+        # poss_ident1 (the ignore assignment itself) is always the FIRST
+        # call -- a second call for the sole candidate as a poss_ident2
+        # next-best-guess (see _populate_next_best_guesses()) now follows
+        # it, so this can no longer assert exactly one call.
+        _, precedence, weight = mock_set.call_args_list[0][0]
+        self.assertEqual(precedence, 1)
         expected = margin / assigner.IGNORE_WEIGHT_MARGIN_CLAMP
         self.assertAlmostEqual(weight, expected, places=3)
         self.assertLess(weight, 0.1)
@@ -473,8 +628,12 @@ class IgnoreWeightMarginTests(TestCase):
         with patch.object(Face, "set_possible_person") as mock_set:
             assigner.classify_unassigned(face)
 
-        mock_set.assert_called_once()
-        _, precedence, weight = mock_set.call_args[0]
+        # See test_near_miss_gets_low_ignore_weight's own comment -- the
+        # sole candidate now also gets proposed as a poss_ident2
+        # next-best guess, so poss_ident1 is the FIRST call, not the only
+        # one.
+        _, precedence, weight = mock_set.call_args_list[0][0]
+        self.assertEqual(precedence, 1)
         self.assertEqual(weight, 1.0)
 
     def test_far_beats_near_miss_in_sort_order(self):
@@ -485,11 +644,18 @@ class IgnoreWeightMarginTests(TestCase):
         far_assigner, far_face = self._make_face_with_single_candidate(similarity=0.0, gallery_size=600)
 
         with patch.object(Face, "set_possible_person") as mock_set:
+            # poss_ident1 (the ignore weight itself) is always the FIRST
+            # call made during a given classify_unassigned() invocation --
+            # a second call now follows it (the sole candidate proposed
+            # as a poss_ident2 next-best guess), so this has to pick out
+            # the first call made *during* each invocation specifically,
+            # not just the most recent call overall.
             near_miss_assigner.classify_unassigned(near_miss_face)
-            near_miss_weight = mock_set.call_args[0][2]
+            near_miss_weight = mock_set.call_args_list[0][0][2]
 
+            calls_before = len(mock_set.call_args_list)
             far_assigner.classify_unassigned(far_face)
-            far_weight = mock_set.call_args[0][2]
+            far_weight = mock_set.call_args_list[calls_before][0][2]
 
         self.assertGreater(far_weight, near_miss_weight)
 
@@ -541,8 +707,11 @@ class DetScoreMarginGateTests(TestCase):
         )
         with patch.object(Face, "set_possible_person") as mock_set:
             assigner.classify_unassigned(face)
-        mock_set.assert_called_once()
-        called_person_id = mock_set.call_args[0][0]
+        # poss_ident1 is the FIRST call -- the barely-passing candidate
+        # still gets proposed as a poss_ident2 next-best guess right
+        # after it.
+        called_person_id, precedence, _ = mock_set.call_args_list[0][0]
+        self.assertEqual(precedence, 1)
         # Falls through to the "no match" branch -- proposed person is
         # the ignore sentinel, not the barely-passing candidate.
         self.assertEqual(called_person_id, assigner.ignore_person_id)
@@ -574,8 +743,11 @@ class DetScoreMarginGateTests(TestCase):
         )
         with patch.object(Face, "set_possible_person") as mock_set:
             assigner.classify_unassigned(face)
-        mock_set.assert_called_once()
-        called_person_id = mock_set.call_args[0][0]
+        # poss_ident1 is the FIRST call -- the det_score-blocked
+        # candidate still gets proposed as a poss_ident2 next-best guess
+        # right after it.
+        called_person_id, precedence, _ = mock_set.call_args_list[0][0]
+        self.assertEqual(precedence, 1)
         self.assertEqual(called_person_id, assigner.ignore_person_id)
 
     def test_null_det_score_skips_det_score_check_but_not_margin(self):
@@ -603,8 +775,11 @@ class DetScoreMarginGateTests(TestCase):
         )
         with patch.object(Face, "set_possible_person") as mock_set2:
             assigner2.classify_unassigned(face2)
-        mock_set2.assert_called_once()
-        self.assertEqual(mock_set2.call_args[0][0], assigner2.ignore_person_id)
+        # poss_ident1 is the FIRST call -- the sole candidate still gets
+        # proposed as a poss_ident2 next-best guess right after it.
+        called_person_id, precedence, _ = mock_set2.call_args_list[0][0]
+        self.assertEqual(precedence, 1)
+        self.assertEqual(called_person_id, assigner2.ignore_person_id)
 
     def _make_video_face_with_single_candidate(self, similarity, gallery_size=600, det_score=None):
         # Same shape as _make_face_with_single_candidate, but the query
@@ -671,8 +846,9 @@ class DetScoreMarginGateTests(TestCase):
         )
         with patch.object(Face, "set_possible_person") as mock_set:
             assigner.classify_unassigned(face)
-        mock_set.assert_called_once()
-        self.assertEqual(mock_set.call_args[0][0], assigner.ignore_person_id)
+        # poss_ident1 is the FIRST call -- the det_score-blocked candidate
+        # still gets proposed as a poss_ident2 next-best guess after it.
+        self.assertEqual(mock_set.call_args_list[0][0][0], assigner.ignore_person_id)
 
     def test_video_subgallery_boosts_a_candidate_above_threshold_for_video_query(self):
         # Full-gallery similarity sits below the margin floor on its own;
@@ -726,8 +902,9 @@ class DetScoreMarginGateTests(TestCase):
 
         with patch.object(Face, "set_possible_person") as mock_set:
             assigner.classify_unassigned(face)
-        mock_set.assert_called_once()
-        self.assertEqual(mock_set.call_args[0][0], assigner.ignore_person_id)
+        # poss_ident1 is the FIRST call -- the candidate still gets
+        # proposed as a poss_ident2 next-best guess right after it.
+        self.assertEqual(mock_set.call_args_list[0][0][0], assigner.ignore_person_id)
 
 
 class LvfaceVetoGateTests(TestCase):
@@ -794,8 +971,12 @@ class LvfaceVetoGateTests(TestCase):
         )
         with patch.object(Face, "set_possible_person") as mock_set:
             assigner.classify_unassigned(face)
-        mock_set.assert_called_once()
-        called_person_id = mock_set.call_args[0][0]
+        # poss_ident1 is the FIRST call -- the vetoed candidate still
+        # gets proposed as a poss_ident2 next-best guess right after it
+        # (see _populate_next_best_guesses()), so this can no longer
+        # assert exactly one call.
+        called_person_id, precedence, _ = mock_set.call_args_list[0][0]
+        self.assertEqual(precedence, 1)
         self.assertEqual(called_person_id, assigner.ignore_person_id)
 
     def test_veto_accepts_when_lvface_also_clears_threshold(self):
@@ -1026,8 +1207,9 @@ class SizeNudgeMarginGateTests(TestCase):
         )
         with patch.object(Face, "set_possible_person") as mock_set:
             assigner.classify_unassigned(face)
-        mock_set.assert_called_once()
-        self.assertEqual(mock_set.call_args[0][0], assigner.ignore_person_id)
+        # poss_ident1 is the FIRST call -- the candidate still gets
+        # proposed as a poss_ident2 next-best guess right after it.
+        self.assertEqual(mock_set.call_args_list[0][0][0], assigner.ignore_person_id)
 
     def test_small_face_with_margin_clearing_the_nudged_floor_is_accepted(self):
         assigner = faceAssigner()
@@ -1093,8 +1275,9 @@ class SizeNudgeMarginGateTests(TestCase):
         )
         with patch.object(Face, "set_possible_person") as mock_set2:
             assigner2.classify_unassigned(face2)
-        mock_set2.assert_called_once()
-        self.assertEqual(mock_set2.call_args[0][0], assigner2.ignore_person_id)
+        # poss_ident1 is the FIRST call -- the candidate still gets
+        # proposed as a poss_ident2 next-best guess right after it.
+        self.assertEqual(mock_set2.call_args_list[0][0][0], assigner2.ignore_person_id)
 
 
 @override_settings(MEDIA_ROOT="/tmp/face_manager_test_media")

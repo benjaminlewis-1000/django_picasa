@@ -185,6 +185,16 @@ class faceAssigner():
         # further distance doesn't make it any more clearly not-a-match.
         self.IGNORE_WEIGHT_MARGIN_CLAMP = 0.3
 
+        # How many "next-best guess" real-person candidates to populate
+        # into poss_ident2../weight_2.. (see _populate_next_best_guesses())
+        # whenever a face lands on .ignore (poss_ident1) instead of a real
+        # match -- added 2026-11-16 per the user's own request, so a human
+        # reviewing a flagged .ignore face gets below-threshold candidate
+        # guesses to confirm/decline instead of only a bare reject. One
+        # less than NUM_POSSIBLE_IDENTITIES, since slot 1 is always the
+        # ignore/best-guess assignment itself.
+        self.NUM_NEXT_BEST_GUESSES = Face.NUM_POSSIBLE_IDENTITIES - 1
+
         # Added 2026-09-21 after a real investigation into whether
         # Face.det_score (insightface's own detection confidence) helps
         # classification. It does NOT work as a standalone global signal
@@ -1120,6 +1130,54 @@ class faceAssigner():
             settings.LOGGER.error(f"Exception classifying face {face_id}: {e}")
             return False
 
+    def _populate_next_best_guesses(self, unassigned_face, metrics_array, exclude_id=None, save=True):
+        """Fills poss_ident2../weight_2.. with the next-best REAL-person
+        candidates by raw similarity, even though none of them cleared
+        classify_unassigned()'s threshold/margin/det_score gate -- added
+        2026-11-16 per the user's own request, so a human reviewing a
+        `.ignore`-proposed (or flagged-for-review) face gets below-
+        threshold candidate guesses to confirm/decline instead of only a
+        bare reject. Doesn't touch poss_ident1/weight_1 -- callers set
+        those (to the ignore person, or to the single best guess when
+        ignore itself has been rejected) before calling this.
+
+        metrics_array is the SAME [sim_99th, threshold, db_id] array
+        classify_unassigned() already built for the gate check -- no new
+        similarity computation here, just ranking numbers already in
+        hand. `.ignore`/`.realignore` are never candidates in this array
+        at all (excluded from likely_people_ids), so every row is a real
+        person -- safe to populate directly.
+
+        weight_N here is the candidate's raw sim_99th, clipped to [0, 1]
+        (cosine similarity can go slightly negative for a genuinely
+        dissimilar candidate, and set_possible_person() asserts
+        weight >= 0) -- the SAME units stored for an actually-accepted
+        match, so a human comparing a "confirmed candidate" face against
+        a "below-threshold guess" face is looking at the same scale.
+
+        exclude_id skips whichever candidate (if any) already became
+        poss_ident1 this call. Clears every slot beyond what's actually
+        filled this pass, so a stale guess from an earlier run (fewer/
+        different candidates existed then) can't linger.
+        """
+        order = np.argsort(metrics_array[:, 0])[::-1]
+        filled = 0
+        for row_idx in order:
+            if filled >= self.NUM_NEXT_BEST_GUESSES:
+                break
+            candidate_id = int(metrics_array[row_idx, 2])
+            if exclude_id is not None and candidate_id == exclude_id:
+                continue
+            score = float(np.clip(metrics_array[row_idx, 0], 0.0, 1.0))
+            filled += 1
+            unassigned_face.set_possible_person(
+                self._cached_person(candidate_id), 1 + filled, score, save=False
+            )
+        for poss_idx in range(2 + filled, Face.NUM_POSSIBLE_IDENTITIES + 1):
+            unassigned_face.remove_poss_ident(poss_idx)
+        if save:
+            unassigned_face.save()
+
 
 
 
@@ -1429,7 +1487,8 @@ class faceAssigner():
                 # print("Need to reject the person")
                 max_idx = np.argmax(metrics_array[:, 0])
                 max_id = candidate_id_arr[max_idx]
-                unassigned_face.set_possible_person(self._cached_person(int(max_id)), 1, metric_max, save=save)
+                unassigned_face.set_possible_person(self._cached_person(int(max_id)), 1, metric_max, save=False)
+                self._populate_next_best_guesses(unassigned_face, metrics_array, exclude_id=int(max_id), save=save)
             else:
                 # This weight answers a different question than a real
                 # match's weight does: not "how confident is this specific
@@ -1453,7 +1512,8 @@ class faceAssigner():
                 closest_call_margin = np.min(margins_below_threshold)  # smallest gap = nearest to passing
                 clamped_margin = np.clip(closest_call_margin, 0, self.IGNORE_WEIGHT_MARGIN_CLAMP)
                 weight = clamped_margin / self.IGNORE_WEIGHT_MARGIN_CLAMP  # 0 (marginal) .. 1 (far from everyone)
-                unassigned_face.set_possible_person(self._cached_person(self.ignore_person_id), 1, weight, save=save)
+                unassigned_face.set_possible_person(self._cached_person(self.ignore_person_id), 1, weight, save=False)
+                self._populate_next_best_guesses(unassigned_face, metrics_array, exclude_id=None, save=save)
         else:
             scores = metrics_array[possible_idcs, 0]
             assign_ids = metrics_array[possible_idcs, 2].astype(np.int64)
