@@ -78,8 +78,27 @@ DEFAULT_SPLIT_PATH = '/models/rotation_classifier/split.json'
 # before its time budget runs out.
 CHECKPOINT_EVERY_STEPS = 50
 EVAL_EVERY_STEPS = 250
-LR_DECAY_EVERY_STEPS = 2000
-LR_DECAY_FACTOR = 0.5
+
+# Cosine annealing with warm restarts (SGDR), not a plain decay schedule
+# (2026-11-15): StepLR at gamma=0.5/2000 steps decayed the LR to
+# ~3.8e-9 by step 36000 -- the back third of a 50-epoch run would have
+# trained at an effectively-frozen LR. Warm restarts periodically kick
+# the LR back up to let the optimizer escape a sharp minimum, then
+# anneal back down.
+#
+# T_0/T_MULT are chosen so the cycles land exactly on the real step
+# budget this command is being run toward (24000 train images / 32
+# batch size = 750 steps/epoch * 50 epochs = 37500 steps total), not
+# an arbitrary round number: with T_MULT=2, cycle lengths are
+# T_0, 2*T_0, 4*T_0, 8*T_0, summing to T_0*15. 37500/15 = 2500 exactly,
+# so 4 cycles of length 2500/5000/10000/20000 steps land training
+# right at a trough (LR == WARM_RESTART_ETA_MIN) exactly at step 37500,
+# instead of ending mid-cycle at an elevated, barely-annealed LR.
+# Restarts get sparser over time (step 2500, 7500, 17500) with one long
+# final ~26.7-epoch descent (17500->37500) for stable convergence.
+WARM_RESTART_T0_STEPS = 2500
+WARM_RESTART_T_MULT = 2
+WARM_RESTART_ETA_MIN = 0.0
 
 # Same panorama/giant-image hang already documented in
 # backfill_verified_kps.py (search CLAUDE.md for "a single
@@ -320,8 +339,9 @@ class Command(BaseCommand):
 
         model = build_model(pretrained=True)
         optimizer = torch.optim.AdamW(model.parameters(), lr=options['lr'], weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=LR_DECAY_EVERY_STEPS, gamma=LR_DECAY_FACTOR,
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=WARM_RESTART_T0_STEPS, T_mult=WARM_RESTART_T_MULT,
+            eta_min=WARM_RESTART_ETA_MIN,
         )
         global_step = 0
         best_val_acc = 0.0
@@ -330,8 +350,18 @@ class Command(BaseCommand):
             ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
             model.load_state_dict(ckpt['model_state'])
             optimizer.load_state_dict(ckpt['optimizer_state'])
-            scheduler.load_state_dict(ckpt['scheduler_state'])
             global_step = ckpt['global_step']
+            # Don't load_state_dict() the saved scheduler: an older
+            # checkpoint's scheduler_state may be from a different
+            # scheduler class entirely (e.g. the StepLR this replaced).
+            # Reconstructing fresh and fast-forwarding to global_step
+            # (CosineAnnealingWarmRestarts.step() supports jumping
+            # directly to an arbitrary step via its epoch= argument) is
+            # robust either way and always reproduces the exact same
+            # state as if .step() had really been called global_step
+            # times.
+            if global_step > 0:
+                scheduler.step(global_step)
             best_val_acc = ckpt.get('best_val_acc', 0.0)
             self.stdout.write(f"Resumed from step {global_step} (best val acc so far: "
                                f"{best_val_acc:.3f})")
