@@ -621,7 +621,12 @@ CELERY_BEAT_SCHEDULE = {
         # Less frequent than the photo scan -- videos are added in bulk
         # historical batches, not a continuous trickle, per the real
         # library.
-        'schedule': crontab(hour='*', minute='30'),
+        # Restricted to 8am-10pm (2026-11-18, per the user's request to
+        # keep heavy jobs off CPU overnight) -- last run starts 10:30pm,
+        # which is a filesystem walk/ingestion task with no model
+        # inference, finishes well within 30 min in practice, safely
+        # clear of the 11pm blackout start.
+        'schedule': crontab(hour='8-22', minute='30'),
     },
     'dirs_datetimes': {
         'task': 'filepopulator.update_dir_dates',
@@ -770,7 +775,13 @@ CELERY_BEAT_SCHEDULE = {
        # the task itself makes any overlap with a still-running previous
        # invocation a harmless no-op, so exact alignment with the 3h
        # period isn't required for correctness.
-       'schedule': crontab(minute='0', hour='*/3'),
+       #
+       # Restricted to start only at 8/11/14/17/20h (2026-11-18, per the
+       # user's request to keep this off CPU overnight) -- 5 runs/day
+       # instead of 8, still ~3h apart, each still capped at 2.5h so the
+       # latest (20:00) finishes by 22:30, safely clear of the 11pm
+       # blackout start. No run is scheduled to start between 11pm-8am.
+       'schedule': crontab(minute='0', hour='8,11,14,17,20'),
        'kwargs': {'max_runtime_seconds': 9000},
    },
    'classify_unlabeled_all_weekly': {
