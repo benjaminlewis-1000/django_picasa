@@ -32,6 +32,14 @@ class ApplicationError(models.Model):
     # ApplicationErrorViewSet.dismiss()'s own `clear_heartbeat` param.
     related_heartbeat_task_name = models.CharField(max_length=256, null=True, blank=True)
 
+    # Set only for errors raised by face_manager.tasks.process_video_faces
+    # (2026-11-18) -- a structured link back to the specific VideoFile this
+    # alert is about, mirroring related_heartbeat_task_name above, so a
+    # successful reprocess of that same video can auto-dismiss the matching
+    # row instead of leaving it to rot once it's no longer applicable. NULL
+    # for every other kind of ApplicationError.
+    related_video_id = models.IntegerField(null=True, blank=True)
+
     class Meta:
         ordering = ['-created_at']
 

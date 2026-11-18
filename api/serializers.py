@@ -544,7 +544,7 @@ class ApplicationErrorSerializer(serializers.ModelSerializer):
     class Meta:
         model = ApplicationError
         fields = ['id', 'source', 'message', 'created_at', 'dismissed', 'dismissed_at',
-                  'related_heartbeat_task_name']
+                  'related_heartbeat_task_name', 'related_video_id']
         read_only_fields = fields
 
 
