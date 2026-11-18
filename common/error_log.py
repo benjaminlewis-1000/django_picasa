@@ -9,7 +9,7 @@
 MAX_MESSAGE_LENGTH = 4000
 
 
-def log_error(source, message, related_heartbeat_task_name=None):
+def log_error(source, message, related_heartbeat_task_name=None, related_video_id=None):
     """Records a persistent, frontend-visible ApplicationError row.
 
     Use this for a small, curated set of things worth a human's
@@ -29,10 +29,15 @@ def log_error(source, message, related_heartbeat_task_name=None):
     related_heartbeat_task_name (2026-10-30): only passed by
     common.tasks.check_task_heartbeats, never by any other caller --
     see ApplicationError.related_heartbeat_task_name's own docstring.
+
+    related_video_id (2026-11-18): only passed by
+    face_manager.tasks.process_video_faces's failure branches -- see
+    ApplicationError.related_video_id's own docstring.
     """
     from common.models import ApplicationError
     if len(message) > MAX_MESSAGE_LENGTH:
         message = message[:MAX_MESSAGE_LENGTH] + f"... [truncated, {len(message)} chars total]"
     ApplicationError.objects.create(
         source=source, message=message, related_heartbeat_task_name=related_heartbeat_task_name,
+        related_video_id=related_video_id,
     )

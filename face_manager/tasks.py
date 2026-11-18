@@ -241,6 +241,7 @@ def process_video_faces(max_runtime_seconds=None, video_ids=None):
                         'face_manager.tasks.process_video_faces',
                         f"{video.filename} gave up after "
                         f"{video.face_extraction_timeout_count} timeouts: {exc}",
+                        related_video_id=video.id,
                     )
                 else:
                     settings.LOGGER.warning(
@@ -268,6 +269,7 @@ def process_video_faces(max_runtime_seconds=None, video_ids=None):
                 log_error(
                     'face_manager.tasks.process_video_faces',
                     f"{video.filename} failed: {type(exc).__name__}: {exc}",
+                    related_video_id=video.id,
                 )
                 video.save()
                 continue
@@ -282,6 +284,20 @@ def process_video_faces(max_runtime_seconds=None, video_ids=None):
             # if this video were ever manually reset and reprocessed again.
             video.face_extraction_timeout_count = 0
             video.save()
+
+            # A prior failure/timeout-giveup for this exact video is no
+            # longer applicable now that it just succeeded -- auto-dismiss
+            # any ApplicationError row(s) still open about it, so the
+            # notification bell doesn't keep flagging a problem that's
+            # already resolved (2026-11-18, see
+            # ApplicationError.related_video_id's own docstring). Scoped to
+            # this video's id and still-undismissed rows only -- never
+            # touches a row already dismissed for some other reason.
+            from common.models import ApplicationError
+            from django.utils import timezone
+            ApplicationError.objects.filter(
+                related_video_id=video.id, dismissed=False,
+            ).update(dismissed=True, dismissed_at=timezone.now())
 
 @shared_task(ignore_result=True, name='face_manager.reencode')
 def reencode_missing_faces():
