@@ -87,6 +87,47 @@ class FaceExtractorCorruptedImageTests(TestCase):
             self.assertTrue(img_obj.image_load_error)
             self.assertEqual(Face.objects.filter(source_image_file=img_obj).count(), 0)
 
+    def test_max_runtime_seconds_stops_loop_between_images(self):
+        # Regression test for the 2026-11-18 overnight-blackout feature
+        # (CLAUDE.md: face_manager.face_extraction now takes
+        # max_runtime_seconds, mirroring process_video_faces()'s own
+        # existing budget). Uses the same 5 real corrupted-image fixture
+        # as the test above (fails fast, no real detection cost) purely
+        # as cheap "something to iterate over" -- this test isn't about
+        # corruption handling, just that the time-budget check actually
+        # stops the loop between images once exceeded.
+        corrupted_files = sorted(os.listdir(self.CORRUPTED_DIR))
+        image_objs = []
+        for fname in corrupted_files:
+            path = os.path.join(self.CORRUPTED_DIR, fname)
+            image_objs.append(make_preexisting_image_row(path))
+
+        # time.time() is also called internally by the logging module's
+        # makeRecord() (confirmed directly -- this isn't just the loop's
+        # own explicit budget-check calls), so rather than pin an exact
+        # call count, give it a plateau: 5 calls at "no time elapsed"
+        # (covers start_time + 2 images' worth of budget-check-plus-
+        # error-log calls), then an indefinite tail at "budget blown" --
+        # robust to exactly how many incidental time.time() calls happen
+        # per iteration, while still deterministically covering "process
+        # 2 images, then stop on the 3rd check".
+        import itertools
+        with patch(
+            "face_manager.face_extract_encode.time.time",
+            side_effect=itertools.chain([1000.0] * 5, itertools.repeat(1100.0)),
+        ):
+            self.extractor.find_and_encode_faces(max_runtime_seconds=50)
+
+        processed = [
+            img.filename for img in image_objs
+            if ImageFile.objects.get(pk=img.pk).isProcessed
+        ]
+        self.assertEqual(
+            len(processed), 2,
+            "time budget should stop the loop after exactly 2 images, "
+            f"got: {processed}",
+        )
+
     def test_good_image_gets_processed_and_gains_faces(self):
         path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/has_face_tags.jpg"
         create_image_file(path)

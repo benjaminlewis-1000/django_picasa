@@ -621,21 +621,30 @@ CELERY_BEAT_SCHEDULE = {
         # Less frequent than the photo scan -- videos are added in bulk
         # historical batches, not a continuous trickle, per the real
         # library.
-        # Restricted to 8am-10pm (2026-11-18, per the user's request to
-        # keep heavy jobs off CPU overnight) -- last run starts 10:30pm,
-        # which is a filesystem walk/ingestion task with no model
-        # inference, finishes well within 30 min in practice, safely
-        # clear of the 11pm blackout start.
-        'schedule': crontab(hour='8-22', minute='30'),
+        # Deliberately NOT part of the 11pm-8am blackout (2026-11-18, per
+        # the user's explicit call) -- this is a lightweight filesystem
+        # walk/ingestion task (no model inference), unlike face
+        # extraction, and ingestion is fine to keep running around the
+        # clock.
+        'schedule': crontab(hour='*', minute='30'),
     },
     'dirs_datetimes': {
         'task': 'filepopulator.update_dir_dates',
         'schedule': crontab(minute=0, hour='*/12')
     },
    'face_add': {
-       'task': 'face_manager.face_extraction', 
+       'task': 'face_manager.face_extraction',
         # 'schedule': crontab( hour = '*', minute='5,15,25,35,45,55'),
-       'schedule': crontab( hour = '*', minute='0'),
+        # Restricted to 8am-10pm, each run capped at 55 min
+        # (max_runtime_seconds below) (2026-11-18, per the user's
+        # request to keep face-extraction ML inference off CPU
+        # overnight) -- the cap guarantees even the 10pm run finishes
+        # by 10:55pm, safely clear of the 11pm blackout start, no
+        # matter how large the unprocessed-image backlog is at the
+        # time. Ingestion itself ('filepopulate_root' above) is
+        # deliberately NOT part of this blackout, only extraction.
+       'schedule': crontab( hour = '8-22', minute='0'),
+       'kwargs': {'max_runtime_seconds': 3300},
         # OK to schedule every 2 minutes, because it will
         # either get locked by the lock file, or it will
         # die and get restarted pretty quickly.
