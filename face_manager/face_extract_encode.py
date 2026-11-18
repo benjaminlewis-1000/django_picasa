@@ -278,7 +278,7 @@ class FaceExtractor(object):
                 pf.reencoded = False
                 pf.save()
 
-    def find_and_encode_faces(self):
+    def find_and_encode_faces(self, max_runtime_seconds=None):
         """
         Workhorse function that finds faces for all unprocessed
         ImageFile objects. If the ImageFile already has Face objects
@@ -295,6 +295,12 @@ class FaceExtractor(object):
         both insert new Face rows for the same face -- confirmed against
         real production data as the cause of a large fraction of
         same-image duplicate-Face-row pairs (see CLAUDE.md).
+
+        max_runtime_seconds, if given, stops the loop (and releases the
+        lock) once elapsed wall time exceeds it -- checked only BETWEEN
+        images, never mid-image (same convention as
+        process_video_faces()'s own max_runtime_seconds), so a given
+        image's own detection/matching is never interrupted partway.
         """
         with common.advisory_lock('face_manager.find_and_encode_faces') as acquired:
             if not acquired:
@@ -302,9 +308,9 @@ class FaceExtractor(object):
                     "find_and_encode_faces() already running elsewhere -- skipping this run."
                 )
                 return
-            self._find_and_encode_faces_locked()
+            self._find_and_encode_faces_locked(max_runtime_seconds=max_runtime_seconds)
 
-    def _find_and_encode_faces_locked(self):
+    def _find_and_encode_faces_locked(self, max_runtime_seconds=None):
         # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Completed/Pictures_finished/Nicholas\' Pictures/Christmas time and Goblin Valley/PC094087.JPG') # SOLVED 
         # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Pictures_In_Progress/2023/Nathaniel Preschool/Bloomz_e4d23164-bcab-4615-ad57-a20dc169de1b.jpeg') # SOLVED 
         # # # unprocessed_imgs = ImageFile.objects.filter(filename='/photos/Completed/Pictures_finished/Family Pictures/2016/February 2016/Meagan Leaves/_DSC0247.JPG') # SOLVED 
@@ -329,7 +335,15 @@ class FaceExtractor(object):
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Family Pictures/2008/2008 July/100_4251.JPG')
         # unprocessed_imgs = ImageFile.objects.filter(filename = '/photos/Completed/Pictures_finished/Misc Picture/Old Phone/20150123_201221.jpg')
 
+        start_time = time.time()
         for processed_count, img_obj in enumerate(unprocessed_imgs):
+
+            if max_runtime_seconds is not None and (time.time() - start_time) >= max_runtime_seconds:
+                settings.LOGGER.debug(
+                    f"find_and_encode_faces(): time budget ({max_runtime_seconds}s) "
+                    "reached, stopping between images."
+                )
+                break
 
             if processed_count > 0 and processed_count % self.REINIT_DETECTOR_EVERY_N_IMAGES == 0:
                 # Bounds onnxruntime's CPU memory arena growth (see

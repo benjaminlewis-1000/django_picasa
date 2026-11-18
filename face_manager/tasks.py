@@ -106,7 +106,13 @@ def _log_task_crash(task_name, exc):
     log_error(f'face_manager.tasks.{task_name}', f"{type(exc).__name__}: {exc}")
 
 @shared_task(ignore_result=True, name='face_manager.face_extraction')
-def process_faces():
+def process_faces(max_runtime_seconds=None):
+    """max_runtime_seconds, if given, is passed straight through to
+    FaceExtractor.find_and_encode_faces() -- stops the loop between
+    images (never mid-image) once elapsed wall time exceeds it. Used to
+    keep this off CPU overnight (see CELERY_BEAT_SCHEDULE's 'face_add'
+    entry) the same way process_video_faces() already bounds the video
+    pipeline."""
     starttime = time.time()
 
     try:
@@ -130,7 +136,7 @@ def process_faces():
             return
 
         extractor = FaceExtractor()
-        extractor.find_and_encode_faces()
+        extractor.find_and_encode_faces(max_runtime_seconds=max_runtime_seconds)
 
     except Exception as e:
         _log_task_crash('process_faces', e)
