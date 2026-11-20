@@ -17,7 +17,10 @@
 # that dispatch ever misses. See CLAUDE.md's 2026-11-03/11-05/11-06
 # orientation-detection write-up.
 
+import re
+
 from django.conf import settings
+from django.db.models.expressions import RawSQL
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -26,6 +29,12 @@ import common
 from api.mobile_views import _clamped_limit
 from face_manager.tasks import correct_image_rotation_ids_task
 from filepopulator.models import ImageFile
+
+# A seed is only ever used inside a parameterized RawSQL value, never
+# string-formatted into the SQL itself -- this whitelist is just to keep
+# a malformed/huge value from doing anything weird, not a SQL-injection
+# guard.
+_SEED_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
 
 def _preview_url(host_url, image):
@@ -38,12 +47,22 @@ def _preview_url(host_url, image):
 class RotationReviewListView(APIView):
     """Lists ImageFiles currently FLAGGED for human rotation review.
 
-    GET /api/rotation_review/?limit=&offset=
+    GET /api/rotation_review/?limit=&offset=&seed=
     Returns [{id, filename, proposed_rotation_degrees, face_count,
-    preview_url}, ...], ordered by id for stable pagination (unlike the
-    mobile `.ignore`-review grids, which deliberately randomize -- this
-    is a bounded, finite backlog a reviewer is expected to work through
-    to completion, not an endless stream to sample from).
+    preview_url}, ...].
+
+    Ordering (2026-11-20): shuffled, but *stably* -- per `seed` (any
+    string the frontend generates once per review session and resends
+    on every page of that session), each row sorts by md5(id || seed),
+    a value fixed for that id/seed pair regardless of which other rows
+    are still in the FLAGGED queryset. That's what makes offset-based
+    paging safe here even though rows keep leaving the underlying table
+    as the reviewer confirms/dismisses them (see the frontend's own
+    comment on why `offset` is `rows.length`, not a running fetch
+    count) -- a real `ORDER BY random()` would reshuffle the remaining
+    rows on every request and skip/duplicate across pages. No `seed` ->
+    falls back to the original `order_by('id')` (also what an invalid/
+    out-of-pattern seed gets, rather than erroring).
     """
 
     permission_classes = (IsAuthenticated,)
@@ -54,13 +73,18 @@ class RotationReviewListView(APIView):
             offset = max(0, int(request.query_params.get('offset', 0)))
         except (TypeError, ValueError):
             offset = 0
+        seed = request.query_params.get('seed', '')
 
         host_url = f'https://{request.get_host()}/api'
-        queryset = (
-            ImageFile.objects
-            .filter(rotation_scan_state=ImageFile.RotationScanState.FLAGGED)
-            .order_by('id')
+        queryset = ImageFile.objects.filter(
+            rotation_scan_state=ImageFile.RotationScanState.FLAGGED,
         )
+        if _SEED_RE.match(seed):
+            queryset = queryset.annotate(
+                _shuffle_key=RawSQL("md5(id::text || %s)", (seed,)),
+            ).order_by('_shuffle_key')
+        else:
+            queryset = queryset.order_by('id')
         total = queryset.count()
         page = list(queryset[offset:offset + limit])
 
