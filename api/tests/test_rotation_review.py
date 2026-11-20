@@ -59,6 +59,42 @@ class RotationReviewListViewTests(ApiTestCase):
         self.assertEqual(len(resp.data['results']), 1)
         self.assertNotEqual(resp.data['results'][0]['id'], first_page_id)
 
+    EXTRA_FIXTURES = ["naming/good/3.JPEG", "naming/good/4.jpeg", "naming/good/6.JpEg"]
+
+    def test_same_seed_gives_a_stable_order_across_requests(self):
+        for fixture in self.EXTRA_FIXTURES:
+            img = self.make_image(relative_fixture=fixture)
+            img.rotation_scan_state = ImageFile.RotationScanState.FLAGGED
+            img.save(update_fields=['rotation_scan_state'])
+
+        first = self.client.get("/api/rotation_review/?seed=abc123").data['results']
+        second = self.client.get("/api/rotation_review/?seed=abc123").data['results']
+        self.assertEqual([r['id'] for r in first], [r['id'] for r in second])
+
+    def test_seeded_order_survives_a_row_leaving_the_queryset(self):
+        for fixture in self.EXTRA_FIXTURES:
+            img = self.make_image(relative_fixture=fixture)
+            img.rotation_scan_state = ImageFile.RotationScanState.FLAGGED
+            img.save(update_fields=['rotation_scan_state'])
+
+        full_order = [r['id'] for r in self.client.get("/api/rotation_review/?seed=xyz").data['results']]
+
+        # Resolve the first id out of the FLAGGED queryset entirely, same as
+        # a real confirm/dismiss would -- the remaining ids' relative order
+        # (by the same seed) must be unaffected.
+        resolved_id = full_order[0]
+        ImageFile.objects.filter(id=resolved_id).update(
+            rotation_scan_state=ImageFile.RotationScanState.DISMISSED_NOT_ROTATED,
+        )
+        remaining_order = [r['id'] for r in self.client.get("/api/rotation_review/?seed=xyz").data['results']]
+        self.assertEqual(remaining_order, full_order[1:])
+
+    def test_an_invalid_seed_falls_back_to_id_order(self):
+        resp = self.client.get("/api/rotation_review/?seed=" + ("x" * 500))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        ids = [row['id'] for row in resp.data['results']]
+        self.assertEqual(ids, sorted(ids))
+
 
 class RotationReviewBulkActionViewTests(ApiTestCase):
     def setUp(self):
