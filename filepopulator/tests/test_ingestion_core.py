@@ -1784,6 +1784,73 @@ class OrientationChangeReprocessTests(TestCase):
         self.assertTrue(os.path.isfile(new_img.thumbnail_small.path))
         self.assertNotEqual(new_img.thumbnail_small.path, old_thumbnail_path)
 
+    def test_orientation_change_resets_a_confirmed_rotation_review_verdict(self):
+        # Real risk this guards against: a human CONFIRMED a rotation
+        # correction (rotation_scan_state=CONFIRMED,
+        # proposed_rotation_degrees=90). If the file's own EXIF
+        # orientation tag later changes on disk -- e.g. something baked
+        # that exact correction into the tag directly -- blindly keeping
+        # the old CONFIRMED verdict would apply the stale 90-degree
+        # override ON TOP of the file's already-corrected orientation on
+        # the very next decode: a real double-rotation. The correct
+        # behavior is to discard the stale human verdict and treat the
+        # image as unreviewed again, not to preserve it the way
+        # reset_rotation_scan_state_for_reprocessing() would for an
+        # unrelated (face-data-only) invalidation reason.
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/naming/good/1.JPG"
+        create_image_file(path)
+        img = ImageFile.objects.get(filename=path)
+
+        ImageFile.objects.filter(pk=img.pk).update(
+            rotation_scan_state=ImageFile.RotationScanState.CONFIRMED,
+            proposed_rotation_degrees=90.0,
+            rotation_signal_source=ImageFile.RotationSignalSource.HUMAN,
+            rotation_scan_logic_hash='deadbeefdeadbeef',
+            rotation_correction_applied=True,
+        )
+
+        ImageFile.objects.filter(pk=img.pk).update(
+            orientation=img.orientation + 1,
+            isProcessed=True,
+            dateModified=img.dateModified - timedelta(days=1),
+        )
+
+        create_image_file(path)
+
+        reprocessed = ImageFile.objects.get(filename=path)
+        self.assertEqual(reprocessed.rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
+        self.assertIsNone(reprocessed.proposed_rotation_degrees)
+        self.assertIsNone(reprocessed.rotation_signal_source)
+        self.assertEqual(reprocessed.rotation_scan_logic_hash, '')
+        self.assertFalse(reprocessed.rotation_correction_applied)
+        self.assertIsNone(reprocessed.confirmed_rotation_override_degrees)
+
+    def test_orientation_change_resets_a_dismissed_not_rotated_verdict(self):
+        # DISMISSED_NOT_ROTATED is also a human decision made against the
+        # file's OLD orientation -- it must not survive an orientation
+        # change either, for the same reason CONFIRMED can't: the premise
+        # it was decided against no longer holds.
+        path = f"{settings.FILEPOPULATOR_VAL_DIRECTORY}/naming/good/1.JPG"
+        create_image_file(path)
+        img = ImageFile.objects.get(filename=path)
+
+        ImageFile.objects.filter(pk=img.pk).update(
+            rotation_scan_state=ImageFile.RotationScanState.DISMISSED_NOT_ROTATED,
+            rotation_scan_logic_hash='deadbeefdeadbeef',
+        )
+
+        ImageFile.objects.filter(pk=img.pk).update(
+            orientation=img.orientation + 1,
+            isProcessed=True,
+            dateModified=img.dateModified - timedelta(days=1),
+        )
+
+        create_image_file(path)
+
+        reprocessed = ImageFile.objects.get(filename=path)
+        self.assertEqual(reprocessed.rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
+        self.assertEqual(reprocessed.rotation_scan_logic_hash, '')
+
 
 class DeleteOldThumbnailsTests(TestCase):
     """Real incident, 2026-10-06: a restored-from-backup database can
