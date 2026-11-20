@@ -124,11 +124,32 @@ def apply_rotation_correction(image, extractor):
     with transaction.atomic():
         updated_face_ids = []
         for face in image.face_set.all():
-            new_box = transform_box(
+            new_left, new_top, new_right, new_bottom = transform_box(
                 face.box_left, face.box_top, face.box_right, face.box_bottom, old_w, old_h, snapped,
             )
             new_kps = transform_kps(list(face.kps), old_w, old_h, snapped) if face.kps else None
 
+            # Clamp left/top to >=0 only - exactly the same asymmetric
+            # invariant face_extract_encode.py's add_new_face() already
+            # applies to a freshly-detected box (see its own 2026-11-09
+            # incident writeup): Face.save() unconditionally rejects a
+            # negative box_left/box_top, but has no equivalent ceiling on
+            # box_right/box_bottom, and nothing downstream slices a pixel
+            # array from the stored box columns directly (get_square_face_img
+            # -- see _save_face_thumbnail below -- re-clamps independently
+            # from whatever bbox it's handed). A pre-existing box whose
+            # right/bottom edge already touched or ran past the original
+            # image's edge (never caught - there's no such ceiling check)
+            # maps to a negative left/top under a 90/-90 transform; without
+            # this, that negative value hit Face.save()'s real validation
+            # and rolled back the whole image's correction, retried forever
+            # by the scheduled sweep with zero chance of success (2026-11-20
+            # incident). kps is deliberately left untouched either way, same
+            # reasoning as the original invariant: it feeds LVFace alignment
+            # and must stay faithful to the real transformed geometry, not a
+            # storage convenience, and the box/kps consistency constraint is
+            # centroid-based so it already tolerates this on its own.
+            new_box = (max(0, new_left), max(0, new_top), new_right, new_bottom)
             face.box_left, face.box_top, face.box_right, face.box_bottom = new_box
             if new_kps is not None:
                 face.kps = new_kps

@@ -63,6 +63,35 @@ class ApplyRotationCorrectionTests(TestCase):
         )
         self.assertIsNone(face.kps)
 
+    def test_a_box_touching_the_original_edge_is_clamped_not_rejected(self):
+        # A pre-existing box whose right edge already sits exactly on the
+        # image's own width (never caught by Face.save() - there's no
+        # ceiling check on box_right, only a floor check on box_left/
+        # box_top, see rotation_correction.py's own comment on this) maps
+        # to box_top=-1 under transform_box's raw 90-degree formula
+        # (old_width - 1 - box_right == -1 whenever box_right == old_width,
+        # regardless of old_width's actual value) - a real incident
+        # (2026-11-20) where this used to raise inside face.save() and
+        # roll back the whole image's correction, retried forever by the
+        # scheduled sweep. apply_rotation_correction must clamp this to 0
+        # instead of letting it reach Face.save() at all.
+        face = make_face(self.image, box_left=5, box_top=5, box_right=self.old_w, box_bottom=25, kps=None)
+        raw_box = transform_box(5, 5, self.old_w, 25, self.old_w, self.old_h, 90.0)
+        self.assertEqual(raw_box[1], -1, "test assumption: the raw transform must actually go negative here")
+
+        extractor = _mock_extractor()
+        apply_rotation_correction(self.image, extractor)  # must not raise
+
+        face.refresh_from_db()
+        self.assertEqual(face.box_top, 0)
+        self.assertEqual(face.box_left, raw_box[0])
+        # right/bottom are intentionally left exactly as transform_box
+        # produced them, even if that runs past the new image's own
+        # dimensions - same established invariant as a freshly-detected
+        # face's box (see face_extract_encode.py's add_new_face()).
+        self.assertEqual(face.box_right, raw_box[2])
+        self.assertEqual(face.box_bottom, raw_box[3])
+
     def test_embeddings_are_left_untouched(self):
         # Confirmed unnecessary (see rotation_correction.py's own
         # docstring): a global rigid rotation + the matching kps
