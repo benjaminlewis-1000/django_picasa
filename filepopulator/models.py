@@ -897,6 +897,38 @@ class ImageFile(models.Model):
             self.rotation_signal_source = None
             self.rotation_scan_logic_hash = ''
 
+    def reset_rotation_scan_state_for_orientation_change(self):
+        """Call this specifically when the file's own EXIF orientation tag
+        has changed on disk (filepopulator/scripts.py's "same pixel hash,
+        different orientation" re-ingestion branch) -- unlike
+        reset_rotation_scan_state_for_reprocessing() above, this
+        unconditionally resets CONFIRMED/DISMISSED_NOT_ROTATED too,
+        including clearing rotation_correction_applied.
+
+        Why this needs different handling than the general reprocessing
+        reset: pixel_hash is computed on the image AFTER both EXIF
+        orientation and confirmed_rotation_override_degrees have been
+        applied (see _init_image()). So "orientation tag changed, but
+        pixel_hash unchanged" specifically means decoding the file fresh
+        (new EXIF tag, no override) produces the exact same final image
+        the old file produced WITH its confirmed override applied -- e.g.
+        someone edited the EXIF tag directly (or a tool baked the
+        confirmed correction into it) without physically rotating any
+        pixels. If we kept the old CONFIRMED override in that case, the
+        very next decode would apply it ON TOP of the file's
+        already-corrected orientation -- a real double-rotation. A human
+        decision made about the file's OLD orientation is not valid
+        evidence about its new one, so always reset to NOT_SCANNED here
+        and let the image be re-evaluated from scratch (by
+        audit_image_rotation, or a human) against whatever the file
+        actually is now.
+        """
+        self.rotation_scan_state = self.RotationScanState.NOT_SCANNED
+        self.proposed_rotation_degrees = None
+        self.rotation_signal_source = None
+        self.rotation_scan_logic_hash = ''
+        self.rotation_correction_applied = False
+
     # thumbnail = models.ImageField(upload_to = settings.FILEPOPULATOR_THUMBNAIL_DIR, default = str(timezone.now) + '_thumbnail.jpg' )
 
     # def _get_full_path(self):

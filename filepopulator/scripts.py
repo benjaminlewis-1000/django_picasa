@@ -439,6 +439,20 @@ def create_image_file(file_path):
                 exist_photo.dateAdded = timezone.now()
                 exist_photo.dateModified = datetime.fromtimestamp(os.path.getctime(file_path))
                 exist_photo.isProcessed = False
+                # The file's own EXIF orientation tag changed -- any prior
+                # rotation-review verdict (including a human CONFIRMED
+                # decision) was made against the OLD orientation and is not
+                # trustworthy evidence about the new one. exist_photo is
+                # already a fresh instance (new_photo) with these fields at
+                # their NOT_SCANNED default, but reset explicitly rather
+                # than relying on that being an accidental side effect of
+                # the reassignment above -- see
+                # reset_rotation_scan_state_for_orientation_change()'s own
+                # docstring for why this must NOT use
+                # reset_rotation_scan_state_for_reprocessing() (which
+                # deliberately preserves CONFIRMED/DISMISSED_NOT_ROTATED
+                # for a different, unrelated invalidation reason).
+                exist_photo.reset_rotation_scan_state_for_orientation_change()
                 saved, _error = instance_clean_and_save(exist_photo)
                 if saved and old_thumbnail_path:
                     try:

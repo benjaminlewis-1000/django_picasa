@@ -185,3 +185,70 @@ class ResetRotationScanStateForReprocessingTests(TestCase):
             self.image.rotation_scan_state, ImageFile.RotationScanState.DISMISSED_NOT_ROTATED,
         )
         self.assertEqual(self.image.rotation_scan_logic_hash, 'deadbeefdeadbeef')
+
+
+class ResetRotationScanStateForOrientationChangeTests(TestCase):
+    """ImageFile.reset_rotation_scan_state_for_orientation_change() --
+    called specifically when the file's own EXIF orientation tag has
+    changed on disk (filepopulator/scripts.py's "same pixel hash,
+    different orientation" re-ingestion branch), per CLAUDE.md's
+    2026-11-20 write-up.
+
+    Deliberately the OPPOSITE of reset_rotation_scan_state_for_
+    reprocessing() above for CONFIRMED/DISMISSED_NOT_ROTATED: those are
+    human decisions made against the file's OLD orientation, which is
+    no longer valid evidence about the file's NEW orientation -- keeping
+    a stale CONFIRMED override would apply it on top of the file's
+    already-changed orientation on the next decode, a real
+    double-rotation.
+    """
+
+    def setUp(self):
+        self.image = make_image(relative_fixture="naming/good/1.JPG")
+
+    def test_not_scanned_stays_not_scanned_and_hash_resets(self):
+        self.image.rotation_scan_logic_hash = 'deadbeefdeadbeef'
+        self.image.reset_rotation_scan_state_for_orientation_change()
+        self.assertEqual(self.image.rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
+        self.assertIsNone(self.image.proposed_rotation_degrees)
+        self.assertIsNone(self.image.rotation_signal_source)
+        self.assertEqual(self.image.rotation_scan_logic_hash, '')
+        self.assertFalse(self.image.rotation_correction_applied)
+
+    def test_flagged_is_reset_to_not_scanned(self):
+        self.image.rotation_scan_state = ImageFile.RotationScanState.FLAGGED
+        self.image.proposed_rotation_degrees = 93.2
+        self.image.rotation_signal_source = ImageFile.RotationSignalSource.LANDMARK_SINGLE_FACE
+        self.image.rotation_scan_logic_hash = 'deadbeefdeadbeef'
+
+        self.image.reset_rotation_scan_state_for_orientation_change()
+
+        self.assertEqual(self.image.rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
+        self.assertIsNone(self.image.proposed_rotation_degrees)
+        self.assertIsNone(self.image.rotation_signal_source)
+        self.assertEqual(self.image.rotation_scan_logic_hash, '')
+
+    def test_confirmed_IS_reset_unlike_the_reprocessing_variant(self):
+        self.image.rotation_scan_state = ImageFile.RotationScanState.CONFIRMED
+        self.image.proposed_rotation_degrees = 90.0
+        self.image.rotation_signal_source = ImageFile.RotationSignalSource.HUMAN
+        self.image.rotation_scan_logic_hash = 'deadbeefdeadbeef'
+        self.image.rotation_correction_applied = True
+
+        self.image.reset_rotation_scan_state_for_orientation_change()
+
+        self.assertEqual(self.image.rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
+        self.assertIsNone(self.image.proposed_rotation_degrees)
+        self.assertIsNone(self.image.rotation_signal_source)
+        self.assertEqual(self.image.rotation_scan_logic_hash, '')
+        self.assertFalse(self.image.rotation_correction_applied)
+        self.assertIsNone(self.image.confirmed_rotation_override_degrees)
+
+    def test_dismissed_not_rotated_is_also_reset(self):
+        self.image.rotation_scan_state = ImageFile.RotationScanState.DISMISSED_NOT_ROTATED
+        self.image.rotation_scan_logic_hash = 'deadbeefdeadbeef'
+
+        self.image.reset_rotation_scan_state_for_orientation_change()
+
+        self.assertEqual(self.image.rotation_scan_state, ImageFile.RotationScanState.NOT_SCANNED)
+        self.assertEqual(self.image.rotation_scan_logic_hash, '')
