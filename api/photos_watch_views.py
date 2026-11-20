@@ -31,7 +31,7 @@ from api.upload_views import _chown_upload_path, _unique_destination
 
 
 def _frontend_tools_url():
-    return f'https://{settings.FRONTEND_DOMAIN}/faces'
+    return f'https://{settings.FRONTEND_DOMAIN}/'
 
 
 class GooglePhotosCredentialView(APIView):
