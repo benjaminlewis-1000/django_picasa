@@ -71,6 +71,19 @@ class KeyedImageViewTests(ApiTestCase):
         resp = self.client.get("/api/keyed_image/face_array/")
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_slideshow_type_handles_rgba_source_without_crashing(self):
+        # Real incident 2026-11-20 (ImageFile 414689): its actual file on
+        # disk was a PNG with an alpha channel despite a .jpg filename (an
+        # upload-pipeline artifact) -- JPEG has no alpha channel, so the
+        # view's final image.save(..., 'JPEG') raised "cannot write mode
+        # RGBA as JPEG", a 500 on every slideshow/face_* request for it.
+        from PIL import Image
+        rgba_image = Image.new('RGBA', (40, 30), (255, 0, 0, 128))
+        with mock.patch('api.views.common.open_img_oriented', return_value=rgba_image):
+            resp = self.client.get(f"/api/keyed_image/slideshow/?id={self.image.id}")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp["Content-Type"], "image/jpeg")
+
 
 class RotationPreviewKeyedImageTests(ApiTestCase):
     """KeyedImageView's 'rotation_preview' type -- see

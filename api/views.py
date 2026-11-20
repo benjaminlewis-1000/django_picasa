@@ -1841,6 +1841,16 @@ class KeyedImageView(APIView):
         FTYPE = 'JPEG'
         temp_thumb = BytesIO()
 
+        # JPEG has no alpha channel -- a source file with an actual RGBA
+        # (or palette-with-transparency) pixel mode, regardless of its own
+        # filename extension (e.g. a PNG uploaded/saved as .jpg), crashes
+        # here with "cannot write mode RGBA as JPEG" otherwise. Real
+        # incident 2026-11-20 (ImageFile 414689, a PNG with alpha ingested
+        # through the upload pipeline under a .jpg name) -- a 500 on every
+        # slideshow/face_* request for that image.
+        if image.mode not in ('RGB', 'L'):
+            image = image.convert('RGB')
+
         # print(time.time()-s)
         image.save(temp_thumb, FTYPE)
         # print("Here")
