@@ -11,7 +11,6 @@ from face_manager.rotation_geometry import (
     circular_mean,
     circular_median,
     eye_angle_degrees,
-    should_overwrite_rotation_proposal,
 )
 
 
@@ -230,28 +229,6 @@ class FourOrientationDeterministicDetectionTests(unittest.TestCase):
                     f"{labels[i]} ({estimates[labels[i]]}) and {labels[j]} "
                     f"({estimates[labels[j]]}) are not clearly distinguishable",
                 )
-
-
-class ShouldOverwriteRotationProposalTests(unittest.TestCase):
-    def test_never_scanned_always_allows_write(self):
-        self.assertTrue(should_overwrite_rotation_proposal(None, 'landmark_single_face'))
-        self.assertTrue(should_overwrite_rotation_proposal(None, 'ml_classifier'))
-
-    def test_higher_priority_source_overwrites_lower(self):
-        self.assertTrue(should_overwrite_rotation_proposal('landmark_single_face', 'landmark_multi_face'))
-        self.assertTrue(should_overwrite_rotation_proposal('landmark_multi_face', 'ml_classifier'))
-        self.assertTrue(should_overwrite_rotation_proposal('landmark_single_face', 'ml_classifier'))
-
-    def test_lower_priority_source_does_not_overwrite_higher(self):
-        self.assertFalse(should_overwrite_rotation_proposal('ml_classifier', 'landmark_multi_face'))
-        self.assertFalse(should_overwrite_rotation_proposal('ml_classifier', 'landmark_single_face'))
-        self.assertFalse(should_overwrite_rotation_proposal('landmark_multi_face', 'landmark_single_face'))
-
-    def test_same_source_rescan_overwrites(self):
-        # A re-scan from the same source (e.g. after a logic-version bump)
-        # is allowed to refresh its own prior proposal.
-        self.assertTrue(should_overwrite_rotation_proposal('landmark_multi_face', 'landmark_multi_face'))
-        self.assertTrue(should_overwrite_rotation_proposal('ml_classifier', 'ml_classifier'))
 
 
 if __name__ == '__main__':

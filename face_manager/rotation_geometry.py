@@ -147,31 +147,3 @@ UPRIGHT_TOLERANCE_MULTI_FACE_DEG = 40.0
 # pushed much closer to the real 90-degree rotation targets themselves --
 # a single face's tilt below this is treated as noise, not a rotation.
 UPRIGHT_TOLERANCE_SINGLE_FACE_DEG = 70.0
-
-# Ordering used to decide whether a NEW proposal is allowed to overwrite
-# an EXISTING one for the same image: a write only takes effect if its
-# source's priority is >= the current proposal's source priority. Human
-# confirm/dismiss is handled separately (always terminal, never
-# overwritten by a re-scan) -- this ordering only governs automated
-# signal sources competing with each other. Higher index = higher
-# priority (a future ML classifier should always win over a pure
-# landmark-geometry guess; multi-face agreement is more trustworthy than
-# a single lonely face).
-ROTATION_SOURCE_PRIORITY = {
-    'landmark_single_face': 0,
-    'landmark_multi_face': 1,
-    'ml_classifier': 2,
-}
-
-
-def should_overwrite_rotation_proposal(existing_source, new_source):
-    """Whether a new automated proposal from new_source is allowed to
-    replace an existing one from existing_source (per ROTATION_SOURCE_
-    PRIORITY). existing_source of None (never scanned, or a prior human
-    dismissal with no proposal) always allows the write. Never call this
-    to decide whether to overwrite a HUMAN-sourced proposal -- that's
-    handled by checking rotation_scan_state, not this priority table.
-    """
-    if existing_source is None:
-        return True
-    return ROTATION_SOURCE_PRIORITY[new_source] >= ROTATION_SOURCE_PRIORITY[existing_source]

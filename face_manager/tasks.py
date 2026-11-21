@@ -9,6 +9,7 @@ from assign_faces import faceAssigner
 from verification_clustering import cluster_all_unverified_faces
 from face_manager.rotation_audit import run_rotation_audit_until_done
 from face_manager.rotation_correction import run_rotation_correction
+from face_manager.rotation_ml_audit import run_rotation_ml_audit_until_done
 from celery import shared_task
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -543,6 +544,34 @@ def audit_image_rotation_task():
             )
         except Exception as e:
             _log_task_crash('audit_image_rotation_task', e)
+
+@shared_task(ignore_result=True, name='face_manager.audit_image_rotation_ml')
+def audit_image_rotation_ml_task():
+    """Scheduled wrapper around face_manager.rotation_ml_audit.
+    run_rotation_ml_audit_until_done() -- the ML-classifier counterpart
+    to audit_image_rotation_task above. Built 2026-11-21 but NOT added
+    to CELERY_BEAT_SCHEDULE (see rotation_ml_audit.py's own docstring) --
+    this task exists so it's ready to schedule later, but currently only
+    ever runs if triggered manually (e.g. via `celery call` or the
+    run_rotation_ml_audit management command calling the underlying
+    function directly).
+    """
+    with advisory_lock('face_manager.audit_image_rotation_ml') as acquired:
+        if not acquired:
+            settings.LOGGER.debug("ML image rotation audit is locked, exiting.")
+            return
+        try:
+            result = run_rotation_ml_audit_until_done()
+            if result.get('skipped_no_checkpoint'):
+                settings.LOGGER.debug("audit_image_rotation_ml_task: no checkpoint found, skipped.")
+                return
+            settings.LOGGER.debug(
+                f"audit_image_rotation_ml_task: examined {result['examined']}, "
+                f"updated {result['updated']} across {result['batches']} batch(es) "
+                f"(hit_time_limit={result['hit_time_limit']}) -- {result['counts']}"
+            )
+        except Exception as e:
+            _log_task_crash('audit_image_rotation_ml_task', e)
 
 @shared_task(ignore_result=True, name='face_manager.correct_image_rotation')
 def correct_image_rotation_task():

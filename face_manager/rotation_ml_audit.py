@@ -1,0 +1,279 @@
+"""DB-touching orchestration for the rotation-review scan's SECOND
+signal source -- the ML orientation classifier (ImageFile.
+RotationSignalSource.ML_CLASSIFIER). Mirrors face_manager.rotation_
+audit's shape exactly (one shared function the management command and
+the scheduled Celery task both call), but classifies via the trained
+model (face_manager.rotation_classifier_model) instead of pure
+face-landmark geometry -- so, unlike the landmark path, this one needs
+no detected faces/kps at all and can examine every NOT_SCANNED image,
+not just the ones with at least one face.
+
+Built 2026-11-21 per the user's explicit request to have this
+infrastructure ready even though it isn't turned on yet: nothing here
+is wired into CELERY_BEAT_SCHEDULE, so it never runs on its own --
+only a manual run_rotation_ml_audit management-command invocation (or
+a direct call to the functions below) ever examines/writes anything.
+
+Deliberately uses its own, separately-tracked staleness hash
+(ImageFile.rotation_ml_scan_hash), NOT rotation_audit's
+rotation_scan_logic_hash -- see that field's own docstring in
+filepopulator/models.py. The landmark path's hash is keyed on SOURCE
+CODE alone (cheap pure geometry, safe to re-run the whole backlog on
+any edit); this one is keyed on source code PLUS the trained
+checkpoint's own weight bytes, since a retrain-and-re-export with
+unchanged code must still re-qualify every row, and re-running real
+model inference on an unrelated code edit elsewhere would be
+genuinely expensive.
+
+Once FLAGGED (by this signal OR the landmark one), a row is excluded
+from both audits' candidate querysets -- only a human confirm/dismiss
+ever moves it again (see rotation_audit._candidate_images_queryset()'s
+own 2026-11-21 note on why the earlier source-priority overwrite
+table was removed).
+"""
+import hashlib
+import inspect
+import sys
+import time
+
+from django.conf import settings
+
+from face_manager import rotation_classifier_model
+from face_manager.rotation_classifier_model import (
+    INPUT_SIZE,
+    MAX_ASPECT_RATIO,
+    MAX_IMAGE_PIXELS,
+    decode_upright,
+    letterbox_to_square,
+    to_model_input,
+    undo_rotation_degrees,
+)
+from filepopulator.models import ImageFile
+
+CHECKPOINT_PATH = '/models/rotation_classifier/checkpoint.pt'
+
+# Deliberately conservative, and NOT empirically validated against this
+# specific checkpoint's real confidence-vs-correctness calibration (the
+# human-adjudicated check earlier this project ran was against an older
+# checkpoint) -- this is infra-only for now (see this module's own
+# docstring), so getting this exactly right isn't yet load-bearing.
+# MUST be re-validated (same leave-one-out-against-human-adjudicated-
+# rows methodology this project already used for the landmark signal)
+# before this is ever actually scheduled.
+CONFIDENCE_FLOOR = 0.95
+
+# Same batching/runtime-budget reasoning as rotation_audit.py's own
+# constants -- see that module's comments. A full classifier forward
+# pass is far more expensive per image than the landmark path's pure
+# geometry, so these are deliberately smaller.
+DEFAULT_MAX_IMAGES_PER_RUN = 500
+DEFAULT_MAX_RUNTIME_SECONDS = 3000
+
+
+def _rotation_ml_scan_hash():
+    """sha256(source of this module + rotation_classifier_model +
+    the checkpoint file's own raw bytes)[:16] -- see this module's own
+    docstring for why the checkpoint's weight bytes are folded in here,
+    unlike rotation_audit's source-only hash. A missing checkpoint
+    hashes to the empty-bytes case deterministically (not an error) --
+    callers that actually need a loaded model handle FileNotFoundError
+    separately, at load time.
+    """
+    src = inspect.getsource(sys.modules[__name__]) + inspect.getsource(rotation_classifier_model)
+    try:
+        with open(CHECKPOINT_PATH, 'rb') as f:
+            checkpoint_bytes = f.read()
+    except FileNotFoundError:
+        checkpoint_bytes = b''
+    return hashlib.sha256(src.encode('utf-8') + checkpoint_bytes).hexdigest()[:16]
+
+
+def _load_model():
+    """Loads the trained checkpoint fresh -- raises FileNotFoundError if
+    it doesn't exist (callers decide how to handle that; see
+    run_rotation_ml_audit_until_done()). Deliberately not cached at
+    module scope: this is infra built ahead of being scheduled, not yet
+    exercised at a frequency where reload cost matters -- revisit if/when
+    this is actually wired into a live, repeatedly-invoked task.
+    """
+    import torch
+
+    from face_manager.rotation_classifier_model import build_model
+
+    model = build_model(pretrained=False)
+    ckpt = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=True)
+    model.load_state_dict(ckpt['model_state'])
+    model.eval()
+    return model
+
+
+def _candidate_images_queryset():
+    """Every NOT_SCANNED image not yet examined under the current ML
+    hash -- no face/kps requirement at all (the whole point of this
+    signal is covering the landmark path's permanent blind spot:
+    faceless content, and any face whose kps will never be recoverable).
+    isProcessed=True is still required, matching the landmark path's own
+    reasoning, so a row mid-ingestion is naturally reconsidered once
+    processing actually settles rather than needing separate "retry
+    later" bookkeeping.
+
+    FLAGGED is deliberately excluded, same as rotation_audit's own
+    queryset -- see this module's docstring.
+    """
+    ScanState = ImageFile.RotationScanState
+    return (
+        ImageFile.objects.filter(rotation_scan_state=ScanState.NOT_SCANNED, isProcessed=True)
+        .exclude(rotation_ml_scan_hash=_rotation_ml_scan_hash())
+        .order_by('id')
+    )
+
+
+def classify_image(arr, model):
+    """Pure inference on an already-decoded HxWx3 uint8 RGB array --
+    model is passed in (not loaded here) so this is directly testable
+    with a cheap stub instead of the real checkpoint. Returns
+    (predicted_class, confidence)."""
+    import torch
+
+    square = letterbox_to_square(arr, size=INPUT_SIZE)
+    tensor = torch.from_numpy(to_model_input(square)).unsqueeze(0)
+    with torch.no_grad():
+        logits = model(tensor)
+        probs = torch.softmax(logits, dim=1)[0]
+    predicted_class = int(probs.argmax())
+    confidence = float(probs[predicted_class])
+    return predicted_class, confidence
+
+
+def evaluate_image_ml(filename, width, height, model):
+    """DB-free evaluation of one image: decode + classify (or skip/fail
+    first). Returns a dict: {'outcome': 'size_skip'|'decode_failure'|
+    'classified', 'degrees': float|None, 'significant': bool}.
+
+    'size_skip'/'decode_failure' are terminal for THIS code/model
+    version (same width/height will always skip; a genuinely unreadable
+    file won't become readable on retry under the same hash) -- the
+    caller still stamps rotation_ml_scan_hash for these so they aren't
+    re-attempted forever, same reasoning as rotation_audit's own
+    no_usable_faces handling.
+    """
+    if width and height:
+        if width * height > MAX_IMAGE_PIXELS or max(width, height) / min(width, height) > MAX_ASPECT_RATIO:
+            return {'outcome': 'size_skip', 'degrees': None, 'significant': False}
+
+    arr = decode_upright(filename, None)
+    if arr is None:
+        return {'outcome': 'decode_failure', 'degrees': None, 'significant': False}
+
+    predicted_class, confidence = classify_image(arr, model)
+    degrees = undo_rotation_degrees(predicted_class)
+    significant = predicted_class != 0 and confidence >= CONFIDENCE_FLOOR
+    return {'outcome': 'classified', 'degrees': degrees, 'significant': significant}
+
+
+def run_rotation_ml_audit(write=False, max_images=DEFAULT_MAX_IMAGES_PER_RUN, model=None):
+    """Scans up to `max_images` eligible ImageFiles and either reports
+    (write=False, the default) or persists (write=True) the resulting
+    rotation_scan_state/proposed_rotation_degrees/rotation_signal_source/
+    rotation_ml_scan_hash changes.
+
+    `model=None` loads the real checkpoint fresh (raises
+    FileNotFoundError if it doesn't exist yet -- e.g. training hasn't
+    produced one, or this is a test environment with no /models mount;
+    callers that want to loop many batches under one loaded model, see
+    run_rotation_ml_audit_until_done(), should load once and pass it in).
+
+    Returns a dict: {'examined': int, 'counts': {...}, 'updated': int}.
+    """
+    ScanState = ImageFile.RotationScanState
+    if model is None:
+        model = _load_model()
+    current_hash = _rotation_ml_scan_hash()
+
+    queryset = _candidate_images_queryset().only(
+        'id', 'filename', 'width', 'height', 'rotation_scan_state',
+        'proposed_rotation_degrees', 'rotation_signal_source', 'rotation_ml_scan_hash',
+    )
+    if max_images is not None:
+        queryset = queryset[:max_images]
+    candidates = list(queryset)
+    counts = {
+        'size_skip': 0,
+        'decode_failure': 0,
+        'confirmed_upright': 0,
+        'flagged_new': 0,
+    }
+
+    to_update = []
+    for image in candidates:
+        outcome = evaluate_image_ml(image.filename, image.width, image.height, model)
+        if outcome['outcome'] in ('size_skip', 'decode_failure'):
+            counts[outcome['outcome']] += 1
+            image.rotation_ml_scan_hash = current_hash
+            to_update.append(image)
+            continue
+
+        if outcome['significant']:
+            counts['flagged_new'] += 1
+            image.rotation_scan_state = ScanState.FLAGGED
+            image.proposed_rotation_degrees = outcome['degrees']
+            image.rotation_signal_source = ImageFile.RotationSignalSource.ML_CLASSIFIER
+        else:
+            counts['confirmed_upright'] += 1
+        image.rotation_ml_scan_hash = current_hash
+        to_update.append(image)
+
+    if write:
+        ImageFile.objects.bulk_update(
+            to_update,
+            ['rotation_scan_state', 'proposed_rotation_degrees',
+             'rotation_signal_source', 'rotation_ml_scan_hash'],
+            batch_size=1000,
+        )
+
+    return {'examined': len(candidates), 'counts': counts, 'updated': len(to_update)}
+
+
+def run_rotation_ml_audit_until_done(batch_size=DEFAULT_MAX_IMAGES_PER_RUN,
+                                      max_runtime_seconds=DEFAULT_MAX_RUNTIME_SECONDS):
+    """Loads the checkpoint once, then repeatedly calls
+    run_rotation_ml_audit(write=True, ...) with that one loaded model
+    until either nothing eligible remains or max_runtime_seconds is
+    exceeded -- mirrors rotation_audit.run_rotation_audit_until_done()'s
+    shape. If no checkpoint exists yet, returns immediately with
+    skipped_no_checkpoint=True rather than raising -- this module is
+    infra built ahead of training necessarily having produced a usable
+    checkpoint in every environment (e.g. a fresh/CI database) that
+    might import it.
+
+    Returns {'examined': int, 'updated': int, 'counts': {...}, 'batches': int,
+    'hit_time_limit': bool, 'skipped_no_checkpoint': bool}.
+    """
+    try:
+        model = _load_model()
+    except FileNotFoundError:
+        settings.LOGGER.debug("run_rotation_ml_audit_until_done: no checkpoint found, skipping.")
+        return {
+            'examined': 0, 'updated': 0, 'counts': {}, 'batches': 0,
+            'hit_time_limit': False, 'skipped_no_checkpoint': True,
+        }
+
+    start = time.monotonic()
+    totals = {
+        'examined': 0, 'updated': 0, 'counts': {}, 'batches': 0,
+        'hit_time_limit': False, 'skipped_no_checkpoint': False,
+    }
+    while True:
+        result = run_rotation_ml_audit(write=True, max_images=batch_size, model=model)
+        totals['examined'] += result['examined']
+        totals['updated'] += result['updated']
+        totals['batches'] += 1
+        for key, value in result['counts'].items():
+            totals['counts'][key] = totals['counts'].get(key, 0) + value
+
+        if result['examined'] == 0:
+            break
+        if time.monotonic() - start >= max_runtime_seconds:
+            totals['hit_time_limit'] = True
+            break
+    return totals

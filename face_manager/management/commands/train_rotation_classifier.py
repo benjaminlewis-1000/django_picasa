@@ -54,10 +54,10 @@ import time
 import numpy as np
 from django.core.management.base import BaseCommand
 
-from common.open_img_oriented import open_img_oriented
 from face_manager.rotation_classifier_model import (
-    INPUT_SIZE, NUM_CLASSES, apply_synthetic_rotation, build_model,
-    letterbox_to_square, to_model_input,
+    INPUT_SIZE, MAX_ASPECT_RATIO, MAX_IMAGE_PIXELS, NUM_CLASSES,
+    apply_synthetic_rotation, build_model, decode_upright, letterbox_to_square,
+    to_model_input,
 )
 from filepopulator.models import ImageFile
 
@@ -100,18 +100,10 @@ WARM_RESTART_T0_STEPS = 2500
 WARM_RESTART_T_MULT = 2
 WARM_RESTART_ETA_MIN = 0.0
 
-# Same panorama/giant-image hang already documented in
-# backfill_verified_kps.py (search CLAUDE.md for "a single
-# uninterruptible C call") -- a huge or extreme-aspect-ratio image can
-# make open_img_oriented()'s underlying PIL decode/resize call run for
-# a very long time (practically unbounded in the worst case seen so
-# far), and since it's a single C call, no SIGALRM-based timeout can
-# interrupt it once started. Checked here against ImageFile's already-
-# stored width/height (zero decode cost) before ever reaching
-# _decode_upright(), using the same thresholds already validated
-# against this library's real population there.
-MAX_IMAGE_PIXELS = 25_000_000
-MAX_ASPECT_RATIO = 2.5
+# MAX_IMAGE_PIXELS/MAX_ASPECT_RATIO now live in rotation_classifier_model
+# (imported above), shared with face_manager.rotation_ml_audit -- see
+# that module's own comment on these for the panorama/giant-image hang
+# they guard against.
 
 
 def _sample_image_ids(num_train, num_val, seed):
@@ -151,21 +143,9 @@ def _load_or_create_split(split_path, num_train, num_val, seed):
     return train_ids, val_ids
 
 
-def _decode_upright(filename, extra_rotation_degrees):
-    """Real, already-EXIF-(and-any-confirmed-rotation-)corrected pixel
-    content for one image file -- the ground-truth 'upright' example
-    this whole training scheme is built on. Takes plain values (not an
-    ImageFile instance -- see _RotationDataset's own docstring for why)
-    so this never touches the ORM/a live DB connection. Returns None on
-    a real decode failure (a handful of genuinely corrupted/missing
-    files are expected at this library's scale -- skipped, not fatal,
-    same tolerance this project's other bulk-scan commands already
-    have)."""
-    try:
-        arr = open_img_oriented(filename, as_numpy=True, extra_rotation_degrees=extra_rotation_degrees)
-    except (FileNotFoundError, OSError):
-        return None
-    return arr
+# _decode_upright moved to rotation_classifier_model.decode_upright
+# (imported above) -- it has no training-specific logic and is now also
+# used by face_manager.rotation_ml_audit.
 
 
 def _augment_brightness_contrast(arr_float, rng):
@@ -248,7 +228,7 @@ class _RotationDataset:
             image_id, k = self._val_pairs[idx]
 
         filename, extra_rotation_degrees = self._file_info[image_id]
-        arr = _decode_upright(filename, extra_rotation_degrees)
+        arr = decode_upright(filename, extra_rotation_degrees)
         if arr is None:
             # Skip a real decode failure by substituting a different
             # valid sample rather than crashing the whole DataLoader
