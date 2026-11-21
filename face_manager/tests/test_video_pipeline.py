@@ -1475,4 +1475,18 @@ class VideoFaceExtractorRealInferenceTests(TestCase):
         second = self.extractor.process_video(self.video)
         self.assertGreaterEqual(len(second), 1)
 
+    def test_progress_cb_is_called_through_every_real_stage_in_order(self):
+        # progress_cb (2026-11-18, see face_manager/tasks.py's dynamic
+        # per-video timeout) must actually fire during a real run, not
+        # just in a mocked-out unit test -- confirms the wiring through
+        # process_video() -> _compute_candidate_groups() reaches every
+        # major phase, in the expected order, against real inference.
+        stages = []
+        self.extractor.process_video(self.video, progress_cb=stages.append)
+        self.assertEqual(
+            stages,
+            ['ffprobe', 'detect_and_track', 'pool_representative_frames',
+             'clustering', 'classify_and_save'],
+        )
+
 

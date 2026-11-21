@@ -32,38 +32,93 @@ import traceback
 
 # from image_face_extractor import reencoder, ip_finder
 
-# Per-video hard timeout for process_video_faces() below -- a pathological
+# Per-video timeout for process_video_faces() below -- a pathological
 # video (an unusually large raw detection/track count blowing up the
 # clustering step's distance-matrix computation) can otherwise stall the
 # whole batch indefinitely, since max_runtime_seconds is only checked
 # *between* videos. Confirmed necessary 2026-09-09: a real production
 # video ran for 2+ hours with zero completion (vs. the slowest known-good
 # real video, 58 face groups, ~17 minutes) and had to be killed by hand.
-# Set comfortably above that known-good outlier. Known limitation: a
-# signal-based alarm can only interrupt at a Python bytecode boundary, so
-# it won't preempt a single very-long-running C-level call (e.g. one
-# AgglomerativeClustering.fit() invocation) mid-call -- it fires as soon
-# as that call returns, which still bounds *most* realistic slow-python-
-# loop cases but isn't a hard real-time guarantee against every possible
-# blowup.
-# Raised 1800 -> 2700 (30 -> 45 min) on 2026-09-19: five real videos had
-# accumulated as face_extraction_failed, all on timeouts, and four of
-# them were short (26s-110s) clips marked failed by the OLD code path
-# before both this session's pathological-track gating
-# (ABSURD_SINGLETON_TRACK_COUNT/MIN_TRACK_LEN_SAMPLES) and the
-# timeout-retry logic existed. A longer default buys real headroom for
-# genuinely long videos and for contention-driven slowness without
-# needing per-video tuning. Longer-term the user wants a frontend
-# affordance to let specific long videos process longer rather than
-# raising the global default further.
-PER_VIDEO_TIMEOUT_SECONDS = 2700
+# Known limitation: a signal-based alarm can only interrupt at a Python
+# bytecode boundary, so it won't preempt a single very-long-running
+# C-level call (e.g. one AgglomerativeClustering.fit() invocation)
+# mid-call -- it fires as soon as that call returns, which still bounds
+# *most* realistic slow-python-loop cases but isn't a hard real-time
+# guarantee against every possible blowup.
+#
+# A flat timeout (1800s, then 2700s -- see git history) kept being wrong
+# in both directions: short, completely normal clips were timing out
+# purely from CPU contention with another concurrent job (confirmed real
+# 2026-09-17), while a real multi-hour video legitimately needs far more
+# than 45 minutes regardless of contention. Replaced 2026-11-18 (per the
+# user's own request) with a scaled, periodically-recomputed budget:
+#   allowed = clamp((BASE + duration_seconds * RATE) * contention, MIN, MAX)
+# -- duration-scaled so a longer video gets a proportionally longer
+# budget, contention-scaled so a CPU-busy host gets more slack too, and
+# clamped on both ends: MIN keeps a short video at least as well off as
+# the old flat timeout even with zero detected contention; MAX is a
+# final backstop (a genuinely pathological, non-duration-related blowup
+# -- the clustering-blowup case this whole mechanism originally existed
+# to catch -- still can't run forever). RATE=3.0 sits comfortably above
+# the real measured wall-time-per-second-of-footage ratio this pipeline
+# has shown even under contention (1.5x-1.76x, see CLAUDE.md's
+# 2026-09-12 throughput write-up).
+#
+# Real incident the same day this was built (video 9575, a 5-minute
+# clip, timed out under contention): an earlier draft floored the
+# duration-based budget at MIN *before* applying contention, which
+# worked out fine for that case but needlessly complicated the formula
+# -- simplified to the user's own suggestion (apply contention first,
+# then clamp the whole thing), which gives the same floor guarantee at
+# baseline while staying one clamp instead of two.
+#
+# CONTENTION_MAX_MULTIPLIER was originally set to 6.0, informed by this
+# pipeline's own real measured contention impact (2026-09-17: one stage
+# alone, _detect_and_track, slowed 5-10x under a concurrent CPU-heavy
+# job) -- but that was sized to cover a video stalling under sustained
+# contention for its ENTIRE run. Once _make_progress_callback() started
+# resetting the timeout clock on every completed stage (same day, per
+# the user's own follow-up), a video that's merely slow-but-advancing no
+# longer depends on this multiplier alone -- the per-stage reset already
+# protects it. Backed off 6.0 -> 3.0 accordingly: still real headroom
+# for a single stage genuinely running slow under contention, without
+# needing to cover a whole video's worst-case sustained slowdown in one
+# number.
+PER_VIDEO_TIMEOUT_BASE_SECONDS = 300
+PER_VIDEO_TIMEOUT_RATE_PER_VIDEO_SECOND = 3.0
+PER_VIDEO_TIMEOUT_CONTENTION_MAX_MULTIPLIER = 3.0
+PER_VIDEO_TIMEOUT_MIN_SECONDS = 2700
+PER_VIDEO_TIMEOUT_MAX_SECONDS = 4 * 3600
+
+# The user's own follow-up: CPU contention can change WHILE a video is
+# still processing, not just at its start -- a single timeout value
+# computed once at launch can't adapt to that. So instead of one
+# signal.alarm(), a repeating signal.setitimer() fires every
+# PER_VIDEO_TIMEOUT_CHECK_INTERVAL_SECONDS and re-evaluates the allowed
+# budget from scratch using the CURRENT load average each time -- if the
+# host gets busier mid-run, later checks see a larger contention
+# multiplier and the video simply keeps running; only real, sustained
+# elapsed-time-over-budget ever raises.
+#
+# A second follow-up the same day: "elapsed" above is time since the
+# video's CURRENT STAGE started, not time since the video itself
+# started -- _make_progress_callback()'s closure resets _video_timeout_
+# state['start'] every time VideoFaceExtractor.process_video() advances
+# to a new stage (detect_and_track -> pool_representative_frames ->
+# clustering -> ...). A video that keeps successfully finishing one
+# stage after another is making real, visible progress even if each
+# stage is individually slow under contention -- the budget now caps how
+# long any ONE stage can run without advancing, not the video's total
+# wall time, so it's never penalized for the sum of several genuinely-
+# completed stages exceeding what one whole-video budget would allow.
+PER_VIDEO_TIMEOUT_CHECK_INTERVAL_SECONDS = 60
 
 # A timeout is left unprocessed (see the timeout except branch below) so
 # a plausibly-transient one (resource contention from another concurrent
 # job -- confirmed real 2026-09-17) gets retried automatically on a later
 # run, rather than requiring a manual reset. But a genuinely-too-long
 # video (not just contention) would otherwise retry forever, each attempt
-# burning a full PER_VIDEO_TIMEOUT_SECONDS -- MAX_VIDEO_TIMEOUT_RETRIES
+# burning its own dynamically-computed budget -- MAX_VIDEO_TIMEOUT_RETRIES
 # caps that: once a video has timed out this many times, it's marked a
 # real failure (face_extraction_failed=True) instead of being retried
 # again, per the user's explicit call.
@@ -74,10 +129,107 @@ class _VideoProcessingTimeout(Exception):
     pass
 
 
-def _raise_video_timeout(signum, frame):
-    raise _VideoProcessingTimeout(
-        f"Video processing exceeded {PER_VIDEO_TIMEOUT_SECONDS}s"
+def _contention_multiplier():
+    """How much busier this host is right now than its own core count,
+    clamped to a sane range. 1.0 = no extra slack (load at or below core
+    count); PER_VIDEO_TIMEOUT_CONTENTION_MAX_MULTIPLIER = fully capped,
+    so one extreme spike can't make a timeout effectively infinite."""
+    try:
+        load1 = os.getloadavg()[0]
+    except OSError:
+        return 1.0
+    cpu_count = os.cpu_count() or 1
+    return min(
+        PER_VIDEO_TIMEOUT_CONTENTION_MAX_MULTIPLIER,
+        max(1.0, load1 / cpu_count),
     )
+
+
+def _video_timeout_budget_seconds(duration_seconds):
+    """The allowed processing budget for a video of this duration, at the
+    CURRENT moment's contention level. Pure except for the one real-time
+    read (current load average, via _contention_multiplier()) --
+    duration_seconds is a plain argument so this is directly unit-
+    testable without mocking os.getloadavg(). Deliberately re-reads
+    contention on every call rather than caching it -- see
+    _check_video_timeout() below, which calls this fresh on every
+    periodic tick specifically so a video already in progress gets more
+    slack automatically if contention rises partway through, not just
+    whatever was true when it started."""
+    duration_seconds = duration_seconds or 0
+    scaled = (
+        PER_VIDEO_TIMEOUT_BASE_SECONDS + duration_seconds * PER_VIDEO_TIMEOUT_RATE_PER_VIDEO_SECOND
+    ) * _contention_multiplier()
+    return min(max(scaled, PER_VIDEO_TIMEOUT_MIN_SECONDS), PER_VIDEO_TIMEOUT_MAX_SECONDS)
+
+
+# Mutable state for the currently-processing video, read by
+# _check_video_timeout() on every periodic tick -- a plain module-level
+# dict rather than a closure/argument, since signal handlers are called
+# with a fixed (signum, frame) signature. Set right before each video's
+# signal.setitimer() call in process_video_faces() and cleared right
+# after, so a stray leftover tick from a prior video (if one somehow fired
+# after setitimer(0, 0)) is a harmless no-op.
+_video_timeout_state = {}
+
+
+def _make_progress_callback():
+    """Returns a closure VideoFaceExtractor.process_video() calls with a
+    short stage-name string right before each major phase starts (see
+    its own docstring in video_face_pipeline.py) -- resets _video_
+    timeout_state['start'] on every call, per the user's own follow-up
+    request (2026-11-18): a video that keeps successfully completing one
+    stage after another (detect_and_track, then pool_representative_
+    frames, then clustering, ...) is making real, visible progress even
+    if each stage is individually slow under contention -- it shouldn't
+    be killed just because the SUM of several completed stages happens
+    to exceed the whole-video budget. The timeout now effectively caps
+    how long any ONE stage can run without advancing, not the video's
+    total wall time -- _check_video_timeout below is unchanged, it just
+    measures time since the last reset rather than time since the video
+    started. Also records the stage name itself, so a timeout's error
+    message says WHICH stage it was stuck in.
+
+    Also logs each completed stage's own wall time plus the host's real
+    load average/contention multiplier AT THAT MOMENT (2026-11-18, per
+    the user's own request for "solid math" backing up a slow/contended
+    video rather than just a bare pass/fail) -- this is durable,
+    appears in picasa_debug.log for every video regardless of whether it
+    times out, and is exactly what distinguishes "this stage took a long
+    time under heavy load" from "this stage never finished at all": the
+    LAST stage before a real timeout simply never logs its own
+    completion line, while every stage before it shows a real number."""
+    def _progress(stage):
+        now = time.time()
+        prev_stage = _video_timeout_state.get('stage')
+        prev_start = _video_timeout_state.get('start')
+        if prev_stage is not None and prev_start is not None:
+            settings.LOGGER.info(
+                "video_face_extraction progress: stage '%s' finished in "
+                "%.1fs (load avg %.2f / %d cores, contention x%.2f)",
+                prev_stage, now - prev_start, os.getloadavg()[0],
+                os.cpu_count() or 1, _contention_multiplier(),
+            )
+        _video_timeout_state['stage'] = stage
+        _video_timeout_state['start'] = now
+    return _progress
+
+
+def _check_video_timeout(signum, frame):
+    state = _video_timeout_state
+    if not state:
+        return
+    elapsed = time.time() - state['start']
+    allowed = _video_timeout_budget_seconds(state['duration_seconds'])
+    if elapsed >= allowed:
+        stage = state.get('stage')
+        stage_note = f", stuck in stage '{stage}'" if stage is not None else ''
+        raise _VideoProcessingTimeout(
+            f"Video processing exceeded its dynamically-computed "
+            f"{allowed:.0f}s budget without advancing to a new stage "
+            f"(stalled {elapsed:.0f}s, duration {state['duration_seconds']}s, "
+            f"contention x{_contention_multiplier():.2f}{stage_note})"
+        )
 
 if not settings.configured:
     settings.configure()
@@ -205,12 +357,20 @@ def process_video_faces(max_runtime_seconds=None, video_ids=None):
                 )
                 break
             try:
-                signal.signal(signal.SIGALRM, _raise_video_timeout)
-                signal.alarm(PER_VIDEO_TIMEOUT_SECONDS)
+                signal.signal(signal.SIGALRM, _check_video_timeout)
+                _video_timeout_state.clear()
+                _video_timeout_state['start'] = time.time()
+                _video_timeout_state['duration_seconds'] = video.duration_seconds or 0
+                signal.setitimer(
+                    signal.ITIMER_REAL,
+                    PER_VIDEO_TIMEOUT_CHECK_INTERVAL_SECONDS,
+                    PER_VIDEO_TIMEOUT_CHECK_INTERVAL_SECONDS,
+                )
                 try:
-                    faces = extractor.process_video(video)
+                    faces = extractor.process_video(video, progress_cb=_make_progress_callback())
                 finally:
-                    signal.alarm(0)
+                    signal.setitimer(signal.ITIMER_REAL, 0, 0)
+                    _video_timeout_state.clear()
             except _VideoProcessingTimeout as exc:
                 # A timeout is plausibly just resource contention
                 # (confirmed real 2026-09-17: several short, completely
@@ -222,8 +382,8 @@ def process_video_faces(max_runtime_seconds=None, video_ids=None):
                 # automatically by a future scheduled run instead of
                 # needing a manual reset. But a genuinely-too-long video
                 # (not just contention) would otherwise retry forever,
-                # each attempt burning a full PER_VIDEO_TIMEOUT_SECONDS --
-                # face_extraction_timeout_count caps that at
+                # each attempt burning its own dynamically-computed budget
+                # -- face_extraction_timeout_count caps that at
                 # MAX_VIDEO_TIMEOUT_RETRIES, per the user's explicit call.
                 video.face_extraction_timeout_count += 1
                 if video.face_extraction_timeout_count >= MAX_VIDEO_TIMEOUT_RETRIES:
@@ -234,8 +394,7 @@ def process_video_faces(max_runtime_seconds=None, video_ids=None):
                     )
                     video.face_extraction_failed = True
                     video.face_extraction_error = (
-                        f"Timed out {video.face_extraction_timeout_count} times "
-                        f"(>{PER_VIDEO_TIMEOUT_SECONDS}s each): {exc}"
+                        f"Timed out {video.face_extraction_timeout_count} times: {exc}"
                     )[:2000]
                     video.isProcessed = True
                     log_error(

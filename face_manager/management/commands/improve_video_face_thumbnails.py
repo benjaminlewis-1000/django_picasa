@@ -65,7 +65,10 @@ from django.db import transaction
 from django.core.management.base import BaseCommand
 
 from face_manager.models import Face
-from face_manager.tasks import PER_VIDEO_TIMEOUT_SECONDS, _VideoProcessingTimeout, _raise_video_timeout
+from face_manager.tasks import (
+    _VideoProcessingTimeout, _check_video_timeout, _video_timeout_state,
+    PER_VIDEO_TIMEOUT_CHECK_INTERVAL_SECONDS,
+)
 from filepopulator.models import VideoFile
 from video_face_pipeline import VideoFaceExtractor, match_redetect_candidates_to_existing_faces
 
@@ -193,12 +196,20 @@ class Command(BaseCommand):
             old_scores = dict(candidates_by_video[video_id])
 
             try:
-                signal.signal(signal.SIGALRM, _raise_video_timeout)
-                signal.alarm(PER_VIDEO_TIMEOUT_SECONDS)
+                signal.signal(signal.SIGALRM, _check_video_timeout)
+                _video_timeout_state.clear()
+                _video_timeout_state['start'] = time.time()
+                _video_timeout_state['duration_seconds'] = video.duration_seconds or 0
+                signal.setitimer(
+                    signal.ITIMER_REAL,
+                    PER_VIDEO_TIMEOUT_CHECK_INTERVAL_SECONDS,
+                    PER_VIDEO_TIMEOUT_CHECK_INTERVAL_SECONDS,
+                )
                 try:
                     fps, frame_pixels, candidates = extractor._compute_candidate_groups(video)
                 finally:
-                    signal.alarm(0)
+                    signal.setitimer(signal.ITIMER_REAL, 0, 0)
+                    _video_timeout_state.clear()
             except _VideoProcessingTimeout:
                 timed_out += len(face_ids)
                 self.stdout.write(f'  [{vi}/{len(video_ids)}] video {video_id}: TIMEOUT, skipped')
