@@ -1501,7 +1501,7 @@ class VideoFaceExtractor(object):
             except FileNotFoundError:
                 pass
 
-    def _compute_candidate_groups(self, video_obj: VideoFile):
+    def _compute_candidate_groups(self, video_obj: VideoFile, progress_cb=None):
         """The full detect->track->cluster->union-merge pipeline for one
         VideoFile, stopping short of any DB write -- factored out of
         process_video() (2026-09-23, see CLAUDE.md's aspect-ratio
@@ -1511,6 +1511,19 @@ class VideoFaceExtractor(object):
         without duplicating it. Pure refactor: process_video() below
         calls this and does exactly what it always did with the result.
 
+        progress_cb, if given, is called with a short stage-name string
+        (e.g. 'detect_and_track') right before each major phase starts --
+        optional, so every existing caller (management commands, tests)
+        is unaffected. Added 2026-11-18 alongside the dynamic per-video
+        timeout in face_manager/tasks.py, so a video that's genuinely
+        still making progress (just slowly, under contention) can be
+        told apart from one that's silently wedged in one stage -- the
+        timeout check itself still only looks at total elapsed-vs-budget
+        (see that file's own comments for why), but the current stage
+        is surfaced in its timeout message for diagnosis, rather than
+        the operator only ever seeing a bare "exceeded Ns" with no idea
+        which phase it died in.
+
         Returns (fps, frame_pixels, candidates) -- fps and frame_pixels
         are needed by callers to resolve a candidate's provisional
         frame/timestamps into real values; candidates is a list of
@@ -1519,12 +1532,16 @@ class VideoFaceExtractor(object):
         reps for the group, needed by _classify_and_pick_thumbnail),
         first_sample/last_sample (raw sample indices, divide by fps for
         seconds). Empty list if the video has no usable tracks at all."""
+        if progress_cb is None:
+            progress_cb = lambda stage: None
         video_path = video_obj.filename
+        progress_cb('ffprobe')
         width, height, fps, field_order, _rotation, color_transfer, sar_scale_width = ffprobe_info(video_path)
         vf_filter = build_vf_filter(field_order, color_transfer, sar_scale_width=sar_scale_width)
         if sar_scale_width is not None:
             width = sar_scale_width
 
+        progress_cb('detect_and_track')
         tracks, stride, total_frames, frame_cache, cache_capped = self._detect_and_track(
             video_path, width, height, fps, vf_filter
         )
@@ -1577,6 +1594,7 @@ class VideoFaceExtractor(object):
             )
         fps = real_fps
 
+        progress_cb('pool_representative_frames')
         frame_pixels = self._pool_representative_frames(
             video_path, width, height, vf_filter, tracks,
             frame_cache=frame_cache, cache_capped=cache_capped,
@@ -1591,6 +1609,7 @@ class VideoFaceExtractor(object):
                 face_track_id.append(ti)
         track_spans = {ti: t['span'] for ti, t in enumerate(tracks)}
 
+        progress_cb('clustering')
         groups_if = _cluster_track_faces(embs_if, face_track_id, track_spans)
         groups_fn = _cluster_track_faces(embs_fn, face_track_id, track_spans)
         final_group_of = _union_merge_groups(len(tracks), groups_if, groups_fn)
@@ -1645,13 +1664,17 @@ class VideoFaceExtractor(object):
 
         return fps, frame_pixels, candidates
 
-    def process_video(self, video_obj: VideoFile):
+    def process_video(self, video_obj: VideoFile, progress_cb=None):
         """Runs the full pipeline for one VideoFile and creates one Face
         row per final union-merge group. Returns the list of created
-        Face objects."""
-        fps, frame_pixels, candidates = self._compute_candidate_groups(video_obj)
+        Face objects. progress_cb -- see _compute_candidate_groups()'s
+        own docstring."""
+        if progress_cb is None:
+            progress_cb = lambda stage: None
+        fps, frame_pixels, candidates = self._compute_candidate_groups(video_obj, progress_cb=progress_cb)
         if not candidates:
             return []
+        progress_cb('classify_and_save')
 
         created = []
         for cand in candidates:
