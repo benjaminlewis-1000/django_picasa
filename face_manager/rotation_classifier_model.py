@@ -27,6 +27,21 @@ and tests without any of them dragging in the others.
 import numpy as np
 from PIL import Image, ImageOps
 
+from common.open_img_oriented import open_img_oriented
+
+# Same panorama/giant-image hang already documented in
+# backfill_verified_kps.py (search CLAUDE.md for "a single
+# uninterruptible C call") -- a huge or extreme-aspect-ratio image can
+# make open_img_oriented()'s underlying PIL decode/resize call run for
+# a very long time (practically unbounded in the worst case seen so
+# far), and since it's a single C call, no SIGALRM-based timeout can
+# interrupt it once started. Check these against ImageFile's already-
+# stored width/height (zero decode cost) before ever calling
+# decode_upright() below, using the same thresholds already validated
+# against this library's real population by the training command.
+MAX_IMAGE_PIXELS = 25_000_000
+MAX_ASPECT_RATIO = 2.5
+
 NUM_CLASSES = 4  # degrees of CLOCKWISE rotation already baked into a
                   # training example, relative to the real upright
                   # orientation: class k means "rotate CCW by 90*k
@@ -90,6 +105,22 @@ def apply_synthetic_rotation(image_rgb_uint8, k):
     each a real, officially-wrong example the model must learn to
     detect and correctly label."""
     return np.ascontiguousarray(np.rot90(image_rgb_uint8, k=k))
+
+
+def decode_upright(filename, extra_rotation_degrees):
+    """Real, already-EXIF-(and-any-confirmed-rotation-)corrected pixel
+    content for one image file. Takes plain values (not an ImageFile
+    instance) so this never touches the ORM/a live DB connection --
+    shared by the training command (as its self-supervised ground
+    truth) and face_manager.rotation_ml_audit (as the real input a
+    live/future inference pass classifies). Returns None on a real
+    decode failure (a handful of genuinely corrupted/missing files are
+    expected at this library's scale -- skipped, not fatal, same
+    tolerance this project's other bulk-scan commands already have)."""
+    try:
+        return open_img_oriented(filename, as_numpy=True, extra_rotation_degrees=extra_rotation_degrees)
+    except (FileNotFoundError, OSError):
+        return None
 
 
 def undo_rotation_degrees(predicted_class):

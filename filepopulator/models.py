@@ -805,9 +805,14 @@ class ImageFile(models.Model):
 
     # Rotation-review fields -- see CLAUDE.md's 2026-11-03/11-05 orientation-
     # detection write-up. Populated by face_manager's audit_image_rotation
-    # command (landmark-geometry signal today; a future ML classifier is a
-    # second signal source writing the same fields, see ROTATION_SOURCE_
-    # PRIORITY below) and consumed/confirmed via a rotation-review API.
+    # command (landmark-geometry signal) and/or run_rotation_ml_audit (ML
+    # classifier signal, built 2026-11-21 but not yet scheduled -- see
+    # rotation_ml_audit.py), both writing the same fields, and consumed/
+    # confirmed via a rotation-review API. Once FLAGGED by either signal,
+    # a row is never re-scanned or overwritten by either one again -- only
+    # a human confirm/dismiss moves it from there (2026-11-21, per the
+    # user's own call -- an earlier source-priority table that let one
+    # automated signal overwrite another's existing flag was removed).
     class RotationScanState(models.TextChoices):
         NOT_SCANNED = 'not_scanned', 'Not scanned'
         FLAGGED = 'flagged', 'Flagged -- awaiting human review'
@@ -847,6 +852,20 @@ class ImageFile(models.Model):
     # (mirrors face_manager.test_face_cache's own sha256(source)-keyed
     # cache-invalidation pattern). '' (never scanned) always mismatches.
     rotation_scan_logic_hash = models.CharField(max_length=16, default='', db_default='', blank=True)
+    # The ML-classifier signal's OWN, separately-tracked staleness hash --
+    # sha256 of the trained model's checkpoint weights + the inference
+    # code (face_manager.rotation_ml_audit + the relevant parts of
+    # rotation_classifier_model) that's run against it. Deliberately NOT
+    # shared with rotation_scan_logic_hash above: that one gates the
+    # landmark path, which is cheap pure geometry on already-stored kps,
+    # so re-running the whole backlog on every unrelated code edit costs
+    # nothing -- but re-running real model inference on the whole backlog
+    # on every edit to an unrelated line in this file would be genuinely
+    # expensive. A row only re-qualifies for ML scanning when the model is
+    # actually retrained/re-exported or this specific inference code
+    # changes, not on an unrelated edit elsewhere. '' (never ML-scanned)
+    # always mismatches, same convention as rotation_scan_logic_hash.
+    rotation_ml_scan_hash = models.CharField(max_length=16, default='', db_default='', blank=True)
     # Set True once face_manager.rotation_correction.apply_rotation_
     # correction() has transformed every attached Face's box/kps into the
     # CONFIRMED rotation's coordinate space and regenerated their
@@ -896,6 +915,7 @@ class ImageFile(models.Model):
             self.proposed_rotation_degrees = None
             self.rotation_signal_source = None
             self.rotation_scan_logic_hash = ''
+            self.rotation_ml_scan_hash = ''
 
     def reset_rotation_scan_state_for_orientation_change(self):
         """Call this specifically when the file's own EXIF orientation tag
@@ -927,6 +947,7 @@ class ImageFile(models.Model):
         self.proposed_rotation_degrees = None
         self.rotation_signal_source = None
         self.rotation_scan_logic_hash = ''
+        self.rotation_ml_scan_hash = ''
         self.rotation_correction_applied = False
 
     # thumbnail = models.ImageField(upload_to = settings.FILEPOPULATOR_THUMBNAIL_DIR, default = str(timezone.now) + '_thumbnail.jpg' )

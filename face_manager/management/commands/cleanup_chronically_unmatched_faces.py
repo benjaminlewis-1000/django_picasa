@@ -91,6 +91,7 @@ class Command(BaseCommand):
             proposed_rotation_degrees=None,
             rotation_signal_source=None,
             rotation_scan_logic_hash='',
+            rotation_ml_scan_hash='',
         )
 
         self.stdout.write(self.style.SUCCESS(f"Deleted {deleted} face(s)."))

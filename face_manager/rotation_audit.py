@@ -22,7 +22,6 @@ from face_manager.rotation_geometry import (
     aggregate_orientation,
     circular_distance,
     eye_angle_degrees,
-    should_overwrite_rotation_proposal,
 )
 from filepopulator.models import ImageFile
 
@@ -96,13 +95,19 @@ def _candidate_images_queryset():
     kps_unrecoverable face (which, by definition, never has one) simply
     contributes nothing to the evaluation, same as it contributing
     nothing today.
+
+    2026-11-21 (per the user's own call): once an image is FLAGGED --
+    by this signal, OR by the ML classifier signal (face_manager.
+    rotation_ml_audit) -- it stays flagged exactly as proposed until a
+    human confirms/dismisses it, full stop. No automated re-scan is ever
+    allowed to touch, refine, or revoke an existing flag, so FLAGGED is
+    no longer part of this queryset at all (it used to be, gated by a
+    now-removed source-priority table) -- a human decision is the only
+    thing that ever moves a FLAGGED row again.
     """
     ScanState = ImageFile.RotationScanState
     return (
-        ImageFile.objects.filter(
-            Q(rotation_scan_state=ScanState.NOT_SCANNED) | Q(rotation_scan_state=ScanState.FLAGGED),
-            isProcessed=True,
-        )
+        ImageFile.objects.filter(rotation_scan_state=ScanState.NOT_SCANNED, isProcessed=True)
         .exclude(rotation_scan_logic_hash=_rotation_scan_logic_hash())
         .annotate(_faces_missing_kps=Count(
             'face', filter=Q(face__kps__isnull=True, face__kps_unrecoverable=False),
@@ -173,7 +178,6 @@ def run_rotation_audit(write=False, max_images=DEFAULT_MAX_IMAGES_PER_RUN):
         'ambiguous_disagreement': 0,
         'confirmed_upright': 0,
         'flagged_new_or_updated': 0,
-        'skipped_lower_priority': 0,
     }
 
     to_update = []
@@ -201,13 +205,6 @@ def run_rotation_audit(write=False, max_images=DEFAULT_MAX_IMAGES_PER_RUN):
 
         if outcome['estimate'] is None:
             counts['ambiguous_disagreement'] += 1
-            image.rotation_scan_logic_hash = current_hash
-            to_update.append(image)
-            continue
-
-        allowed = should_overwrite_rotation_proposal(image.rotation_signal_source, outcome['source'])
-        if not allowed:
-            counts['skipped_lower_priority'] += 1
             image.rotation_scan_logic_hash = current_hash
             to_update.append(image)
             continue
