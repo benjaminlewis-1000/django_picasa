@@ -703,6 +703,16 @@ CELERY_BEAT_SCHEDULE = {
         # reencode_missing_faces (:20) and clear_ignored_encodings (:35).
         'schedule': crontab(minute='40', hour='*'),
     },
+   'audit_image_rotation_ml': {
+        'task': 'face_manager.audit_image_rotation_ml',
+        # Real model inference per image (unlike audit_image_rotation's
+        # pure geometry) -- every 2 hours, not hourly, to leave real
+        # breathing room against its own up-to-50-minute runtime budget
+        # (DEFAULT_MAX_RUNTIME_SECONDS) and the other CPU-heavy backfill
+        # jobs this host already runs concurrently. Offset from
+        # audit_image_rotation (:40)/correct_image_rotation (:10).
+        'schedule': crontab(minute='55', hour='*/2'),
+    },
    'correct_image_rotation': {
         'task': 'face_manager.correct_image_rotation',
         # A SAFETY NET only, not the primary delivery path -- confirming
