@@ -67,15 +67,24 @@ ONNX_MODEL_PATH = '/models/rotation_classifier/rotation_classifier.onnx'
 # CONFIRMED + 2374 DISMISSED_NOT_ROTATED) as ground truth -- a harder,
 # more adversarial population than a random held-out split, since every
 # DISMISSED row was something another signal already thought looked
-# rotated and a human said no. At this threshold: ~10.3% false-flag rate
-# on genuinely-upright images, ~80.9% recall on genuinely-rotated ones
-# (full sweep in the dated CLAUDE.md write-up). Deliberately on the
-# loose/high-recall end of that curve, not the conservative end -- per
-# explicit user direction: confirmed/dismissed rows are a one-time
-# review, never re-surfaced, so a wrong flag just costs one quick human
-# dismissal rather than a standing cost, and catching more real rotations
-# is worth a higher false-flag rate here.
-CONFIDENCE_FLOOR = 0.75
+# rotated and a human said no.
+#
+# Gate is on the AGGREGATE "not confidently upright" mass (1 - P(upright)),
+# not the old per-class-argmax confidence -- see the dated CLAUDE.md
+# write-up ("Is one threshold for orientation the right way to go about
+# this?"). The old rule required the network to commit confidently to ONE
+# specific rotated class; a model split ~evenly between two rotated
+# classes (e.g. 35%/35%/20% upright) never cleared that gate even though
+# it was clearly, confidently NOT upright. At this threshold (0.80): ~10.6%
+# false-flag rate on genuinely-upright images, ~83.5% recall on
+# genuinely-rotated ones (full sweep in the dated write-up) -- same
+# false-flag cost as the old 0.75 per-class rule, meaningfully higher
+# recall. Deliberately on the loose/high-recall end of that curve, not the
+# conservative end -- per explicit user direction: confirmed/dismissed
+# rows are a one-time review, never re-surfaced, so a wrong flag just
+# costs one quick human dismissal rather than a standing cost, and
+# catching more real rotations is worth a higher false-flag rate here.
+CONFIDENCE_FLOOR = 0.80
 
 # Same batching/runtime-budget reasoning as rotation_audit.py's own
 # constants -- see that module's comments. A full classifier forward
@@ -165,8 +174,10 @@ def _candidate_images_queryset():
 def classify_image(arr, model):
     """Pure inference on an already-decoded HxWx3 uint8 RGB array --
     model is passed in (not loaded here) so this is directly testable
-    with a cheap stub instead of the real checkpoint. Returns
-    (predicted_class, confidence)."""
+    with a cheap stub instead of the real checkpoint. Returns the full
+    4-class softmax probability vector (numpy array, class 0 = upright),
+    not just the top class -- the aggregate flagging rule below needs
+    P(upright) specifically, not only whichever single class wins."""
     import torch
 
     square = letterbox_to_square(arr, size=INPUT_SIZE)
@@ -174,15 +185,19 @@ def classify_image(arr, model):
     with torch.no_grad():
         logits = model(tensor)
         probs = torch.softmax(logits, dim=1)[0]
-    predicted_class = int(probs.argmax())
-    confidence = float(probs[predicted_class])
-    return predicted_class, confidence
+    return probs.numpy()
 
 
 def evaluate_image_ml(filename, width, height, model):
     """DB-free evaluation of one image: decode + classify (or skip/fail
     first). Returns a dict: {'outcome': 'size_skip'|'decode_failure'|
     'classified', 'degrees': float|None, 'significant': bool}.
+
+    Flags on the AGGREGATE "not confidently upright" mass
+    (1 - P(upright)), not on any single class's own confidence -- see
+    CONFIDENCE_FLOOR's docstring above. The proposed DIRECTION is still
+    whichever rotated class (1..3) has the most probability mass, but
+    that choice no longer gates whether the image is flagged at all.
 
     'size_skip'/'decode_failure' are terminal for THIS code/model
     version (same width/height will always skip; a genuinely unreadable
@@ -199,9 +214,11 @@ def evaluate_image_ml(filename, width, height, model):
     if arr is None:
         return {'outcome': 'decode_failure', 'degrees': None, 'significant': False}
 
-    predicted_class, confidence = classify_image(arr, model)
-    degrees = undo_rotation_degrees(predicted_class)
-    significant = predicted_class != 0 and confidence >= CONFIDENCE_FLOOR
+    probs = classify_image(arr, model)
+    predicted_rotated_class = 1 + int(probs[1:].argmax())
+    degrees = undo_rotation_degrees(predicted_rotated_class)
+    not_upright_mass = 1.0 - float(probs[0])
+    significant = not_upright_mass >= CONFIDENCE_FLOOR
     return {'outcome': 'classified', 'degrees': degrees, 'significant': significant}
 
 

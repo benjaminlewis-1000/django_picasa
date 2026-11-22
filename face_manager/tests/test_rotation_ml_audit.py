@@ -41,8 +41,19 @@ def _rotated_90_confident_model():
 
 
 def _rotated_90_unconfident_model():
-    # class 1 picked, but only barely -- below CONFIDENCE_FLOOR.
+    # class 1 picked, but only barely -- below CONFIDENCE_FLOOR, and the
+    # aggregate not-upright mass (~0.74) is also below CONFIDENCE_FLOOR.
     return _FixedLogitsModel([0.1, 0.2, 0.0, 0.0])
+
+
+def _split_between_rotated_classes_model():
+    # Split almost evenly between two rotated classes (1 and 2), neither
+    # individually clearing CONFIDENCE_FLOOR -- but the network is
+    # clearly, confidently NOT upright (P(upright) ~= 0.06). This is
+    # exactly the case the aggregate rule exists to catch: the old
+    # per-class-argmax rule would never flag this (no single class ever
+    # reaches 0.75), even though "not upright" is obvious in aggregate.
+    return _FixedLogitsModel([0.0, 2.0, 1.9, 0.0])
 
 
 class RotationMlScanHashTests(TestCase):
@@ -95,17 +106,18 @@ class ClassifyImageTests(TestCase):
         from face_manager.rotation_ml_audit import classify_image
 
         arr = np.zeros((50, 50, 3), dtype=np.uint8)
-        predicted_class, confidence = classify_image(arr, _upright_confident_model())
-        self.assertEqual(predicted_class, 0)
-        self.assertGreater(confidence, 0.99)
+        probs = classify_image(arr, _upright_confident_model())
+        self.assertEqual(len(probs), 4)
+        self.assertEqual(int(probs.argmax()), 0)
+        self.assertGreater(probs[0], 0.99)
 
     def test_confident_rotated_prediction(self):
         from face_manager.rotation_ml_audit import classify_image
 
         arr = np.zeros((50, 50, 3), dtype=np.uint8)
-        predicted_class, confidence = classify_image(arr, _rotated_90_confident_model())
-        self.assertEqual(predicted_class, 1)
-        self.assertGreater(confidence, 0.99)
+        probs = classify_image(arr, _rotated_90_confident_model())
+        self.assertEqual(int(probs.argmax()), 1)
+        self.assertGreater(probs[1], 0.99)
 
 
 class EvaluateImageMlTests(TestCase):
@@ -186,6 +198,23 @@ class EvaluateImageMlTests(TestCase):
             )
         self.assertEqual(outcome['outcome'], 'classified')
         self.assertFalse(outcome['significant'])
+
+    def test_split_between_rotated_classes_is_significant_under_aggregate_rule(self):
+        # The core behavior this rule change exists for: neither rotated
+        # class individually clears CONFIDENCE_FLOOR, but the network is
+        # clearly, confidently not-upright in aggregate -- must flag, with
+        # direction from whichever rotated class has the most mass.
+        from face_manager.rotation_ml_audit import evaluate_image_ml
+
+        arr = np.zeros((50, 50, 3), dtype=np.uint8)
+        with patch('face_manager.rotation_ml_audit.decode_upright', return_value=arr):
+            outcome = evaluate_image_ml(
+                "/does/not/matter.jpg", width=100, height=100,
+                model=_split_between_rotated_classes_model(),
+            )
+        self.assertEqual(outcome['outcome'], 'classified')
+        self.assertTrue(outcome['significant'])
+        self.assertEqual(outcome['degrees'], 90.0)
 
 
 class RunRotationMlAuditTests(TestCase):
