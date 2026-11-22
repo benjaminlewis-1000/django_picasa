@@ -69,7 +69,7 @@ class RotationMlScanHashTests(TestCase):
     def test_missing_checkpoint_hashes_deterministically_not_an_error(self):
         from face_manager.rotation_ml_audit import _rotation_ml_scan_hash
 
-        with patch('face_manager.rotation_ml_audit.CHECKPOINT_PATH', '/nonexistent/path.pt'):
+        with patch('face_manager.rotation_ml_audit.ONNX_MODEL_PATH', '/nonexistent/path.pt'):
             value = _rotation_ml_scan_hash()
         self.assertEqual(len(value), 16)
 
@@ -83,9 +83,9 @@ class RotationMlScanHashTests(TestCase):
             f1.flush()
             f2.write(b'bbb')
             f2.flush()
-            with patch('face_manager.rotation_ml_audit.CHECKPOINT_PATH', f1.name):
+            with patch('face_manager.rotation_ml_audit.ONNX_MODEL_PATH', f1.name):
                 hash1 = _rotation_ml_scan_hash()
-            with patch('face_manager.rotation_ml_audit.CHECKPOINT_PATH', f2.name):
+            with patch('face_manager.rotation_ml_audit.ONNX_MODEL_PATH', f2.name):
                 hash2 = _rotation_ml_scan_hash()
         self.assertNotEqual(hash1, hash2)
 
@@ -353,7 +353,7 @@ class RunRotationMlAuditTests(TestCase):
     def test_no_model_and_no_checkpoint_raises(self):
         from face_manager.rotation_ml_audit import run_rotation_ml_audit
 
-        with patch('face_manager.rotation_ml_audit.CHECKPOINT_PATH', '/nonexistent/checkpoint.pt'):
+        with patch('face_manager.rotation_ml_audit.ONNX_MODEL_PATH', '/nonexistent/checkpoint.pt'):
             with self.assertRaises(FileNotFoundError):
                 run_rotation_ml_audit(write=False)
 
@@ -372,7 +372,7 @@ class RunRotationMlAuditUntilDoneTests(TestCase):
     def test_no_checkpoint_returns_immediately_without_raising(self):
         from face_manager.rotation_ml_audit import run_rotation_ml_audit_until_done
 
-        with patch('face_manager.rotation_ml_audit.CHECKPOINT_PATH', '/nonexistent/checkpoint.pt'):
+        with patch('face_manager.rotation_ml_audit.ONNX_MODEL_PATH', '/nonexistent/checkpoint.pt'):
             result = run_rotation_ml_audit_until_done()
 
         self.assertTrue(result['skipped_no_checkpoint'])

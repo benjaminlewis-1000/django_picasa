@@ -22,8 +22,9 @@ class Command(BaseCommand):
         "needs no detected faces/kps and considers every NOT_SCANNED image. Read-only, "
         "single-batch by default; pass --yes to write, which loops bounded batches "
         "until the backlog is exhausted or --max-runtime-seconds is reached. Requires "
-        "a trained checkpoint at the path face_manager.rotation_ml_audit.CHECKPOINT_PATH "
-        "names -- if none exists yet, fails with a clear error rather than crashing."
+        "a trained, exported ONNX model at the path "
+        "face_manager.rotation_ml_audit.ONNX_MODEL_PATH names -- if none exists yet, "
+        "fails with a clear error rather than crashing."
     )
 
     def add_arguments(self, parser):

@@ -33,6 +33,7 @@ table was removed).
 """
 import hashlib
 import inspect
+import os
 import sys
 import time
 
@@ -50,7 +51,16 @@ from face_manager.rotation_classifier_model import (
 )
 from filepopulator.models import ImageFile
 
-CHECKPOINT_PATH = '/models/rotation_classifier/checkpoint.pt'
+# Deliberately the ONNX export, not train_rotation_classifier.py's own
+# checkpoint.pt -- that file is overwritten with the LATEST weights on
+# every CHECKPOINT_EVERY_STEPS tick, not just on a new best, so it drifts
+# away from the best val_acc actually reached as training continues past
+# that point. export_onnx() in the training command, by contrast, only
+# ever fires when a NEW best val_acc is found, so this file always holds
+# the best model seen so far -- exactly the weights this live-inference
+# path should use. Also matches this project's existing all-ONNX CPU-
+# inference convention elsewhere (insightface's det_500m/det_10g, LVFace).
+ONNX_MODEL_PATH = '/models/rotation_classifier/rotation_classifier.onnx'
 
 # Deliberately conservative, and NOT empirically validated against this
 # specific checkpoint's real confidence-vs-correctness calibration (the
@@ -72,39 +82,58 @@ DEFAULT_MAX_RUNTIME_SECONDS = 3000
 
 def _rotation_ml_scan_hash():
     """sha256(source of this module + rotation_classifier_model +
-    the checkpoint file's own raw bytes)[:16] -- see this module's own
-    docstring for why the checkpoint's weight bytes are folded in here,
-    unlike rotation_audit's source-only hash. A missing checkpoint
+    the exported ONNX model's own raw bytes)[:16] -- see this module's own
+    docstring for why the model's weight bytes are folded in here,
+    unlike rotation_audit's source-only hash. A missing model file
     hashes to the empty-bytes case deterministically (not an error) --
     callers that actually need a loaded model handle FileNotFoundError
     separately, at load time.
     """
     src = inspect.getsource(sys.modules[__name__]) + inspect.getsource(rotation_classifier_model)
     try:
-        with open(CHECKPOINT_PATH, 'rb') as f:
-            checkpoint_bytes = f.read()
+        with open(ONNX_MODEL_PATH, 'rb') as f:
+            model_bytes = f.read()
     except FileNotFoundError:
-        checkpoint_bytes = b''
-    return hashlib.sha256(src.encode('utf-8') + checkpoint_bytes).hexdigest()[:16]
+        model_bytes = b''
+    return hashlib.sha256(src.encode('utf-8') + model_bytes).hexdigest()[:16]
+
+
+class _OnnxLogitsModel:
+    """Minimal callable wrapper around an onnxruntime InferenceSession so
+    classify_image()'s torch-tensor-in/torch-tensor-out interface --
+    shared with the plain-callable stub models this module's own tests
+    use in place of a real model -- works unchanged regardless of which
+    backend _load_model() returns."""
+
+    def __init__(self, session):
+        self._session = session
+        self._input_name = session.get_inputs()[0].name
+
+    def __call__(self, tensor):
+        import torch
+
+        logits = self._session.run(None, {self._input_name: tensor.numpy()})[0]
+        return torch.from_numpy(logits)
+
+    def eval(self):
+        return self
 
 
 def _load_model():
-    """Loads the trained checkpoint fresh -- raises FileNotFoundError if
-    it doesn't exist (callers decide how to handle that; see
-    run_rotation_ml_audit_until_done()). Deliberately not cached at
-    module scope: this is infra built ahead of being scheduled, not yet
-    exercised at a frequency where reload cost matters -- revisit if/when
-    this is actually wired into a live, repeatedly-invoked task.
+    """Loads the best-exported ONNX model fresh -- raises
+    FileNotFoundError if it doesn't exist (callers decide how to handle
+    that; see run_rotation_ml_audit_until_done()). Deliberately not
+    cached at module scope: this is infra built ahead of being
+    scheduled, not yet exercised at a frequency where reload cost
+    matters -- revisit if/when this is actually wired into a live,
+    repeatedly-invoked task.
     """
-    import torch
+    import onnxruntime as ort
 
-    from face_manager.rotation_classifier_model import build_model
-
-    model = build_model(pretrained=False)
-    ckpt = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=True)
-    model.load_state_dict(ckpt['model_state'])
-    model.eval()
-    return model
+    if not os.path.exists(ONNX_MODEL_PATH):
+        raise FileNotFoundError(ONNX_MODEL_PATH)
+    session = ort.InferenceSession(ONNX_MODEL_PATH, providers=['CPUExecutionProvider'])
+    return _OnnxLogitsModel(session)
 
 
 def _candidate_images_queryset():
