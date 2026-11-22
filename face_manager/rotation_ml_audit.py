@@ -62,15 +62,20 @@ from filepopulator.models import ImageFile
 # inference convention elsewhere (insightface's det_500m/det_10g, LVFace).
 ONNX_MODEL_PATH = '/models/rotation_classifier/rotation_classifier.onnx'
 
-# Deliberately conservative, and NOT empirically validated against this
-# specific checkpoint's real confidence-vs-correctness calibration (the
-# human-adjudicated check earlier this project ran was against an older
-# checkpoint) -- this is infra-only for now (see this module's own
-# docstring), so getting this exactly right isn't yet load-bearing.
-# MUST be re-validated (same leave-one-out-against-human-adjudicated-
-# rows methodology this project already used for the landmark signal)
-# before this is ever actually scheduled.
-CONFIDENCE_FLOOR = 0.95
+# Empirically calibrated 2026-11-22 against this checkpoint's best-exported
+# ONNX weights, using REAL human-adjudicated rotation-review rows (960
+# CONFIRMED + 2374 DISMISSED_NOT_ROTATED) as ground truth -- a harder,
+# more adversarial population than a random held-out split, since every
+# DISMISSED row was something another signal already thought looked
+# rotated and a human said no. At this threshold: ~10.3% false-flag rate
+# on genuinely-upright images, ~80.9% recall on genuinely-rotated ones
+# (full sweep in the dated CLAUDE.md write-up). Deliberately on the
+# loose/high-recall end of that curve, not the conservative end -- per
+# explicit user direction: confirmed/dismissed rows are a one-time
+# review, never re-surfaced, so a wrong flag just costs one quick human
+# dismissal rather than a standing cost, and catching more real rotations
+# is worth a higher false-flag rate here.
+CONFIDENCE_FLOOR = 0.75
 
 # Same batching/runtime-budget reasoning as rotation_audit.py's own
 # constants -- see that module's comments. A full classifier forward
